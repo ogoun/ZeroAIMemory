@@ -6887,7 +6887,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.0.14-m7.1"
+version = "0.0.15-m7.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -6946,13 +6946,14 @@ dependencies = [
 
 [[package]]
 name = "zam-cli"
-version = "0.0.14-m7.1"
+version = "0.0.15-m7.2"
 dependencies = [
  "assert_cmd",
  "axum",
  "blake3",
  "clap",
  "globset",
+ "jiff",
  "regex",
  "rpassword",
  "rusqlite",
@@ -6973,7 +6974,7 @@ dependencies = [
 
 [[package]]
 name = "zam-code"
-version = "0.0.14-m7.1"
+version = "0.0.15-m7.2"
 dependencies = [
  "blake3",
  "proptest",
@@ -6993,7 +6994,7 @@ dependencies = [
 
 [[package]]
 name = "zam-core"
-version = "0.0.14-m7.1"
+version = "0.0.15-m7.2"
 dependencies = [
  "rand 0.9.5",
  "rusqlite",
@@ -7005,7 +7006,7 @@ dependencies = [
 
 [[package]]
 name = "zam-docs"
-version = "0.0.14-m7.1"
+version = "0.0.15-m7.2"
 dependencies = [
  "encoding_rs",
  "fast_image_resize",
@@ -7021,7 +7022,7 @@ dependencies = [
 
 [[package]]
 name = "zam-fetch"
-version = "0.0.14-m7.1"
+version = "0.0.15-m7.2"
 dependencies = [
  "flate2",
  "lzma-rust2",
@@ -7036,7 +7037,7 @@ dependencies = [
 
 [[package]]
 name = "zam-index"
-version = "0.0.14-m7.1"
+version = "0.0.15-m7.2"
 dependencies = [
  "blake3",
  "fs4",
@@ -7066,7 +7067,7 @@ dependencies = [
 
 [[package]]
 name = "zam-markdown"
-version = "0.0.14-m7.1"
+version = "0.0.15-m7.2"
 dependencies = [
  "ammonia",
  "comrak",
@@ -7085,7 +7086,7 @@ dependencies = [
 
 [[package]]
 name = "zam-ml"
-version = "0.0.14-m7.1"
+version = "0.0.15-m7.2"
 dependencies = [
  "half 2.7.1",
  "lru",
@@ -7104,7 +7105,7 @@ dependencies = [
 
 [[package]]
 name = "zam-search"
-version = "0.0.14-m7.1"
+version = "0.0.15-m7.2"
 dependencies = [
  "jiff",
  "regex",
@@ -7115,7 +7116,7 @@ dependencies = [
 
 [[package]]
 name = "zam-secrets"
-version = "0.0.14-m7.1"
+version = "0.0.15-m7.2"
 dependencies = [
  "comrak",
  "proptest",
@@ -7125,7 +7126,7 @@ dependencies = [
 
 [[package]]
 name = "zam-server"
-version = "0.0.14-m7.1"
+version = "0.0.15-m7.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -7184,7 +7185,7 @@ dependencies = [
 
 [[package]]
 name = "zam-store"
-version = "0.0.14-m7.1"
+version = "0.0.15-m7.2"
 dependencies = [
  "base64 0.22.1",
  "blake3",

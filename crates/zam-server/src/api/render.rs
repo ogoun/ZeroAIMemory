@@ -34,13 +34,13 @@
 //! своим резолвером файлов записи ([`super::reports::view`]).
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::extract::rejection::BytesRejection;
-use axum::http::{HeaderMap, HeaderValue, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lru::LruCache;
 use serde::Deserialize;
@@ -453,17 +453,35 @@ pub async fn preview(
     })))
 }
 
-/// `GET /render/highlight.css` — стили подсветки кода; кэшируется сутки.
-pub async fn highlight(_: Principal) -> Response {
-    let mut r = highlight_css().into_response();
+/// Сильный `ETag` стилей подсветки — `"<blake3 hex>"` содержимого: CSS вычисляется один раз
+/// на процесс, тег — тоже.
+static HIGHLIGHT_ETAG: LazyLock<HeaderValue> = LazyLock::new(|| {
+    let hex = blake3::hash(highlight_css().as_bytes()).to_hex();
+    HeaderValue::from_str(&format!("\"{hex}\"")).expect("hex — допустимый заголовок")
+});
+
+/// `GET /render/highlight.css` — стили подсветки кода. Кэш — проверкой (M7.2, §5.1 п. 10):
+/// `ETag` по хэшу содержимого, `Cache-Control: private, no-cache`, на совпавший
+/// `If-None-Match` — 304. Новый вывод `highlight_css` браузер получает сразу, без ручной
+/// версии в адресе; параметр `?v=` WebUI принимается и не влияет.
+pub async fn highlight(_: Principal, headers: HeaderMap) -> Response {
+    let etag = &*HIGHLIGHT_ETAG;
+    let tag = etag.to_str().expect("ASCII").trim_matches('"');
+    let mut r = if super::files::not_modified(&headers, tag) {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        let mut r = highlight_css().into_response();
+        r.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/css; charset=utf-8"),
+        );
+        r
+    };
     let h = r.headers_mut();
-    h.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/css; charset=utf-8"),
-    );
+    h.insert(header::ETAG, etag.clone());
     h.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=86400"),
+        HeaderValue::from_static("private, no-cache"),
     );
     r
 }

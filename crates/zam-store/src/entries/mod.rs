@@ -397,8 +397,10 @@ pub struct EntryPatch {
     pub human_edit: bool,
 }
 
-/// Фильтр ленты записей пространства.
-#[derive(Debug, Clone)]
+/// Фильтр ленты записей пространства. Сборка — `EntryFilter { space_id, limit, …,
+/// ..Default::default() }`: `space_id` и `limit` задаются явно (умолчание `limit` — 0, его
+/// лента отклоняет), прочее по умолчанию — без ограничения.
+#[derive(Debug, Clone, Default)]
 pub struct EntryFilter {
     pub space_id: Id,
     /// `None` — любые виды, кроме report (если не [`EntryFilter::with_reports`]).
@@ -434,6 +436,14 @@ pub struct EntryFilter {
     /// запрашивающему пространств (пункты плана, M6.5 §9, фильтр «Из идей» «Задач» WebUI);
     /// `None` — без фильтра; только при `kind = Some(Task)`, иначе `BadInput`.
     pub from_idea: Option<crate::ideas::IdeaSpaces>,
+    /// Только записи с этими id (лента `parent=<id>` — прямые подзадачи, M7 §5.4 п. 3); пустой
+    /// список — пустая лента, `None` — без ограничения. Повторы id не в счёт.
+    pub only_ids: Option<Vec<Id>>,
+    /// Кроме записей с этими id (`top_level=1` — без подзадач); пусто — без ограничения.
+    pub except_ids: Vec<Id>,
+    /// Порядок ленты — порядок [`EntryFilter::only_ids`] (порядок шагов плана), а не «новые
+    /// первыми»; курсор — позиция в списке. Без `only_ids` или с `deleted_only` — `BadInput`.
+    pub ids_order: bool,
 }
 
 /// Нормализованный заголовок (дедупликация, §7.5): нижний регистр, всё, что не буква и не

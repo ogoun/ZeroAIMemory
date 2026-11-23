@@ -34,7 +34,10 @@
   } from '../lib/api';
   import { JOURNAL_TITLE, journalsOf } from '../lib/journals';
   import { go, href, routeUser, type Journal, type Route } from '../lib/router';
+  import { NOTES_HINT, countDescription, countHint, formatCount, notesLabel, openLabel } from '../lib/counts';
+  import { counts } from '../lib/counts.svelte';
   import IndexBadge from './IndexBadge.svelte';
+  import LazyFail from './LazyFail.svelte';
 
   interface Props {
     /** Пользователи; свой — первым. */
@@ -161,6 +164,17 @@
     if (open[key] && !loaded) await load();
   }
 
+  /** Раскрытие и сворачивание пространства; раскрытие перечитывает числа разделов (§5.3 п. 3):
+   * запись агента видна без перезагрузки страницы. */
+  function toggleSpace(uid: string, ref: string) {
+    const k = kSpace(uid, ref);
+    void toggle(k, () => loadKids(uid, ref, ''), !!kids[k]);
+    if (open[k]) counts.invalidate(uid, ref);
+  }
+
+  /** Id описания числа в дереве (`aria-describedby`): пользователь, пространство, журнал. */
+  const countId = (uid: string, ref: string, j = '') => `tree-count-${uid}-${ref}${j ? `-${j}` : ''}`;
+
   /** Перечитывает раскрытые уровни пространства после изменения. */
   async function refreshSpace(uid: string, ref: string) {
     const root = kSpace(uid, ref);
@@ -240,8 +254,33 @@
       );
     } else {
       items.push({ label: 'Экспорт (.zip)', action: () => void exportSpace(t) });
+      // импорт (§5.7 п. 1): свои пространства, у администратора — любого пользователя; в решение
+      // у участника — нет (сервер ответил бы 403: импорт пишет от имени владельца базы)
+      if (t.space.role !== 'member') items.push({ label: 'Импорт (.zip)…', action: () => void openImport(t) });
     }
     return items;
+  }
+
+  // ---- импорт архива (M7.2, §5.7): диалог — ленивый чанк `ImportDialog` ----
+
+  type ImportDialogType = typeof import('./ImportDialog.svelte').default;
+  let importDialog = $state.raw<ImportDialogType | null>(null);
+  let importing = $state.raw<Target | null>(null);
+  /** Чанк диалога не загрузился: текст под строкой пространства (`LazyFail`, §5.1 п. 9). */
+  let importFail = $state<{ key: string; error: unknown } | null>(null);
+  /** Итог закрытого окна (отправка прервана) — строкой под пространством до следующего импорта. */
+  let importNote = $state<{ key: string; text: string } | null>(null);
+  const kImport = (u: string, ref: string) => `i|${u}|${ref}`;
+
+  async function openImport(t: Target) {
+    importFail = null;
+    importNote = null;
+    try {
+      importDialog ??= (await import('./ImportDialog.svelte')).default;
+      importing = t;
+    } catch (e) {
+      importFail = { key: kImport(t.uid, spaceRef(t.space)), error: e };
+    }
   }
 
   const kExport = (u: string, ref: string) => `x|${u}|${ref}`;
@@ -506,6 +545,9 @@
   {@const ref = spaceRef(s)}
   {@const k = kSpace(uid, ref)}
   {@const target = { uid, space: s, node: null }}
+  {@const c = counts.get(uid, ref, !!open[k])}
+  <!-- числа разделов (§5.3 п. 2): свёрнутое пространство — уже загруженные, раскрытое — загружает;
+       число — отдельный элемент вне имени кнопки и ссылки, для чтения с экрана — описание (N3) -->
   <li>
     <div class="tree-row space" style:--depth={depth} oncontextmenu={(e) => menuAt(e, target)} role="presentation">
       <button
@@ -513,20 +555,39 @@
         class="twisty"
         aria-expanded={!!open[k]}
         aria-label={open[k] ? `Свернуть ${s.name}` : `Развернуть ${s.name}`}
-        onclick={() => toggle(k, () => loadKids(uid, ref, ''), !!kids[k])}
+        onclick={() => toggleSpace(uid, ref)}
       >
         {@render chevron(!!open[k])}
       </button>
-      <button type="button" class="label" onclick={() => toggle(k, () => loadKids(uid, ref, ''), !!kids[k])}>
+      <button
+        type="button"
+        class="label"
+        aria-describedby={c ? countId(uid, ref) : undefined}
+        onclick={() => toggleSpace(uid, ref)}
+      >
         {@render icon(s.kind)}<span class="name">{s.name}</span>
         {#each roleTags(s) as t (t.text)}<span class="tag role" title={t.title}>{t.text}</span>{/each}
         {#if s.kind === 'rules' && rules[uid]?.warning === 'rules_heavy'}
           <span class="tag heavy" title={rulesHeavyText(rules[uid]!)}>много правил</span>
         {/if}
       </button>
+      {#if c}
+        <span class="num" class:zero={c.notes === 0} data-count="notes" aria-hidden="true" title={NOTES_HINT}>{formatCount(c.notes)}</span>
+        <span id={countId(uid, ref)} hidden>{notesLabel(c.notes)}</span>
+      {/if}
       <button type="button" class="more" aria-label="Действия: {s.name}" onclick={(e) => menuBelow(e, target)}>⋯</button>
     </div>
     {@render status(kExport(uid, ref))}
+    {#if importNote?.key === kImport(uid, ref)}
+      <div class="tree-note muted" role="status" style:--depth={depth}>{importNote.text}</div>
+    {/if}
+    {#if importFail?.key === kImport(uid, ref)}
+      <div class="tree-note" style:--depth={depth}>
+        <LazyFail error={importFail.error} label="Окно импорта не загрузилось">
+          <button type="button" onclick={() => (importFail = null)}>Закрыть</button>
+        </LazyFail>
+      </div>
+    {/if}
     {#if open[k]}
       {@const js = journalsOf(s.kind)}
       {#if s.kind === 'rules' && rules[uid]?.warning === 'rules_heavy'}
@@ -535,6 +596,8 @@
       {#if js.length}
         <ul class="journals" aria-label="Журналы: {s.name}">
           {#each js as j (j)}
+            {@const n = c?.journals[j]}
+            {@const oq = j === 'questions' ? (c?.open.questions ?? 0) : 0}
             <li>
               <div class="tree-row" class:selected={isJournal(uid, ref, j)} style:--depth={depth + 1}>
                 <span class="twisty"></span>
@@ -542,9 +605,15 @@
                   class="label journal"
                   href={href({ name: 'journal', user: uid, space: ref, journal: j, entry: null })}
                   aria-current={isJournal(uid, ref, j) ? 'page' : undefined}
+                  aria-describedby={n !== undefined ? countId(uid, ref, j) : undefined}
                 >
                   {@render icon(`j-${j}`)}<span class="name">{JOURNAL_TITLE[j]}</span>
                 </a>
+                {#if n !== undefined}
+                  {#if oq > 0}<span class="tag open" aria-hidden="true">{openLabel(oq)}</span>{/if}
+                  <span class="num" class:zero={n === 0} data-count={j} aria-hidden="true" title={countHint(j)}>{formatCount(n)}</span>
+                  <span id={countId(uid, ref, j)} hidden>{countDescription(j, n, oq)}</span>
+                {/if}
               </div>
             </li>
           {/each}
@@ -666,6 +735,26 @@
   <ContextMenu x={menu.x} y={menu.y} items={menu.items} onclose={() => (menu = null)} />
 {/if}
 <Prompt bind:ask />
+{#if importing && importDialog}
+  {@const ImportDialog = importDialog}
+  {@const t = importing}
+  {@const ref = spaceRef(t.space)}
+  <!-- итог без `dry_run`: заметки и вложенные уровни пространства перечитываются; числа разделов
+       помечает устаревшими `importJob` (api.ts) -->
+  <ImportDialog
+    user={t.uid}
+    space={ref}
+    spaceName={t.space.name}
+    userName={t.uid === ownId ? '' : (users.find((u) => u.id === t.uid)?.name ?? t.uid)}
+    onclose={(note) => {
+      // до `importing = null`: `t` и `ref` — производные от него
+      if (note) importNote = { key: kImport(t.uid, ref), text: note };
+      importing = null;
+    }}
+    ondone={() => void refreshSpace(t.uid, ref)}
+    {onexpired}
+  />
+{/if}
 
 <style>
   .tree {
@@ -769,6 +858,28 @@
     color: var(--accent-text);
     text-decoration: none;
   }
+  /* числа разделов (§5.3 п. 2): справа в строке; ноль — приглушённо, цветом `--muted` без
+     прозрачности: контраст на `--panel` 4,98 : 1 (светлая тема) и 6,27 : 1 (тёмная), WCAG AA ≥ 4,5
+     (ревью r1, M2). На подсвеченной и выбранной строке светлой темы `--muted` даёт 4,50 и 4,26 —
+     там ноль цветом текста, как прочие числа. «Открыто N» — акцентом, как «запросы: N» */
+  .num {
+    flex: none;
+    padding: 0 4px;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+  }
+  .num.zero {
+    color: var(--muted);
+  }
+  .tree-row:hover .num,
+  .tree-row.selected .num {
+    color: var(--text);
+  }
+  .tag.open {
+    background: var(--accent);
+    color: var(--accent-text);
+  }
   .label.journal .name {
     color: var(--muted);
   }
@@ -839,5 +950,29 @@
     flex: none;
     padding: 2px 8px;
     font-size: 12px;
+  }
+  /* сенсорный ввод (M7.2, §5.1 п. 2): строка, раскрывашка, ссылка и «⋯» — не меньше 44 × 44 px,
+     между ними в строке — `--touch-gap` (8 px); строки одна под другой — без зазора, как списки */
+  @media (pointer: coarse) {
+    .tree-row {
+      min-height: 44px;
+      gap: var(--touch-gap);
+    }
+    .twisty,
+    .more {
+      width: 44px;
+      height: 44px;
+    }
+    .label {
+      min-height: 44px;
+    }
+    .tag.pending {
+      display: inline-flex;
+      align-items: center;
+      min-height: 44px;
+    }
+    .tree-note {
+      padding-left: calc(58px + var(--depth) * 14px);
+    }
   }
 </style>

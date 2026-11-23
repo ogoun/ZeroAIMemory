@@ -5,10 +5,26 @@
   // (author_kind = human). Правка идёт с ревизией открытой записи (If-Match, §11.3): запись
   // изменилась — 409, карточка перечитывается. Столбец «показы / полезно / бесполезно» и
   // кнопки оценки (`POST /entries/{id}/feedback`, источник `webui`, §10.5).
-  import { untrack } from 'svelte';
+  // Узкие экраны (M7.2, спецификация §5.2 п. 3): таблица и карточка — `JournalSplit` (рядом или
+  // карточка вместо таблицы); в области журнала уже 720 px таблица остаётся таблицей (те же строки
+  // и ячейки), столбцы «Вид», «Область», «Показы», «Изменено» скрыты, их значения — строкой под
+  // заголовком. Условие — ширина области журнала, а не колонки списка рядом с карточкой.
+  // Корзина (M7.2, спецификация §5.9 пп. 2–3): «Удалить» карточки — в корзину, с подтверждением
+  // (отзыв оставляет запись в истории, удаление убирает её из журнала и поиска); «Корзина» — вместо
+  // таблицы удалённые записи с «Восстановить» (`JournalTrash`, ленивый чанк).
+  // Несохранённое (финальное ревью M7.2, I1): поля открытой формы карточки (замещение, ADR, отзыв,
+  // надёжность, триггеры) против их значений при открытии — `unsaved()`; «← Insights» сначала
+  // спрашивает «Закрыть без сохранения?» (`JournalSplit`), уход по адресу и действия карточки,
+  // которые закрыли бы форму (другая форма, «Пересмотреть»), — `LEAVE_EDIT` (`lib/leaveEdit.ts`).
+  import { onMount, tick, untrack } from 'svelte';
   import CertaintyBadge from './CertaintyBadge.svelte';
   import FileRefs from './FileRefs.svelte';
+  import JournalSplit from './JournalSplit.svelte';
   import Links from './Links.svelte';
+  import Notice from './Notice.svelte';
+  import Prompt, { type Ask } from './Prompt.svelte';
+  import TrashPanel from './TrashPanel.svelte';
+  import { trashAsk } from '../lib/entryTrash';
   import {
     ApiError,
     entryFeedback,
@@ -34,6 +50,7 @@
     CERTAINTY_TEXT,
     DECIDED_BY_TEXT,
     INSIGHT_KINDS,
+    JOURNAL_TITLE,
     STATUSES,
     STATUS_TEXT,
     TRIGGER_TEXT,
@@ -46,7 +63,10 @@
     fmtTime,
     type Adr,
   } from '../lib/journals';
-  import { go } from '../lib/router';
+  import { BP_TABLET } from '../lib/layout';
+  import { LEAVE_EDIT, guardLeave } from '../lib/leaveEdit';
+  import { go, href } from '../lib/router';
+  import { observeWidth } from '../lib/viewport.svelte';
   import { supersedeData } from '../lib/adrData';
 
   interface Props {
@@ -77,6 +97,9 @@
   let fHuman = $state(false);
   let refs = $state<RefsByTarget>(new Map());
   let seq = 0;
+  /** Ширина области журнала (CSS px); уже 720 px — компактная таблица (§5.2 п. 3). */
+  let width = $state(0);
+  let compact = $derived(width > 0 && width < BP_TABLET);
 
   // ---- карточка ----
   let cur = $state<Entry | null>(null);
@@ -90,6 +113,11 @@
   let actionError = $state('');
   let notice = $state('');
   let eseq = 0;
+  /** «Корзина»: вместо таблицы — удалённые записи. */
+  let trash = $state(false);
+  /** Итог действия, закрывшего карточку (удаление), — над таблицей. */
+  let listNotice = $state('');
+  let ask = $state<Ask | null>(null);
 
   // формы
   let sTitle = $state('');
@@ -110,6 +138,46 @@
   let tType = $state<TriggerType>('keyword');
   let tPattern = $state('');
   let tTools = $state('');
+
+  /** Поля открытой формы (без выбора типа нового триггера — он не уходит при сохранении). */
+  function formState(): string {
+    switch (mode) {
+      case 'supersede':
+        return JSON.stringify([sTitle, sBody, sKind, sCertainty, adr, adrOptions]);
+      case 'adr':
+        return JSON.stringify([adr, adrOptions]);
+      case 'retract':
+        return rReason;
+      case 'certainty':
+        return JSON.stringify([cTo, cReason, evChecked, evMethod, evResult]);
+      case 'triggers':
+        return JSON.stringify([tDraft, tPattern, tTools]);
+      default:
+        return '';
+    }
+  }
+  /** Поля формы при её открытии (из записи карточки). */
+  let pristine = '';
+
+  /** Открыть форму `m`: поля уже взяты из записи — их снимок для `unsaved()`. */
+  function openForm(m: Mode) {
+    mode = m;
+    pristine = formState();
+  }
+
+  /** В открытой форме карточки есть несохранённое. Карточка закрыта (удаление) — нет. */
+  const unsaved = (): boolean => mode !== 'none' && cur !== null && formState() !== pristine;
+
+  /** Действие закроет открытую форму: при несохранённом — сначала вопрос; `false` — остаться. */
+  const leaveForm = (): boolean => !unsaved() || window.confirm(LEAVE_EDIT);
+
+  onMount(() => guardLeave(unsaved));
+
+  /** «← Insights»: форма закрывается здесь (несохранённое `JournalSplit` уже спросил). */
+  function closeDetail() {
+    mode = 'none';
+    actionError = '';
+  }
 
   function emptyAdr(): Adr {
     return { context: '', options: [], chosen: '', rationale: '', consequences: '', decided_by: 'human', revisit_if: '' };
@@ -133,22 +201,44 @@
     set(errorText(e));
   }
 
+  // Таблица — заново только при смене пользователя или пространства: свойства приходят из объекта
+  // маршрута, и эффект перезапускается на каждый переход (открытие записи) — фильтры, загруженные
+  // страницы и прокрутка при этом целы (§5.1 п. 5); неудавшаяся загрузка повторяется при следующем
+  // переходе с прежними фильтрами.
+  let listOf = '';
+  /** Первая страница таблицы не загрузилась: следующий переход повторит загрузку. */
+  let failed = false;
   $effect(() => {
     const u = user;
     const s = space;
     untrack(() => {
+      if (listOf === `${u}|${s}`) {
+        if (failed) load(u, s, true);
+        return;
+      }
+      listOf = `${u}|${s}`;
       fKind = '';
       fStatus = '';
       fCertainty = '';
       fArea = '';
       fTag = '';
       fHuman = false;
+      trash = false;
+      listNotice = '';
       load(u, s, true);
-      loadRefs(u, s).then((r) => {
-        if (u === user && s === space) refs = r;
-      });
+      reloadRefs();
     });
   });
+
+  /** Ссылки на файлы записей («возможно устарело»): при входе в журнал и после правки (новая
+   * запись замены приходит со своими ссылками). */
+  function reloadRefs() {
+    const u = user;
+    const s = space;
+    loadRefs(u, s).then((r) => {
+      if (u === user && s === space) refs = r;
+    });
+  }
 
   $effect(() => {
     const id = entry;
@@ -160,6 +250,7 @@
     const my = ++seq;
     loading = true;
     error = '';
+    if (reset) failed = false;
     try {
       const r = await listEntries(u, s, {
         kind: 'insight',
@@ -177,7 +268,10 @@
       next = r.next_cursor;
     } catch (e) {
       if (my !== seq) return;
-      if (reset) items = [];
+      if (reset) {
+        items = [];
+        failed = true;
+      }
       fail(e, (m) => (error = m));
     } finally {
       if (my === seq) loading = false;
@@ -272,10 +366,29 @@
     }
   }
 
+  /** «Показать ещё»: на время загрузки кнопка остаётся (`aria-disabled`), фокус на ней цел;
+   * страниц больше нет и кнопка ушла — фокус на первую догруженную запись. */
+  async function more(e: MouseEvent) {
+    if (loading) return;
+    const btn = e.currentTarget as HTMLElement;
+    const n = items.length;
+    await load(user, space, false);
+    await tick();
+    const a = document.activeElement;
+    const first = items[n]?.id;
+    if (btn.isConnected || (a && a !== document.body) || !first) return;
+    document.querySelector<HTMLElement>(`tr[data-entry="${CSS.escape(first)}"] button`)?.focus();
+  }
+
+  /** Открыть запись: новая запись истории — «назад» браузера возвращает к таблице (§5.1 п. 5). */
   function select(id: string) {
     notice = '';
-    go({ name: 'journal', user, space, journal: 'insights', entry: id }, { replace: true });
+    listNotice = '';
+    go({ name: 'journal', user, space, journal: 'insights', entry: id });
   }
+
+  /** Карточка показана (рядом с таблицей или вместо неё). */
+  let detailOpen = $derived(cur !== null || curError !== '');
 
   /** Действие над карточкой: ошибка — понятным текстом, успех — перечитать. */
   async function act(fn: () => Promise<string | void>, done: string) {
@@ -287,6 +400,7 @@
       const target = (await fn()) ?? cur?.id ?? null;
       mode = 'none';
       await reloadList();
+      reloadRefs();
       if (target && target !== entry) {
         select(target);
       } else {
@@ -309,19 +423,25 @@
   }
 
   function startSupersede() {
-    if (!cur) return;
+    if (!cur || !leaveForm()) return;
     sTitle = cur.title;
     sBody = cur.body;
     sKind = dataStr(cur.data, 'kind') || 'discovery';
     sCertainty = '';
     loadAdr(cur.data);
-    mode = 'supersede';
+    openForm('supersede');
   }
 
   function startAdr() {
-    if (!cur) return;
+    if (!cur || !leaveForm()) return;
     loadAdr(cur.data);
-    mode = 'adr';
+    openForm('adr');
+  }
+
+  function startRetract() {
+    if (!leaveForm()) return;
+    rReason = '';
+    openForm('retract');
   }
 
   function submitAdr(e: SubmitEvent) {
@@ -373,7 +493,7 @@
 
   function toggleRevisit() {
     const c = cur;
-    if (!c) return;
+    if (!c || !leaveForm()) return;
     const to = c.status === 'revisit' ? 'active' : 'revisit';
     act(
       async () => {
@@ -384,14 +504,14 @@
   }
 
   function startCertainty() {
-    if (!cur) return;
+    if (!cur || !leaveForm()) return;
     cTo = cur.certainty ?? '';
     cReason = '';
     const ev = cur.data.evidence as Record<string, unknown> | undefined;
     evChecked = typeof ev?.checked === 'string' ? ev.checked : '';
     evMethod = typeof ev?.method === 'string' ? ev.method : '';
     evResult = typeof ev?.result === 'string' ? ev.result : '';
-    mode = 'certainty';
+    openForm('certainty');
   }
 
   function submitCertainty(e: SubmitEvent) {
@@ -418,11 +538,11 @@
   }
 
   function startTriggers() {
-    if (!cur) return;
+    if (!cur || !leaveForm()) return;
     tDraft = (cur.triggers ?? []).map((t) => ({ type: t.type, pattern: t.pattern, tools: t.tools }));
     tPattern = '';
     tTools = '';
-    mode = 'triggers';
+    openForm('triggers');
   }
 
   function addTrigger(e: SubmitEvent) {
@@ -447,6 +567,39 @@
     }, 'Триггеры сохранены.');
   }
 
+  /** «Удалить» карточки: в корзину; карточка закрывается, итог — над таблицей. */
+  function askDelete(c: Entry) {
+    actionError = '';
+    notice = '';
+    ask = trashAsk(user, c, {
+      deleted: async (msg) => {
+        // карточка закрывается сразу: иначе её «Связи» перечитались бы для удалённой записи (404),
+        // пока смена адреса и перечитывание оболочки ещё идут; форма карточки — вместе с ней
+        mode = 'none';
+        cur = null;
+        go({ name: 'journal', user, space, journal: 'insights', entry: null }, { replace: true });
+        await reloadList();
+        listNotice = msg;
+      },
+      stale: async (msg) => {
+        await open(user, c.id);
+        actionError = msg;
+      },
+      expired: onexpired,
+      focus: () => listEl?.querySelector('[role="status"]'),
+    });
+  }
+
+  function toggleTrash() {
+    trash = !trash;
+    listNotice = '';
+    // назад к таблице: восстановленные из корзины — в ней
+    if (!trash) reloadList();
+  }
+
+  /** Итог над таблицей (`Notice`): фокус после удаления — сюда, кнопки карточки уже нет. */
+  let listEl = $state<HTMLElement | null>(null);
+
   const live = (e: Entry) => e.status === 'active' || e.status === 'revisit';
   const evidenceOf = (e: Entry): Record<string, unknown> | null => {
     const ev = e.data.evidence;
@@ -454,45 +607,83 @@
   };
 </script>
 
-<section class="journal insights">
-  <form class="filters row" onsubmit={applyText}>
-    <label class="row">
-      Вид
-      <select bind:value={fKind} aria-label="Вид insight" onchange={reloadList}>
-        <option value="">все</option>
-        {#each INSIGHT_KINDS as k (k)}<option value={k}>{k}</option>{/each}
-      </select>
-    </label>
-    <label class="row">
-      Статус
-      <select bind:value={fStatus} aria-label="Статус" onchange={reloadList}>
-        <option value="">все</option>
-        {#each STATUSES as s (s)}<option value={s}>{STATUS_TEXT[s]}</option>{/each}
-      </select>
-    </label>
-    <label class="row">
-      Надёжность
-      <select bind:value={fCertainty} aria-label="Надёжность" onchange={reloadList}>
-        <option value="">любая</option>
-        {#each CERTAINTIES as c (c)}<option value={c}>{c}</option>{/each}
-      </select>
-    </label>
-    <input bind:value={fArea} placeholder="область" aria-label="Область" />
-    <input bind:value={fTag} placeholder="тег" aria-label="Тег" />
-    <label class="row">
-      <input type="checkbox" bind:checked={fHuman} onchange={reloadList} aria-label="Решения человека" /> Решения человека
-    </label>
-    <button type="submit">Применить</button>
-  </form>
+<section class="journal insights" use:observeWidth={(w) => (width = w)}>
+  <!-- таблица и карточка — рядом в широкой области, карточка вместо таблицы в узкой (§5.2 п. 3) -->
+  <JournalSplit
+    open={detailOpen}
+    back={{ href: href({ name: 'journal', user, space, journal: 'insights', entry: null }), label: JOURNAL_TITLE.insights }}
+    onclose={closeDetail}
+    dirty={unsaved}
+    {entry}
+  >
+    {#snippet list()}
+      {@render table()}
+    {/snippet}
+    {#snippet detail()}
+      {@render insightDetail()}
+    {/snippet}
+  </JournalSplit>
+</section>
 
+<Prompt bind:ask />
+
+{#snippet table()}
+  <!-- фильтры — у живой таблицы; «Корзина» — одна кнопка в обоих видах (фокус переживает
+       переключение) -->
+  <form class="filters row" onsubmit={applyText}>
+    {#if !trash}{@render filters()}{/if}
+    <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
+  </form>
+  {#if trash}
+    <TrashPanel {user} {space} kind="insight" {onexpired} />
+  {:else}
+    {@render liveTable()}
+  {/if}
+{/snippet}
+
+{#snippet filters()}
+  <label class="row">
+    Вид
+    <select bind:value={fKind} aria-label="Вид insight" onchange={reloadList}>
+      <option value="">все</option>
+      {#each INSIGHT_KINDS as k (k)}<option value={k}>{k}</option>{/each}
+    </select>
+  </label>
+  <label class="row">
+    Статус
+    <select bind:value={fStatus} aria-label="Статус" onchange={reloadList}>
+      <option value="">все</option>
+      {#each STATUSES as s (s)}<option value={s}>{STATUS_TEXT[s]}</option>{/each}
+    </select>
+  </label>
+  <label class="row">
+    Надёжность
+    <select bind:value={fCertainty} aria-label="Надёжность" onchange={reloadList}>
+      <option value="">любая</option>
+      {#each CERTAINTIES as c (c)}<option value={c}>{c}</option>{/each}
+    </select>
+  </label>
+  <input bind:value={fArea} placeholder="область" aria-label="Область" />
+  <input bind:value={fTag} placeholder="тег" aria-label="Тег" />
+  <label class="row">
+    <input type="checkbox" bind:checked={fHuman} onchange={reloadList} aria-label="Решения человека" /> Решения человека
+  </label>
+  <button type="submit">Применить</button>
+{/snippet}
+
+{#snippet liveTable()}
+  <div bind:this={listEl}><Notice text={listNotice} /></div>
   {#if error}<p class="error" role="alert">{error}</p>{/if}
 
   <div class="table-wrap">
     <table aria-label="Insights">
       <thead>
         <tr>
-          <th>Надёжность</th><th>Заголовок</th><th>Вид</th><th>Статус</th><th>Область</th>
-          <th title="Показы подсказками / полезно / бесполезно">Показы / полезно / бесполезно</th><th>Изменено</th>
+          <th>Надёжность</th><th>Заголовок</th>{#if !compact}<th>Вид</th>{/if}<th>Статус</th>
+          {#if !compact}
+            <th>Область</th>
+            <th title="Показы подсказками / полезно / бесполезно">Показы / полезно / бесполезно</th><th>Изменено</th>
+          {/if}
         </tr>
       </thead>
       <tbody>
@@ -505,12 +696,20 @@
               {#if staleOf(refs.get(entryRef('insight', e.id))).length}
                 <span class="chip stale" title={staleText(staleOf(refs.get(entryRef('insight', e.id))))}>возможно устарело</span>
               {/if}
+              {#if compact}
+                <!-- скрытые столбцы — строкой под заголовком -->
+                <div class="muted small row-meta" data-testid="row-meta">
+                  {[dataStr(e.data, 'kind'), e.area ?? '', `показы ${usageText(e.usage)}`, fmtTime(e.updated_at)].filter(Boolean).join(' · ')}
+                </div>
+              {/if}
             </td>
-            <td>{dataStr(e.data, 'kind')}</td>
+            {#if !compact}<td>{dataStr(e.data, 'kind')}</td>{/if}
             <td>{e.status ? STATUS_TEXT[e.status] : ''}</td>
-            <td>{e.area ?? ''}</td>
-            <td class="usage">{usageText(e.usage)}</td>
-            <td class="muted">{fmtTime(e.updated_at)}</td>
+            {#if !compact}
+              <td>{e.area ?? ''}</td>
+              <td class="usage">{usageText(e.usage)}</td>
+              <td class="muted">{fmtTime(e.updated_at)}</td>
+            {/if}
           </tr>
         {/each}
       </tbody>
@@ -518,10 +717,12 @@
   </div>
   {#if !loading && items.length === 0 && !error}<p class="muted">Записей нет.</p>{/if}
   {#if loading}<p class="muted">Загрузка…</p>{/if}
-  {#if next && !loading}
-    <button type="button" onclick={() => load(user, space, false)}>Показать ещё</button>
+  {#if next}
+    <button type="button" class="more" aria-disabled={loading} aria-busy={loading} onclick={more}>Показать ещё</button>
   {/if}
+{/snippet}
 
+{#snippet insightDetail()}
   {#if curError}<p class="error" role="alert">{curError}</p>{/if}
   {#if cur}
     {@const c = cur}
@@ -610,10 +811,11 @@
           {/if}
         {/if}
         {#if c.status !== 'retracted'}
-          <button type="button" class="danger" onclick={() => ((rReason = ''), (mode = 'retract'))}>Отозвать</button>
+          <button type="button" class="danger" onclick={startRetract}>Отозвать</button>
         {/if}
+        <button type="button" class="danger" onclick={() => askDelete(c)} disabled={busy}>Удалить</button>
       </div>
-      {#if notice}<p class="muted" role="status">{notice}</p>{/if}
+      <Notice text={notice} />
 
       {#if mode === 'supersede'}
         <form class="form" onsubmit={submitSupersede} aria-label="Замена insight">
@@ -709,7 +911,7 @@
       </div>
     </article>
   {/if}
-</section>
+{/snippet}
 
 {#snippet adrFields()}
   <fieldset class="adr-form">
@@ -738,17 +940,22 @@
 {/snippet}
 
 <style>
+  .more[aria-disabled='true'] {
+    opacity: 0.5;
+    cursor: default;
+  }
   .filters {
     margin-bottom: 12px;
   }
   .filters label {
     gap: 6px;
   }
-  .filters input {
+  .filters input:not([type='checkbox']) {
     width: 130px;
   }
-  .table-wrap {
-    overflow-x: auto;
+  .row-meta {
+    margin-top: 2px;
+    overflow-wrap: anywhere;
   }
   .usage {
     white-space: nowrap;
@@ -783,7 +990,7 @@
     font-size: 12px;
   }
   .card {
-    margin-top: 16px;
+    margin-top: 4px;
   }
   .card h2 {
     margin: 0 0 4px;
@@ -924,7 +1131,9 @@
   .small {
     font-size: 12px;
   }
+  /* «×» триггера — прежний кегль: общее `button.small-btn` (app.css) задаёт 12 px */
   .small-btn {
     padding: 0 6px;
+    font-size: inherit;
   }
 </style>

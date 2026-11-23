@@ -33,6 +33,7 @@
   import { LINE_ANCHOR_HINT, isLineAnchor, symbolEntry } from '../lib/codeRef';
   import { JOURNAL_OF_KIND } from '../lib/journals';
   import { href } from '../lib/router';
+  import { onTabKey } from '../lib/tabs';
 
   interface Props {
     user: string;
@@ -300,19 +301,8 @@
     return j ? href({ name: 'journal', user, space: sp, journal: j, entry: id }) : null;
   }
 
-  /** Клавиатура tablist: ←/→ по кругу, Home, End; выбор следует за фокусом. */
-  function ontabkey(e: KeyboardEvent, i: number) {
-    const n = TABS.length;
-    let j = -1;
-    if (e.key === 'ArrowRight') j = (i + 1) % n;
-    else if (e.key === 'ArrowLeft') j = (i - 1 + n) % n;
-    else if (e.key === 'Home') j = 0;
-    else if (e.key === 'End') j = n - 1;
-    if (j < 0) return;
-    e.preventDefault();
-    selectTab(TABS[j].id);
-    tabEls[j]?.focus();
-  }
+  /** Клавиатура tablist (`lib/tabs.ts`): ←/→ по кругу, Home, End; выбор следует за фокусом. */
+  const ontabkey = (e: KeyboardEvent, i: number) => onTabKey(e, i, TABS.length, tabEls, (j) => selectTab(TABS[j].id));
 
   const pct = (x: number) => `${Math.round(x * 100)} %`;
   const rankText = (r: number) => r.toFixed(4);
@@ -440,15 +430,18 @@
           <p class="muted">Ранги пересчитываются: порядок файлов может измениться.</p>
         {/if}
         <div class="status-grid">
-          <table class="langs">
-            <caption>Языки</caption>
-            <thead><tr><th>язык</th><th class="num">файлов</th><th class="num">символов</th></tr></thead>
-            <tbody>
-              {#each status.by_lang as l (l.lang)}
-                <tr><td>{l.lang}</td><td class="num">{l.files}</td><td class="num">{l.symbols}</td></tr>
-              {/each}
-            </tbody>
-          </table>
+          <!-- таблицы — в `.table-wrap` (§5.1 п. 6): на телефоне прокручиваются внутри -->
+          <div class="table-wrap">
+            <table class="langs">
+              <caption>Языки</caption>
+              <thead><tr><th>язык</th><th class="num">файлов</th><th class="num">символов</th></tr></thead>
+              <tbody>
+                {#each status.by_lang as l (l.lang)}
+                  <tr><td>{l.lang}</td><td class="num">{l.files}</td><td class="num">{l.symbols}</td></tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
           {#if status.skipped_total > 0}
             <details class="skips" data-testid="code-skips">
               <summary>Пропущено: {status.skipped_total}</summary>
@@ -505,23 +498,25 @@
         </form>
         {#if filesError}<p class="error" role="alert">{filesError}</p>{/if}
         {#if page}
-          <table class="files">
-            <caption>Файлы карты</caption>
-            <thead>
-              <tr><th class="num">№</th><th>путь</th><th>язык</th><th class="num">ранг</th><th class="num">символов</th></tr>
-            </thead>
-            <tbody>
-              {#each page.files as f, i (f.id)}
-                <tr>
-                  <td class="num muted">{page.offset + i + 1}</td>
-                  <td class="mono path">{f.path}</td>
-                  <td>{f.lang}</td>
-                  <td class="num rank">{rankText(f.rank)}</td>
-                  <td class="num">{f.symbols}</td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
+          <div class="table-wrap">
+            <table class="files">
+              <caption>Файлы карты</caption>
+              <thead>
+                <tr><th class="num">№</th><th>путь</th><th>язык</th><th class="num">ранг</th><th class="num">символов</th></tr>
+              </thead>
+              <tbody>
+                {#each page.files as f, i (f.id)}
+                  <tr>
+                    <td class="num muted">{page.offset + i + 1}</td>
+                    <td class="mono path">{f.path}</td>
+                    <td>{f.lang}</td>
+                    <td class="num rank">{rankText(f.rank)}</td>
+                    <td class="num">{f.symbols}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
           {#if page.total === 0}<p class="muted">Файлов по фильтру нет.</p>{/if}
           <div class="pager row">
             <span class="muted" data-testid="code-files-total">

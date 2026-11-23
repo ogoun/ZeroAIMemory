@@ -3,8 +3,17 @@
   // псевдониму и определению, карточка (псевдонимы, «не путать с», код) и правка. Сессия WebUI —
   // человек. Правка идёт с ревизией карточки (If-Match): запись изменилась — 409, карточка
   // перечитывается. Имя или псевдоним занят другим термином — 409 term-conflict со ссылками
-  // на занявшие термины.
-  import { untrack } from 'svelte';
+  // на занявшие термины. Корзина (M7.2, спецификация §5.9 пп. 2–3): «Удалить» карточки — в
+  // корзину, с подтверждением; «Корзина» — вместо списка удалённые термины с «Восстановить»
+  // (`JournalTrash`, ленивый чанк; имя, занятое за это время, — 409 со ссылкой в тексте ошибки).
+  // Несохранённое (финальное ревью M7.2, I1): поля открытой формы (создание, правка, отзыв) против
+  // их значений при открытии — `unsaved()`; «← Словарь» сначала спрашивает «Закрыть без
+  // сохранения?» (`JournalSplit`), уход по адресу и другая форма — `LEAVE_EDIT` (`lib/leaveEdit.ts`).
+  import { onMount, untrack } from 'svelte';
+  import Notice from './Notice.svelte';
+  import Prompt, { type Ask } from './Prompt.svelte';
+  import TrashPanel from './TrashPanel.svelte';
+  import { trashAsk } from '../lib/entryTrash';
   import {
     ApiError,
     createEntry,
@@ -18,8 +27,10 @@
     type Entry,
     type GlossaryItem,
   } from '../lib/api';
-  import { AUTHOR_TEXT, fmtTime } from '../lib/journals';
+  import { AUTHOR_TEXT, JOURNAL_TITLE, fmtTime } from '../lib/journals';
+  import { LEAVE_EDIT, guardLeave } from '../lib/leaveEdit';
   import { go, href } from '../lib/router';
+  import JournalSplit from './JournalSplit.svelte';
 
   interface Props {
     user: string;
@@ -47,6 +58,11 @@
   let actionError = $state('');
   let conflicts = $state<{ id: string; title: string; matched: string }[]>([]);
   let notice = $state('');
+  /** «Корзина»: вместо списка — удалённые термины. */
+  let trash = $state(false);
+  /** Итог действия, закрывшего карточку (удаление), — над списком. */
+  let listNotice = $state('');
+  let ask = $state<Ask | null>(null);
 
   // форма
   let fName = $state('');
@@ -56,6 +72,30 @@
   let fCode = $state('');
   let fBody = $state('');
   let rReason = $state('');
+
+  /** Поля открытой формы. */
+  const formState = (): string =>
+    mode === 'create' || mode === 'edit'
+      ? JSON.stringify([fName, fDefinition, fAliases, fNot, fCode, fBody])
+      : mode === 'retract'
+        ? rReason
+        : '';
+  /** Поля формы при её открытии (пустые или из термина карточки). */
+  let pristine = '';
+
+  /** Открыть форму `m`: поля уже заданы — их снимок для `unsaved()`. */
+  function openForm(m: Mode) {
+    mode = m;
+    pristine = formState();
+  }
+
+  /** В открытой форме есть несохранённое. */
+  const unsaved = (): boolean => mode !== 'none' && formState() !== pristine;
+
+  /** Действие закроет открытую форму: при несохранённом — сначала вопрос; `false` — остаться. */
+  const leaveForm = (): boolean => !unsaved() || window.confirm(LEAVE_EDIT);
+
+  onMount(() => guardLeave(unsaved));
 
   const lines = (s: string) =>
     s
@@ -69,11 +109,19 @@
     set(errorText(e));
   }
 
+  // Список — заново только при смене пользователя или пространства: свойства приходят из объекта
+  // маршрута, и эффект перезапускается на каждый переход (открытие термина) — поиск и загруженный
+  // список при этом целы (§5.1 п. 5, карточка вместо списка в узкой области).
+  let listOf = '';
   $effect(() => {
     const u = user;
     const s = space;
     untrack(() => {
+      if (listOf === `${u}|${s}`) return;
+      listOf = `${u}|${s}`;
       search = '';
+      trash = false;
+      listNotice = '';
       load(u, s);
     });
   });
@@ -95,6 +143,8 @@
     } catch (e) {
       if (my !== seq) return;
       items = [];
+      // неудача — следующий переход в журнал загрузит список снова
+      listOf = '';
       fail(e, (m) => (error = m));
     } finally {
       if (my === seq) loading = false;
@@ -154,12 +204,56 @@
     document.getElementById(`gl-${letter}`)?.scrollIntoView({ block: 'start' });
   }
 
+  /** Открыть термин: новая запись истории — «назад» браузера возвращает к списку (§5.1 п. 5). */
   function select(id: string) {
     notice = '';
-    go({ name: 'journal', user, space, journal: 'glossary', entry: id }, { replace: true });
+    listNotice = '';
+    go({ name: 'journal', user, space, journal: 'glossary', entry: id });
+  }
+
+  /** «Удалить» карточки: в корзину; карточка закрывается, итог — над списком. */
+  function askDelete(c: Entry) {
+    actionError = '';
+    notice = '';
+    ask = trashAsk(user, c, {
+      deleted: async (msg) => {
+        mode = 'none';
+        cur = null;
+        go({ name: 'journal', user, space, journal: 'glossary', entry: null }, { replace: true });
+        await load(user, space);
+        listNotice = msg;
+      },
+      stale: async (msg) => {
+        await open(user, c.id);
+        actionError = msg;
+      },
+      expired: onexpired,
+      focus: () => listEl?.querySelector('[role="status"]'),
+    });
+  }
+
+  function toggleTrash() {
+    trash = !trash;
+    listNotice = '';
+    // назад к списку: восстановленные из корзины — в нём
+    if (!trash) load(user, space);
+  }
+
+  /** Итог над списком (`Notice`): фокус после удаления — сюда, кнопки карточки уже нет. */
+  let listEl = $state<HTMLElement | null>(null);
+
+  /** Карточка или форма показана (в узкой области — вместо списка). */
+  let detailOpen = $derived(cur !== null || curError !== '' || mode === 'create' || mode === 'edit');
+
+  /** «← Словарь»: адрес без записи закрывает карточку, форма нового термина закрывается здесь. */
+  function closeDetail() {
+    mode = 'none';
+    actionError = '';
+    conflicts = [];
   }
 
   function startCreate() {
+    if (!leaveForm()) return;
     fName = '';
     fDefinition = '';
     fAliases = '';
@@ -168,12 +262,12 @@
     fBody = '';
     actionError = '';
     conflicts = [];
-    mode = 'create';
+    openForm('create');
   }
 
   function startEdit() {
     const c = cur;
-    if (!c) return;
+    if (!c || !leaveForm()) return;
     fName = c.title;
     fDefinition = typeof c.data.definition === 'string' ? c.data.definition : '';
     fAliases = strs(c.data.aliases).join('\n');
@@ -182,7 +276,14 @@
     fBody = c.body;
     actionError = '';
     conflicts = [];
-    mode = 'edit';
+    openForm('edit');
+  }
+
+  function startRetract() {
+    if (!leaveForm()) return;
+    rReason = '';
+    actionError = '';
+    openForm('retract');
   }
 
   const formData = () => ({
@@ -260,13 +361,47 @@
 </script>
 
 <section class="journal glossary">
+  <!-- список и карточка — рядом в широкой области, карточка вместо списка в узкой (§5.1 п. 5) -->
+  <JournalSplit
+    open={detailOpen}
+    back={{ href: href({ name: 'journal', user, space, journal: 'glossary', entry: null }), label: JOURNAL_TITLE.glossary }}
+    onclose={closeDetail}
+    dirty={unsaved}
+    {entry}
+  >
+    {#snippet list()}
+      {@render termList()}
+    {/snippet}
+    {#snippet detail()}
+      {@render termDetail()}
+    {/snippet}
+  </JournalSplit>
+</section>
+
+<Prompt bind:ask />
+
+{#snippet termList()}
+  <!-- «Корзина» — одна кнопка в обоих видах: фокус на ней переживает переключение -->
   <div class="row bar">
-    <input type="search" bind:value={search} placeholder="Поиск по имени, псевдониму, определению" aria-label="Поиск по словарю" />
-    <button type="button" class="primary" onclick={startCreate}>Новый термин</button>
+    {#if !trash}
+      <input type="search" bind:value={search} placeholder="Поиск по имени, псевдониму, определению" aria-label="Поиск по словарю" />
+      <button type="button" class="primary" onclick={startCreate}>Новый термин</button>
+    {/if}
+    <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
   </div>
+  {#if trash}
+    <TrashPanel {user} {space} kind="term" {onexpired} />
+  {:else}
+    {@render liveList()}
+  {/if}
+{/snippet}
+
+{#snippet liveList()}
+  <div bind:this={listEl}><Notice text={listNotice} /></div>
 
   {#if groups.length > 1}
-    <nav class="alpha" aria-label="Алфавитный указатель">
+    <!-- указатель букв — полоса (§5.2 п. 4): одна строка с прокруткой на телефоне и планшете -->
+    <nav class="alpha strip" aria-label="Алфавитный указатель">
       {#each groups as [letter] (letter)}
         <button type="button" class="link" onclick={() => jump(letter)}>{letter}</button>
       {/each}
@@ -282,7 +417,7 @@
     {#each groups as [letter, terms] (letter)}
       <h2 id="gl-{letter}" class="letter">{letter}</h2>
       {#each terms as t (t.id)}
-        <div role="listitem" class="term" class:selected={t.id === entry} data-term={t.id}>
+        <div role="listitem" class="term" class:selected={t.id === entry} data-term={t.id} data-entry={t.id}>
           <button type="button" class="link name" onclick={() => select(t.id)}>{t.title}</button>
           {#each t.aliases as a (a)}<span class="chip">{a}</span>{/each}
           <div class="muted def">{t.definition}</div>
@@ -290,7 +425,9 @@
       {/each}
     {/each}
   </div>
+{/snippet}
 
+{#snippet termDetail()}
   {#if curError}<p class="error" role="alert">{curError}</p>{/if}
   {#if cur}
     {@const c = cur}
@@ -321,10 +458,11 @@
       <div class="row actions">
         {#if c.status === 'active'}
           <button type="button" onclick={startEdit}>Править</button>
-          <button type="button" class="danger" onclick={() => ((rReason = ''), (actionError = ''), (mode = 'retract'))}>Отозвать</button>
+          <button type="button" class="danger" onclick={startRetract}>Отозвать</button>
         {/if}
+        <button type="button" class="danger" onclick={() => askDelete(c)} disabled={busy}>Удалить</button>
       </div>
-      {#if notice}<p class="muted" role="status">{notice}</p>{/if}
+      <Notice text={notice} />
       {#if mode === 'none' && actionError}<p class="error" role="alert">{actionError}</p>{/if}
       {#if mode === 'retract'}
         <form class="form" onsubmit={submitRetract} aria-label="Отзыв термина">
@@ -362,7 +500,7 @@
       {@render formEnd('Сохранить')}
     </form>
   {/if}
-</section>
+{/snippet}
 
 {#snippet formEnd(label: string)}
   {#if actionError && conflicts.length === 0}<p class="error" role="alert">{actionError}</p>{/if}
@@ -380,10 +518,8 @@
     flex: 1;
     min-width: 220px;
   }
+  /* раскладка — `.strip` (app.css): при касании буквы — цели по 44 px с зазором `--touch-gap` */
   .alpha {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 2px;
     margin-bottom: 8px;
   }
   .link {
@@ -421,7 +557,7 @@
     font-size: 12px;
   }
   .card {
-    margin-top: 16px;
+    margin-top: 4px;
   }
   .card h2 {
     margin: 0 0 4px;

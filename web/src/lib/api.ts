@@ -1,4 +1,6 @@
 // Клиент REST API. Пути относительные: разрешаются от <base href>, который подставляет сервер.
+import { ApiError, apiError } from './apiError';
+import { changesCounts } from './counts';
 
 export interface User {
   id: string;
@@ -32,21 +34,13 @@ export interface IssuedToken {
   plaintext: string;
 }
 
-export class ApiError extends Error {
-  constructor(
-    public status: number,
-    message: string,
-    /** Тело problem+json (RFC 9457) с дополнительными полями, если пришло. */
-    public problem: Record<string, unknown> | null = null,
-  ) {
-    super(message);
-  }
-}
+// Отказ API — `apiError.ts` (без runtime-импортов: модульный тест разбора `Retry-After`).
+export { ApiError };
 
 /**
- * Стили подсветки кода сервера (кэш — сутки, `render.rs`): версия в адресе сбрасывает кэш
- * браузера при смене CSS. Поднимать вместе с `zam_markdown::highlight_css` (v2 — тёмная тема
- * только для screen, M5.5).
+ * Стили подсветки кода сервера. Кэш — проверкой (`render.rs`, M7.2): `ETag` по хэшу содержимого
+ * и `no-cache`, браузер получает новый CSS сразу. `?v=2` — след прежней ручной версии (кэш на
+ * сутки до M7.2): сервер параметр принимает и не учитывает, поднимать его больше не нужно.
  */
 export const HIGHLIGHT_CSS = 'api/v1/render/highlight.css?v=2';
 
@@ -64,7 +58,30 @@ interface Req {
   headers?: Record<string, string>;
 }
 
-/** Запрос к API: CSRF для изменяющих методов, выбор пользователя, разбор problem+json. */
+// ---- устаревание чисел разделов (M7.2, спецификация §5.3 п. 3) ----
+
+/** Подписчик: числа разделов пользователя `user` устарели (`undefined` — запрос без выбора
+ * пользователя: свой или любой). */
+type EntriesChanged = (user: string | undefined) => void;
+const entriesChanged = new Set<EntriesChanged>();
+
+/** Подписка на изменения записей журналов и заметок из WebUI (кэш чисел разделов,
+ * `counts.svelte.ts`): одна точка — успешный изменяющий запрос `request` по правилу
+ * `changesCounts` (`counts.ts`), а не страницы. Возвращает отписку. Модуль подписчика
+ * импортирует `api.ts`, а не наоборот — без кругового импорта (пре-флайт N40). */
+export function onEntriesChanged(cb: EntriesChanged): () => void {
+  entriesChanged.add(cb);
+  return () => entriesChanged.delete(cb);
+}
+
+/** Сообщить подписчикам об изменении записей пользователя `user`. Задание импорта (M6 §12б.5)
+ * кончается позже ответа `POST …/import` — его итог без `dry_run` зовёт это сам (пре-флайт N33). */
+function notifyEntriesChanged(user: string | undefined): void {
+  for (const cb of entriesChanged) cb(user);
+}
+
+/** Запрос к API: CSRF для изменяющих методов, выбор пользователя, разбор problem+json; успешный
+ * запрос, меняющий числа разделов (`changesCounts`, `counts.ts`), помечает их устаревшими. */
 async function request(method: string, path: string, r: Req = {}): Promise<Response> {
   const headers: Record<string, string> = { ...r.headers };
   let body: BodyInit | undefined;
@@ -84,17 +101,15 @@ async function request(method: string, path: string, r: Req = {}): Promise<Respo
     body,
   });
   if (!resp.ok) {
-    let detail = resp.statusText;
-    let problem: Record<string, unknown> | null = null;
+    let text = '';
     try {
-      const p = await resp.json();
-      if (p && typeof p === 'object') problem = p as Record<string, unknown>;
-      if (typeof p.detail === 'string') detail = p.detail;
+      text = await resp.text();
     } catch {
-      /* тело не JSON */
+      /* тело оборвано */
     }
-    throw new ApiError(resp.status, detail, problem);
+    throw apiError(resp.status, resp.statusText, text, resp.headers.get('Retry-After'));
   }
+  if (changesCounts(method, path)) notifyEntriesChanged(r.user);
   return resp;
 }
 
@@ -270,6 +285,18 @@ export const listChildren = (user: string, space: string, path: string) =>
     undefined,
     user,
   );
+/** Число записей разделов пространства (`GET /spaces/{space}/counts`, M7.2 §5.3 п. 1). */
+export interface SpaceCounts {
+  /** Журнал WebUI вида пространства → живые записи без корзины, все статусы; `code` — файлы карты
+   * кода, `vault` — записи Vault зрителя. Токену — без `reports`. */
+  journals: Partial<Record<string, number>>;
+  /** Вопросы `open`; задачи `open`, `in_progress`, `blocked`. */
+  open: { questions: number; tasks: number };
+  /** Живые заметки без папок. */
+  notes: number;
+}
+export const spaceCounts = (user: string, space: string) =>
+  call<SpaceCounts>('GET', `spaces/${q(space)}/counts`, undefined, user);
 export const getNode = (user: string, id: string) =>
   call<{ node: NodeInfo; content: string | null; rev: number }>(
     'GET',
@@ -413,6 +440,144 @@ export const exportUrl = (user: string, space: string) =>
  */
 export const exportProbe = (user: string, space: string) =>
   call<void>('GET', `spaces/${q(space)}/export?probe=true`, undefined, user);
+
+// ---- импорт архива пространства (M6 §12б.5; WebUI — M7.2, спецификация M7 §5.7) ----
+
+/** Флаги импорта (диалог `ImportDialog`). */
+export interface ImportOptions {
+  /** «Это мой архив (перенос с другого сервера)»: id и аксиомы как есть. */
+  own: boolean;
+  /** Элемент уже есть и отличается: в конфликты или новой ревизией. */
+  onConflict: 'skip' | 'revision';
+  /** «Аксиомы чужого архива»: `demote` — понизить до theorem, `keep` — оставить. */
+  axioms: 'demote' | 'keep';
+  /** «Проверить без записи». */
+  dryRun: boolean;
+}
+
+/** Задание импорта принято (202): id и путь опроса от `api/v1`. */
+export interface ImportStarted {
+  job: string;
+  status: string;
+}
+
+/** Этап задания: приём тела, очередь записи, проверка архива, вложения, запись, итог. */
+export type ImportStage = 'receiving' | 'queued' | 'validating' | 'extracting' | 'writing' | 'done' | 'failed';
+
+/** Конфликт итога: элемент (id записи или путь заметки) и причина (`changed`, `path-taken`,
+ * `report-immutable`, `term-conflict`, `release-version`, `report-space`, `invalid`). */
+export interface ImportConflict {
+  id?: string;
+  path?: string;
+  reason: string;
+}
+
+/** Итог импорта (`zam_store::import::ImportReport`): списки — не длиннее 1000, полные длины — в
+ * `*_total`. */
+export interface ImportReport {
+  created: number;
+  revised: number;
+  skipped: number;
+  conflicts: ImportConflict[];
+  demoted_axioms: number;
+  id_remapped: number;
+  remapped: { from: string; to: string }[];
+  unresolved: string[];
+  links_skipped: number;
+  warnings: string[];
+  dry_run: boolean;
+  archive_fingerprint: string;
+  own: boolean;
+  conflicts_total: number;
+  unresolved_total: number;
+  warnings_total: number;
+  remapped_total: number;
+}
+
+/** Состояние задания (`GET /spaces/{space}/imports/{job}`); итог живёт на сервере час (ТЗ §16.4). */
+export interface ImportJob {
+  job: string;
+  state: 'running' | 'done' | 'failed';
+  stage: ImportStage;
+  /** Место в очереди записи — пока этап `queued`. */
+  queue: number | null;
+  dry_run: boolean;
+  progress: { total: number; done: number };
+  report: ImportReport | null;
+  /** problem+json ошибки задания с `status`. */
+  error: Record<string, unknown> | null;
+}
+
+/**
+ * Отправка архива `file` в пространство `space` пользователя `user` (`POST /spaces/{space}/import`
+ * → 202 и задание). Тело — сам файл (`Content-Type: application/zip`, `X-Zam-Expected-Bytes` — его
+ * размер) через `XMLHttpRequest`: у `fetch` нет хода отправки (`onprogress(sent, total)`). CSRF и
+ * выбор пользователя — как у `request`, отказ — `ApiError` тем же разбором (`apiError`) с
+ * `Retry-After`. `axioms: 'demote'` — параметр не передаётся: сервер понижает аксиомы только у
+ * чужого архива, у своего (по описи или `own`) оставляет как есть (ТЗ §16.4); явный
+ * `axioms=demote` понизил бы и свои. Ответ 202 числа разделов не меняет — их помечает итог
+ * задания (`importJob`, пре-флайт N33). `signal` прерывает отправку до ответа (`x.abort()`):
+ * промис отклоняется `DOMException` `AbortError` «отправка прервана» (`isImportAborted`), сервер
+ * снимает резерв задания и пишет аудит `space.import.done` с `reason: client` — задания нет.
+ */
+export function importArchive(
+  user: string,
+  space: string,
+  file: File,
+  o: ImportOptions,
+  onprogress: (sent: number, total: number) => void,
+  signal?: AbortSignal,
+): Promise<ImportStarted> {
+  const p = new URLSearchParams({ own: String(o.own), on_conflict: o.onConflict });
+  if (o.axioms === 'keep') p.set('axioms', 'keep');
+  p.set('dry_run', String(o.dryRun));
+  const aborted = () => new DOMException('отправка прервана', 'AbortError');
+  if (signal?.aborted) return Promise.reject(aborted());
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    const stop = () => x.abort();
+    signal?.addEventListener('abort', stop, { once: true });
+    x.onloadend = () => signal?.removeEventListener('abort', stop);
+    x.onabort = () => reject(aborted());
+    x.open('POST', `api/v1/spaces/${q(space)}/import?${p}`);
+    x.setRequestHeader('Content-Type', 'application/zip');
+    x.setRequestHeader('X-Zam-Expected-Bytes', String(file.size));
+    if (csrf) x.setRequestHeader('X-CSRF-Token', csrf);
+    if (user) x.setRequestHeader(USER_HEADER, user);
+    x.upload.onprogress = (e) => onprogress(e.loaded, e.lengthComputable ? e.total : file.size);
+    x.onload = () => {
+      if (x.status < 200 || x.status >= 300) {
+        reject(apiError(x.status, x.statusText, x.responseText, x.getResponseHeader('Retry-After')));
+        return;
+      }
+      try {
+        resolve(JSON.parse(x.responseText) as ImportStarted);
+      } catch {
+        reject(new ApiError(x.status, 'ответ сервера — не JSON'));
+      }
+    };
+    // отказ до тела сервер дочитывает не больше 16 МиБ и 5 с — у большого архива соединение
+    // рвётся без ответа (как у `zam import`, подсказка — та же)
+    x.onerror = () =>
+      reject(
+        new Error(
+          'сервер прервал приём архива или нет связи; частые причины — архив больше import.max_bytes сервера или сервер занят',
+        ),
+      );
+    x.send(file);
+  });
+}
+
+/** Отправку прервали (`importArchive` с `signal`). */
+export const isImportAborted = (e: unknown): boolean => e instanceof DOMException && e.name === 'AbortError';
+
+/** Состояние задания импорта; итог без `dry_run` (готово или ошибка — запись могла начаться)
+ * помечает числа разделов пользователя устаревшими — та же точка, что у `request` (пре-флайт N33). */
+export async function importJob(user: string, space: string, job: string): Promise<ImportJob> {
+  const j = await call<ImportJob>('GET', `spaces/${q(space)}/imports/${q(job)}`, undefined, user);
+  if (j.state !== 'running' && !j.dry_run) notifyEntriesChanged(user);
+  return j;
+}
 
 /** Байты файла вложения (просмотрщики PDF и DOCX разбирают его в браузере). */
 export const blobBytes = async (user: string, sha: string, filename: string): Promise<ArrayBuffer> =>
@@ -637,6 +802,9 @@ export interface IndexStatus {
   /** Rules пользователя запроса (токен, пользователь, администратор с `X-Zam-User`); у
    * администратора по всем базам — `null` (Rules каждой — в `dbs`). */
   rules?: RulesStatus | null;
+  /** Копии сервера (M6 §12б.4): последняя готовая копия каталога копий, расписание и
+   * `no_recent_backup`; WebUI показывает с M7.2 (блок «Копии» на «Индексе»). */
+  backup?: BackupStatus | null;
 }
 
 /** Перенарезка базы (§8.2): `reason` — `params` | `algorithm` | `tokenizer` | `unknown`;
@@ -659,6 +827,92 @@ export const reindex = (full: boolean) =>
     'POST',
     'admin/reindex',
     { full },
+  );
+
+// ---- копии сервера и аудит (администратор, M7.2: спецификация M7 §5.6) ----
+
+/** Поле `backup` статуса (`GET /index/status`, `?only=backup`): время последней готовой копии,
+ * расписание и `no_recent_backup` (копии нет или она старше `[backup] warn_days`). Путей нет. */
+export interface BackupStatus {
+  last_at: string | null;
+  schedule: 'off' | 'daily';
+  warning: 'no_recent_backup' | null;
+}
+
+/** Кто снимает копию: страница «Копии» или автокопия по расписанию. */
+export type BackupBy = 'webui' | 'schedule';
+
+/** Итог копии без пути: имя каталога копии и числа отчёта. */
+export interface BackupReport {
+  name: string;
+  dbs: number;
+  blobs: number;
+  /** Блобов связано жёсткой ссылкой с предыдущей копией и скопировано. */
+  linked: number;
+  copied: number;
+  bytes: number;
+  ms: number;
+  drift: string[];
+}
+
+/** Готовая копия каталога копий — по описи (`bytes` — сумма размеров описи). */
+export interface BackupCopy {
+  name: string;
+  created_at: string;
+  server_version: string;
+  bytes: number;
+  files: number;
+  dbs: number;
+  blobs: number;
+  drift: string[];
+}
+
+/** `GET /admin/backups`: `dir` — каталог копий (только администратору), `at` — `HH:MM` UTC;
+ * `items` — новые первыми. */
+export interface Backups extends BackupStatus {
+  dir: string;
+  at: string;
+  keep: number;
+  warn_days: number;
+  running: { started_at: string; by: BackupBy } | null;
+  last_run: {
+    finished_at: string;
+    by?: BackupBy;
+    ok: boolean;
+    error: string | null;
+    report: BackupReport | null;
+  } | null;
+  items: BackupCopy[];
+}
+
+export const listBackups = () => call<Backups>('GET', 'admin/backups');
+/** Копия в процессе сервера: 202 `{started_at}`; идёт другая — 409 `/problems/backup-running`
+ * с `running` в problem. */
+export const startBackup = () => call<{ started_at: string }>('POST', 'admin/backups');
+/** Удаление готовой копии по имени: 204; не копия каталога копий — 404. */
+export const deleteBackup = (name: string) => call<void>('DELETE', `admin/backups/${q(name)}`);
+/** Лёгкий статус копий для плашки `no_recent_backup` (только `{backup}`). */
+export const backupStatus = () => call<{ backup: BackupStatus }>('GET', 'index/status?only=backup');
+
+/** Событие журнала аудита (`GET /admin/audit`); `details` — JSON события. */
+export interface AuditRow {
+  id: number;
+  ts: string;
+  actor: string;
+  user_id: string | null;
+  action: string;
+  target: string | null;
+  ip: string | null;
+  details: unknown;
+}
+
+/** Страница аудита: события новые первыми, по 100 (сервер по умолчанию отдаёт 50); `before` —
+ * `next` прошлой страницы, `next` — `null` на последней. */
+export const AUDIT_PAGE = 100;
+export const listAudit = (before?: number) =>
+  call<{ items: AuditRow[]; next: number | null }>(
+    'GET',
+    `admin/audit?limit=${AUDIT_PAGE}` + (before !== undefined ? `&before=${before}` : ''),
   );
 
 // ---- журналы решения: Changelog, Releases, Insights (§7.2–7.5) ----
@@ -760,6 +1014,48 @@ export interface Entry {
   /** У задачи из идеи (запись и лента, M6.5 §9): первая идея плана; `ideas` — все её идеи. */
   idea?: TaskIdea;
   ideas?: TaskIdea[];
+  /** У задачи (запись, лента, эхо; M7 §5.4 п. 2): родитель подзадачи `part_of` со сводкой его
+   * подзадач; `null` — задача верхнего уровня. */
+  parent?: TaskParent | null;
+  /** У общей задачи: сводка прямых подзадач (подзадач нет — поля нет); строки `items` — только в
+   * `GET /entries/{id}`. */
+  subtasks?: SubtaskSummary;
+  /** У задачи: наибольшее `updated_at` задачи и её прямых подзадач. */
+  last_activity_at?: string;
+  /** У задачи «в работе» без живого захвата, не менявшейся (с подзадачами) 12 ч; иначе поля нет. */
+  stale?: true;
+}
+
+/** Сводка прямых подзадач общей задачи (M7 §5.4 п. 2): прогресс — `done/(total − dropped)`
+ * (`taskProgress.ts`). */
+export interface SubtaskSummary {
+  total: number;
+  done: number;
+  dropped: number;
+  open: number;
+  in_progress: number;
+  blocked: number;
+  /** Только `GET /entries/{id}`: строки подзадач в порядке шагов (порядок связей), до 200. */
+  items?: SubtaskItem[];
+  /** Рядом с `items`: подзадач больше 200. */
+  truncated?: boolean;
+}
+
+/** Строка подзадачи карточки общей задачи; `claimed` — живой захват агентом. */
+export interface SubtaskItem {
+  id: string;
+  title: string;
+  status: EntryStatus | null;
+  updated_at: string;
+  claimed: { agent: string | null; until: string } | null;
+}
+
+/** Родитель подзадачи и сводка его подзадач («Часть: k:<id> «…» (8/13)» без второго запроса). */
+export interface TaskParent {
+  id: string;
+  title: string;
+  status: EntryStatus | null;
+  subtasks: Pick<SubtaskSummary, 'total' | 'done' | 'dropped'>;
 }
 
 /** Идея задачи плана (поле `idea` задачи); `space_id` — пространство идеи (у идеи Knowledge
@@ -809,11 +1105,19 @@ export interface EntryQuery {
   priority?: 'low' | 'normal' | 'high';
   /** Только `kind: task`: задачи из идей (пункты плана, M6.5 §9). */
   fromIdea?: boolean;
+  /** Только `kind: task`: без подзадач — верхний уровень доски (`top_level=1`, M7 §5.4 п. 3). */
+  topLevel?: boolean;
+  /** Только `kind: task`: прямые подзадачи задачи `<id>` в порядке шагов (курсор — позиция). */
+  parent?: string;
+  /** Корзина вида `kind` (`deleted=only`, M7 §5.9 п. 3): удалённые записи, новые удаления первыми;
+   * права — как у восстановления (`ro` — 403). */
+  deleted?: boolean;
   cursor?: string | null;
   limit?: number;
 }
 
-/** Лента записей пространства (новые — первыми), курсор — `next_cursor`. */
+/** Лента записей пространства (новые — первыми; `parent` — в порядке шагов; корзина — по времени
+ * удаления), курсор — `next_cursor`. */
 export function listEntries(user: string, space: string, f: EntryQuery) {
   const p = new URLSearchParams();
   if (f.kind) p.set('kind', f.kind);
@@ -826,6 +1130,9 @@ export function listEntries(user: string, space: string, f: EntryQuery) {
   if (f.origin) p.set('origin', f.origin);
   if (f.priority) p.set('priority', f.priority);
   if (f.fromIdea) p.set('from_idea', '1');
+  if (f.topLevel) p.set('top_level', '1');
+  if (f.parent) p.set('parent', f.parent);
+  if (f.deleted) p.set('deleted', 'only');
   if (f.cursor) p.set('cursor', f.cursor);
   if (f.limit) p.set('limit', String(f.limit));
   return call<{ items: Entry[]; next_cursor: string | null }>(
@@ -837,11 +1144,11 @@ export function listEntries(user: string, space: string, f: EntryQuery) {
 }
 
 /** Число живых записей вида по статусам с фильтрами ленты (`GET …/entries/counts`, M6.5 §9):
- * все статусы вида, нулевые тоже. */
+ * все статусы вида, нулевые тоже; `topLevel` — задачи без подзадач (вкладки доски, M7 §5.5 п. 4). */
 export function entryCounts(
   user: string,
   space: string,
-  f: Pick<EntryQuery, 'kind' | 'area' | 'tag' | 'origin' | 'priority' | 'fromIdea'> & { kind: EntryKind },
+  f: Pick<EntryQuery, 'kind' | 'area' | 'tag' | 'origin' | 'priority' | 'fromIdea' | 'topLevel'> & { kind: EntryKind },
 ) {
   const p = new URLSearchParams({ kind: f.kind });
   if (f.area) p.set('area', f.area);
@@ -849,6 +1156,7 @@ export function entryCounts(
   if (f.origin) p.set('origin', f.origin);
   if (f.priority) p.set('priority', f.priority);
   if (f.fromIdea) p.set('from_idea', '1');
+  if (f.topLevel) p.set('top_level', '1');
   return call<Partial<Record<EntryStatus, number>>>('GET', `spaces/${q(space)}/entries/counts?${p}`, undefined, user);
 }
 
@@ -860,6 +1168,8 @@ export interface EntryPatch {
   body?: string;
   data?: Record<string, unknown>;
   tags?: string[];
+  /** Область; `null` — снять. */
+  area?: string | null;
   status?: EntryStatus;
   /** Задача: что делать дальше; пустая строка снимает. */
   next_step?: string;
@@ -1161,6 +1471,27 @@ export const entryLinks = (user: string, id: string) =>
   call<EdgeList>('GET', `entries/${q(id)}/links`, undefined, user);
 export const entryBacklinks = (user: string, id: string) =>
   call<EdgeList>('GET', `entries/${q(id)}/backlinks`, undefined, user);
+
+/** Подграф вокруг узла или записи (M7.2, локальный граф §5.10): узлы — ближние к началу первыми. */
+export interface Graph {
+  nodes: GraphNode[];
+  /** Рёбра между узлами подграфа (`dst` у них не `null`). */
+  edges: EdgeView[];
+  /** Подграф обрезан пределами сервера (500 узлов, 2000 рёбер). */
+  truncated: boolean;
+}
+
+/** `GET /graph?node=|entry=&depth=&types=`: `depth` шагов (1..3, по умолчанию 1) в обе стороны по
+ * рёбрам типов `types` (пусто — любые). */
+export function graph(
+  user: string,
+  o: ({ node: string } | { entry: string }) & { depth?: number; types?: string[] },
+): Promise<Graph> {
+  const p = new URLSearchParams('node' in o ? { node: o.node } : { entry: o.entry });
+  if (o.depth) p.set('depth', String(o.depth));
+  if (o.types?.length) p.set('types', o.types.join(','));
+  return call<Graph>('GET', `graph?${p}`, undefined, user);
+}
 
 // ---- Vault (§7.6): значения не кэшируются и не логируются ----
 
@@ -1524,13 +1855,34 @@ export interface SessionSnapshot {
 export const sessionSnapshot = (id: string, user?: string) =>
   call<SessionSnapshot>('GET', `sessions/${encodeURIComponent(id)}/snapshot`, undefined, user);
 
-/** Свои сессии, свежие первыми, с выданным по событию; администратор — пользователя `user`. */
-export function listSessions(f: { solution?: string; limit?: number }, user?: string) {
+/** Сессия `id` с выданным по событию (`GET /sessions/{id}`; `snapshot_at` в ответе нет);
+ * администратор — пользователя `user`. */
+export const getSession = (id: string, user?: string) =>
+  call<SessionItem>('GET', `sessions/${encodeURIComponent(id)}`, undefined, user);
+
+/** Свои сессии, свежие первыми, с выданным по событию; `parent` — только субагенты этой сессии и
+ * их субагенты (M7 §5.8 п. 1); администратор — пользователя `user`. */
+export function listSessions(f: { solution?: string; limit?: number; parent?: string }, user?: string) {
   const p = new URLSearchParams({ tokens: 'true' });
   if (f.solution) p.set('solution', f.solution);
   if (f.limit) p.set('limit', String(f.limit));
+  if (f.parent) p.set('parent', f.parent);
   return call<{ items: SessionItem[] }>('GET', `sessions?${p}`, undefined, user);
 }
+
+/** Выданное без явной сессии за сутки UTC `day` по событию (M6 §7.1): MCP по HTTP без привязки
+ * к сессии агента. */
+export interface UnattributedRow {
+  day: string;
+  event: string;
+  calls: number;
+  tokens: number;
+}
+
+/** Выдача без сессии за `days` суток (1..=366), свежие сутки первыми; администратор —
+ * пользователя `user`. */
+export const unattributed = (days: number, user?: string) =>
+  call<{ items: UnattributedRow[] }>('GET', `sessions/unattributed?days=${days}`, undefined, user);
 
 /** Rules пользователя (`GET /index/status?only=rules`, M6 §8): `warning` — `rules_heavy` при
  * больше 10 правил или L1 в сумме больше 1500 токенов. */

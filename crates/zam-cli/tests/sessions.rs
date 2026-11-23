@@ -1,6 +1,8 @@
 //! `zam sessions tokens` против настоящего zam-server в том же процессе тестов (M6 §8, задача
 //! 8b): таблица «событие · вызовов · токенов · уже выдавалось» одной сессии, сумма по
-//! `--last N`, `--by-holdout`, `--json` и сессия агента из `ZAM_SESSION`.
+//! `--last N`, `--by-holdout`, `--json` и сессия агента из `ZAM_SESSION`; выдача без сессии
+//! (`--unattributed`, строка «без сессии за 30 сут.») и субагенты сессии (`--subagents`) — M7
+//! §5.8 п. 2 (задача 9 M7.2).
 mod common;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -25,9 +27,53 @@ fn count(event: &str, calls: u64, tokens: u64, reread: u64) -> TokenCount {
     }
 }
 
+/// Выдача без сессии для посева: (суток назад, событие, вызовов, токенов).
+type Unattributed = &'static [(i64, &'static str, u32, u64)];
+
+/// Что ещё посеять в базе пользователя тестового сервера ([`start_with`]).
+#[derive(Default, Clone, Copy)]
+struct Seed {
+    /// Субагенты `s-new:a1` (`pre_tool` 2/20, `read` 1/50) и `s-new:a2` (`read` 1/30), внук
+    /// `s-new:a1:c1` (`read` 1/20) и сессия с самоссылкой `loop` (`parent_id = loop`,
+    /// `session_start` 1/9) — раньше обеих сессий: `--last 2` их не берёт.
+    subagents: bool,
+    /// Строки `tokens_unattributed` (сутки UTC от `today`).
+    unattributed: Unattributed,
+    /// «Сегодня» посева (сутки UTC): тест берёт его один раз и сверяет с ним ожидания — переход
+    /// через полночь UTC между посевом и запросом не меняет ожиданий (ревью задачи 9, Minor 7);
+    /// `None` — сегодня в момент посева.
+    today: Option<jiff::civil::Date>,
+}
+
+/// Выдача без сессии: сегодня `mcp` 2/30 и `brief` 1/5, три дня назад `mcp` 1/7 (за 30 суток —
+/// вызовов 4, токенов 42), 40 дней назад `mcp` 4/100 (вне 30 суток).
+const UNATTRIBUTED: Unattributed = &[
+    (0, "mcp", 2, 30),
+    (0, "brief", 1, 5),
+    (3, "mcp", 1, 7),
+    (40, "mcp", 4, 100),
+];
+
+/// Сегодня, сутки UTC.
+fn utc_today() -> jiff::civil::Date {
+    jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .date()
+}
+
+/// Сутки `days` до `base`.
+fn days_before(base: jiff::civil::Date, days: i64) -> jiff::civil::Date {
+    base.checked_sub(jiff::Span::new().days(days)).unwrap()
+}
+
 /// Сервер в фоновом потоке с учётом двух сессий (`s-old` — holdout, затем `s-new`): адрес и
 /// токен `rw` пользователя.
 fn start(name: &str) -> (String, String) {
+    start_with(name, Seed::default())
+}
+
+/// [`start`] с посевом `seed`.
+fn start_with(name: &str, seed: Seed) -> (String, String) {
     let data = tmp(&format!("{name}-data"));
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -49,6 +95,35 @@ fn start(name: &str) -> (String, String) {
                 agent: Some("claude".into()),
                 ..SessionTouch::default()
             };
+            if seed.subagents {
+                for (id, parent, counts) in [
+                    (
+                        "s-new:a1",
+                        "s-new",
+                        vec![count("pre_tool", 2, 20, 0), count("read", 1, 50, 0)],
+                    ),
+                    ("s-new:a2", "s-new", vec![count("read", 1, 30, 0)]),
+                    ("s-new:a1:c1", "s-new:a1", vec![count("read", 1, 20, 0)]),
+                    ("loop", "loop", vec![count("session_start", 1, 9, 0)]),
+                ] {
+                    let sub = SessionTouch {
+                        parent_id: Some(parent.into()),
+                        agent_type: Some("Explore".into()),
+                        ..touch(id)
+                    };
+                    zam_store::add_token_counts(&db, &sub, &counts)
+                        .await
+                        .unwrap();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let today = seed.today.unwrap_or_else(utc_today);
+            for (ago, event, calls, tokens) in seed.unattributed {
+                let day = days_before(today, *ago);
+                zam_store::add_unattributed(&db, day, event, *calls, *tokens)
+                    .await
+                    .unwrap();
+            }
             zam_store::add_token_counts(
                 &db,
                 &touch("s-old"),
@@ -233,4 +308,373 @@ fn cli_sessions_tokens_old_server() {
         err.contains("сервер не поддерживает учёт по сессиям"),
         "{err}"
     );
+}
+
+/// M7 §5.8 п. 2: `--unattributed [--days N]` — выдача без сессии по суткам и событиям
+/// (`GET /sessions/unattributed?days=N`): строки «сутки · событие · вызовов · токенов», итог;
+/// `--json` — строки сервера и сумма; `--days` вне 1..=366 — ошибка разбора флага, как `--last`
+/// вне 1..=500; `--days` без `--unattributed` и `--unattributed` вместе с id, `--last`,
+/// `--subagents` — тоже. Сутки посева берутся один раз: окна проверки (2, 7, 30, 366 сут.) дают
+/// те же строки и после полуночи UTC между посевом и запросом.
+#[test]
+fn sessions_tokens_unattributed_table() {
+    let t = utc_today();
+    let (url, tok) = start_with(
+        "unattributed",
+        Seed {
+            unattributed: UNATTRIBUTED,
+            today: Some(t),
+            ..Seed::default()
+        },
+    );
+    let r = tmp("unattributed-repo");
+    let (d3, d40) = (days_before(t, 3), days_before(t, 40));
+    let out = ok(&zam(
+        &url,
+        &tok,
+        &r,
+        &["sessions", "tokens", "--unattributed"],
+        None,
+    ));
+    assert_eq!(
+        out,
+        format!(
+            "выдано без сессии за 30 сут. (MCP по HTTP без привязки к сессии агента; сутки UTC)\n\
+             сутки\tсобытие\tвызовов\tтокенов\n\
+             {t}\tbrief\t1\t5\n\
+             {t}\tmcp\t2\t30\n\
+             {d3}\tmcp\t1\t7\n\
+             итого\t\t4\t42\n"
+        )
+    );
+    let all = ok(&zam(
+        &url,
+        &tok,
+        &r,
+        &["sessions", "tokens", "--unattributed", "--days", "366"],
+        None,
+    ));
+    assert!(all.starts_with("выдано без сессии за 366 сут."), "{all}");
+    assert!(all.contains(&format!("\n{d40}\tmcp\t4\t100\n")), "{all}");
+    assert!(all.ends_with("\nитого\t\t8\t142\n"), "{all}");
+    // 2 суток: «сегодня» посева — и до полуночи UTC, и после неё
+    let today = ok(&zam(
+        &url,
+        &tok,
+        &r,
+        &["sessions", "tokens", "--unattributed", "--days", "2"],
+        None,
+    ));
+    assert!(
+        today.ends_with(&format!("\n{t}\tmcp\t2\t30\nитого\t\t3\t35\n")),
+        "{today}"
+    );
+    let j: Value = serde_json::from_str(&ok(&zam(
+        &url,
+        &tok,
+        &r,
+        &[
+            "sessions",
+            "tokens",
+            "--unattributed",
+            "--days",
+            "7",
+            "--json",
+        ],
+        None,
+    )))
+    .unwrap();
+    assert_eq!(j["days"], 7, "{j}");
+    assert_eq!(j["items"].as_array().unwrap().len(), 3, "{j}");
+    assert_eq!(
+        j["items"][0],
+        serde_json::json!({"day": t.to_string(), "event": "brief", "calls": 1, "tokens": 5}),
+        "{j}"
+    );
+    assert_eq!(
+        j["total"],
+        serde_json::json!({"calls": 4, "tokens": 42}),
+        "{j}"
+    );
+    // `--days` разбирает clap тем же `value_parser!(u32).range(..)`, что `--last`: вне
+    // диапазона — тот же код ошибки ввода `zam`, до запроса к серверу
+    let last = zam(
+        &url,
+        &tok,
+        &r,
+        &["sessions", "tokens", "--last", "501"],
+        None,
+    );
+    assert_eq!(last.status.code(), Some(6), "{last:?}");
+    for args in [
+        &["sessions", "tokens", "--unattributed", "--days", "400"][..],
+        &["sessions", "tokens", "--unattributed", "--days", "0"],
+        &["sessions", "tokens", "--days", "7"],
+        &["sessions", "tokens", "--unattributed", "s-new"],
+        &["sessions", "tokens", "--unattributed", "--last", "2"],
+        &["sessions", "tokens", "--unattributed", "--subagents"],
+    ] {
+        let o = zam(&url, &tok, &r, args, None);
+        assert_eq!(o.status.code(), last.status.code(), "{args:?}: {o:?}");
+        assert!(o.stdout.is_empty(), "{args:?}: {o:?}");
+    }
+}
+
+/// M7 §5.8 п. 2: в выводе одной сессии и `--last N` — строка «без сессии за 30 сут.: вызовов C,
+/// токенов T — zam sessions tokens --unattributed» при T > 0; T = 0 (выдача без сессии только
+/// раньше 30 суток или её нет) — строки нет; в `--json` её нет.
+#[test]
+fn sessions_tokens_line_when_unattributed() {
+    let line =
+        "без сессии за 30 сут.: вызовов 4, токенов 42 — zam sessions tokens --unattributed\n";
+    let (url, tok) = start_with(
+        "line",
+        Seed {
+            unattributed: UNATTRIBUTED,
+            ..Seed::default()
+        },
+    );
+    let r = tmp("line-repo");
+    let one = ok(&zam(&url, &tok, &r, &["sessions", "tokens", "s-new"], None));
+    assert!(
+        one.ends_with(&format!(
+            "итого\t\t1490\t\n\
+             уже выдавалось: read 1 из 4 (25 %); чтения MCP 2 из 3 (67 %)\n\
+             {line}"
+        )),
+        "{one}"
+    );
+    let last = ok(&zam(
+        &url,
+        &tok,
+        &r,
+        &["sessions", "tokens", "--last", "2", "--by-holdout"],
+        None,
+    ));
+    assert!(last.ends_with(line), "{last}");
+    assert_eq!(last.matches("без сессии").count(), 1, "{last}");
+    let j = ok(&zam(
+        &url,
+        &tok,
+        &r,
+        &["sessions", "tokens", "s-new", "--json"],
+        None,
+    ));
+    assert!(!j.contains("без сессии"), "{j}");
+    // выдача без сессии только 40 суток назад — за 30 суток T = 0
+    let (url, tok) = start_with(
+        "line-old",
+        Seed {
+            unattributed: &[(40, "mcp", 4, 100)],
+            ..Seed::default()
+        },
+    );
+    let out = ok(&zam(&url, &tok, &r, &["sessions", "tokens", "s-new"], None));
+    assert!(!out.contains("без сессии"), "{out}");
+    // выдачи без сессии нет вовсе
+    let (url, tok) = start("line-none");
+    let out = ok(&zam(
+        &url,
+        &tok,
+        &r,
+        &["sessions", "tokens", "--last", "2"],
+        None,
+    ));
+    assert!(!out.contains("без сессии"), "{out}");
+}
+
+/// M7 §5.8 п. 2: `--subagents` — к сессии прибавляются её субагенты и их субагенты
+/// (`GET /sessions?parent=`), строка «с субагентами: N»; без флага — только сессия; `--json` —
+/// сессия и субагенты в `items`, их число — `subagents`; вместе с `--last` — ошибка ввода. Сессия
+/// с самоссылкой (`parent_id = id`) к себе не прибавляется (ревью задачи 9, Minor 2).
+#[test]
+fn sessions_tokens_subagents_sum() {
+    let (url, tok) = start_with(
+        "subagents",
+        Seed {
+            subagents: true,
+            ..Seed::default()
+        },
+    );
+    let r = tmp("subagents-repo");
+    let out = ok(&zam(
+        &url,
+        &tok,
+        &r,
+        &["sessions", "tokens", "s-new", "--subagents"],
+        None,
+    ));
+    let mut lines = out.splitn(3, '\n');
+    let head = lines.next().unwrap();
+    assert!(head.starts_with("сессия s-new · claude · "), "{out}");
+    // субагенты `a1`, `a2` и внук `a1:c1`
+    assert_eq!(lines.next(), Some("с субагентами: 3"), "{out}");
+    assert_eq!(
+        lines.next().unwrap(),
+        "событие\tвызовов\tтокенов\tуже выдавалось\n\
+         session_start\t1\t700\t\n\
+         rules\t1\t300\t\n\
+         pre_tool\t2\t20\t\n\
+         read\t7\t500\t1\n\
+         mcp\t5\t90\t\n\
+         mcp_read\t3\t0\t2\n\
+         итого\t\t1610\t\n\
+         уже выдавалось: read 1 из 7 (14 %); чтения MCP 2 из 3 (67 %)\n",
+        "{out}"
+    );
+    // сессия агента (`ZAM_SESSION`) — то же
+    let cur = ok(&zam(
+        &url,
+        &tok,
+        &r,
+        &["sessions", "tokens", "--subagents"],
+        Some("s-new"),
+    ));
+    assert_eq!(cur, out);
+    // без флага — только сессия
+    let plain = ok(&zam(&url, &tok, &r, &["sessions", "tokens", "s-new"], None));
+    assert!(plain.contains("\nитого\t\t1490\t\n"), "{plain}");
+    assert!(!plain.contains("субагент"), "{plain}");
+    let j: Value = serde_json::from_str(&ok(&zam(
+        &url,
+        &tok,
+        &r,
+        &["sessions", "tokens", "s-new", "--subagents", "--json"],
+        None,
+    )))
+    .unwrap();
+    assert_eq!(j["subagents"], 3, "{j}");
+    assert_eq!(j["items"][0]["id"], "s-new", "{j}");
+    assert_eq!(j["items"].as_array().unwrap().len(), 4, "{j}");
+    assert_eq!(j["groups"]["all"]["sessions"], 4, "{j}");
+    assert_eq!(j["groups"]["all"]["tokens"]["read"]["calls"], 7, "{j}");
+    // самоссылка: субагентов нет, своя выдача — один раз
+    let lp = ok(&zam(
+        &url,
+        &tok,
+        &r,
+        &["sessions", "tokens", "loop", "--subagents"],
+        None,
+    ));
+    assert!(lp.contains("\nс субагентами: 0\n"), "{lp}");
+    assert!(
+        lp.contains("\nsession_start\t1\t9\t\nитого\t\t9\t\n"),
+        "{lp}"
+    );
+    // `--last 2` субагентов не берёт (они раньше обеих сессий); `--subagents` с ним — ошибка
+    let last = ok(&zam(
+        &url,
+        &tok,
+        &r,
+        &["sessions", "tokens", "--last", "2"],
+        None,
+    ));
+    assert!(last.contains("\nread\t6\t480\t1\n"), "{last}");
+    let o = zam(
+        &url,
+        &tok,
+        &r,
+        &["sessions", "tokens", "--last", "2", "--subagents"],
+        None,
+    );
+    assert_eq!(o.status.code(), Some(6), "{o:?}");
+}
+
+/// Review Focus 5 (задача 9 M7.2): сервер до M6 на `GET /sessions/unattributed` отвечает 404
+/// (это путь `GET /sessions/{id}`), признаков в `/health` нет. Вывод сессии — без строки «без
+/// сессии», код 0; `--unattributed` и `--subagents` (400 на неизвестный параметр `parent`) —
+/// код 1 с подсказкой обновить сервер.
+#[test]
+fn sessions_tokens_old_server_no_line() {
+    let (url, seen) = common::stub_with(std::sync::Arc::new(|_: &str, p: &str, _: usize| {
+        let now = std::time::Duration::ZERO;
+        if p == "/api/v1/health" {
+            return (200, r#"{"status":"ok","version":"0.0.10-m5.7"}"#, now);
+        }
+        if p.starts_with("/api/v1/sessions?") {
+            let bad = r#"{"type":"/problems/bad-request","status":400,"detail":"unknown field `parent`"}"#;
+            return (400, bad, now);
+        }
+        if p == "/api/v1/sessions/s-old" {
+            let s = r#"{"id":"s-old","agent":"claude","started_at":"2026-11-01T00:00:00Z",
+                        "last_seen_at":"2026-11-01T00:00:00Z",
+                        "tokens":{"read":{"calls":1,"tokens":10}}}"#;
+            return (200, s, now);
+        }
+        (404, r#"{"type":"/problems/not-found","status":404}"#, now)
+    }));
+    let r = tmp("old-line-repo");
+    let out = ok(&zam(&url, "t", &r, &["sessions", "tokens", "s-old"], None));
+    assert!(
+        out.ends_with("\nитого\t\t10\t\nуже выдавалось: read 0 из 1 (0 %)\n"),
+        "{out}"
+    );
+    assert!(!out.contains("без сессии"), "{out}");
+    let asked: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, p, _)| p.clone())
+        .collect();
+    assert!(
+        asked
+            .iter()
+            .any(|p| p.starts_with("/api/v1/sessions/unattributed")),
+        "{asked:?}"
+    );
+    for args in [
+        &["sessions", "tokens", "--unattributed"][..],
+        &["sessions", "tokens", "s-old", "--subagents"],
+    ] {
+        let o = zam(&url, "t", &r, args, None);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {o:?}");
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(err.contains("обновите zam-server"), "{args:?}: {err}");
+        assert!(o.stdout.is_empty(), "{args:?}: {o:?}");
+    }
+}
+
+/// Ревью задачи 9, Minor 6: субагентов в пределе `GET /sessions` (ровно 500) — сумма может быть
+/// неполной: строка-предупреждение в stderr, вывод и код прежние; 499 — без предупреждения.
+#[test]
+fn sessions_tokens_subagents_limit_warned() {
+    for (n, warned) in [(500usize, true), (499, false)] {
+        let (url, _) = common::stub_body(std::sync::Arc::new(
+            move |_: &str, p: &str, _: usize, _: &Value| {
+                let now = std::time::Duration::ZERO;
+                if p.starts_with("/api/v1/sessions?") {
+                    let items: Vec<Value> = (0..n)
+                        .map(|i| {
+                            serde_json::json!({"id": format!("s-big:a{i}"), "parent_id": "s-big",
+                                               "tokens": {"read": {"calls": 1, "tokens": 1}}})
+                        })
+                        .collect();
+                    return (200, serde_json::json!({ "items": items }).to_string(), now);
+                }
+                if p == "/api/v1/sessions/s-big" {
+                    let s = r#"{"id":"s-big","agent":"claude","started_at":"2026-11-01T00:00:00Z",
+                                "last_seen_at":"2026-11-01T00:00:00Z",
+                                "tokens":{"read":{"calls":1,"tokens":10}}}"#;
+                    return (200, s.to_string(), now);
+                }
+                (404, r#"{"status":404}"#.to_string(), now)
+            },
+        ));
+        let r = tmp(&format!("limit-{n}-repo"));
+        let o = zam(
+            &url,
+            "t",
+            &r,
+            &["sessions", "tokens", "s-big", "--subagents"],
+            None,
+        );
+        let out = ok(&o);
+        assert!(out.contains(&format!("\nс субагентами: {n}\n")), "{out}");
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert_eq!(
+            err.contains("субагентов не меньше 500"),
+            warned,
+            "{n}: {err}"
+        );
+    }
 }

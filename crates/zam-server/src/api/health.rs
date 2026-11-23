@@ -42,6 +42,11 @@ pub const FEATURES: &[&str] = &[
     "vault_move",
     "idea_queue_line",
     "post_tool_subject",
+    "task_subtasks",
+    "sessions_parent",
+    "space_counts",
+    "backup_api",
+    "entries_trash",
     "agent_text_masked",
 ];
 

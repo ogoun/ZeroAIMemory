@@ -156,14 +156,19 @@ test('tasks_board_claim_shown', async ({ page }) => {
   await card.getByRole('button', { name: 'Применить' }).click();
   await expect(col('заблокирован')).toContainText('Блокер: ждём ответа владельца');
 
-  // снятие захвата человеком
+  // снятие захвата человеком; карточка — панель 480 px поверх доски (M7.2, §5.2 п. 1): она
+  // закрывает правые колонки, поэтому перед щелчком по следующей плитке — Esc
+  await page.keyboard.press('Escape');
+  await expect(card).toHaveCount(0);
   await col('в работе').getByRole('button', { name: 'Задача WM захвачена' }).click();
   await expect(card.getByTestId('claim')).toContainText('в работе у claude-wm');
   await card.getByRole('button', { name: 'Снять захват' }).click();
   await expect(card.getByTestId('claim')).toHaveCount(0);
   await expect(col('в работе')).not.toContainText('в работе у claude-wm');
 
-  // переоткрытие выполненной — с причиной
+  // переоткрытие выполненной — с причиной (панель сначала закрыть — Esc)
+  await page.keyboard.press('Escape');
+  await expect(card).toHaveCount(0);
   await col('выполнен').getByRole('button', { name: 'Задача WM выполнена' }).click();
   await card.getByRole('button', { name: 'Переоткрыть' }).click();
   await card.getByLabel('Причина переоткрытия').fill('тесты красные');
@@ -199,6 +204,46 @@ test('question_answer_one_click_creates_decision', async ({ page }) => {
     `${SP}/entries?kind=insight&data_kind=decision&decided_by=human`,
   );
   expect(decided.items.some((e) => e.data.decision?.decided_by === 'human')).toBe(true);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('question_obsolete_with_reason', async ({ page }) => {
+  // M7.2, спецификация §5.9 п. 2: «Неактуален» открытого вопроса — `status: obsolete` с причиной
+  // (окно с полем «Причина»; без причины сервер не примет); ответить на неактуальный нельзя
+  const problems = watch(page);
+  const q = await entry({
+    kind: 'question',
+    title: 'Вопрос WM: нужен ли экспорт в CSV?',
+    body: 'Агент спрашивает про формат выгрузки.',
+    data: { options: [{ key: 'yes', text: 'Да' }, { key: 'no', text: 'Нет' }] },
+  });
+  await openJournal(page, 'questions');
+  const card = page.locator(`[data-question="${q.id}"]`);
+  await expect(card.getByRole('button', { name: 'Да', exact: true })).toBeVisible();
+  await card.getByRole('button', { name: 'Неактуален «Вопрос WM: нужен ли экспорт в CSV?»' }).click();
+  const ask = page.getByRole('dialog', { name: 'Вопрос неактуален?' });
+  await expect(ask).toContainText('уйдёт из открытых');
+  // без причины окно не отправляется (поле обязательно)
+  await ask.getByRole('button', { name: 'Неактуален', exact: true }).click();
+  await expect(ask).toBeVisible();
+  await ask.getByLabel('Причина').fill('решили без вопроса');
+  const sent = page.waitForRequest((r) => r.method() === 'PATCH' && r.url().endsWith(`/entries/${q.id}`));
+  await ask.getByRole('button', { name: 'Неактуален', exact: true }).click();
+  const req = await sent;
+  expect(req.postDataJSON()).toEqual({ status: 'obsolete', reason: 'решили без вопроса' });
+  expect(req.headers()['if-match']).toBe(`"${q.rev}"`);
+  await expect(ask).toHaveCount(0);
+  await expect(page.locator('section.journal').getByRole('status')).toHaveText('Вопрос «Вопрос WM: нужен ли экспорт в CSV?» отмечен неактуальным.');
+  await expect(card.locator('.status')).toHaveText('неактуален');
+  await expect(card).toContainText('Вопрос неактуален.');
+  // вариантов ответа и «Неактуален» больше нет, «Удалить» — есть
+  await expect(card.getByRole('button', { name: 'Да', exact: true })).toHaveCount(0);
+  await expect(card.getByRole('button', { name: /^Неактуален/ })).toHaveCount(0);
+  await expect(card.getByRole('button', { name: /^Удалить/ })).toBeVisible();
+  const got = await api<{ status: string }>('GET', `entries/${q.id}`);
+  expect(got.status).toBe('obsolete');
+  const revs = await api<{ items: { status: string | null; reason: string | null }[] }>('GET', `entries/${q.id}/revisions`);
+  expect(revs.items.at(-1)).toMatchObject({ status: 'obsolete', reason: 'решили без вопроса' });
   expect(problems, problems.join('\n')).toEqual([]);
 });
 

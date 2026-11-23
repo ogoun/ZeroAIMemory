@@ -94,20 +94,27 @@ function chunk(type: string, data: Buffer): Buffer {
   return Buffer.concat([len, td, crc]);
 }
 
-export function makePng(w: number, h: number): Buffer {
+/**
+ * PNG `w` × `h` RGB: градиент; `noise` — детерминированный шум (сжимается плохо: размер файла ≈
+ * `3 · w · h` байт — «большой PNG» превью страницы отчёта, M7.2).
+ */
+export function makePng(w: number, h: number, noise = false): Buffer {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(w, 0);
   ihdr.writeUInt32BE(h, 4);
   ihdr[8] = 8; // глубина
   ihdr[9] = 2; // RGB
   const raw = Buffer.alloc((w * 3 + 1) * h);
+  let seed = 0x2f6fed;
+  // линейный конгруэнтный генератор (Numerical Recipes): шум одинаков от прогона к прогону
+  const rnd = () => (seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) >>> 24;
   for (let y = 0; y < h; y++) {
     const row = y * (w * 3 + 1);
     for (let x = 0; x < w; x++) {
       const p = row + 1 + x * 3;
-      raw[p] = Math.round((x / w) * 255);
-      raw[p + 1] = Math.round((y / h) * 255);
-      raw[p + 2] = 180;
+      raw[p] = noise ? rnd() : Math.round((x / w) * 255);
+      raw[p + 1] = noise ? rnd() : Math.round((y / h) * 255);
+      raw[p + 2] = noise ? rnd() : 180;
     }
   }
   return Buffer.concat([
@@ -389,6 +396,30 @@ graph LR
 [^f1]: F1 — среднее гармоническое точности и полноты.
 `;
 
+/** Файл отчёта для multipart: имя, MIME, содержимое. */
+export type ReportFile = [string, string, Uint8Array | string];
+
+/**
+ * Отчёт агента в пространстве `space` по токену (multipart как `zam report`): `meta` — поля записи,
+ * `files` — файлы; результат — id записи.
+ */
+export async function postReport(
+  base: string,
+  token: string,
+  space: string,
+  meta: Record<string, unknown>,
+  files: ReportFile[] = [],
+  headers: Record<string, string> = {},
+): Promise<string> {
+  const form = new FormData();
+  form.append('meta', new Blob([JSON.stringify(meta)], { type: 'application/json' }));
+  for (const [name, mime, data] of files) {
+    form.append('file', new Blob([typeof data === 'string' ? data : new Uint8Array(data)], { type: mime }), name);
+  }
+  const r = await api<EntryResp>(base, token, 'POST', `spaces/${space}/entries`, { body: form, headers });
+  return r.id;
+}
+
 export interface ReportSeed {
   print: string;
   full: string;
@@ -406,21 +437,8 @@ export interface ReportSeed {
 export async function seedReports(base: string, token: string, noteId: string): Promise<ReportSeed> {
   const sp = `spaces/${SOLUTION_GUID}/entries`;
   const task = await api<EntryResp>(base, token, 'POST', sp, json({ kind: 'task', title: 'Задача из отчёта E2E', body: '' }));
-  const report = async (
-    meta: Record<string, unknown>,
-    files: [string, string, Uint8Array | string][] = [],
-  ): Promise<string> => {
-    const form = new FormData();
-    form.append('meta', new Blob([JSON.stringify(meta)], { type: 'application/json' }));
-    for (const [name, mime, data] of files) {
-      form.append('file', new Blob([typeof data === 'string' ? data : new Uint8Array(data)], { type: mime }), name);
-    }
-    const r = await api<EntryResp>(base, token, 'POST', sp, {
-      body: form,
-      headers: { 'X-Zam-Session': REPORT_SESSION, 'X-Zam-Machine': REPORT_MACHINE },
-    });
-    return r.id;
-  };
+  const report = (meta: Record<string, unknown>, files: ReportFile[] = []): Promise<string> =>
+    postReport(base, token, SOLUTION_GUID, meta, files, { 'X-Zam-Session': REPORT_SESSION, 'X-Zam-Machine': REPORT_MACHINE });
   // печатный — первым: лента (reports.spec) ждёт полный отчёт последним
   const print = await report(
     {

@@ -850,6 +850,18 @@ pub fn trash_allowed(st: &AppState, p: &Principal, owner: Id, role: Role) -> Res
     }
 }
 
+/// Корзина ленты вида, кроме отчётов (`deleted=only`, M7 §5.9 п. 3, решение 30): права
+/// восстановления — право записи области `sc`, то же, что [`entry_scope`] с [`Mode::Write`] даёт
+/// `DELETE` и `POST …/restore`: токен `ro` и участник `ro` — 403, участник `rw` — видит корзину
+/// решения. Корзина отчётов — [`trash_allowed`].
+pub async fn trash_feed_allowed(
+    st: &AppState,
+    p: &Principal,
+    sc: &MemScope,
+) -> Result<(), ApiError> {
+    authorize_role(st, p, &sc.space, sc.role, Mode::Write).await
+}
+
 /// `DELETE /entries/{id}` и `POST …/restore`: у отчёта — [`trash_allowed`], у прочих записей —
 /// общие права записи (уже проверены [`entry_scope`]). Токену отчёт — 404 ещё в
 /// [`entry_scope`]; 403 здесь получают сессии WebUI не владельца.

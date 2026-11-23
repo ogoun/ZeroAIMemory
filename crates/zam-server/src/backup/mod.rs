@@ -31,10 +31,12 @@
 //! На Linux копия получает права только владельца (каталоги 0700, файлы 0600): в ней токены
 //! и шифротексты Vault.
 //!
-//! **Восстановление** — [`mod@restore`], **расписание** — [`schedule`].
+//! **Восстановление** — [`mod@restore`], **расписание** — [`schedule`], **копия в процессе
+//! сервера** (страница «Копии» WebUI и автокопия под одним замком, M7 §5.6) — [`runner`].
 
 pub mod manifest;
 pub mod restore;
+pub mod runner;
 pub mod schedule;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -96,6 +98,10 @@ pub enum BackupError {
     NoData(PathBuf),
     #[error("копия повреждена: {0}")]
     BadArchive(String),
+    /// Не готовая копия каталога копий (`DELETE /admin/backups/{name}`, M7 §5.6): имя не по
+    /// шаблону, сборка, неудачная копия, архив, каталог без описи — в ответе 404.
+    #[error("нет готовой копии «{0}» в каталоге копий")]
+    NotACopy(String),
     /// Сбой после начала записи в каталог данных: каталог помечен незавершённым
     /// восстановлением, сервер его не примет до повтора `restore --replace`.
     #[error(
@@ -193,7 +199,9 @@ pub fn copy_time(name: &str) -> Option<jiff::Timestamp> {
 
 /// Готовые копии каталога копий (с описью), от старых к новым. Сюда входят и копии,
 /// снятые вручную `zam-server backup` в тот же каталог: ротация автокопий (`keep`) считает
-/// и удаляет их наравне с автокопиями.
+/// и удаляет их наравне с автокопиями. Готовая копия — [`ready_copy`]: ссылка (symlink,
+/// junction) на каталог с описью копией не считается — её нет ни в списке страницы «Копии», ни в
+/// ротации, ни в `no_recent_backup`, и `DELETE` её не удаляет (M7 §5.6, ревью r1 задачи 7).
 pub fn list_copies(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -202,13 +210,27 @@ pub fn list_copies(dir: &Path) -> Vec<PathBuf> {
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
-            let t = copy_time(&name)?;
-            let p = e.path();
-            p.join(MANIFEST_FILE).is_file().then_some((t, name, p))
+            let (t, p) = ready_copy(dir, &name)?;
+            Some((t, name, p))
         })
         .collect();
     v.sort();
     v.into_iter().map(|(_, _, p)| p).collect()
+}
+
+/// Готовая копия `name` каталога копий `dir`: имя только из цифр, `-`, `_` по шаблону
+/// [`copy_time`] (ни разделителей пути, ни `..`, ни суффиксов `.partial`, `.failed`, ни
+/// расширения архива), сам каталог — не ссылка (symlink, junction) — с описью. Одно правило у
+/// списка копий ([`list_copies`]) и удаления ([`delete_copy`]).
+fn ready_copy(dir: &Path, name: &str) -> Option<(jiff::Timestamp, PathBuf)> {
+    let plain = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b'-' || b == b'_');
+    let t = copy_time(name).filter(|_| plain)?;
+    let p = dir.join(name);
+    let ft = std::fs::symlink_metadata(&p).ok()?.file_type();
+    (ft.is_dir() && !ft.is_symlink() && p.join(MANIFEST_FILE).is_file()).then_some((t, p))
 }
 
 /// Время последней готовой копии каталога копий.
@@ -229,6 +251,92 @@ pub fn status_json(cfg: &ServerConfig, now: jiff::Timestamp) -> serde_json::Valu
         "schedule": cfg.backup.schedule,
         "warning": stale.then_some("no_recent_backup"),
     })
+}
+
+/// Сводка готовой копии по её описи (M7 §5.6, `GET /admin/backups`): числа без обхода диска.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CopySummary {
+    /// Имя каталога копии (`yyyy-MM-dd_HHmmss[-N]`).
+    pub name: String,
+    pub created_at: String,
+    pub server_version: String,
+    /// Сумма размеров файлов описи и самой описи — как `bytes` отчёта копии.
+    pub bytes: u64,
+    /// Файлов в описи.
+    pub files: usize,
+    /// Баз: `system.db` и `users/*.db`.
+    pub dbs: usize,
+    /// Блобов вложений (`blobs/…`).
+    pub blobs: usize,
+    pub drift: Vec<String>,
+}
+
+/// Сводка копии-каталога `path` по описи (`manifest.json`); нет описи или она не читается —
+/// `None`. Опись разбирается частично: суммы файлов пропускаются, пути не копируются (у копии с
+/// десятками тысяч блобов опись — мегабайты).
+pub fn copy_summary(path: &Path) -> Option<CopySummary> {
+    #[derive(serde::Deserialize)]
+    struct File<'a> {
+        #[serde(borrow)]
+        path: std::borrow::Cow<'a, str>,
+        size: u64,
+    }
+    #[derive(serde::Deserialize)]
+    struct Head<'a> {
+        server_version: String,
+        created_at: String,
+        #[serde(borrow)]
+        files: Vec<File<'a>>,
+        #[serde(default)]
+        drift: Vec<String>,
+    }
+    let name = path.file_name()?.to_str()?.to_string();
+    let mf = path.join(MANIFEST_FILE);
+    let text = std::fs::read(&mf).ok()?;
+    let head: Head<'_> = serde_json::from_slice(&text).ok()?;
+    let blobs = head
+        .files
+        .iter()
+        .filter(|f| f.path.starts_with("blobs/"))
+        .count();
+    let dbs = head
+        .files
+        .iter()
+        .filter(|f| !f.path.starts_with("blobs/") && f.path.ends_with(".db"))
+        .count();
+    let bytes = head.files.iter().map(|f| f.size).sum::<u64>() + text.len() as u64;
+    Some(CopySummary {
+        name,
+        created_at: head.created_at,
+        server_version: head.server_version,
+        bytes,
+        files: head.files.len(),
+        dbs,
+        blobs,
+        drift: head.drift,
+    })
+}
+
+/// Удаляет готовую копию `name` каталога копий `dir` (`DELETE /admin/backups/{name}`, M7 §5.6):
+/// только [`ready_copy`], иначе — [`BackupError::NotACopy`], на диске ничего не меняется. Путь
+/// из запроса не используется: только `dir` и проверенное имя. Копии не стало во время удаления
+/// (её удалил кто-то ещё) — тоже `NotACopy`; удаления самого сервера разводит замок удаления
+/// [`runner::BackupRunner::delete`].
+pub fn delete_copy(dir: &Path, name: &str) -> Result<(), BackupError> {
+    let not = || BackupError::NotACopy(name.to_string());
+    let (_, p) = ready_copy(dir, name).ok_or_else(not)?;
+    match remove_copy(&p) {
+        Ok(()) => {}
+        Err(_) if !p.exists() => return Err(not()),
+        Err(e) => return Err(e.into()),
+    }
+    tracing::info!(path = %p.display(), "копия удалена (WebUI)");
+    Ok(())
+}
+
+/// Удаление каталога копии — одно у ротации [`prune`] и у [`delete_copy`].
+fn remove_copy(p: &Path) -> std::io::Result<()> {
+    std::fs::remove_dir_all(p)
 }
 
 #[cfg(feature = "test-hooks")]
@@ -1067,12 +1175,20 @@ fn write_zip_to(stage: &Path, m: &Manifest, tmp: &Path, root: &Path) -> Result<(
     Ok(())
 }
 
-/// Удаляет копии (каталоги) из `Prune` расписания.
-pub fn prune(paths: &[PathBuf]) {
+/// Удаляет копии (каталоги) сверх `keep`: `Prune` расписания и ротация копии из WebUI при
+/// `schedule = "daily"` ([`runner`]); число удалённых.
+pub fn prune(paths: &[PathBuf]) -> usize {
+    let mut n = 0;
     for p in paths {
-        match std::fs::remove_dir_all(p) {
-            Ok(()) => tracing::info!(path = %p.display(), "копия удалена (сверх backup.keep)"),
+        match remove_copy(p) {
+            Ok(()) => {
+                n += 1;
+                tracing::info!(path = %p.display(), "копия удалена (сверх backup.keep)");
+            }
+            // уже удалена (не сервером) между списком и удалением — не сбой
+            Err(_) if !p.exists() => tracing::debug!(path = %p.display(), "копии уже нет"),
             Err(e) => tracing::warn!(path = %p.display(), error = %e, "копия не удалена"),
         }
     }
+    n
 }

@@ -2,6 +2,8 @@
   // Редактор заметки: CodeMirror 6 (ленивый чанк) слева, предпросмотр сервера справа.
   // Текст правится как есть (без WYSIWYG); сохранение — PUT с If-Match текущей ревизии,
   // конфликт — окно с диффом и выбором. Уход с несохранёнными правками — с подтверждением.
+  // Окно уже 1024 px (M7.2, §5.2 п. 4) — две панели не рядом, а вкладками «Текст | Предпросмотр»
+  // (ARIA tablist; панели не пересоздаются — CodeMirror и правки целы); гибридного режима нет.
   import '../doc.css';
   import { Dialog } from 'bits-ui';
   import { onMount, tick, untrack } from 'svelte';
@@ -22,6 +24,8 @@
   import { codeOf, flashButton } from '../lib/hydrate/dom';
   import { hydrateRendered } from '../lib/hydrate/render';
   import { anchorId, href, parse, setGuard } from '../lib/router';
+  import { onTabKey } from '../lib/tabs';
+  import { viewport } from '../lib/viewport.svelte';
 
   interface Props {
     user: string;
@@ -62,6 +66,38 @@
 
   let previewSeq = 0;
   let previewTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** Окно уже настольного: панели — вкладками, видна одна. */
+  let tabbed = $derived(viewport.current !== 'desktop');
+  type Pane = 'source' | 'preview';
+  const PANES: Pane[] = ['source', 'preview'];
+  const PANE_TITLE: Record<Pane, string> = { source: 'Текст', preview: 'Предпросмотр' };
+  let pane = $state<Pane>('source');
+  const uid = $props.id();
+  let tabEls = $state<HTMLButtonElement[]>([]);
+  let previewPane = $state<HTMLDivElement | null>(null);
+
+  // Смена ширины (поворот, окно) не теряет фокус. Сузилось — выбранной становится панель с
+  // фокусом (иначе фокус ушёл бы со скрытой панели); расширилось с фокусом на вкладке — фокус в её
+  // панель (вкладки исчезают). До обновления DOM (`$effect.pre`): фокус ещё на месте.
+  let wasTabbed = false;
+  $effect.pre(() => {
+    const t = tabbed;
+    untrack(() => {
+      const a = document.activeElement;
+      if (t && !wasTabbed) {
+        if (previewPane?.contains(a)) pane = 'preview';
+        else if (host?.contains(a)) pane = 'source';
+      } else if (!t && wasTabbed && a instanceof HTMLElement && tabEls.includes(a as HTMLButtonElement)) {
+        const p = pane;
+        void tick().then(() => (p === 'source' ? cm?.focus() : previewPane?.focus()));
+      }
+      wasTabbed = t;
+    });
+  });
+
+  /** Клавиатура вкладок (`lib/tabs.ts`): ←/→ по кругу, Home, End; выбор следует за фокусом. */
+  const ontabkey = (e: KeyboardEvent, i: number) => onTabKey(e, i, PANES.length, tabEls, (j) => (pane = PANES[j]));
 
   const message = (e: unknown) => (e instanceof Error ? e.message : 'Ошибка');
   const isDirty = () => cm !== null && cm.text() !== saved;
@@ -353,12 +389,49 @@
   </div>
   {#if error}<p class="error" role="alert">{error}</p>{/if}
 
-  <div class="split">
-    <div class="pane source" bind:this={host}>
+  {#if tabbed}
+    <!-- узкое окно: вкладки вместо двух колонок; панели ниже те же (не пересоздаются) -->
+    <div class="pane-tabs" role="tablist" aria-label="Панель редактора">
+      {#each PANES as p, i (p)}
+        <button
+          type="button"
+          role="tab"
+          id={`${uid}-tab-${p}`}
+          bind:this={tabEls[i]}
+          aria-selected={pane === p}
+          aria-controls={`${uid}-${p}`}
+          tabindex={pane === p ? 0 : -1}
+          onclick={() => (pane = p)}
+          onkeydown={(e) => ontabkey(e, i)}>{PANE_TITLE[p]}</button
+        >
+      {/each}
+    </div>
+  {/if}
+  <div class="split" class:tabbed>
+    <div
+      class="pane source"
+      bind:this={host}
+      id={`${uid}-source`}
+      role={tabbed ? 'tabpanel' : undefined}
+      aria-labelledby={tabbed ? `${uid}-tab-source` : undefined}
+      hidden={tabbed && pane !== 'source'}
+    >
       {#if !ready && !error}<p class="muted loading">Загрузка редактора…</p>{/if}
     </div>
-    <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-    <div class="pane preview" aria-label="Предпросмотр" onclick={onpreviewclick}>
+    <!-- панель — в порядке Tab на узком окне (`tabindex="0"`, образец ARIA APG): в предпросмотре
+         может не быть ни одной цели; на настольном (`-1`) — цель фокуса при расширении окна -->
+    <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions, a11y_no_noninteractive_tabindex -->
+    <div
+      class="pane preview"
+      bind:this={previewPane}
+      id={`${uid}-preview`}
+      role={tabbed ? 'tabpanel' : undefined}
+      aria-labelledby={tabbed ? `${uid}-tab-preview` : undefined}
+      aria-label={tabbed ? undefined : PANE_TITLE.preview}
+      tabindex={tabbed ? 0 : -1}
+      hidden={tabbed && pane !== 'preview'}
+      onclick={onpreviewclick}
+    >
       {#if previewNote}<p class="warn">{previewNote}</p>{/if}
       {#if preview}
         {#key preview}
@@ -370,11 +443,16 @@
   </div>
 </section>
 
+<!-- окно открыто, пока есть конфликт: Esc и щелчок мимо закрывают его, только когда выбор не
+     выполняется (`conflictBusy`), — иначе после неудачи ошибка и выбор были бы скрыты (привязка
+     функцией, как у `ImportDialog`; финальное ревью M7.2, M4) -->
 <Dialog.Root
-  open={conflict !== null}
-  onOpenChange={(o) => {
-    if (!o && !conflictBusy) conflict = null;
-  }}
+  bind:open={
+    () => conflict !== null,
+    (o) => {
+      if (!o && !conflictBusy) conflict = null;
+    }
+  }
 >
   <Dialog.Portal>
     <Dialog.Overlay class="overlay" />
@@ -426,7 +504,7 @@
     gap: 16px;
   }
   .pane {
-    height: calc(100vh - var(--header-h) - 150px);
+    height: calc(var(--app-h) - var(--header-h) - 150px);
     min-height: 320px;
     overflow: auto;
     border: 1px solid var(--border);
@@ -446,7 +524,8 @@
     padding: 12px 16px;
   }
   :global(.dialog.conflict) {
-    width: min(860px, 94vw);
+    /* ширина — переменной: на телефоне окно во всю ширину (app.css) */
+    --dialog-w: 860px;
   }
   .conflict-diff {
     margin-top: 12px;
@@ -455,12 +534,42 @@
     margin-top: 16px;
     justify-content: flex-end;
   }
-  @media (max-width: 999px) {
-    .split {
-      grid-template-columns: minmax(0, 1fr);
-    }
-    .pane {
-      height: 60vh;
+  /* две колонки «рядом» — с 1024 px (BP_DESKTOP, layout.ts); уже — одна панель выбранной вкладки
+     (`tabbed` — класс окна `viewport.current`, та же граница) во всю высоту под панелью кнопок */
+  .split.tabbed {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .split.tabbed .pane {
+    height: calc(var(--app-h) - var(--header-h) - 200px);
+    min-height: 280px;
+  }
+  .pane-tabs {
+    display: flex;
+    gap: 2px;
+    box-shadow: inset 0 -1px var(--border);
+  }
+  .pane-tabs button {
+    border: 0;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    background: transparent;
+    padding: 6px 14px;
+    color: var(--muted);
+  }
+  .pane-tabs button[aria-selected='true'] {
+    color: var(--text);
+    border-bottom-color: var(--accent);
+  }
+  .pane-tabs button:focus-visible {
+    outline-offset: -2px;
+  }
+  .preview:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  @media (pointer: coarse) {
+    .pane-tabs {
+      gap: var(--touch-gap);
     }
   }
 </style>

@@ -108,6 +108,16 @@ fn health_features_documented() {
         "epochs",
         // выдача агенту по токену — с `‹secret›` (задача 5 M7.1)
         "agent_text_masked",
+        // подзадачи `part_of`: поля задачи, фильтры ленты и счётчиков (задача 5 M7.2)
+        "task_subtasks",
+        // сессии субагентов `GET /sessions?parent=` (задача 9 M7.2)
+        "sessions_parent",
+        // копии из WebUI `GET|POST /admin/backups`, `DELETE /admin/backups/{name}` (задача 7 M7.2)
+        "backup_api",
+        // число записей разделов `GET /spaces/{space}/counts` (задача 4 M7.2)
+        "space_counts",
+        // корзина любого журнала `deleted=only` (задача 10 M7.2)
+        "entries_trash",
     ] {
         assert!(built.contains(f), "{f}");
     }

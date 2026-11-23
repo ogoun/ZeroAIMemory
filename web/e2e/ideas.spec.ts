@@ -291,9 +291,18 @@ test('ideas_defer_with_date_and_decline', async ({ page }) => {
   await expectUtcDay(date, 1, 'min');
   await expectUtcDay(date, 30);
   await expect(form.getByText('UTC', { exact: true })).toBeVisible();
-  // повторное нажатие той же кнопки карточки открывает форму заново: введённое сброшено
+  // повторное нажатие той же кнопки карточки открывает форму заново: введённое сброшено; при
+  // введённом — сначала вопрос (финальное ревью M7.2, I1): «Отмена» — форма с введённым цела
   await date.fill(utc(7));
-  await card(page).getByRole('group', { name: 'Решение по идее' }).getByRole('button', { name: 'Отложить' }).click();
+  const again = card(page).getByRole('group', { name: 'Решение по идее' }).getByRole('button', { name: 'Отложить' });
+  for (const accept of [false, true]) {
+    page.once('dialog', (d) => {
+      expect([d.type(), d.message()]).toEqual(['confirm', 'В форме есть несохранённый текст. Закрыть её без сохранения?']);
+      void (accept ? d.accept() : d.dismiss());
+    });
+    await again.click();
+    if (!accept) await expect(date).toHaveValue(utc(7));
+  }
   await expectUtcDay(date, 30);
   await date.fill(utc(5));
   const sent = page.waitForRequest((r) => r.url().endsWith(`/entries/${idea.id}/decide`));
@@ -990,5 +999,39 @@ test('agent_setup_ideas_mode_persists', async ({ page }) => {
     });
     expect(r.status()).toBe(200);
   }
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+// M7.2, задача 2: лента не загрузилась (500) — ошибка; следующий переход (открытие идеи) повторяет
+// загрузку с прежними фильтрами (чип «Все», приоритет), а не сбрасывает их.
+test('ideas_retry_after_error_keeps_filters', async ({ page }) => {
+  const problems = watch(page, [500]);
+  const high = await api<{ items: { id: string }[] }>('GET', `${SP}/entries?kind=idea&origin=human&priority=high&limit=50`);
+  expect(high.items.length).toBeGreaterThan(0);
+  await openIdeas(page);
+  await chip(page, 'Все').click();
+  await expect(chip(page, 'Все')).toHaveAttribute('aria-pressed', 'true');
+  let fail = true;
+  await page.route(/\/entries\?.*kind=idea.*priority=high/, async (route) => {
+    if (!fail) return route.continue();
+    fail = false;
+    await route.fulfill({ status: 500, contentType: 'text/plain', body: 'сбой для теста' });
+  });
+  await page.getByLabel('Приоритет идей').selectOption('high');
+  const alert = page.locator('section.ideas').getByRole('alert');
+  await expect(alert).toBeVisible();
+  await expect(feed(page).locator('article.idea')).toHaveCount(0);
+  const retried = page.waitForRequest(
+    (r) => /\/entries\?/.test(r.url()) && r.url().includes('kind=idea') && r.url().includes('priority=high'),
+  );
+  const u = await me(page);
+  await page.evaluate((h) => (location.hash = h), `#/u/${u}/s/${IDEAS_GUID}/j/ideas/${high.items[0].id}`);
+  const again = new URL((await retried).url());
+  expect(again.searchParams.get('status'), '«Все» — без статуса').toBeNull();
+  await expect(card(page)).toBeVisible();
+  await expect(feed(page).locator('article.idea')).toHaveCount(high.items.length);
+  await expect(page.getByLabel('Приоритет идей')).toHaveValue('high');
+  await expect(chip(page, 'Все')).toHaveAttribute('aria-pressed', 'true');
+  await expect(alert).toHaveCount(0);
   expect(problems, problems.join('\n')).toEqual([]);
 });

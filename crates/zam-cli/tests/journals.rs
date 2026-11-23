@@ -1,5 +1,6 @@
 //! `zam log changelog` и `zam release add|compare` против настоящего zam-server в том же
-//! процессе тестов; git-репозиторий — в `CARGO_TARGET_TMPDIR` (§7.3, §7.4).
+//! процессе тестов; git-репозиторий — в `CARGO_TARGET_TMPDIR` (§7.3, §7.4). `zam task`: поля
+//! задачи, ленты журналов и подзадачи `part_of` (`show`, `list --parent|--top`; M7 §5.4).
 mod common;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,12 @@ fn tmp(name: &str) -> PathBuf {
 
 /// Сервер в фоновом потоке: адрес и токен `rw` пользователя «Анна».
 fn start(name: &str) -> (String, String) {
+    let (url, token, _) = start_db(name);
+    (url, token)
+}
+
+/// [`start`] и путь базы пользователя «Анна» (`<data>/users/<id>.db`).
+fn start_db(name: &str) -> (String, String, PathBuf) {
     let data = tmp(&format!("{name}-data"));
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -34,7 +41,8 @@ fn start(name: &str) -> (String, String) {
             let (_, t) = st.system.issue_token(u.id, "t", Access::Rw).await.unwrap();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
-            tx.send((url, t)).unwrap();
+            let db = st.cfg.data_dir.join("users").join(format!("{}.db", u.id));
+            tx.send((url, t, db)).unwrap();
             axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -545,4 +553,214 @@ fn journal_lists_walk_cursor_and_hint() {
         );
         assert_eq!(o.status.code(), Some(6), "{kind}: {}", err(&o));
     }
+}
+
+// ---------- Подзадачи `part_of` (M7 §5.4 п. 4, задача 5 M7.2) ----------
+
+/// Статусы шагов плана [`plan`] по порядку связей: 8 `done`, 1 `dropped`, 2 `in_progress`,
+/// 1 `blocked`, 2 `open` — прогресс 8/13 (снятый в знаменатель не входит).
+const PLAN: [&str; 14] = [
+    "done",
+    "done",
+    "done",
+    "done",
+    "done",
+    "done",
+    "done",
+    "done",
+    "dropped",
+    "in_progress",
+    "in_progress",
+    "blocked",
+    "open",
+    "open",
+];
+
+/// Общая задача «Этап» (`in_progress`) и 14 шагов «Шаг i» решения проекта `r` через `zam`:
+/// связи `zam link k:<шаг> part_of k:<общая>` — в обратном порядке создания шагов, статусы — по
+/// [`PLAN`]. Возвращает общую и шаги в порядке связей.
+fn plan(url: &str, tok: &str, r: &Path) -> (String, Vec<String>) {
+    let z = |args: &[&str]| zam(url, tok, r, args, b"");
+    let new = |title: &str| -> String {
+        let s = ok(&z(&["task", "new", "--title", title]));
+        s.trim().split('@').next().unwrap().to_string()
+    };
+    let p = new("Этап");
+    let steps: Vec<String> = (0..PLAN.len()).map(|i| new(&format!("Шаг {i}"))).collect();
+    let order: Vec<String> = steps.iter().rev().cloned().collect();
+    for s in &order {
+        ok(&z(&[
+            "link",
+            &format!("k:{s}"),
+            "part_of",
+            &format!("k:{p}"),
+        ]));
+    }
+    for (s, st) in order.iter().zip(PLAN) {
+        match st {
+            "open" => {}
+            "blocked" => {
+                ok(&z(&[
+                    "task",
+                    "status",
+                    s.as_str(),
+                    st,
+                    "--blocked-by",
+                    "ревью",
+                ]));
+            }
+            _ => {
+                ok(&z(&["task", "status", s.as_str(), st]));
+            }
+        }
+    }
+    ok(&z(&["task", "status", &p, "in_progress"]));
+    (p, order)
+}
+
+/// Все задачи базы `db` (сервер работает, WAL) — с `updated_at` `hours` часов назад; время в
+/// тексте агенту (`yyyy-MM-dd HH:mm:ss` UTC).
+fn age_tasks(db: &Path, hours: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let ts = zam_core::time::rfc3339_from_secs(now - hours * 3600);
+    let c = rusqlite::Connection::open(db).unwrap();
+    c.busy_timeout(std::time::Duration::from_secs(10)).unwrap();
+    c.execute(
+        "UPDATE entries SET updated_at = ?1 WHERE kind = 'task'",
+        [&ts],
+    )
+    .unwrap();
+    zam_core::time::agent_ts(&ts).unwrap()
+}
+
+/// `zam task show` общей — «подзадачи: 8/13 (в работе 2, открыто 2, заблокировано 1, снято 1)»
+/// (снятые — отдельно и не в знаменателе) и строки шагов `k:<id> [статус] «заголовок»` в порядке
+/// связей; у шага — «часть: k:<общая> «Этап» (8/13)»; `in_progress` без захвата и без правок
+/// 12 ч — «в работе без обновлений N ч (последнее — <время>)»; `--json` — поля сервера.
+#[test]
+fn task_show_subtasks_progress() {
+    let (url, tok, db) = start_db("task-subtasks-show");
+    let r = project("task-subtasks-show-repo");
+    let z = |args: &[&str]| zam(&url, &tok, &r, args, b"");
+    let (p, order) = plan(&url, &tok, &r);
+    let card = ok(&z(&["task", "show", &format!("k:{p}")]));
+    assert!(
+        card.contains("подзадачи: 8/13 (в работе 2, открыто 2, заблокировано 1, снято 1)\n"),
+        "{card}"
+    );
+    let rows: Vec<&str> = card
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| l.starts_with("k:"))
+        .collect();
+    assert_eq!(rows.len(), order.len(), "{card}");
+    for ((row, s), st) in rows.iter().zip(&order).zip(PLAN) {
+        assert!(
+            row.starts_with(&format!("k:{s} [{st}] «Шаг ")),
+            "{row}: {card}"
+        );
+    }
+    assert_eq!(rows[0], format!("k:{} [done] «Шаг 13»", order[0]), "{card}");
+    assert!(
+        !card.contains("часть:") && !card.contains("без обновлений"),
+        "{card}"
+    );
+    // шаг — часть общей, с её прогрессом
+    let c = ok(&z(&["task", "show", &order[12]]));
+    assert!(c.contains(&format!("часть: k:{p} «Этап» (8/13)\n")), "{c}");
+    assert!(!c.contains("подзадачи:"), "{c}");
+    // общая и шаги не менялись 14 ч, захвата нет
+    let at = age_tasks(&db, 14);
+    let card = ok(&z(&["task", "show", &p]));
+    assert!(
+        card.contains(&format!(
+            "в работе без обновлений 14 ч (последнее — {at})\n"
+        )),
+        "{card}"
+    );
+    let j = json(&z(&["task", "show", &p, "--json"]));
+    assert_eq!(j["subtasks"]["total"], 14, "{j}");
+    assert_eq!(j["stale"], true, "{j}");
+}
+
+/// `zam task list --top` — без подзадач, у общей « · 8/13»; `--parent k:<id>` — прямые
+/// подзадачи в порядке связей и всех статусов (без `--status`); `--status` сужает; вместе — код 6.
+#[test]
+fn task_list_parent_and_top() {
+    let (url, tok) = start("task-subtasks-list");
+    let r = project("task-subtasks-list-repo");
+    let z = |args: &[&str]| zam(&url, &tok, &r, args, b"");
+    let (p, order) = plan(&url, &tok, &r);
+    let lone = ok(&z(&["task", "new", "--title", "Отдельная"]));
+    let lone = lone.trim().split('@').next().unwrap().to_string();
+    let top = ok(&z(&["task", "list", "--top"]));
+    let lines: Vec<&str> = top.lines().collect();
+    assert_eq!(lines.len(), 2, "{top}");
+    assert_eq!(lines[0], format!("{lone} [open] «Отдельная»"), "{top}");
+    assert_eq!(
+        lines[1],
+        format!("{p} [in_progress] «Этап» · 8/13"),
+        "{top}"
+    );
+    // прямые подзадачи — все статусы, в порядке связей
+    let kids = ok(&z(&["task", "list", "--parent", &format!("k:{p}")]));
+    let got: Vec<&str> = kids.lines().map(|l| l.split(' ').next().unwrap()).collect();
+    assert_eq!(got, order, "{kids}");
+    let done = ok(&z(&["task", "list", "--parent", &p, "--status", "done"]));
+    assert_eq!(done.lines().count(), 8, "{done}");
+    // без флагов — прежняя лента: шаги в работе видны
+    let all = ok(&z(&["task", "list"]));
+    assert!(all.contains(&order[9]) && all.contains(&p), "{all}");
+    let o = z(&["task", "list", "--top", "--parent", &p]);
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
+}
+
+/// Сервер без признака `task_subtasks` (0.0.14-m7.1): карточка — прежняя (полей нет — строк нет,
+/// «без обновлений» клиент сам не считает); `--parent` и `--top` — код 1 с подсказкой обновить
+/// сервер, до запроса ленты (старый сервер молча игнорирует неизвестные параметры).
+#[test]
+fn task_show_old_server_no_subtasks() {
+    let r = project("task-subtasks-old");
+    let (url, seen) = common::stub_body(std::sync::Arc::new(
+        |_: &str, p: &str, _: usize, _: &serde_json::Value| {
+            let body = if p.contains("/health") {
+                serde_json::json!({"status": "ok", "version": "0.0.14-m7.1",
+                                   "features": ["m6", "agent_text_masked"]})
+            } else if p.contains("/entries/01A") {
+                serde_json::json!({"id": "01A", "rev": 3, "status": "in_progress",
+                                   "title": "Миграция", "body": "План.\n",
+                                   "data": {"next_step": "ревью",
+                                            "started_at": "2026-10-28T10:00:00.000000Z"}})
+            } else {
+                serde_json::json!({"items": [{"id": "01A", "status": "in_progress",
+                                              "title": "Миграция", "data": {}}],
+                                   "next_cursor": null})
+            };
+            (200, body.to_string(), std::time::Duration::ZERO)
+        },
+    ));
+    let card = ok(&zam(&url, "t", &r, &["task", "show", "k:01A"], b""));
+    assert_eq!(
+        card,
+        "01A [in_progress] «Миграция» · далее: ревью  rev3\nначата: 2026-10-28 10:00:00\n\nПлан.\n"
+    );
+    for flags in [&["--parent", "k:01A"][..], &["--top"][..]] {
+        seen.lock().unwrap().clear();
+        let args = [&["task", "list"][..], flags].concat();
+        let o = zam(&url, "t", &r, &args, b"");
+        assert_eq!(o.status.code(), Some(1), "{flags:?}: {}", err(&o));
+        assert!(err(&o).contains("обновите zam-server"), "{}", err(&o));
+        assert!(out(&o).is_empty(), "{}", out(&o));
+        let paths: Vec<String> = seen.lock().unwrap().iter().map(|s| s.1.clone()).collect();
+        assert!(
+            paths.iter().all(|p| !p.contains("/entries")),
+            "ленту не запрашивали: {paths:?}"
+        );
+    }
+    // без флагов — прежняя лента
+    let l = ok(&zam(&url, "t", &r, &["task", "list"], b""));
+    assert_eq!(l, "01A [in_progress] «Миграция»\n");
 }

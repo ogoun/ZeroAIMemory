@@ -1,8 +1,18 @@
 <script lang="ts">
   // Releases решения (§7.4): список релизов и сравнение выбранного с предыдущим или с любым
-  // другим — записи changelog интервала по видам, дифф текста релиза, коммиты.
+  // другим — записи changelog интервала по видам, дифф текста релиза, коммиты. Правка и корзина
+  // (M7.2, спецификация §5.9): у выбранного релиза — «Изменить» (`EntryEdit`: заголовок, текст,
+  // теги, область; версия и коммиты — как есть) и «Удалить» (в корзину, с подтверждением);
+  // «Корзина» — удалённые релизы с «Восстановить» (`JournalTrash`). Форма и корзина — ленивые чанки.
+  // Форма привязана к выбранному релизу: выбор другого, «Сравнить с», «Корзина» и переход по адресу
+  // её закрывают, при несохранённом — сначала вопрос (`EntryEdit`: проверка ухода и `leave()`).
+  // Переход к записи выключает «Корзину».
   import { untrack } from 'svelte';
   import DiffView from './DiffView.svelte';
+  import EditPanel from './EditPanel.svelte';
+  import Notice from './Notice.svelte';
+  import Prompt, { type Ask } from './Prompt.svelte';
+  import TrashPanel from './TrashPanel.svelte';
   import {
     ApiError,
     compareRelease,
@@ -11,6 +21,8 @@
     type Entry,
     type ReleaseCompare,
   } from '../lib/api';
+  import { trashAsk } from '../lib/entryTrash';
+  import { focusSoon } from '../lib/focus';
   import { CHANGELOG_KINDS, dataStr, fmtTime } from '../lib/journals';
   import { go } from '../lib/router';
 
@@ -37,16 +49,42 @@
   let cmpLoading = $state(false);
   let seq = 0;
   let cseq = 0;
+  /** «Корзина»: вместо списка и сравнения — удалённые релизы. */
+  let trash = $state(false);
+  /** Форма правки выбранного релиза открыта. */
+  let editing = $state(false);
+  let actionError = $state('');
+  let notice = $state('');
+  let ask = $state<Ask | null>(null);
 
   function fail(e: unknown, set: (m: string) => void) {
     if (e instanceof ApiError && e.status === 401) return onexpired();
     set(errorText(e));
   }
 
+  /** Пространство, для которого сброшены корзина, форма и итог: эффект ниже перезапускается на
+   * каждый переход (свойства — из объекта маршрута), а сброс нужен только при смене пространства —
+   * иначе переход (адрес без записи после удаления, запись из поиска) стёр бы итог и форму. */
+  let scopeOf = '';
   $effect(() => {
     const u = user;
     const s = space;
-    untrack(() => load(u, s, true));
+    const id = entry;
+    untrack(() => {
+      if (scopeOf !== `${u}|${s}`) {
+        scopeOf = `${u}|${s}`;
+        trash = false;
+        editing = false;
+        notice = '';
+      }
+      // переход к записи (Ctrl+K, ссылка) — она показывается: корзина выключается, прежний итог
+      // убирается (после удаления адрес — без записи, итог остаётся)
+      if (id) {
+        trash = false;
+        notice = '';
+      }
+      load(u, s, true);
+    });
   });
 
   async function load(u: string, s: string, reset: boolean) {
@@ -80,6 +118,8 @@
     const my = ++cseq;
     cmp = null;
     cmpError = '';
+    editing = false;
+    actionError = '';
     if (!id) return;
     cmpLoading = true;
     try {
@@ -92,9 +132,90 @@
     }
   }
 
+  /** Открытая форма правки (`EditPanel`): её несохранённое — в `leaveEdit`. */
+  let editor = $state<{ leave: () => boolean; release: () => void } | null>(null);
+
+  /** Действие закроет открытую форму: при несохранённом — сначала вопрос; `false` — остаться. */
+  function leaveEdit(): boolean {
+    if (!editing) return true;
+    if (editor && !editor.leave()) return false;
+    editor?.release();
+    editing = false;
+    return true;
+  }
+
+  /** «Сравнить с»: сравнение перечитывается — открытая форма закрывается (с вопросом). */
+  function changeWith(el: HTMLSelectElement) {
+    if (!leaveEdit()) {
+      el.value = withId;
+      return;
+    }
+    withId = el.value;
+  }
+
   function pick(id: string) {
+    // уже выбранный — ничего (форма цела); другой — открытая форма закрывается, с вопросом
+    if (id === selected || !leaveEdit()) return;
     withId = '';
+    notice = '';
     go({ name: 'journal', user, space, journal: 'releases', entry: id }, { replace: true });
+  }
+
+  let root = $state<HTMLElement | null>(null);
+  /** «Изменить» выбранного релиза — фокус после закрытия формы. */
+  const editButton = () => root?.querySelector('.compare .actions button');
+
+  /** Форма закрыта «Отменой»: фокус — на «Изменить». */
+  function closeEdit() {
+    editing = false;
+    focusSoon(editButton);
+  }
+
+  /** Релиз сохранён: список и сравнение — с новой ревизией, фокус — на «Изменить». */
+  async function refresh(done: string) {
+    editing = false;
+    await load(user, space, true);
+    await compare(user, selected, withId);
+    notice = done;
+    focusSoon(editButton);
+  }
+
+  /** 409 правки или удаления: сравнение перечитано, ошибка — под заголовком. */
+  async function stale(message: string) {
+    await compare(user, selected, withId);
+    actionError = message;
+  }
+
+  function askDelete(e: Entry) {
+    actionError = '';
+    notice = '';
+    ask = trashAsk(user, e, {
+      deleted: async (msg) => {
+        editing = false;
+        // сначала список без удалённого, потом адрес без записи — сравнение последнего релиза: иначе
+        // «последним» на миг оказался бы удалённый, и его сравнение ответило бы 404
+        await load(user, space, true);
+        go({ name: 'journal', user, space, journal: 'releases', entry: null }, { replace: true });
+        notice = msg;
+      },
+      stale,
+      expired: onexpired,
+      focus: () => root?.querySelector(':scope > [role="status"]'),
+    });
+  }
+
+  function toggleTrash() {
+    if (!leaveEdit()) return;
+    trash = !trash;
+    notice = '';
+    // назад к списку: восстановленные из корзины — в нём
+    if (!trash) load(user, space, true);
+  }
+
+  /** 409 формы правки: релиз перечитан — заголовок и текст сравнения с новой ревизией, форма цела. */
+  function reread(e: Entry) {
+    if (cmp?.to.id === e.id) cmp = { ...cmp, to: e };
+    releases = releases.map((r) => (r.id === e.id ? e : r));
   }
 
   const version = (e: Entry) => dataStr(e.data, 'version') || e.title;
@@ -106,89 +227,120 @@
   });
 </script>
 
-<section class="journal releases">
-  {#if error}<p class="error" role="alert">{error}</p>{/if}
-  <div class="layout">
-    <ul class="list" aria-label="Релизы">
-      {#each releases as r (r.id)}
-        <li>
-          <button
-            type="button"
-            class="rel"
-            aria-current={r.id === selected ? 'true' : undefined}
-            onclick={() => pick(r.id)}
-          >
-            <span class="ver">{version(r)}</span>
-            <span class="muted small">{dataStr(r.data, 'date') || fmtTime(r.created_at)}</span>
-          </button>
-        </li>
-      {/each}
-      {#if !loading && releases.length === 0 && !error}
-        <li class="muted">Релизов пока нет.</li>
-      {/if}
-      {#if loading}<li class="muted">Загрузка…</li>{/if}
-      {#if next && !loading}
-        <li><button type="button" onclick={() => load(user, space, false)}>Ещё</button></li>
-      {/if}
-    </ul>
-
-    <div class="compare">
-      {#if cmpError}<p class="error" role="alert">{cmpError}</p>{/if}
-      {#if cmpLoading && !cmp}<p class="muted">Загрузка…</p>{/if}
-      {#if cmp}
-        <header>
-          <h2>Релиз {version(cmp.to)}</h2>
-          <div class="muted small">
-            {dataStr(cmp.to.data, 'date')}
-            {#if dataStr(cmp.to.data, 'git_tag')}· тег <code>{dataStr(cmp.to.data, 'git_tag')}</code>{/if}
-          </div>
-          <label class="row with">
-            Сравнить с
-            <select bind:value={withId} aria-label="Сравнить с">
-              <option value="">предыдущим релизом</option>
-              {#each releases.filter((r) => r.id !== cmp?.to.id) as r (r.id)}
-                <option value={r.id}>{version(r)}</option>
-              {/each}
-            </select>
-          </label>
-          <p class="muted small">
-            Интервал: {cmp.from ? version(cmp.from) : 'начало журнала'} → {version(cmp.to)}
-          </p>
-        </header>
-        {#if cmp.to.body}<p class="body">{cmp.to.body}</p>{/if}
-
-        <h3>Изменения</h3>
-        {#if groups.length === 0}<p class="muted">Записей changelog в интервале нет.</p>{/if}
-        {#each groups as g (g.kind)}
-          <div class="group" data-group={g.kind}>
-            <h4><span class="kind">{g.kind}</span> <span class="muted">{g.items.length}</span></h4>
-            <ul>
-              {#each g.items as e (e.id)}
-                <li>{e.title}{#if e.area} <span class="chip">{e.area}</span>{/if}</li>
-              {/each}
-            </ul>
-          </div>
-        {/each}
-        {#if cmp.truncated}<p class="warn">Показаны не все записи интервала: их слишком много.</p>{/if}
-
-        <h3>Текст релиза</h3>
-        {#if cmp.notes_diff.trim()}
-          <DiffView diff={cmp.notes_diff} />
-        {:else}
-          <p class="muted">Текст релиза не изменился.</p>
-        {/if}
-
-        <h3>Коммиты</h3>
-        {#if cmp.commits.length === 0}<p class="muted">Коммиты не указаны.</p>{/if}
-        <ul class="commits">
-          {#each cmp.commits as c, i (i)}
-            <li><code>{c.sha.slice(0, 10)}</code> {c.subject ?? ''}</li>
-          {/each}
-        </ul>
-      {/if}
-    </div>
+<section class="journal releases" bind:this={root}>
+  <div class="row bar">
+    <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
   </div>
+  <Notice text={notice} />
+  {#if trash}
+    <TrashPanel {user} {space} kind="release" {onexpired} />
+  {:else}
+    {#if error}<p class="error" role="alert">{error}</p>{/if}
+    <div class="layout">
+      <ul class="list" aria-label="Релизы">
+        {#each releases as r (r.id)}
+          <li>
+            <button
+              type="button"
+              class="rel"
+              aria-current={r.id === selected ? 'true' : undefined}
+              onclick={() => pick(r.id)}
+            >
+              <span class="ver">{version(r)}</span>
+              <span class="muted small">{dataStr(r.data, 'date') || fmtTime(r.created_at)}</span>
+            </button>
+          </li>
+        {/each}
+        {#if !loading && releases.length === 0 && !error}
+          <li class="muted">Релизов пока нет.</li>
+        {/if}
+        {#if loading}<li class="muted">Загрузка…</li>{/if}
+        {#if next && !loading}
+          <li><button type="button" onclick={() => load(user, space, false)}>Ещё</button></li>
+        {/if}
+      </ul>
+
+      <div class="compare">
+        {#if cmpError}<p class="error" role="alert">{cmpError}</p>{/if}
+        {#if cmpLoading && !cmp}<p class="muted">Загрузка…</p>{/if}
+        {#if cmp}
+          <header>
+            <h2>Релиз {version(cmp.to)}</h2>
+            <!-- заголовок записи, если он не «Релиз <версия>» (правка заголовка видна) -->
+            {#if cmp.to.title !== `Релиз ${version(cmp.to)}`}<p class="rel-title">{cmp.to.title}</p>{/if}
+            <div class="muted small">
+              {dataStr(cmp.to.data, 'date')}
+              {#if dataStr(cmp.to.data, 'git_tag')}· тег <code>{dataStr(cmp.to.data, 'git_tag')}</code>{/if}
+            </div>
+            <label class="row with">
+              Сравнить с
+              <select value={withId} aria-label="Сравнить с" onchange={(e) => changeWith(e.currentTarget)}>
+                <option value="">предыдущим релизом</option>
+                {#each releases.filter((r) => r.id !== cmp?.to.id) as r (r.id)}
+                  <option value={r.id}>{version(r)}</option>
+                {/each}
+              </select>
+            </label>
+            <p class="muted small">
+              Интервал: {cmp.from ? version(cmp.from) : 'начало журнала'} → {version(cmp.to)}
+            </p>
+            {#if !editing}
+              {@const to = cmp.to}
+              <div class="row actions">
+                <button type="button" class="small-btn" onclick={() => ((editing = true), (actionError = ''), (notice = ''))}>Изменить</button>
+                <button type="button" class="small-btn danger" onclick={() => askDelete(to)}>Удалить</button>
+              </div>
+            {/if}
+            {#if actionError}<p class="error" role="alert">{actionError}</p>{/if}
+          </header>
+          {#if editing}
+            <EditPanel
+              bind:this={editor}
+              {user}
+              entry={cmp.to}
+              onsaved={(e) => refresh(`Релиз «${e.title}» сохранён.`)}
+              oncancel={closeEdit}
+              onreread={reread}
+              {onexpired}
+            />
+          {/if}
+          {#if cmp.to.body}<p class="body">{cmp.to.body}</p>{/if}
+
+          <h3>Изменения</h3>
+          {#if groups.length === 0}<p class="muted">Записей changelog в интервале нет.</p>{/if}
+          {#each groups as g (g.kind)}
+            <div class="group" data-group={g.kind}>
+              <h4><span class="kind">{g.kind}</span> <span class="muted">{g.items.length}</span></h4>
+              <ul>
+                {#each g.items as e (e.id)}
+                  <li>{e.title}{#if e.area} <span class="chip">{e.area}</span>{/if}</li>
+                {/each}
+              </ul>
+            </div>
+          {/each}
+          {#if cmp.truncated}<p class="warn">Показаны не все записи интервала: их слишком много.</p>{/if}
+
+          <h3>Текст релиза</h3>
+          {#if cmp.notes_diff.trim()}
+            <DiffView diff={cmp.notes_diff} />
+          {:else}
+            <p class="muted">Текст релиза не изменился.</p>
+          {/if}
+
+          <h3>Коммиты</h3>
+          {#if cmp.commits.length === 0}<p class="muted">Коммиты не указаны.</p>{/if}
+          <ul class="commits">
+            {#each cmp.commits as c, i (i)}
+              <li><code>{c.sha.slice(0, 10)}</code> {c.subject ?? ''}</li>
+            {/each}
+          </ul>
+        {/if}
+      </div>
+    </div>
+  {/if}
 </section>
+
+<Prompt bind:ask />
 
 <style>
   .layout {
@@ -263,5 +415,16 @@
   }
   .small {
     font-size: 12px;
+  }
+  .bar {
+    margin-bottom: 8px;
+  }
+  .rel-title {
+    margin: 0 0 4px;
+    font-weight: 600;
+    overflow-wrap: anywhere;
+  }
+  .actions {
+    margin-top: 6px;
   }
 </style>

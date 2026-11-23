@@ -7,6 +7,7 @@
   import { untrack } from 'svelte';
   import { ApiError, errorText, previewSheet, type PreviewSheetRef, type SheetPreview } from '../../lib/api';
   import { colName, type CellRange, type Locator } from '../../lib/attachments';
+  import { onTabKey } from '../../lib/tabs';
 
   interface Props {
     user: string;
@@ -203,18 +204,8 @@
     const jump = locator && sheetOf(locator, sheets) === s.no ? locator.range : null;
     void openSheet(s.no, jump);
   }
-  function ontabkey(e: KeyboardEvent, i: number) {
-    const n = sheets.length;
-    let j = -1;
-    if (e.key === 'ArrowRight') j = (i + 1) % n;
-    else if (e.key === 'ArrowLeft') j = (i - 1 + n) % n;
-    else if (e.key === 'Home') j = 0;
-    else if (e.key === 'End') j = n - 1;
-    if (j < 0) return;
-    e.preventDefault();
-    tabEls[j]?.focus();
-    select(j);
-  }
+  /** Клавиатура листов (`lib/tabs.ts`): ←/→ по кругу, Home, End; выбор следует за фокусом. */
+  const ontabkey = (e: KeyboardEvent, i: number) => onTabKey(e, i, sheets.length, tabEls, select);
 </script>
 
 {#if error}<p class="error" role="alert">{error}</p>{/if}
@@ -328,7 +319,7 @@
   }
   .grid {
     position: relative;
-    height: calc(100vh - var(--header-h) - 220px);
+    height: calc(var(--app-h) - var(--header-h) - 220px);
     min-height: 360px;
     overflow: auto;
     border: 1px solid var(--border);

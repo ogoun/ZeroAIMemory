@@ -135,7 +135,7 @@
     }
   }
   .list {
-    max-height: calc(100vh - var(--header-h) - 180px);
+    max-height: calc(var(--app-h) - var(--header-h) - 180px);
     overflow: auto;
     border: 1px solid var(--border);
     border-radius: 8px;

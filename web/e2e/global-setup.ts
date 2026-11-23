@@ -140,6 +140,12 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     process.env.E2E_NOTE_DOCS = docs.docs;
     process.env.E2E_NOTE_ATTACH = docs.attach;
     process.env.E2E_NOTE_BOMB = docs.bomb;
+    // обход узких экранов (M7.2, mobile-pages.ts): широкая таблица и код, адреса просмотрщиков
+    process.env.E2E_NOTE_WIDE = docs.wide;
+    process.env.E2E_PDF_SHA = docs.sha.pdf;
+    process.env.E2E_DOCX_SHA = docs.sha.docx;
+    process.env.E2E_XLSX_SHA = docs.sha.xlsx;
+    process.env.E2E_PPTX_SHA = docs.sha.pptx;
     // токен администратора — для правок «из другого места» в сценариях конфликта
     process.env.E2E_ADMIN_TOKEN = token;
     process.env.E2E_INSIGHT_OLD = journals.oldInsight;

@@ -171,7 +171,7 @@
           <span class="muted small">ревизия {it.rev} · {fmtTime(it.updated_at)}</span>
         </div>
         {#if it.data.username || it.data.url || it.data.description}
-          <div class="muted small">
+          <div class="muted small fields">
             {#if it.data.username}пользователь <code>{it.data.username}</code>{/if}
             {#if it.data.url}· <code>{it.data.url}</code>{/if}
             {#if it.data.description}· {it.data.description}{/if}
@@ -239,9 +239,12 @@
   .value {
     margin-top: 6px;
   }
+  .fields {
+    overflow-wrap: anywhere;
+  }
   .open {
     display: grid;
-    grid-template-columns: max-content 1fr;
+    grid-template-columns: max-content minmax(0, 1fr);
     gap: 2px 12px;
     margin: 6px 0 0;
     font-size: 14px;
@@ -260,7 +263,7 @@
   }
   .secret {
     flex: 1;
-    min-width: 200px;
+    min-width: min(200px, 100%);
     font-family: ui-monospace, Consolas, monospace;
   }
   .small {

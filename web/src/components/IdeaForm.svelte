@@ -4,7 +4,9 @@
   // «Отказаться», «Вернуть». Ленивый чанк (M6 §16, задача 16): нужен только после нажатия кнопки
   // карточки, поэтому грузится при первом открытии формы и в чанк журнала не входит. Запросы к
   // серверу делает журнал (`onsubmit`), здесь — поля и проверка заполнения. Форма создаётся
-  // заново на каждое открытие — начальные значения берутся из свойств один раз.
+  // заново на каждое открытие — начальные значения берутся из свойств один раз. Несохранённое —
+  // `dirty()`: поля против значений при открытии (финальное ревью M7.2, I1; вопрос перед закрытием
+  // задаёт журнал).
   import { untrack } from 'svelte';
   import { spaceRef, type Entry, type Space } from '../lib/api';
   import { IDEA_FORMS, decisionOf, priorityOf, tagsOf, type IdeaSubmit } from '../lib/ideaButtons';
@@ -43,6 +45,16 @@
   let reason = $state('');
   let taskSpace = $state(untrack(() => space0));
   let chosen = $derived(targets.find((s) => spaceRef(s) === taskSpace) ?? null);
+
+  /** Поля формы (все виды: у каждого меняется только своё). */
+  const fields = () => JSON.stringify([title, body, priority, horizon, tags, reason, taskSpace]);
+  /** Поля при открытии формы. */
+  const opened = fields();
+
+  /** В форме есть несохранённое (для вопроса «Закрыть без сохранения?» журнала). */
+  export function dirty(): boolean {
+    return fields() !== opened;
+  }
 
   function submit(e: SubmitEvent) {
     e.preventDefault();

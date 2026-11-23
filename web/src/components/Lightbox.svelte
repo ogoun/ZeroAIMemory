@@ -89,9 +89,11 @@
   }
   .lb-bar {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 6px;
     padding: 8px 12px;
+    padding-top: calc(8px + var(--safe-top));
   }
   .lb-title {
     flex: 1;
@@ -123,7 +125,7 @@
   }
   .lb-stage img {
     max-width: 100%;
-    max-height: calc(100vh - 80px);
+    max-height: calc(var(--app-h) - 80px);
     cursor: zoom-in;
     background: #fff;
   }
@@ -135,5 +137,16 @@
     max-width: none;
     max-height: none;
     cursor: zoom-out;
+  }
+  /* при касании — цели 44 px (кнопки — app.css, «Оригинал» — здесь) с зазором 8 px */
+  @media (pointer: coarse) {
+    .lb-bar {
+      gap: var(--touch-gap);
+    }
+    .lb-open {
+      display: inline-flex;
+      align-items: center;
+      min-height: 44px;
+    }
   }
 </style>

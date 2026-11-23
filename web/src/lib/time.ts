@@ -19,3 +19,13 @@ export function localTime(iso: string, opts: Intl.DateTimeFormatOptions = {}): s
     opts.dateStyle !== undefined || opts.timeStyle !== undefined || fields.some((f) => opts[f] !== undefined);
   return d.toLocaleString('ru-RU', styled ? opts : { ...DEFAULT_STYLE, ...opts });
 }
+
+/** Давность: «только что», «N мин назад», «N ч назад» (до двух суток), «N дн. назад» — снимок
+ * карты кода, последняя копия сервера (M7.2; одно правило, `code.ts` реэкспортирует). */
+export function ageText(secs: number): string {
+  const s = Math.max(0, Math.floor(secs));
+  if (s < 60) return 'только что';
+  if (s < 3600) return `${Math.floor(s / 60)} мин назад`;
+  if (s < 172_800) return `${Math.floor(s / 3600)} ч назад`;
+  return `${Math.floor(s / 86_400)} дн. назад`;
+}

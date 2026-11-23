@@ -197,6 +197,32 @@
     opacity: 0.85;
   }
 }
+/* без наведения «Копировать» видна всегда: над кодом — своя полоса, кнопка не закрывает первую
+   строку (M7.2, §5.2 п. 4); печать — без полосы */
+@media screen and (hover: none) {
+  .doc .code-block:has(> .copy-code) > pre {
+    padding-top: 36px;
+  }
+}
+/* сенсорный ввод (M7.2, §5.1 п. 2): «Копировать» над кодом и «копировать путь» в тексте — прежнего
+   видимого размера (кнопка в 44 px закрыла бы строки кода и раздвинула бы строку текста), цель
+   касания — 44 px по высоте за счёт расширенной области `::after`; ширина подписей — больше 44 px */
+@media (pointer: coarse) {
+  .doc .copy-code,
+  .doc .copy-path {
+    min-width: 0;
+    min-height: 0;
+  }
+  .doc .copy-path {
+    position: relative;
+  }
+  .doc .copy-code::after,
+  .doc .copy-path::after {
+    content: '';
+    position: absolute;
+    inset: -12px 0;
+  }
+}
 
 /* ---- таблицы ---- */
 .doc table {

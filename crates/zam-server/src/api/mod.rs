@@ -2,6 +2,7 @@
 pub mod admin;
 pub mod agent_setup;
 pub mod agent_view;
+pub mod backups;
 pub mod big_body;
 pub mod blobs;
 pub mod cache;
@@ -247,6 +248,8 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
         )
         .route("/api/v1/spaces", get(spaces::list))
         .route("/api/v1/spaces/{space}/tree", get(spaces::tree))
+        // число записей разделов (M7 §5.3): чтение, не запись памяти
+        .route("/api/v1/spaces/{space}/counts", get(spaces::counts))
         // экспорт пространства (M6 §12б.5): чтение, не запись памяти
         .route(
             "/api/v1/spaces/{space}/export",
@@ -385,6 +388,12 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
         )
         .route("/api/v1/admin/tokens/{id}", delete(admin::revoke_token))
         .route("/api/v1/admin/audit", get(admin::list_audit))
+        // копии из WebUI (M7 §5.6): копия в процессе сервера, список, удаление готовой копии
+        .route(
+            "/api/v1/admin/backups",
+            get(backups::list).post(backups::start),
+        )
+        .route("/api/v1/admin/backups/{name}", delete(backups::remove))
         .route(
             "/api/v1/admin/settings",
             get(admin::get_settings).patch(admin::patch_settings),

@@ -736,9 +736,9 @@ struct PrevRelease {
 }
 
 const PREV_RELEASE: PrevRelease = PrevRelease {
-    tag: "v0.0.13-m6.6",
-    version: "0.0.13-m6.6",
-    git: "5800ed92d9f8",
+    tag: "v0.0.14-m7.1",
+    version: "0.0.14-m7.1",
+    git: "a2daa25dc8fe",
 };
 
 /// Release `zam-server` предыдущего выпуска [`PREV_RELEASE`]: `ZAM_PREV_SERVER_BIN` или

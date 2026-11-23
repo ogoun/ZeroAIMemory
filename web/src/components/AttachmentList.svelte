@@ -94,6 +94,7 @@
   }
   .atts li {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 10px;
     padding: 8px 4px;
@@ -110,7 +111,7 @@
     text-align: center;
   }
   .main {
-    flex: 1;
+    flex: 1 1 160px;
     min-width: 0;
     display: flex;
     flex-direction: column;
@@ -130,5 +131,17 @@
   .atts button {
     padding: 3px 10px;
     font-size: 13px;
+  }
+  /* узкая строка переносится: «Открепить» на своей строке — у правого края, под «Скачать» */
+  .atts li > button {
+    margin-left: auto;
+  }
+  /* при касании «Скачать» — цель 44 px, как кнопка «Открепить» (app.css) */
+  @media (pointer: coarse) {
+    .dl {
+      display: inline-flex;
+      align-items: center;
+      min-height: 44px;
+    }
   }
 </style>

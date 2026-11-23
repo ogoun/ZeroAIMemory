@@ -1,0 +1,1150 @@
+// Узкие экраны и сенсорный ввод (M7.2, спецификация §5.1): классы ширины (шапка, выдвижная
+// панель, дерево), цели касания 44 px, полоса журналов, «список — карточка» (`JournalSplit`) в
+// «Словаре», «Идеи» (аккордеон разделов, фильтры под кнопкой) и «Insights» (компактная таблица) на
+// телефоне (§5.2 пп. 2–3; доска задач — tasks.spec.ts), сбой ленивого чанка, отсутствие
+// горизонтальной прокрутки; обход всех страниц `PAGES`, вкладки редактора и варианты «Вопросов»
+// (§5.2 пп. 4, 7). Сессия — общая администратора (у адресов `as: 'user'` — пользователя,
+// `userSession`); на телефоне «Выйти» — в меню аккаунта, поэтому сценарии ждут оболочку по кнопке
+// «Поиск» (есть на всех классах ширины). Размеры и помощники — viewports.ts, адреса — mobile-pages.ts.
+import { expect, test, type Browser, type BrowserContext, type Locator, type Page } from '@playwright/test';
+import { randomUUID } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { loginChangingPassword } from './login';
+import { PAGES, env, pageCtx } from './mobile-pages';
+import { IDEAS_GUID, SOLUTION_GUID } from './seed';
+import { ADMIN_STATE } from './session';
+import { VIEWPORTS, minGap, minTarget, noHorizontalScroll, touch, type ViewportName } from './viewports';
+
+const base = () => env('E2E_BASE_URL');
+const screens = fileURLToPath(new URL('../../.tmp/e2e/screens/mobile/', import.meta.url));
+
+test.use({ storageState: ADMIN_STATE });
+
+/** Ошибки JS, CSP и неожиданные HTTP-ответы страницы. */
+function watch(page: Page, allow: (path: string, status: number) => boolean = () => false): string[] {
+  const problems: string[] = [];
+  page.on('console', (m) => {
+    if (m.type() === 'error' && !m.text().startsWith('Failed to load resource')) problems.push(m.text());
+  });
+  page.on('pageerror', (e) => problems.push(e.message));
+  page.on('response', (r) => {
+    const path = new URL(r.url()).pathname;
+    const expected =
+      (r.status() === 401 && path.endsWith('/api/v1/auth/me')) ||
+      (r.status() === 404 && path.endsWith('/favicon.ico')) ||
+      allow(path, r.status());
+    if (r.status() >= 400 && !expected) problems.push(`HTTP ${r.status()} ${r.request().method()} ${path}`);
+  });
+  return problems;
+}
+
+/** Адрес приложения (`#/…`), оболочка готова: кнопка «Поиск» — в шапке на любой ширине. */
+async function open(page: Page, hash = ''): Promise<void> {
+  await page.goto(`${base()}${hash}`);
+  await expect(page.getByRole('button', { name: 'Поиск', exact: true })).toBeVisible();
+}
+
+/** REST по токену администратора (агент). */
+async function api<T = Record<string, unknown>>(method: string, path: string, body?: unknown): Promise<T> {
+  const r = await fetch(`${base()}api/v1/${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${env('E2E_ADMIN_TOKEN')}`,
+      ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`${method} ${path}: HTTP ${r.status} ${await r.text()}`);
+  return (await r.json()) as T;
+}
+
+/** Новое решение администратора — свои записи сценария; возвращает его GUID. */
+async function newSolution(name: string): Promise<string> {
+  const guid = randomUUID();
+  await api('POST', 'solutions', { agent_solution_id: guid, name: `Мобильный E2E: ${name}` });
+  return guid;
+}
+
+/** Вопрос перед уходом из формы с несохранённым (`LEAVE_EDIT`, `web/src/lib/leaveEdit.ts`). */
+const LEAVE_EDIT = 'В форме есть несохранённый текст. Закрыть её без сохранения?';
+
+/**
+ * Несохранённое в карточке журнала на телефоне (финальное ревью M7.2, I1): набранное в `field` —
+ * «← <label>» спрашивает «Закрыть без сохранения?» (адрес `here` прежний), «Продолжить правку» —
+ * текст цел; уход по адресу `away` (ссылка, Ctrl+K, «назад») — вопрос `LEAVE_EDIT`, «Отмена» —
+ * адрес и текст на месте; снова «←» и «Закрыть без сохранения» — список `list`, формы нет.
+ */
+async function unsavedAsksPhone(
+  page: Page,
+  o: { label: string; field: Locator; typed: string; here: RegExp; away: string; list: Locator },
+): Promise<void> {
+  const back = page.getByRole('link', { name: `← ${o.label}` });
+  const ask = page.getByRole('alertdialog', { name: 'Несохранённый текст' });
+  await o.field.fill(o.typed);
+  await back.tap();
+  await expect(ask).toBeVisible();
+  await expect(ask).toHaveAccessibleDescription('В карточке есть несохранённый текст. Закрыть без сохранения?');
+  await expect(page).toHaveURL(o.here);
+  await ask.getByRole('button', { name: 'Продолжить правку' }).tap();
+  await expect(ask).toHaveCount(0);
+  await expect(o.field).toHaveValue(o.typed);
+  let asked = '';
+  page.once('dialog', (d) => {
+    asked = `${d.type()}: ${d.message()}`;
+    void d.dismiss();
+  });
+  await page.evaluate((h) => (location.hash = h), o.away);
+  await expect.poll(() => asked).toBe(`confirm: ${LEAVE_EDIT}`);
+  await expect(page).toHaveURL(o.here);
+  await expect(o.field).toHaveValue(o.typed);
+  await expect(o.list).toBeHidden();
+  await back.tap();
+  await ask.getByRole('button', { name: 'Закрыть без сохранения' }).tap();
+  await expect(o.list).toBeVisible();
+  await expect(ask).toHaveCount(0);
+  await expect(o.field).toHaveCount(0);
+}
+
+// По CSS, а не по роли: закрытая панель inert и выпадает из дерева доступности.
+const sidebar = (page: Page) => page.locator('#sidebar');
+const treeNav = (page: Page) => page.locator('nav[aria-label="Дерево заметок"]');
+const header = (page: Page) => page.locator('header.topbar');
+
+test.describe('телефон, сенсорный ввод', () => {
+  test.use({ viewport: VIEWPORTS.phone, ...touch });
+
+  test('touch_emulation_pointer_coarse', async ({ page }) => {
+    // способ эмуляции касания в Edge: hasTouch включает (pointer: coarse) без CDP (viewports.ts)
+    await page.setContent('<meta name="viewport" content="width=device-width, initial-scale=1"><p>x</p>');
+    const m = await page.evaluate(() => ({
+      coarse: matchMedia('(pointer: coarse)').matches,
+      hoverNone: matchMedia('(hover: none)').matches,
+      width: innerWidth,
+    }));
+    expect(m).toEqual({ coarse: true, hoverNone: true, width: VIEWPORTS.phone.width });
+  });
+
+  test('phone_drawer_has_sections', async ({ page }) => {
+    const problems = watch(page);
+    await open(page);
+    // шапка телефона: ☰, заголовок раздела, поиск, меню аккаунта; разделов в шапке нет
+    await expect(header(page).getByRole('navigation', { name: 'Разделы' })).toHaveCount(0);
+    await expect(header(page).getByText('Заметки', { exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Выйти' })).toHaveCount(0);
+    await expect(sidebar(page)).not.toBeInViewport();
+
+    const toggle = page.getByRole('button', { name: 'Показать дерево' });
+    await toggle.click();
+    await expect(sidebar(page)).toBeInViewport();
+    await expect(page.getByRole('button', { name: 'Скрыть дерево' })).toHaveAttribute('aria-expanded', 'true');
+    // в панели — «Разделы» строками по 44 px, затем дерево
+    const sections = sidebar(page).getByRole('navigation', { name: 'Разделы' });
+    for (const name of ['Заметки', 'Индекс', 'Администрирование', 'Подключение агента', 'Кэш выжимок', 'Сессии']) {
+      await expect(sections.getByRole('link', { name, exact: true })).toBeVisible();
+    }
+    await minTarget(sections.getByRole('link'), 44);
+    // строки «Разделов» — по левому краю, как строки дерева
+    const align = await sections.getByRole('link').evaluateAll((els) => els.map((e) => getComputedStyle(e).justifyContent));
+    expect(align.filter((j) => j === 'center'), 'строки «Разделов» не по центру').toEqual([]);
+    await expect(treeNav(page)).toBeVisible();
+    const order = await sidebar(page).evaluate((s) => {
+      const nav = s.querySelector('nav[aria-label="Разделы"]')!;
+      const tree = s.querySelector('nav[aria-label="Дерево заметок"]')!;
+      return Boolean(nav.compareDocumentPosition(tree) & Node.DOCUMENT_POSITION_FOLLOWING);
+    });
+    expect(order, 'разделы — перед деревом').toBe(true);
+    // фокус — в панели; Esc закрывает, фокус — на ☰
+    expect(await sidebar(page).evaluate((s) => s.contains(document.activeElement))).toBe(true);
+    await page.keyboard.press('Escape');
+    await expect(sidebar(page)).not.toBeInViewport();
+    await expect(toggle).toBeFocused();
+
+    // фон закрывает панель; переход по разделу — тоже, заголовок шапки — новый раздел
+    await toggle.click();
+    await expect(sidebar(page)).toBeInViewport();
+    await page.mouse.click(VIEWPORTS.phone.width - 10, VIEWPORTS.phone.height / 2);
+    await expect(sidebar(page)).not.toBeInViewport();
+    await expect(toggle).toBeFocused();
+    // выбор текущего раздела (адрес не меняется) — тоже закрывает
+    await toggle.click();
+    await expect(sidebar(page)).toBeInViewport();
+    await sections.getByRole('link', { name: 'Заметки', exact: true }).click();
+    await expect(sidebar(page)).not.toBeInViewport();
+    await expect(toggle).toBeFocused();
+    await toggle.click();
+    await sections.getByRole('link', { name: 'Сессии' }).click();
+    await expect(page).toHaveURL(/#\/sessions$/);
+    await expect(sidebar(page)).not.toBeInViewport();
+    await expect(header(page).getByText('Сессии', { exact: true })).toBeVisible();
+
+    // меню аккаунта: логин и «Выйти»; панель меню — в DOM (на неё ссылается aria-controls);
+    // Esc закрывает, фокус — на кнопке меню
+    const account = page.getByRole('button', { name: 'Меню аккаунта', exact: true });
+    const controls = await account.getAttribute('aria-controls');
+    expect(await page.locator(`[id="${controls}"]`).count(), 'aria-controls — на существующий узел').toBe(1);
+    await account.click();
+    await expect(account).toHaveAttribute('aria-expanded', 'true');
+    await expect(header(page).getByText('admin', { exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Выйти' })).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('button', { name: 'Выйти' })).toHaveCount(0);
+    await expect(account).toBeFocused();
+    // Esc закрывает меню и когда фокус не в нём (Safari и Firefox на macOS не фокусируют кнопку
+    // по щелчку)
+    await account.click();
+    await expect(page.getByRole('button', { name: 'Выйти' })).toBeVisible();
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('button', { name: 'Выйти' })).toHaveCount(0);
+    await expect(account).toHaveAttribute('aria-expanded', 'false');
+
+    // смена класса ширины закрывает панель: телефон → планшет (фокус с исчезнувших «Разделов» —
+    // на ☰), затем настольный и обратно — панель не открывается сама
+    await toggle.click();
+    await expect(sidebar(page)).toBeInViewport();
+    expect(await sidebar(page).evaluate((s) => s.contains(document.activeElement))).toBe(true);
+    await page.setViewportSize(VIEWPORTS.tablet);
+    await expect(page.getByRole('button', { name: 'Показать дерево' })).toBeFocused();
+    await expect(treeNav(page)).not.toBeInViewport();
+    await page.getByRole('button', { name: 'Показать дерево' }).click();
+    await expect(treeNav(page)).toBeInViewport();
+    await page.setViewportSize(VIEWPORTS.desktop);
+    await expect(page.getByRole('button', { name: 'Скрыть дерево' })).toHaveCount(0);
+    await page.setViewportSize(VIEWPORTS.phone);
+    await expect(page.getByRole('button', { name: 'Показать дерево' })).toHaveAttribute('aria-expanded', 'false');
+    await expect(sidebar(page)).not.toBeInViewport();
+
+    await page.screenshot({ path: `${screens}phone-header.png` });
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+
+  test('touch_targets_44', async ({ page }) => {
+    const problems = watch(page);
+    const c = await pageCtx(page);
+    await open(page, `#/u/${c.user}/s/${SOLUTION_GUID}/j/glossary`);
+    // ссылки полосы журналов: 44 × 44 и зазор между соседними не меньше 8 px
+    const strip = page.getByRole('navigation', { name: 'Журналы пространства' });
+    await expect(strip.getByRole('link')).toHaveCount(10);
+    await minTarget(strip.getByRole('link'), 44);
+    expect(await minGap(strip.getByRole('link'), 8)).toBe(9);
+    // поле поиска словаря и Ctrl+K — шрифт не меньше 16 px (Safari иначе увеличивает страницу)
+    const fontPx = (l: Locator) => l.evaluate((el) => parseFloat(getComputedStyle(el).fontSize));
+    expect(await fontPx(page.getByRole('searchbox', { name: 'Поиск по словарю' }))).toBeGreaterThanOrEqual(16);
+
+    // дерево: раскрывашки, строки (кнопки и ссылки), «⋯» — 44 × 44, в строке зазор не меньше 8 px
+    await page.getByRole('button', { name: 'Показать дерево' }).click();
+    await expect(sidebar(page)).toBeInViewport();
+    const t = treeNav(page);
+    await t.getByRole('button', { name: 'Knowledge', exact: true }).click();
+    await expect(t.getByRole('list', { name: 'Журналы: Knowledge' })).toBeVisible();
+    await minTarget(t.getByRole('button', { name: /^(Развернуть|Свернуть) / }), 44);
+    await minTarget(t.getByRole('button', { name: /^Действия: / }), 44);
+    await minTarget(t.getByRole('button'), 44);
+    await minTarget(t.getByRole('link'), 44);
+    expect(await minGap(t.getByRole('button').or(t.getByRole('link')), 8)).toBeGreaterThan(10);
+    // пункты контекстного меню — по 44 px; Esc закрывает меню, а не панель
+    await t.getByRole('button', { name: 'Действия: Knowledge' }).click();
+    await expect(page.getByRole('menuitem').first()).toBeFocused();
+    await minTarget(page.getByRole('menuitem'), 44);
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('menuitem')).toHaveCount(0);
+    await expect(sidebar(page)).toBeInViewport();
+    await page.keyboard.press('Escape');
+    await expect(sidebar(page)).not.toBeInViewport();
+
+    // «Копировать» над кодом — прежнего размера (не закрывает строки), цель касания расширена
+    // `::after`: точки в 8 px выше и ниже кнопки попадают в неё
+    await open(page, `#/u/${c.user}/s/knowledge/n/${env('E2E_NOTE_MEDIA')}`);
+    const copy = page.locator('.doc').getByRole('button', { name: 'Копировать' }).first();
+    await expect(copy).toBeVisible();
+    await copy.scrollIntoViewIfNeeded();
+    const cb = (await copy.boundingBox())!;
+    expect(cb.height, 'видимая высота «Копировать»').toBeLessThan(32);
+    const hits = await copy.evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      const x = r.left + r.width / 2;
+      return [r.top - 8, r.bottom + 8].map((y) => document.elementFromPoint(x, y) === el);
+    });
+    expect(hits, 'расширенная область касания').toEqual([true, true]);
+
+    await page.getByRole('button', { name: 'Поиск', exact: true }).click();
+    const q = page.getByRole('combobox', { name: 'Поиск по заметкам' });
+    await expect(q).toBeFocused();
+    expect(await q.evaluate((el) => parseFloat(getComputedStyle(el).fontSize))).toBeGreaterThanOrEqual(16);
+    // поиск на телефоне — во весь экран, закрывается кнопкой
+    const dlg = page.getByRole('dialog');
+    const box = (await dlg.boundingBox())!;
+    expect([box.x, box.y, box.width, box.height]).toEqual([0, 0, VIEWPORTS.phone.width, VIEWPORTS.phone.height]);
+    await page.getByRole('button', { name: 'Закрыть поиск' }).click();
+    await expect(dlg).toBeHidden();
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+
+  test('journal_strip_single_row_phone', async ({ page }) => {
+    const problems = watch(page);
+    const c = await pageCtx(page);
+    // «Словарь» — шестой из десяти журналов решения: на 390 px он за краем полосы
+    await open(page, `#/u/${c.user}/s/${SOLUTION_GUID}/j/glossary`);
+    const strip = page.getByRole('navigation', { name: 'Журналы пространства' });
+    const links = strip.getByRole('link');
+    await expect(links).toHaveCount(10);
+    const boxes = await links.evaluateAll((els) => els.map((e) => e.getBoundingClientRect().toJSON() as DOMRect));
+    const top = boxes[0].top;
+    expect(boxes.every((b) => Math.abs(b.top - top) < 1), 'полоса — одна строка').toBe(true);
+    expect(await strip.evaluate((s) => s.scrollWidth > s.clientWidth), 'полоса прокручивается').toBe(true);
+    // выбранный журнал — целиком в видимой части полосы
+    const selected = strip.locator('[aria-current="page"]');
+    await expect(selected).toHaveText('Словарь');
+    await expect
+      .poll(async () => {
+        const [s, l] = await Promise.all([strip.boundingBox(), selected.boundingBox()]);
+        return !!s && !!l && l.x >= s.x - 1 && l.x + l.width <= s.x + s.width + 1;
+      })
+      .toBe(true);
+    expect(await noHorizontalScroll(page)).toBe(true);
+    await page.screenshot({ path: `${screens}phone-journal-strip.png` });
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+
+  test('glossary_card_replaces_list_phone', async ({ page, browser }) => {
+    const problems = watch(page);
+    // 40 терминов в Knowledge — список длиннее окна; имена уникальны на прогон
+    const run = Date.now().toString(36);
+    const name = (i: number) => `Моб ${run} ${String(i).padStart(2, '0')}`;
+    const ids: string[] = [];
+    for (let i = 1; i <= 40; i++) {
+      const t = await api<{ id: string }>('POST', 'spaces/knowledge/entries', {
+        kind: 'term',
+        title: name(i),
+        body: '',
+        data: { definition: `Определение мобильного термина номер ${i} для проверки раскладки`, aliases: [], code: [] },
+      });
+      ids.push(t.id);
+    }
+    const c = await pageCtx(page);
+    const listUrl = `#/u/${c.user}/s/knowledge/j/glossary`;
+    await open(page, listUrl);
+    const split = page.locator('.jsplit');
+    await expect(split).toHaveAttribute('data-layout', 'stack');
+    const list = page.getByRole('list', { name: 'Термины' });
+    const row = list.getByRole('button', { name: name(30), exact: true });
+    // фильтр списка — по метке прогона (все 40): после возврата он цел
+    const find = page.getByRole('searchbox', { name: 'Поиск по словарю' });
+    await find.fill(run);
+    await expect(list.getByRole('listitem')).toHaveCount(40);
+    await row.scrollIntoViewIfNeeded();
+    // прокрутка устоялась: два одинаковых замера подряд
+    let y0 = -1;
+    await expect
+      .poll(async () => {
+        const y = await page.evaluate(() => window.scrollY);
+        const same = y === y0;
+        y0 = y;
+        return same;
+      })
+      .toBe(true);
+    expect(y0, 'список прокручен').toBeGreaterThan(300);
+    const rowTop = (await row.boundingBox())!.y;
+
+    // открытие: карточка вместо списка, заголовок — в видимой области под шапкой, фокус — на нём
+    await row.click();
+    const card = page.getByRole('article', { name: 'Карточка термина' });
+    const title = card.getByRole('heading', { name: name(30) });
+    await expect(title).toBeInViewport({ ratio: 1 });
+    await expect(title).toBeFocused();
+    const headerBottom = (await header(page).boundingBox())!;
+    expect((await title.boundingBox())!.y).toBeGreaterThanOrEqual(headerBottom.y + headerBottom.height - 1);
+    await expect(list).toBeHidden();
+    await expect(page).toHaveURL(/\/j\/glossary\/[0-9A-Za-z]+$/);
+
+    // «← Словарь»: список на прежней позиции, фокус — на строке термина
+    await page.getByRole('link', { name: '← Словарь' }).click();
+    await expect(list).toBeVisible();
+    await expect(card).toHaveCount(0);
+    await expect(row).toBeFocused();
+    expect(Math.abs((await row.boundingBox())!.y - rowTop), 'строка — на прежнем месте окна').toBeLessThanOrEqual(2);
+    expect(Math.abs((await page.evaluate(() => window.scrollY)) - y0), `scrollY к ${y0}`).toBeLessThanOrEqual(2);
+    await expect(find).toHaveValue(run);
+
+    // «назад» браузера — то же, что «←»
+    await row.click();
+    await expect(title).toBeFocused();
+    await page.goBack();
+    await expect(list).toBeVisible();
+    await expect(row).toBeFocused();
+    await page.screenshot({ path: `${screens}phone-glossary-list.png` });
+
+    // открытие по адресу (поиск, ссылка `k:`): карточка сразу, фокус — на её заголовке; смена
+    // записи в адресе внутри карточки — фокус на заголовке новой; «←» — фокус на строку записи
+    await page.goto('about:blank');
+    await open(page, `${listUrl}/${ids[34]}`);
+    await expect(card.getByRole('heading', { name: name(35) })).toBeFocused();
+    await expect(list).toBeHidden();
+    await page.evaluate((h) => (location.hash = h), `${listUrl}/${ids[19]}`);
+    await expect(card.getByRole('heading', { name: name(20) })).toBeFocused();
+    await page.getByRole('link', { name: '← Словарь' }).click();
+    const row20 = list.getByRole('button', { name: name(20), exact: true });
+    await expect(row20).toBeFocused();
+    await expect(row20).toBeInViewport();
+    expect(problems, problems.join('\n')).toEqual([]);
+
+    // настольный: список и карточка рядом
+    // мышь: параметры касания describe переходят и в контексты, созданные в тесте
+    const ctx = await browser.newContext({ storageState: ADMIN_STATE, viewport: VIEWPORTS.desktop, hasTouch: false, isMobile: false });
+    const dp = await ctx.newPage();
+    const dProblems = watch(dp);
+    await open(dp, listUrl);
+    await dp.getByRole('list', { name: 'Термины' }).getByRole('button', { name: name(30), exact: true }).click();
+    await expect(dp.locator('.jsplit')).toHaveAttribute('data-layout', 'split');
+    const dCard = dp.getByRole('article', { name: 'Карточка термина' });
+    await expect(dCard.getByRole('heading', { name: name(30) })).toBeVisible();
+    const dList = dp.getByRole('list', { name: 'Термины' });
+    await expect(dList).toBeVisible();
+    const [lb, cb] = [(await dList.boundingBox())!, (await dCard.boundingBox())!];
+    expect(cb.x, 'карточка справа от списка').toBeGreaterThanOrEqual(lb.x + lb.width);
+    expect(cb.width).toBeGreaterThanOrEqual(380);
+    await expect(dp.getByRole('link', { name: '← Словарь' })).toHaveCount(0);
+    await dp.screenshot({ path: `${screens}desktop-glossary-split.png` });
+    expect(dProblems, dProblems.join('\n')).toEqual([]);
+    await ctx.close();
+  });
+
+  test('ideas_groups_accordion_phone', async ({ page }) => {
+    // «Идеи» на телефоне (§5.2 п. 2): фильтры под кнопкой «Фильтры», чипы — полоса, «Группировать
+    // по статусу» — аккордеон `<details>`: открыт первый непустой раздел, число — в заголовке
+    const problems = watch(page);
+    const labels: Record<string, string> = {
+      new: 'Непросмотрено',
+      returned: 'На доработку',
+      accepted: 'В плане',
+      declined: 'Отклонена',
+      done: 'Сделано',
+      deferred: 'Отложена',
+      proposed: 'Предложена',
+    };
+    const counts = await api<Record<string, number>>('GET', `spaces/${IDEAS_GUID}/entries/counts?kind=idea&origin=human`);
+    const c = await pageCtx(page);
+    await open(page, `#/u/${c.user}/s/${IDEAS_GUID}/j/ideas`);
+    await expect(page.getByRole('feed', { name: 'Лента идей' })).toBeVisible();
+
+    const filters = page.getByRole('form', { name: 'Фильтры идей' });
+    await expect(filters).toBeHidden();
+    const toggle = page.getByRole('button', { name: /^Фильтры/ });
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await minTarget(toggle, 44);
+    await toggle.tap();
+    await expect(filters).toBeVisible();
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    await expect(page.getByLabel('Приоритет идей')).toBeVisible();
+    await toggle.tap();
+    await expect(filters).toBeHidden();
+
+    // чипы — одна строка с прокруткой внутри полосы
+    const chips = page.getByRole('group', { name: 'Статус идей' });
+    const boxes = await chips.getByRole('button').evaluateAll((els) => els.map((e) => e.getBoundingClientRect().top));
+    expect(boxes.every((t) => Math.abs(t - boxes[0]) < 1), 'чипы — одна строка').toBe(true);
+    expect(await chips.evaluate((s) => s.scrollWidth > s.clientWidth), 'полоса чипов прокручивается').toBe(true);
+    await minTarget(chips.getByRole('button'), 44);
+    await minGap(chips.getByRole('button'), 8);
+
+    await chips.getByRole('button', { name: /^Все/ }).tap();
+    await expect(chips.getByRole('button', { name: /^Все/ })).toHaveAttribute('aria-pressed', 'true');
+    await page.getByLabel('Группировать по статусу').check();
+    const groups = page.locator('details[data-group]');
+    const expected = Object.keys(labels).filter((s) => (counts[s] ?? 0) > 0);
+    expect(expected.length).toBeGreaterThan(1);
+    await expect(groups).toHaveCount(expected.length);
+    expect(await groups.evaluateAll((els) => els.map((e) => e.getAttribute('data-group')))).toEqual(expected);
+    // число — сервера («k из N», если загружены не все)
+    await expect(groups.locator('summary')).toHaveText(expected.map((s) => new RegExp(`^${labels[s]} (\\d+ из )?${counts[s]}$`)));
+    expect(await groups.evaluateAll((els) => els.map((e) => (e as HTMLDetailsElement).open))).toEqual(expected.map((_, i) => i === 0));
+    const feedOf = (s: string) => page.getByRole('feed', { name: `Идеи раздела «${labels[s]}»` });
+    await expect(feedOf(expected[0])).toBeVisible();
+    await expect(feedOf(expected[1])).toBeHidden();
+    // раскрытие раздела касанием заголовка
+    await groups.nth(1).locator('summary').tap();
+    await expect(feedOf(expected[1])).toBeVisible();
+    await minTarget(groups.locator('summary'), 44);
+    expect(await noHorizontalScroll(page)).toBe(true);
+    await page.screenshot({ path: `${screens}phone-ideas-accordion.png`, fullPage: true });
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+
+  test('insights_compact_rows_phone', async ({ page, browser }) => {
+    // «Insights» на телефоне (§5.2 п. 3): та же таблица (строки считаются), «Вид», «Область»,
+    // «Показы», «Изменено» скрыты, их значения — под заголовком; условие — ширина области журнала.
+    // Открытие записи фильтры не сбрасывает; сбой загрузки повторяется с прежними фильтрами.
+    const problems = watch(page, (path, status) => status === 500 && path.endsWith('/entries'));
+    type Row = {
+      id: string;
+      area: string | null;
+      certainty: string | null;
+      data: { kind?: string };
+      usage?: { shown: number; useful: number; useless: number };
+    };
+    const all = await api<{ items: Row[] }>('GET', `spaces/${SOLUTION_GUID}/entries?kind=insight&limit=100`);
+    expect(all.items.length).toBeGreaterThan(2);
+    const c = await pageCtx(page);
+    const url = `#/u/${c.user}/s/${SOLUTION_GUID}/j/insights`;
+    await open(page, url);
+    const table = page.getByRole('table', { name: 'Insights' });
+    await expect(table.locator('tbody tr')).toHaveCount(all.items.length);
+    await expect(table.getByRole('columnheader')).toHaveText(['Надёжность', 'Заголовок', 'Статус']);
+    await expect(table.locator('tbody tr').first().getByRole('cell')).toHaveCount(3);
+    const x = all.items.find((i) => i.area && i.data.kind) ?? all.items[0];
+    const meta = table.locator(`tr[data-entry="${x.id}"]`).getByTestId('row-meta');
+    if (x.data.kind) await expect(meta).toContainText(x.data.kind);
+    if (x.area) await expect(meta).toContainText(x.area);
+    const u = x.usage ?? { shown: 0, useful: 0, useless: 0 };
+    await expect(meta).toContainText(`показы ${u.shown} / ${u.useful} / ${u.useless}`);
+    expect(await noHorizontalScroll(page)).toBe(true);
+    await page.screenshot({ path: `${screens}phone-insights.png`, fullPage: true });
+    // открытая запись — карточка вместо таблицы, «← Insights» — таблица прежняя
+    await table.locator(`tr[data-entry="${x.id}"]`).getByRole('button').first().tap();
+    await expect(page.getByRole('article', { name: 'Карточка insight' })).toBeVisible();
+    await expect(table).toBeHidden();
+    await page.getByRole('link', { name: '← Insights' }).tap();
+    await expect(table.locator('tbody tr')).toHaveCount(all.items.length);
+
+    // фильтр цел после открытия записи и возврата: таблица не перечитывается и не сбрасывается
+    const lists: string[] = [];
+    page.on('request', (r) => {
+      const u = new URL(r.url());
+      if (u.pathname.endsWith(`/spaces/${SOLUTION_GUID}/entries`) && u.searchParams.get('kind') === 'insight') lists.push(u.search);
+    });
+    const ofCertainty = (cert: string) => all.items.filter((i) => i.certainty === cert);
+    const hyp = ofCertainty('hypothesis');
+    expect(hyp.length).toBeGreaterThan(0);
+    const certainty = page.getByLabel('Надёжность', { exact: true });
+    await certainty.selectOption('hypothesis');
+    await expect(table.locator('tbody tr')).toHaveCount(hyp.length);
+    const n = lists.length;
+    await table.locator(`tr[data-entry="${hyp[0].id}"]`).getByRole('button').first().tap();
+    await expect(page.getByRole('article', { name: 'Карточка insight' })).toBeVisible();
+    await page.getByRole('link', { name: '← Insights' }).tap();
+    await expect(certainty).toHaveValue('hypothesis');
+    await expect(table.locator('tbody tr')).toHaveCount(hyp.length);
+    expect(lists.length, 'таблица не перечитывалась').toBe(n);
+
+    // сбой загрузки — следующий переход повторяет её с прежними фильтрами
+    let fail = true;
+    await page.route(/\/entries\?.*kind=insight/, async (route) => {
+      if (!fail) return route.continue();
+      fail = false;
+      await route.fulfill({ status: 500, contentType: 'text/plain', body: 'сбой для теста' });
+    });
+    const thm = ofCertainty('theorem');
+    await certainty.selectOption('theorem');
+    await expect(page.locator('section.insights').getByRole('alert')).toBeVisible();
+    await expect(table.locator('tbody tr')).toHaveCount(0);
+    await page.evaluate((h) => (location.hash = h), `${url}/${thm[0]?.id ?? x.id}`);
+    await expect(page.getByRole('article', { name: 'Карточка insight' })).toBeVisible();
+    await page.getByRole('link', { name: '← Insights' }).tap();
+    await expect(certainty).toHaveValue('theorem');
+    await expect(table.locator('tbody tr')).toHaveCount(thm.length);
+    await expect(page.locator('section.insights').getByRole('alert')).toHaveCount(0);
+    await page.unroute(/\/entries\?.*kind=insight/);
+    expect(problems, problems.join('\n')).toEqual([]);
+
+    // 1280 × 720 с открытой карточкой: колонка списка рядом с карточкой уже 720 px, но область
+    // журнала шире — таблица полная
+    const ctx = await browser.newContext({ storageState: ADMIN_STATE, viewport: { width: 1280, height: 720 }, hasTouch: false, isMobile: false });
+    const dp = await ctx.newPage();
+    const dProblems = watch(dp);
+    await open(dp, `${url}/${x.id}`);
+    await expect(dp.locator('.jsplit')).toHaveAttribute('data-layout', 'split');
+    await expect(dp.getByRole('article', { name: 'Карточка insight' })).toBeVisible();
+    const dt = dp.getByRole('table', { name: 'Insights' });
+    expect((await dp.locator('.jsplit-list').boundingBox())!.width, 'колонка списка').toBeLessThan(720);
+    await expect(dt.getByRole('columnheader')).toHaveText([
+      'Надёжность',
+      'Заголовок',
+      'Вид',
+      'Статус',
+      'Область',
+      'Показы / полезно / бесполезно',
+      'Изменено',
+    ]);
+    await expect(dt.getByTestId('row-meta')).toHaveCount(0);
+    expect(dProblems, dProblems.join('\n')).toEqual([]);
+    await ctx.close();
+  });
+
+  test('questions_options_targets_44', async ({ page }) => {
+    // «Вопросы» (§5.2 п. 4): варианты ответа — кнопками не меньше 44 × 44 с зазором 8 px в ряду,
+    // длинный вариант переносится внутри кнопки, страница вбок не прокручивается. Своё решение:
+    // вопросы решения E2E проверяют другие спецификации.
+    const problems = watch(page);
+    const guid = randomUUID();
+    await api('POST', 'solutions', { agent_solution_id: guid, name: `Вопросы E2E: ${guid.slice(0, 8)}` });
+    const long = 'Оставить прежний порядок и вернуться к вопросу после замеров на рабочей памяти владельца';
+    await api('POST', `spaces/${guid}/entries`, {
+      kind: 'question',
+      title: 'Какой предел выбрать?',
+      body: 'Варианты — ниже.',
+      data: { options: [{ key: 'a', text: 'Да' }, { key: 'b', text: 'Нет' }, { key: 'c', text: long }], recommendation: 'a' },
+    });
+    const c = await pageCtx(page);
+    await open(page, `#/u/${c.user}/s/${guid}/j/questions`);
+    const opts = page.getByRole('group', { name: 'Варианты ответа' }).getByRole('button');
+    await expect(opts).toHaveCount(3);
+    await minTarget(opts, 44);
+    // короткие варианты — в одном ряду с зазором (длинный переносится на свою строку)
+    expect(await minGap(opts.filter({ hasNotText: long }), 8), 'варианты в одном ряду').toBe(1);
+    // длинный вариант — в пределах окна, текст переносится
+    const box = (await opts.nth(2).boundingBox())!;
+    expect(box.x + box.width).toBeLessThanOrEqual(VIEWPORTS.phone.width);
+    expect(box.height).toBeGreaterThan(44);
+    const answer = page.getByRole('form', { name: 'Ответ текстом' });
+    await minTarget(answer.getByRole('button', { name: 'Ответить' }), 44);
+    expect(await noHorizontalScroll(page)).toBe(true);
+    await page.screenshot({ path: `${screens}phone-questions.png`, fullPage: true });
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+
+  // финальное ревью M7.2, I1: несохранённое в формах Insights, «Идей» и «Словаря» молча не теряется
+  // ни по «←», ни при уходе по адресу — как у доски задач и формы правки записи
+  test('insights_unsaved_back_asks_phone', async ({ page }) => {
+    // форма отзыва в карточке; без набранного «← Insights» уводит сразу
+    const problems = watch(page);
+    const guid = await newSolution('insights и несохранённое');
+    const e = await api<{ id: string }>('POST', `spaces/${guid}/entries`, {
+      kind: 'insight',
+      title: 'Insight под отзывом',
+      body: 'Суть.',
+      data: { kind: 'gotcha' },
+    });
+    const c = await pageCtx(page);
+    const listUrl = `#/u/${c.user}/s/${guid}/j/insights`;
+    await open(page, listUrl);
+    const table = page.getByRole('table', { name: 'Insights' });
+    const row = table.locator(`tr[data-entry="${e.id}"]`).getByRole('button').first();
+    const card = page.getByRole('article', { name: 'Карточка insight' });
+    const form = card.getByRole('form', { name: 'Отзыв insight' });
+    await row.tap();
+    await card.getByRole('button', { name: 'Отозвать', exact: true }).tap();
+    await unsavedAsksPhone(page, {
+      label: 'Insights',
+      field: form.getByLabel('Причина'),
+      typed: 'Опровергнуто замером',
+      here: new RegExp(`/j/insights/${e.id}$`),
+      away: `#/u/${c.user}/s/${guid}/j/glossary`,
+      list: table,
+    });
+    await expect(page).toHaveURL(/\/j\/insights$/);
+    await row.tap();
+    await card.getByRole('button', { name: 'Отозвать', exact: true }).tap();
+    await expect(form).toBeVisible();
+    await page.getByRole('link', { name: '← Insights' }).tap();
+    await expect(table).toBeVisible();
+    await expect(page.getByRole('alertdialog')).toHaveCount(0);
+    expect((await api<{ status: string }>('GET', `entries/${e.id}`)).status).toBe('active');
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+
+  test('ideas_unsaved_back_asks_phone', async ({ page }) => {
+    // форма правки идеи (`IdeaForm`, ленивый чанк); без набранного «← Идеи» уводит сразу
+    const problems = watch(page);
+    const guid = await newSolution('идеи и несохранённое');
+    const idea = await api<{ id: string }>('POST', `spaces/${guid}/entries`, {
+      kind: 'idea',
+      title: 'Идея под правкой',
+      body: 'Замысел.',
+      data: { origin: 'human' },
+    });
+    const c = await pageCtx(page);
+    await open(page, `#/u/${c.user}/s/${guid}/j/ideas`);
+    const feed = page.getByRole('feed', { name: 'Лента идей' });
+    const row = feed.locator(`[data-idea="${idea.id}"]`).getByRole('button', { name: 'Идея под правкой' });
+    const card = page.getByRole('article', { name: 'Карточка идеи' });
+    const form = card.getByRole('form', { name: 'Правка идеи' });
+    await row.tap();
+    await card.getByRole('button', { name: 'Изменить', exact: true }).tap();
+    await expect(form.getByLabel('Замысел')).toHaveValue('Замысел.');
+    await unsavedAsksPhone(page, {
+      label: 'Идеи',
+      field: form.getByLabel('Замысел'),
+      typed: 'Замысел, дописанный на телефоне.',
+      here: new RegExp(`/j/ideas/${idea.id}$`),
+      away: `#/u/${c.user}/s/${guid}/j/glossary`,
+      list: feed,
+    });
+    await expect(page).toHaveURL(/\/j\/ideas$/);
+    await row.tap();
+    await card.getByRole('button', { name: 'Изменить', exact: true }).tap();
+    await expect(form).toBeVisible();
+    await page.getByRole('link', { name: '← Идеи' }).tap();
+    await expect(feed).toBeVisible();
+    await expect(page.getByRole('alertdialog')).toHaveCount(0);
+    expect((await api<{ body: string }>('GET', `entries/${idea.id}`)).body).toBe('Замысел.');
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+
+  test('glossary_unsaved_back_asks_phone', async ({ page }) => {
+    // форма нового термина (карточки нет, адрес — список); без набранного «← Словарь» — сразу
+    const problems = watch(page);
+    const guid = await newSolution('словарь и несохранённое');
+    const c = await pageCtx(page);
+    await open(page, `#/u/${c.user}/s/${guid}/j/glossary`);
+    const add = page.getByRole('button', { name: 'Новый термин', exact: true });
+    const form = page.getByRole('form', { name: 'Новый термин' });
+    await add.tap();
+    await expect(form).toBeVisible();
+    await expect(add).toBeHidden();
+    await unsavedAsksPhone(page, {
+      label: 'Словарь',
+      field: form.getByLabel('Определение'),
+      typed: 'Определение, набранное на телефоне',
+      here: /\/j\/glossary$/,
+      away: `#/u/${c.user}/s/${guid}/j/insights`,
+      list: add,
+    });
+    await add.tap();
+    await expect(form).toBeVisible();
+    await page.getByRole('link', { name: '← Словарь' }).tap();
+    await expect(add).toBeVisible();
+    await expect(page.getByRole('alertdialog')).toHaveCount(0);
+    expect((await api<{ items: unknown[] }>('GET', `spaces/${guid}/glossary`)).items).toEqual([]);
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+});
+
+test.describe('планшет, сенсорный ввод', () => {
+  test.use({ viewport: VIEWPORTS.tablet, ...touch });
+
+  test('tablet_tree_is_drawer', async ({ page }) => {
+    const problems = watch(page);
+    await open(page);
+    // разделы — в шапке короткими подписями (имя ссылки — полное), «Выйти» — в шапке
+    const sections = header(page).getByRole('navigation', { name: 'Разделы' });
+    await expect(sections).toBeVisible();
+    await expect(sections.getByRole('link', { name: 'Администрирование' })).toHaveText('Админ', { useInnerText: true });
+    await expect(sections.getByRole('link', { name: 'Сессии' })).toBeVisible();
+    await minTarget(sections.getByRole('link'), 44);
+    expect(await minGap(sections.getByRole('link'), 8)).toBe(5);
+    await expect(page.getByRole('button', { name: 'Выйти' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Меню аккаунта' })).toHaveCount(0);
+    // дерево — выдвижная панель, в ней только дерево
+    await expect(treeNav(page)).not.toBeInViewport();
+    await page.getByRole('button', { name: 'Показать дерево' }).click();
+    await expect(treeNav(page)).toBeInViewport();
+    await expect(sidebar(page).getByRole('navigation', { name: 'Разделы' })).toHaveCount(0);
+    await page.keyboard.press('Escape');
+    await expect(treeNav(page)).not.toBeInViewport();
+    await expect(page.getByRole('button', { name: 'Показать дерево' })).toBeFocused();
+    expect(await noHorizontalScroll(page)).toBe(true);
+    await page.screenshot({ path: `${screens}tablet-header.png` });
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+
+  test('tablet_header_720', async ({ page }) => {
+    // самый узкий планшет: шапка помещается, разделы при нехватке места прокручиваются внутри
+    // своей полосы, страница вбок не прокручивается
+    const problems = watch(page);
+    await page.setViewportSize({ width: 720, height: 1024 });
+    await open(page);
+    const top = header(page);
+    const sections = top.getByRole('navigation', { name: 'Разделы' });
+    await expect(sections).toBeVisible();
+    expect(await noHorizontalScroll(page)).toBe(true);
+    expect(await top.evaluate((h) => h.scrollWidth <= h.clientWidth), 'шапка без переполнения').toBe(true);
+    const nav = (await sections.boundingBox())!;
+    const search = (await page.getByRole('button', { name: 'Поиск', exact: true }).boundingBox())!;
+    expect(nav.x + nav.width, 'разделы не заходят под «Поиск»').toBeLessThanOrEqual(search.x + 0.5);
+    await expect(page.getByRole('button', { name: 'Выйти' })).toBeInViewport({ ratio: 1 });
+    // последний раздел достижим (прокруткой полосы разделов, если не поместился)
+    const last = sections.getByRole('link', { name: 'Сессии' });
+    await last.scrollIntoViewIfNeeded();
+    await expect(last).toBeInViewport({ ratio: 1 });
+    expect(await noHorizontalScroll(page)).toBe(true);
+    await minTarget(sections.getByRole('link'), 44);
+    await minGap(sections.getByRole('link'), 8);
+    await page.screenshot({ path: `${screens}tablet-720-header.png` });
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+});
+
+test.describe('планшет в альбомной ориентации, сенсорный ввод', () => {
+  test.use({ viewport: VIEWPORTS.tabletLand, ...touch });
+
+  test('card_keeps_focus_on_width_change', async ({ page }) => {
+    // поворот 1180 → 820 и обратно с открытой формой правки: раскладка меняется (рядом ↔ вместо
+    // списка), фокус и набранный текст остаются в поле
+    const problems = watch(page);
+    const run = Date.now().toString(36);
+    const t = await api<{ id: string }>('POST', 'spaces/knowledge/entries', {
+      kind: 'term',
+      title: `Поворот ${run}`,
+      body: '',
+      data: { definition: 'Определение для проверки поворота', aliases: [], code: [] },
+    });
+    const c = await pageCtx(page);
+    await open(page, `#/u/${c.user}/s/knowledge/j/glossary/${t.id}`);
+    const split = page.locator('.jsplit');
+    await expect(split).toHaveAttribute('data-layout', 'split');
+    await page.getByRole('article', { name: 'Карточка термина' }).getByRole('button', { name: 'Править' }).click();
+    const def = page.getByRole('form', { name: 'Правка термина' }).getByLabel('Определение');
+    await def.click();
+    await def.press('End');
+    await def.pressSequentially(' — правка');
+    await expect(def).toBeFocused();
+
+    await page.setViewportSize({ width: VIEWPORTS.tablet.width, height: VIEWPORTS.tablet.height });
+    await expect(split).toHaveAttribute('data-layout', 'stack');
+    await expect(page.getByRole('link', { name: '← Словарь' })).toBeVisible();
+    await expect(def).toBeFocused();
+    await expect(def).toHaveValue('Определение для проверки поворота — правка');
+
+    await page.setViewportSize(VIEWPORTS.tabletLand);
+    await expect(split).toHaveAttribute('data-layout', 'split');
+    await expect(def).toBeFocused();
+    await expect(page.getByRole('list', { name: 'Термины' })).toBeVisible();
+
+    // фокус в списке, а сужение прячет список — фокус на заголовок карточки, не на body
+    await page.getByRole('searchbox', { name: 'Поиск по словарю' }).focus();
+    await page.setViewportSize({ width: VIEWPORTS.tablet.width, height: VIEWPORTS.tablet.height });
+    await expect(split).toHaveAttribute('data-layout', 'stack');
+    await expect(
+      page.getByRole('article', { name: 'Карточка термина' }).getByRole('heading', { name: `Поворот ${run}` }),
+    ).toBeFocused();
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+});
+
+test.describe('настольный', () => {
+  test.use({ viewport: VIEWPORTS.desktop });
+
+  test('desktop_tree_fixed', async ({ page }) => {
+    const problems = watch(page);
+    await open(page);
+    await expect(treeNav(page)).toBeInViewport();
+    await expect(page.getByRole('button', { name: 'Показать дерево' })).toBeHidden();
+    await expect(page.getByRole('button', { name: 'Выйти' })).toBeVisible();
+    const sections = header(page).getByRole('navigation', { name: 'Разделы' });
+    await expect(sections.getByRole('link', { name: 'Администрирование' })).toHaveText('Администрирование', { useInnerText: true });
+    // дерево 300 px с 1280, 260 px — на 1024–1279
+    expect((await sidebar(page).boundingBox())!.width).toBe(300);
+    await page.setViewportSize(VIEWPORTS.laptop);
+    await expect.poll(async () => (await sidebar(page).boundingBox())!.width).toBe(260);
+    await expect(treeNav(page)).toBeInViewport();
+    await expect(page.getByRole('button', { name: 'Показать дерево' })).toBeHidden();
+    expect(await noHorizontalScroll(page)).toBe(true);
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+
+  test('lazy_chunk_failure_reload', async ({ page }) => {
+    // отказ загрузки чанка страницы «Сессии»: текст ошибки и «Обновить страницу»
+    const chunk = /\/assets\/SessionsView-[^/]+\.js$/;
+    await page.route(chunk, (r) => r.abort('failed'));
+    await open(page, '#/sessions');
+    const fail = page.getByRole('alert').filter({ hasText: 'Страница не загрузилась' });
+    await expect(fail).toBeVisible();
+    const reload = fail.getByRole('button', { name: 'Обновить страницу' });
+    await expect(reload).toBeVisible();
+    // перезагрузка (адрес сохраняется) с доступным чанком — страница открывается
+    await page.unroute(chunk);
+    await reload.click();
+    await expect(page).toHaveURL(/#\/sessions$/);
+    await expect(page.getByRole('heading', { name: 'Сессии', level: 2 })).toBeVisible();
+    await expect(page.getByText('Страница не загрузилась')).toHaveCount(0);
+  });
+});
+
+type StorageState = Awaited<ReturnType<BrowserContext['storageState']>>;
+
+/**
+ * Новая вкладка на размере `v` (касание — у телефонов и планшетов); сессия — общая администратора
+ * или `state` (пользователь, {@link userSession}).
+ */
+async function contextAt(browser: Browser, v: ViewportName, state: string | StorageState = ADMIN_STATE) {
+  const touchy = v === 'phoneS' || v === 'phone' || v === 'tablet' || v === 'tabletLand';
+  return browser.newContext({ storageState: state, viewport: VIEWPORTS[v], ...(touchy ? touch : { hasTouch: false, isMobile: false }) });
+}
+
+test('frame_no_horizontal_scroll', async ({ browser }) => {
+  test.setTimeout(180_000);
+  mkdirSync(screens, { recursive: true });
+  const frame = PAGES.filter((p) => ['стартовая', 'документ', 'журнал'].includes(p.name));
+  expect(frame).toHaveLength(3);
+  const wide: string[] = [];
+  for (const v of Object.keys(VIEWPORTS) as ViewportName[]) {
+    const ctx = await contextAt(browser, v);
+    const page = await ctx.newPage();
+    const problems = watch(page);
+    const c = await pageCtx(page);
+    for (const p of frame) {
+      await open(page, p.path(c));
+      if (p.name === 'документ') {
+        await expect(page.locator('.doc').getByRole('heading', { level: 1, name: /^Медиа-заметка/ })).toBeVisible();
+        await expect(page.locator('.doc .mermaid-diagram svg')).toBeVisible({ timeout: 20_000 });
+      } else if (p.name === 'журнал') {
+        await expect(page.getByRole('heading', { level: 1, name: 'Словарь' })).toBeVisible();
+        await expect(page.locator('.jsplit')).toBeVisible();
+      } else {
+        await expect(page.locator('.welcome h1')).toBeVisible();
+      }
+      // дерево на узком окне — после анимации панели
+      await page.waitForFunction(() => document.getAnimations().every((a) => a.playState !== 'running'));
+      if (!(await noHorizontalScroll(page))) wide.push(`${v} ${VIEWPORTS[v].width}: ${p.name}`);
+      await page.screenshot({ path: `${screens}frame-${v}-${p.name}.png`, fullPage: true });
+    }
+    expect(problems, `${v}: ${problems.join('\n')}`).toEqual([]);
+    await ctx.close();
+  }
+  expect(wide, 'горизонтальная прокрутка страницы').toEqual([]);
+});
+
+test('journals_split_no_horizontal_scroll', async ({ browser }) => {
+  // Задачи, Идеи, Insights (§5.2 пп. 1–3): без горизонтальной прокрутки на узком телефоне,
+  // планшете и ноутбуке (область 700 px — вкладки доски и компактная таблица)
+  test.setTimeout(120_000);
+  mkdirSync(screens, { recursive: true });
+  const pages = PAGES.filter((p) => ['задачи', 'идеи', 'insights'].includes(p.name));
+  expect(pages).toHaveLength(3);
+  const wide: string[] = [];
+  for (const v of ['phoneS', 'tablet', 'laptop'] as ViewportName[]) {
+    const ctx = await contextAt(browser, v);
+    const page = await ctx.newPage();
+    const problems = watch(page);
+    const c = await pageCtx(page);
+    for (const p of pages) {
+      await open(page, p.path(c));
+      await expect(page.locator('.jsplit')).toBeVisible();
+      await expect(page.getByText('Загрузка…')).toHaveCount(0);
+      if (!(await noHorizontalScroll(page))) wide.push(`${v} ${VIEWPORTS[v].width}: ${p.name}`);
+      await page.screenshot({ path: `${screens}journal-${v}-${p.name}.png`, fullPage: true });
+    }
+    expect(problems, `${v}: ${problems.join('\n')}`).toEqual([]);
+    await ctx.close();
+  }
+  expect(wide, 'горизонтальная прокрутка страницы').toEqual([]);
+});
+
+/**
+ * Сессия пользователя (не администратора) для адресов `as: 'user'`: один вход на прогон спецификации
+ * (лимит входа — 5 в минуту на IP), смена пароля при первом входе; cookie — в памяти.
+ */
+let userState: StorageState | null = null;
+async function userSession(browser: Browser): Promise<StorageState> {
+  if (userState) return userState;
+  const pass = ['e2e-mobile-pass-1', 'e2e-mobile-pass-2'];
+  const ac = await browser.newContext({ storageState: ADMIN_STATE });
+  const me = await ac.request.get(`${base()}api/v1/auth/me`);
+  const { csrf } = (await me.json()) as { csrf: string };
+  const name = `e2e-mobile-${Date.now()}`;
+  const u = await ac.request.post(`${base()}api/v1/admin/users`, { headers: { 'X-CSRF-Token': csrf }, data: { name } });
+  expect(u.ok(), `admin/users: HTTP ${u.status()}`).toBe(true);
+  const id = ((await u.json()) as { user: { id: string } }).user.id;
+  const set = await ac.request.post(`${base()}api/v1/admin/users/${id}/password`, {
+    headers: { 'X-CSRF-Token': csrf },
+    data: { password: pass[0] },
+  });
+  expect(set.ok(), `пароль: HTTP ${set.status()}`).toBe(true);
+  await ac.close();
+  const uc = await browser.newContext({ storageState: { cookies: [], origins: [] } });
+  // лимит входа общий у спек прогона — вход с повтором при 429 (`login.ts`)
+  await loginChangingPassword(uc.request, base(), name, pass[0], pass[1]);
+  userState = await uc.storageState();
+  await uc.close();
+  return userState;
+}
+
+/** Страница догрузилась: нет «Загрузка…», сеть затихла, анимации (панель дерева) закончились. */
+async function settled(page: Page): Promise<void> {
+  await expect(page.locator('main').getByText(/^Загрузка/)).toHaveCount(0, { timeout: 20_000 });
+  await page.waitForLoadState('networkidle');
+  await page.waitForFunction(() => document.getAnimations().every((a) => a.playState !== 'running'));
+}
+
+/** Самые глубокие элементы, выходящие правым краем за окно вне прокручиваемого предка (сообщение). */
+function overflowing(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const vw = document.documentElement.clientWidth;
+    const clips = (e: Element) => ['auto', 'scroll', 'hidden', 'clip'].includes(getComputedStyle(e).overflowX);
+    const out: string[] = [];
+    for (const e of document.body.querySelectorAll('*')) {
+      const r = e.getBoundingClientRect();
+      if (r.width === 0 || r.right <= vw + 0.5) continue;
+      // обрезает только предок — содержащий блок: у абсолютного элемента — позиционированный
+      const abs = ['absolute', 'fixed'].includes(getComputedStyle(e).position);
+      let p = e.parentElement;
+      while (p && p !== document.body && !(clips(p) && (!abs || getComputedStyle(p).position !== 'static'))) p = p.parentElement;
+      if (p && p !== document.body) continue;
+      if ([...e.children].some((ch) => ch.getBoundingClientRect().right > vw + 0.5)) continue;
+      const cls = typeof e.className === 'string' && e.className.trim() ? `.${e.className.trim().split(/\s+/).join('.')}` : '';
+      out.push(`${e.tagName.toLowerCase()}${cls} → ${Math.round(r.right)}`);
+      if (out.length >= 5) break;
+    }
+    return out;
+  });
+}
+
+test('all_pages_no_horizontal_scroll', async ({ browser }) => {
+  // обход узких экранов (§5.2 п. 7): каждый адрес PAGES (и его вкладки) на узком телефоне и
+  // планшете — без горизонтальной прокрутки страницы и без ошибок консоли; снимки — для ревью
+  // глазами (.tmp/e2e/screens/mobile/<размер>-<имя>.png)
+  test.setTimeout(600_000);
+  mkdirSync(screens, { recursive: true });
+  // «Кэш выжимок» с таблицей: выжимка агента с длинным запросом (своя заметка-источник)
+  const src = await api<{ id: string }>('POST', 'nodes', {
+    space: 'knowledge',
+    path: `E2E/Кэш обхода ${Date.now()}`,
+    kind: 'note',
+    content: '# Кэш обхода\n\nИсточник выжимки.\n',
+  });
+  await api('POST', 'cache', {
+    query: 'Как устроен обход узких экранов WebUI и почему таблицы прокручиваются внутри обёртки',
+    summary: 'Таблицы — в .table-wrap, страница вбок не прокручивается.',
+    sources: [{ id: src.id }],
+  });
+  const wide: string[] = [];
+  const problems: string[] = [];
+  for (const v of ['phoneS', 'tablet'] as ViewportName[]) {
+    for (const as of ['admin', 'user'] as const) {
+      const pages = PAGES.filter((p) => (p.as ?? 'admin') === as);
+      if (!pages.length) continue;
+      const ctx = await contextAt(browser, v, as === 'user' ? await userSession(browser) : ADMIN_STATE);
+      const page = await ctx.newPage();
+      const seen = watch(page);
+      const c = await pageCtx(page);
+      const check = async (name: string) => {
+        await settled(page);
+        if (!(await noHorizontalScroll(page))) wide.push(`${v} ${VIEWPORTS[v].width}: ${name} — ${(await overflowing(page)).join('; ')}`);
+        await page.screenshot({ path: `${screens}${v}-${name}.png`, fullPage: true });
+      };
+      for (const p of pages) {
+        // полная загрузка на каждый адрес: «сеть затихла» — о самой странице
+        await page.goto('about:blank');
+        await open(page, p.path(c));
+        await check(p.name);
+        for (const t of p.tabs ?? []) {
+          await page.getByRole('tab', { name: new RegExp(`^${t}`) }).click();
+          await check(`${p.name}-${t}`);
+        }
+        for (const b of p.buttons ?? []) {
+          await page.getByRole('button', { name: b, exact: true }).first().click();
+          await check(`${p.name}-${b}`);
+        }
+      }
+      problems.push(...seen.map((s) => `${v} ${as}: ${s}`));
+      await ctx.close();
+    }
+  }
+  expect(wide, 'горизонтальная прокрутка страницы').toEqual([]);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('editor_phone_modes', async ({ browser }) => {
+  // редактор (§5.2 п. 4): ниже 1024 px — вкладки «Текст | Предпросмотр» (tablist) вместо двух
+  // колонок, правка текста видна в предпросмотре, «Сохранить» — в видимой области; на 1440 — две
+  // колонки рядом, вкладок нет
+  const run = Date.now();
+  const note = await api<{ id: string }>('POST', 'nodes', {
+    space: 'knowledge',
+    path: `E2E/Редактор телефона ${run}`,
+    kind: 'note',
+    // блок кода — в предпросмотре есть цель фокуса («Копировать»)
+    content: '# Редактор телефона\n\nисходный текст\n\n```\nкод\n```\n',
+  });
+  const ctx = await contextAt(browser, 'phone');
+  const page = await ctx.newPage();
+  const problems = watch(page);
+  const c = await pageCtx(page);
+  await open(page, `#/u/${c.user}/s/knowledge/n/${note.id}`);
+  await page.getByRole('button', { name: 'Править', exact: true }).click();
+  const editor = page.getByRole('region', { name: 'Редактор заметки' });
+  const tabs = editor.getByRole('tablist', { name: 'Панель редактора' });
+  await expect(tabs.getByRole('tab')).toHaveText(['Текст', 'Предпросмотр']);
+  const text = tabs.getByRole('tab', { name: 'Текст' });
+  const prev = tabs.getByRole('tab', { name: 'Предпросмотр' });
+  await expect(text).toHaveAttribute('aria-selected', 'true');
+  const source = editor.getByRole('tabpanel', { name: 'Текст' });
+  await expect(source.locator('.cm-content')).toBeVisible();
+  await expect(editor.locator('.pane.preview')).toBeHidden();
+  const save = editor.getByRole('button', { name: 'Сохранить' });
+  await expect(save).toBeInViewport();
+  await minTarget(tabs.getByRole('tab'), 44);
+  // правка текста — в предпросмотре
+  await source.locator('.cm-content').click();
+  await page.keyboard.press('Control+End');
+  await page.keyboard.type(`\nправка-${run}\n`);
+  await prev.tap();
+  await expect(prev).toHaveAttribute('aria-selected', 'true');
+  const preview = editor.getByRole('tabpanel', { name: 'Предпросмотр' });
+  await expect(preview).toContainText(`правка-${run}`);
+  await expect(source).toBeHidden();
+  await expect(save).toBeInViewport();
+  expect(await noHorizontalScroll(page)).toBe(true);
+  await page.screenshot({ path: `${screens}phone-editor-preview.png`, fullPage: true });
+  // клавиатура tablist: ←/→ по кругу, Home, End; один tabindex="0"
+  await prev.focus();
+  await page.keyboard.press('ArrowRight');
+  await expect(text).toBeFocused();
+  await expect(text).toHaveAttribute('aria-selected', 'true');
+  await expect(source).toBeVisible();
+  await page.keyboard.press('End');
+  await expect(prev).toBeFocused();
+  await page.keyboard.press('Home');
+  await expect(text).toBeFocused();
+  await expect(tabs.locator('[tabindex="0"]')).toHaveCount(1);
+  await page.screenshot({ path: `${screens}phone-editor-text.png`, fullPage: true });
+
+  // смена ширины с несохранённой правкой (поворот, окно): CodeMirror тот же — текст, предпросмотр
+  // и история отмены целы; на настольном — колонки без вкладок
+  const edited = editor.locator('.pane.source .cm-content');
+  await page.setViewportSize(VIEWPORTS.desktop);
+  await expect(editor.getByRole('tablist')).toHaveCount(0);
+  // фокус был на вкладке «Текст» — вкладки исчезли, фокус в тексте, а не в `body`
+  await expect(edited).toBeFocused();
+  await expect(edited).toContainText(`правка-${run}`);
+  await expect(editor.locator('.pane.preview')).toContainText(`правка-${run}`);
+  await expect(editor.locator('.pane.preview')).toBeVisible();
+  await expect(editor.getByRole('status')).toHaveText('Есть несохранённые изменения');
+  // сужение с фокусом в предпросмотре — выбрана вкладка «Предпросмотр», фокус на месте
+  const copy = editor.locator('.pane.preview .copy-code');
+  await copy.focus();
+  await page.setViewportSize(VIEWPORTS.phone);
+  await expect(prev).toHaveAttribute('aria-selected', 'true');
+  await expect(copy).toBeFocused();
+  await expect(source).toBeHidden();
+  // расширение с фокусом на вкладке «Предпросмотр» — фокус в предпросмотр; снова узкое — та же вкладка
+  await prev.focus();
+  await page.setViewportSize(VIEWPORTS.desktop);
+  await expect(editor.locator('.pane.preview')).toBeFocused();
+  await page.setViewportSize(VIEWPORTS.phone);
+  await expect(prev).toHaveAttribute('aria-selected', 'true');
+  await expect(editor.locator('.pane.preview')).toBeFocused();
+  await text.tap();
+  await expect(edited).toContainText(`правка-${run}`);
+  // история отмены цела: Ctrl+Z снимает правку (ввод — несколькими шагами), затем ввод заново
+  await edited.click();
+  for (let k = 0; k < 10 && (await edited.textContent())?.includes(`правка-${run}`); k++) await page.keyboard.press('Control+z');
+  await expect(edited).not.toContainText(`правка-${run}`);
+  await expect(editor.getByRole('status')).toHaveText(/^Ревизия \d+$/);
+  await page.keyboard.press('Control+End');
+  await page.keyboard.type(`\nправка-${run}\n`);
+  await save.tap();
+  await expect(editor.getByRole('status')).toContainText('Сохранено');
+  expect(problems, problems.join('\n')).toEqual([]);
+  await ctx.close();
+
+  // настольный: две колонки рядом, вкладок нет
+  const dctx = await contextAt(browser, 'desktop');
+  const dp = await dctx.newPage();
+  const dProblems = watch(dp);
+  await open(dp, `#/u/${c.user}/s/knowledge/n/${note.id}`);
+  await dp.getByRole('button', { name: 'Править', exact: true }).click();
+  const de = dp.getByRole('region', { name: 'Редактор заметки' });
+  await expect(de.locator('.cm-content')).toBeVisible();
+  await expect(de.getByRole('tablist')).toHaveCount(0);
+  const dPreview = de.locator('.pane.preview');
+  await expect(dPreview).toContainText(`правка-${run}`);
+  const sBox = (await de.locator('.pane.source').boundingBox())!;
+  const pBox = (await dPreview.boundingBox())!;
+  expect(pBox.x, 'предпросмотр — справа от текста').toBeGreaterThan(sBox.x + sBox.width);
+  expect(Math.abs(pBox.y - sBox.y), 'колонки на одной высоте').toBeLessThan(4);
+  await dp.getByRole('button', { name: 'Отмена' }).click();
+  expect(dProblems, dProblems.join('\n')).toEqual([]);
+  await dctx.close();
+});

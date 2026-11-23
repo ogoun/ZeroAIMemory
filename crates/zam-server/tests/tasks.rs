@@ -1,6 +1,7 @@
 //! Журнал задач (M4.5 §3, задача 4): статусы и время, переоткрытие с причиной, захват
 //! (свободна, истёк, та же сессия, 409, гонка), снятие (чужой — 403, человек — можно), аудит,
-//! раздел `### Задачи` дайджеста, `claimed_tasks` сессии, MCP `status|claim|release`.
+//! раздел `### Задачи` дайджеста, `claimed_tasks` сессии, MCP `status|claim|release`; подзадачи
+//! `part_of` (M7 §5.4, задача 5 M7.2): сводка, `parent`, `stale`, фильтры ленты и счётчиков.
 //! Сервер без моделей (поиск — FTS).
 mod common;
 
@@ -1204,4 +1205,507 @@ async fn mcp_status_done_clears_next_step() {
         get(&a, &t2).await["data"]["next_step"],
         "сообщить владельцу"
     );
+}
+
+// ---------- Подзадачи `part_of` (M7 §5.4, задача 5 M7.2) ----------
+
+/// Связь `part_of` шага с общей задачей (`POST /edges`); порядок вызовов — порядок шагов.
+async fn part_of(a: &Api, step: &str, parent: &str) {
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/edges",
+            Some(json!({"src": format!("e:{step}"), "type": "part_of",
+                        "dst": format!("e:{parent}")})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+}
+
+/// Лента задач пространства `space` (`knowledge` или GUID) с параметрами `q`: ответ целиком.
+async fn feed_in(a: &Api, space: &str, q: &str) -> Value {
+    let r = a
+        .t(
+            Method::GET,
+            &format!("/api/v1/spaces/{space}/entries?kind=task{q}"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{q}: {}", r.text());
+    r.json()
+}
+
+async fn feed(a: &Api, q: &str) -> Value {
+    feed_in(a, "knowledge", q).await
+}
+
+fn ids_of(v: &Value) -> Vec<String> {
+    v["items"].as_array().unwrap().iter().map(id).collect()
+}
+
+/// Запись `id` из ленты `v`.
+fn item<'a>(v: &'a Value, id: &str) -> &'a Value {
+    v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == id)
+        .unwrap_or_else(|| panic!("нет {id} в ленте: {v}"))
+}
+
+/// Общая задача «Этап» и 13 шагов «Шаг i»: связи `part_of` — в порядке `(5·i) mod 13`, не в
+/// порядке создания задач (и не в обратном); статусы по порядку шагов — 8 `done`, 1 `dropped`,
+/// 2 `in_progress`, 2 `open`. Возвращает общую и шаги в порядке рёбер.
+async fn umbrella_13(a: &Api) -> (String, Vec<String>) {
+    let p = id(&new_task(a, "Этап", json!({})).await);
+    let mut steps = Vec::new();
+    for i in 0..13 {
+        steps.push(id(&new_task(a, &format!("Шаг {i}"), json!({})).await));
+    }
+    let order: Vec<String> = (0..13).map(|i| steps[(5 * i) % 13].clone()).collect();
+    for s in &order {
+        part_of(a, s, &p).await;
+    }
+    for (k, s) in order.iter().enumerate() {
+        let st = match k {
+            0..=7 => "done",
+            8 => "dropped",
+            9 | 10 => "in_progress",
+            _ => continue,
+        };
+        status(a, s, st).await;
+    }
+    (p, order)
+}
+
+/// Сводка `subtasks` у общей: всего и по статусам; строки `items` — только в `GET /entries/{id}`
+/// в порядке рёбер (не создания задач), в ленте и эхо правки — без них; MCP `memory_read` общей
+/// в Markdown — без строк о подзадачах (решение 31: Markdown-выдача агенту в волне не меняется).
+#[tokio::test]
+async fn subtasks_summary_and_items_order() {
+    let a = api("tasks-subtasks-summary", |_| {}).await;
+    let (p, order) = umbrella_13(&a).await;
+    let j = get(&a, &p).await;
+    let s = &j["subtasks"];
+    for (k, n) in [
+        ("total", 13),
+        ("done", 8),
+        ("dropped", 1),
+        ("open", 2),
+        ("in_progress", 2),
+        ("blocked", 0),
+    ] {
+        assert_eq!(s[k], n, "{k}: {j}");
+    }
+    let items = s["items"].as_array().unwrap_or_else(|| panic!("{j}"));
+    let got: Vec<String> = items.iter().map(id).collect();
+    assert_eq!(got, order, "порядок рёбер: {j}");
+    assert_eq!(s["truncated"], false, "{j}");
+    assert_eq!(items[0]["status"], "done");
+    assert_eq!(items[8]["status"], "dropped");
+    assert_eq!(items[12]["status"], "open");
+    let first = get(&a, &order[0]).await;
+    assert_eq!(items[0]["title"], first["title"]);
+    assert_eq!(items[0]["claimed"], Value::Null, "{j}");
+    assert_eq!(ts_of(&items[0], "updated_at"), ts_of(&first, "updated_at"));
+    assert!(j["parent"].is_null(), "у общей родителя нет: {j}");
+    assert!(j.get("stale").is_none(), "{j}");
+    // захват шага — в строке: агент и срок
+    let r = claim(
+        &a,
+        &order[11],
+        Some("cs-sub"),
+        json!({"agent": "claude", "ttl_min": 60}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = get(&a, &p).await;
+    let c = &j["subtasks"]["items"][11]["claimed"];
+    assert_eq!(c["agent"], "claude", "{j}");
+    assert!(ts_of(c, "until") > Timestamp::now(), "{j}");
+    // лента: сводка без строк
+    let f = feed(&a, "").await;
+    let s = &item(&f, &p)["subtasks"];
+    assert_eq!(s["total"], 13, "{f}");
+    assert!(
+        s.get("items").is_none() && s.get("truncated").is_none(),
+        "{f}"
+    );
+    // эхо правки — тоже без строк
+    let e = status(&a, &p, "in_progress").await;
+    assert_eq!(e["subtasks"]["done"], 8, "{e}");
+    assert!(e["subtasks"].get("items").is_none(), "{e}");
+    // MCP memory_read в Markdown — прежний: ни сводки, ни заголовков шагов
+    let (t, err) = mcp(
+        &a,
+        "memory_read",
+        json!({"items": [{"id": format!("k:{p}")}]}),
+    )
+    .await;
+    assert!(!err, "{t}");
+    assert!(t.contains("План: Этап"), "{t}");
+    for bad in ["Шаг ", "subtasks", "подзадач", "8/12", "last_activity"] {
+        assert!(!t.contains(bad), "{bad}: {t}");
+    }
+}
+
+/// У подзадачи — `parent {id, title, status, subtasks {total, done, dropped}}` (сводка родителя
+/// для «(8/13)» без второго запроса); `top_level=1` — без подзадач, порядок прежний (новые
+/// первыми); `parent=<id>` — ровно прямые подзадачи в порядке рёбер, курсор — позиция, с
+/// фильтрами ленты; `top_level` и `parent` — только у `kind=task` (422), вместе — 422.
+#[tokio::test]
+async fn subtask_parent_and_top_level_filter() {
+    let a = api("tasks-subtasks-parent", |_| {}).await;
+    let (p, order) = umbrella_13(&a).await;
+    let other = id(&new_task(&a, "Отдельная", json!({})).await);
+    let j = get(&a, &order[3]).await;
+    assert_eq!(
+        j["parent"],
+        json!({"id": p, "title": "Этап", "status": "open",
+               "subtasks": {"total": 13, "done": 8, "dropped": 1}}),
+        "{j}"
+    );
+    assert!(j.get("subtasks").is_none(), "у шага подзадач нет: {j}");
+    assert!(j["last_activity_at"].as_str().is_some(), "{j}");
+    // в ленте у шага — тот же parent
+    let f = feed(&a, "").await;
+    assert_eq!(item(&f, &order[3])["parent"], j["parent"], "{f}");
+    assert!(item(&f, &other)["parent"].is_null(), "{f}");
+    // верхний уровень: без шагов, новые первыми
+    let top = feed(&a, "&top_level=1").await;
+    assert_eq!(ids_of(&top), [other.clone(), p.clone()], "{top}");
+    let top = feed(&a, "&top_level=1&status=open").await;
+    assert_eq!(ids_of(&top), [other.clone(), p.clone()], "{top}");
+    // прямые подзадачи — в порядке рёбер
+    let kids = feed(&a, &format!("&parent={p}")).await;
+    assert_eq!(ids_of(&kids), order, "{kids}");
+    assert!(kids["next_cursor"].is_null(), "{kids}");
+    // курсор — позиция: 5 + 5 + 3
+    let mut got = Vec::new();
+    let mut cursor: Option<String> = None;
+    for want in [5, 5, 3] {
+        let q = match &cursor {
+            Some(c) => format!("&parent={p}&limit=5&cursor={c}"),
+            None => format!("&parent={p}&limit=5"),
+        };
+        let page = feed(&a, &q).await;
+        assert_eq!(ids_of(&page).len(), want, "{page}");
+        got.extend(ids_of(&page));
+        cursor = page["next_cursor"].as_str().map(str::to_string);
+    }
+    assert!(cursor.is_none());
+    assert_eq!(got, order);
+    // фильтр статуса — в том же порядке
+    let done = feed(&a, &format!("&parent={p}&status=done")).await;
+    assert_eq!(ids_of(&done), order[..8], "{done}");
+    // у отдельной задачи подзадач нет; ссылка k: тоже принимается
+    assert!(ids_of(&feed(&a, &format!("&parent={other}")).await).is_empty());
+    assert_eq!(ids_of(&feed(&a, &format!("&parent=k:{p}")).await), order);
+    // не своего вида и вместе — 422; неверный id, флаг и курсор — 400
+    for (q, code) in [
+        (
+            "?kind=idea&top_level=1".to_string(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            format!("?kind=idea&parent={p}"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        ("?top_level=1".to_string(), StatusCode::UNPROCESSABLE_ENTITY),
+        (
+            format!("?kind=task&top_level=1&parent={p}"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        ("?kind=task&parent=xyz".to_string(), StatusCode::BAD_REQUEST),
+        (
+            "?kind=task&top_level=2".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("?kind=task&parent={p}&cursor=x"),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let r = a.t(Method::GET, &format!("{KN}{q}"), None).await;
+        assert_eq!(r.status, code, "{q}: {}", r.text());
+    }
+}
+
+/// Цикл `part_of` любой длины (2, 3, 10 задач): все задачи цикла — верхнего уровня, ни у одной
+/// нет `parent` и подзадач из цикла; ребро задачи цикла к общей вне цикла тоже не учитывается
+/// (решение 21); задача вне цикла (`D part_of A`) — подзадача задачи цикла.
+#[tokio::test]
+async fn part_of_cycle_keeps_top_level() {
+    let a = api("tasks-subtasks-cycle", |_| {}).await;
+    let mut cycles: Vec<Vec<String>> = Vec::new();
+    for n in [2, 3, 10] {
+        let mut c = Vec::new();
+        for i in 0..n {
+            c.push(id(&new_task(&a, &format!("Цикл {n}.{i}"), json!({})).await));
+        }
+        for (i, t) in c.iter().enumerate() {
+            part_of(&a, t, &c[(i + 1) % n]).await;
+        }
+        cycles.push(c);
+    }
+    let x = id(&new_task(&a, "Общая вне цикла", json!({})).await);
+    let y = id(&new_task(&a, "Шаг общей", json!({})).await);
+    part_of(&a, &y, &x).await;
+    part_of(&a, &cycles[1][0], &x).await;
+    let d = id(&new_task(&a, "D", json!({})).await);
+    let a0 = cycles[0][0].clone();
+    part_of(&a, &d, &a0).await;
+    let top = ids_of(&feed(&a, "&top_level=1").await);
+    for c in &cycles {
+        for t in c {
+            assert!(top.contains(t), "задача цикла на верхнем уровне: {t}");
+            let j = get(&a, t).await;
+            assert!(j["parent"].is_null(), "{j}");
+            if *t != a0 {
+                assert!(j.get("subtasks").is_none(), "{j}");
+            }
+        }
+    }
+    assert!(top.contains(&x) && !top.contains(&y) && !top.contains(&d));
+    assert_eq!(top.len(), 2 + 3 + 10 + 1, "{top:?}");
+    // у A — только D
+    let j = get(&a, &a0).await;
+    assert_eq!(j["subtasks"]["total"], 1, "{j}");
+    assert_eq!(j["subtasks"]["items"][0]["id"], d.as_str(), "{j}");
+    assert_eq!(get(&a, &d).await["parent"]["id"], a0.as_str());
+    assert_eq!(ids_of(&feed(&a, &format!("&parent={a0}")).await), [d]);
+    // у общей вне цикла — только её шаг, задача цикла не в счёт
+    let j = get(&a, &x).await;
+    assert_eq!(j["subtasks"]["total"], 1, "{j}");
+    assert_eq!(ids_of(&feed(&a, &format!("&parent={x}")).await), [y]);
+}
+
+/// Подзадача в другом пространстве (Knowledge → общая в решении): в сводку не входит, у неё
+/// нет `parent`, в Knowledge она — верхнего уровня.
+#[tokio::test]
+async fn subtasks_other_space_not_counted() {
+    const G: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e35";
+    let a = api("tasks-subtasks-space", |_| {}).await;
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G, "name": "Подзадачи"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let mut sol = Vec::new();
+    for title in ["Общая решения", "Шаг решения"] {
+        let r = a
+            .t(
+                Method::POST,
+                &format!("/api/v1/spaces/{G}/entries"),
+                Some(json!({"kind": "task", "title": title, "body": "план"})),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        sol.push(id(&r.json()));
+    }
+    let (u, s1) = (sol[0].clone(), sol[1].clone());
+    let s2 = id(&new_task(&a, "Шаг в Knowledge", json!({})).await);
+    part_of(&a, &s1, &u).await;
+    part_of(&a, &s2, &u).await;
+    let j = get(&a, &u).await;
+    assert_eq!(j["subtasks"]["total"], 1, "{j}");
+    assert_eq!(j["subtasks"]["items"][0]["id"], s1.as_str(), "{j}");
+    assert!(get(&a, &s2).await["parent"].is_null());
+    assert_eq!(get(&a, &s1).await["parent"]["id"], u.as_str());
+    assert!(ids_of(&feed(&a, "&top_level=1").await).contains(&s2));
+    assert_eq!(ids_of(&feed_in(&a, G, "&top_level=1").await), [u.as_str()]);
+    assert_eq!(ids_of(&feed_in(&a, G, &format!("&parent={u}")).await), [s1]);
+}
+
+/// `updated_at` записи `id` — `hours` часов назад (прямо в базе: часы `freeze_now` общие для
+/// процесса и сдвинули бы сроки захватов соседних тестов). Возвращает записанное время.
+async fn age(a: &Api, id: &str, hours: i64) -> Timestamp {
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let ts = zam_store::time::fmt_ts(Timestamp::now() - SignedDuration::from_hours(hours));
+    let id = id.to_string();
+    let at = ts.clone();
+    db.write(move |c| {
+        c.execute(
+            "UPDATE entries SET updated_at = ?2 WHERE id = ?1",
+            [&id, &at],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    ts.parse().unwrap()
+}
+
+/// Время в поле `field` значения `v`.
+fn ts_of(v: &Value, field: &str) -> Timestamp {
+    v[field]
+        .as_str()
+        .unwrap_or_else(|| panic!("нет {field}: {v}"))
+        .parse()
+        .unwrap()
+}
+
+/// «Давно без обновлений»: `in_progress`, захвата нет, задача и её подзадачи не менялись больше
+/// 12 ч — `stale: true` (карточка и лента); `last_activity_at` — позднейшее из `updated_at`
+/// задачи и подзадач; правка подзадачи снимает `stale`, `last_activity_at` — её время; захват с
+/// истёкшим сроком — не захват.
+#[tokio::test]
+async fn stale_in_progress_after_12h_without_claim() {
+    let a = api("tasks-stale", |_| {}).await;
+    let p = id(&new_task(&a, "Давняя", json!({})).await);
+    let s = id(&new_task(&a, "Её шаг", json!({})).await);
+    part_of(&a, &s, &p).await;
+    status(&a, &p, "in_progress").await;
+    let fresh = get(&a, &p).await;
+    assert!(fresh.get("stale").is_none(), "{fresh}");
+    let tp = age(&a, &p, 14).await;
+    let ts = age(&a, &s, 13).await;
+    let j = get(&a, &p).await;
+    assert_eq!(j["stale"], true, "{j}");
+    assert_eq!(ts_of(&j, "last_activity_at"), ts.max(tp), "{j}");
+    let f = feed(&a, "").await;
+    assert_eq!(item(&f, &p)["stale"], true, "{f}");
+    assert!(item(&f, &s).get("stale").is_none(), "шаг open: {f}");
+    // правка подзадачи — свежая активность общей
+    let e = status(&a, &s, "in_progress").await;
+    let j = get(&a, &p).await;
+    assert!(j.get("stale").is_none(), "{j}");
+    assert_eq!(
+        ts_of(&j, "last_activity_at"),
+        ts_of(&e, "updated_at"),
+        "{j}"
+    );
+    // без подзадач: истёкший захват — как его нет
+    let q = id(&new_task(&a, "Одна", json!({})).await);
+    status(&a, &q, "in_progress").await;
+    let r = claim(&a, &q, Some("cs-old"), json!({"ttl_min": 1})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let qid = q.clone();
+    let past = zam_store::time::fmt_ts(Timestamp::now() - SignedDuration::from_hours(1));
+    db.write(move |c| {
+        c.execute(
+            "UPDATE entries SET data = json_set(data, '$.claimed_by.until', ?2) WHERE id = ?1",
+            [&qid, &past],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let tq = age(&a, &q, 13).await;
+    let j = get(&a, &q).await;
+    assert_eq!(j["stale"], true, "{j}");
+    assert_eq!(ts_of(&j, "last_activity_at"), tq, "{j}");
+}
+
+/// Живой захват снимает «давно без обновлений» при том же возрасте; не `in_progress` — тоже.
+#[tokio::test]
+async fn stale_not_with_live_claim() {
+    let a = api("tasks-stale-claim", |_| {}).await;
+    let p = id(&new_task(&a, "Захваченная", json!({})).await);
+    status(&a, &p, "in_progress").await;
+    let r = claim(&a, &p, Some("cs-live"), json!({"ttl_min": 120})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    age(&a, &p, 14).await;
+    let j = get(&a, &p).await;
+    assert!(j.get("stale").is_none(), "{j}");
+    assert!(j["last_activity_at"].is_string(), "{j}");
+    assert!(item(&feed(&a, "").await, &p).get("stale").is_none());
+    // тот же возраст без захвата — «давно без обновлений»: дело именно в захвате
+    let r = release(&a, &p, Some("cs-live")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(get(&a, &p).await["stale"], true);
+    // открытая и заблокированная задача того же возраста — не «давно без обновлений»
+    for st in ["open", "blocked"] {
+        let t = id(&new_task(&a, &format!("Старая {st}"), json!({})).await);
+        if st != "open" {
+            status(&a, &t, st).await;
+        }
+        age(&a, &t, 14).await;
+        let j = get(&a, &t).await;
+        assert!(j.get("stale").is_none(), "{st}: {j}");
+    }
+}
+
+/// Счётчики статусов доски — `entries/counts?kind=task&top_level=1` без подзадач,
+/// `parent=<id>` — по прямым подзадачам; не у задач и вместе — 422, неверный флаг или id — 400
+/// (ревью r1, Minor 4: разбор у счётчиков — свой вызов `SubtaskFilter::parse`).
+#[tokio::test]
+async fn counts_top_level() {
+    let a = api("tasks-subtasks-counts", |_| {}).await;
+    let p = id(&new_task(&a, "Общая", json!({})).await);
+    let other = id(&new_task(&a, "Другая", json!({})).await);
+    status(&a, &other, "in_progress").await;
+    let mut steps = Vec::new();
+    for i in 0..3 {
+        let s = id(&new_task(&a, &format!("Шаг {i}"), json!({})).await);
+        part_of(&a, &s, &p).await;
+        steps.push(s);
+    }
+    status(&a, &steps[0], "done").await;
+    let counts = |q: String| {
+        let a = &a;
+        async move {
+            let r = a
+                .t(
+                    Method::GET,
+                    &format!("/api/v1/spaces/knowledge/entries/counts{q}"),
+                    None,
+                )
+                .await;
+            (r.status, r.json())
+        }
+    };
+    let all = json!({"open": 3, "in_progress": 1, "blocked": 0, "done": 1, "dropped": 0});
+    assert_eq!(counts("?kind=task".into()).await, (StatusCode::OK, all));
+    let top = json!({"open": 1, "in_progress": 1, "blocked": 0, "done": 0, "dropped": 0});
+    assert_eq!(
+        counts("?kind=task&top_level=1".into()).await,
+        (StatusCode::OK, top)
+    );
+    let kids = json!({"open": 2, "in_progress": 0, "blocked": 0, "done": 1, "dropped": 0});
+    assert_eq!(
+        counts(format!("?kind=task&parent={p}")).await,
+        (StatusCode::OK, kids)
+    );
+    // разбор фильтров у счётчиков — тот же, что у ленты (`SubtaskFilter::parse`): не у задач и
+    // вместе — 422, неверный флаг и id — 400
+    for (q, code) in [
+        (
+            "?kind=idea&top_level=1".to_string(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "?kind=question&parent=x".to_string(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            format!("?kind=idea&parent={p}"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            format!("?kind=task&top_level=1&parent={p}"),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "?kind=task&top_level=2".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        ("?kind=task&parent=xyz".to_string(), StatusCode::BAD_REQUEST),
+        (
+            "?kind=idea&top_level=yes".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        // вид без статусов — 400 раньше фильтров (прежнее правило счётчиков)
+        (
+            "?kind=changelog&top_level=1".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let (got, j) = counts(q.clone()).await;
+        assert_eq!(got, code, "{q}: {j}");
+    }
 }
