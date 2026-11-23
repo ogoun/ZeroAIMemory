@@ -28,9 +28,10 @@
   // Правка и корзина (M7.2, спецификация §5.9): в карточке — «Изменить» (`EntryEdit`: заголовок,
   // текст, приоритет, кто ведёт, оценка, ссылки, теги, область; несохранённое в форме — вопрос перед
   // закрытием панели) и «Удалить» (в корзину, с подтверждением); «Корзина» доски — вместо доски
-  // удалённые задачи с «Восстановить» (`JournalTrash`). Форма и корзина — ленивые чанки. Пока форма
-  // правки открыта, смена статуса, «Снять захват» и «Следующий шаг» неактивны (набранное молча не
-  // теряется); 409 формы переносит и черновик шага (`reread`).
+  // удалённые задачи с «Восстановить» (`JournalTrash`). Форма и корзина — ленивые чанки. Смена статуса,
+  // «Снять захват», «Сохранить шаг» и переход к другой задаче закрывают открытую форму правки, при
+  // несохранённом — сначала вопрос (`leaveEdit`, проверка ухода `EntryEdit`); 409 формы переносит и
+  // черновик шага (`reread`).
   import { tick, untrack } from 'svelte';
   import FileRefs from './FileRefs.svelte';
   import JournalSplit from './JournalSplit.svelte';
@@ -52,6 +53,7 @@
     type Entry,
     type EntryStatus,
   } from '../lib/api';
+  import { LEAVE_EDIT } from '../lib/leaveEdit';
   import { trashAsk } from '../lib/entryTrash';
   import { focusSoon } from '../lib/focus';
   import { loadRefs, staleOf, type RefsByTarget } from '../lib/fileRefs';
@@ -148,8 +150,8 @@
   /** Итог действия, закрывшего карточку (удаление), — над доской. */
   let boardNotice = $state('');
   let ask = $state<Ask | null>(null);
-  /** Форма правки (`EntryEdit`): её несохранённое — в `unsaved()`. */
-  let editor = $state<{ dirty: () => boolean } | null>(null);
+  /** Форма правки (`EditPanel`): её несохранённое — в `unsaved()` и `leaveEdit()`. */
+  let editor = $state<{ dirty: () => boolean; leave: () => boolean; release: () => void } | null>(null);
 
   let nStep = $state('');
   let nTitle = $state('');
@@ -484,8 +486,20 @@
 
   /** Закрыли карточку («← Задачи», фон, Esc): форма новой задачи закрывается здесь. */
   function closeDetail() {
+    // несохранённое панель уже спросила («Закрыть без сохранения?») — переход не спрашивает снова
+    editor?.release();
     mode = 'none';
     actionError = '';
+  }
+
+  /** Действие закроет открытую форму правки (смена статуса, шаг, захват): при несохранённом —
+   * сначала вопрос; `false` — остаться. */
+  function leaveEdit(): boolean {
+    if (mode !== 'edit') return true;
+    if (editor && !editor.leave()) return false;
+    editor?.release();
+    mode = 'none';
+    return true;
   }
 
   /** Несохранённое в панели (вопрос перед закрытием): поля — так, как уйдут при отправке
@@ -537,6 +551,7 @@
       : TASK_COLUMNS.filter((s) => s !== e.status);
 
   function startStatus(s: EntryStatus) {
+    if (!leaveEdit()) return;
     toStatus = s;
     sReason = '';
     sBlocked = cur ? str(cur.data, 'blocked_by') : '';
@@ -565,7 +580,7 @@
   function saveStep(e: SubmitEvent) {
     e.preventDefault();
     const c = cur;
-    if (!c) return;
+    if (!c || !leaveEdit()) return;
     act(async () => {
       await patchEntry(user, c.id, c.rev, { next_step: stepDraft.trim() });
     }, 'Следующий шаг сохранён.');
@@ -573,13 +588,16 @@
 
   function release() {
     const c = cur;
-    if (!c) return;
+    if (!c || !leaveEdit()) return;
     act(async () => {
       await releaseTask(user, c.id);
     }, 'Захват снят.');
   }
 
   function startEdit() {
+    // открыта форма статуса с набранной причиной или блокером — сначала вопрос
+    const typed = mode === 'status' && (!!sReason.trim() || (toStatus === 'blocked' && sBlocked.trim() !== str(cur?.data ?? {}, 'blocked_by')));
+    if (typed && !window.confirm(LEAVE_EDIT)) return;
     actionError = '';
     notice = '';
     mode = 'edit';
@@ -948,8 +966,8 @@
 
       {#if c.status !== 'done' && c.status !== 'dropped'}
         <form class="row" onsubmit={saveStep}>
-          <input bind:value={stepDraft} placeholder="следующий шаг" aria-label="Следующий шаг" maxlength="2000" disabled={mode === 'edit'} />
-          <button type="submit" disabled={busy || mode === 'edit'}>Сохранить шаг</button>
+          <input bind:value={stepDraft} placeholder="следующий шаг" aria-label="Следующий шаг" maxlength="2000" />
+          <button type="submit" disabled={busy}>Сохранить шаг</button>
         </form>
       {:else if str(c.data, 'next_step')}
         <p class="muted">Дальше было: {str(c.data, 'next_step')}</p>
@@ -957,19 +975,19 @@
 
       <div class="row actions" role="group" aria-label="Смена статуса">
         {#each targets(c) as s (s)}
-          <button type="button" onclick={() => startStatus(s)} disabled={busy || mode === 'edit'}>
+          <button type="button" onclick={() => startStatus(s)} disabled={busy}>
             {c.status === 'done' || c.status === 'dropped' ? 'Переоткрыть' : `→ ${STATUS_TEXT[s]}`}
           </button>
         {/each}
-        {#if claim}<button type="button" class="danger" onclick={release} disabled={busy || mode === 'edit'}>Снять захват</button>{/if}
+        {#if claim}<button type="button" class="danger" onclick={release} disabled={busy}>Снять захват</button>{/if}
       </div>
       {#if mode !== 'edit'}
         <div class="row actions" role="group" aria-label="Правка задачи">
-          <button type="button" onclick={startEdit} disabled={busy || mode === 'status'}>Изменить</button>
+          <button type="button" onclick={startEdit} disabled={busy}>Изменить</button>
           <button type="button" class="danger" onclick={() => askDelete(c)} disabled={busy}>Удалить</button>
         </div>
       {/if}
-      {#if notice}<p class="muted" role="status">{notice}</p>{/if}
+      <Notice text={notice} />
 
       {#if mode === 'edit'}
         <EditPanel bind:this={editor} {user} entry={c} onsaved={edited} oncancel={cancelEdit} onreread={reread} {onexpired} />

@@ -425,7 +425,7 @@
         {/if}
         <button type="button" class="danger" onclick={() => askDelete(c)} disabled={busy}>Удалить</button>
       </div>
-      {#if notice}<p class="muted" role="status">{notice}</p>{/if}
+      <Notice text={notice} />
       {#if mode === 'none' && actionError}<p class="error" role="alert">{actionError}</p>{/if}
       {#if mode === 'retract'}
         <form class="form" onsubmit={submitRetract} aria-label="Отзыв термина">

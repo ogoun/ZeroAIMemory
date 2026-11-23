@@ -10,9 +10,10 @@
   // Правка и корзина (M7.2, спецификация §5.9): у открытого вопроса — «Изменить» (`EntryEdit`:
   // текст вопроса, теги, область) и «Неактуален» (`status: obsolete` с причиной); у любого —
   // «Удалить» (в корзину, с подтверждением); «Корзина» — удалённые вопросы с «Восстановить»
-  // (`JournalTrash`). Форма и корзина — ленивые чанки. Пока форма открыта, «Изменить» другого
-  // вопроса и «Корзина» неактивны; вопрос, отвеченный в другом месте за время правки, закрывает
-  // форму с объяснением.
+  // (`JournalTrash`). Форма и корзина — ленивые чанки. Форма привязана к вопросу: переход по адресу,
+  // «Изменить» другого вопроса и «Корзина» её закрывают, при несохранённом — сначала вопрос
+  // (`EntryEdit`: проверка ухода и `leave()`); вопрос, отвеченный в другом месте за время правки,
+  // закрывает форму с объяснением. Переход к записи выключает «Корзину».
 
   import { tick, untrack } from 'svelte';
   import EditPanel from './EditPanel.svelte';
@@ -88,11 +89,18 @@
   $effect(() => {
     const u = user;
     const s = space;
+    const id = entry;
     untrack(() => {
       if (scopeOf !== `${u}|${s}`) {
         scopeOf = `${u}|${s}`;
         trash = false;
-        editing = '';
+        notice = '';
+      }
+      // переход: форма закрывается (уход с несохранённым спросил `EntryEdit`), к записи — корзина
+      // выключается, прежний итог убирается
+      editing = '';
+      if (id) {
+        trash = false;
         notice = '';
       }
       load(u, s, true);
@@ -233,7 +241,20 @@
   /** Вопрос `e` в списке — новой ревизией (после правки или перечитывания). */
   const replace = (e: Entry) => (items = items.map((x) => (x.id === e.id ? e : x)));
 
+  /** Открытая форма правки (`EditPanel`): её несохранённое — в `leaveEdit`. */
+  let editor = $state<{ leave: () => boolean; release: () => void } | null>(null);
+
+  /** Действие закроет открытую форму: при несохранённом — сначала вопрос; `false` — остаться. */
+  function leaveEdit(): boolean {
+    if (!editing) return true;
+    if (editor && !editor.leave()) return false;
+    editor?.release();
+    editing = '';
+    return true;
+  }
+
   function startEdit(q: Entry) {
+    if (editing !== q.id && !leaveEdit()) return;
     editing = q.id;
     errors[q.id] = '';
     notice = '';
@@ -315,6 +336,7 @@
   }
 
   function toggleTrash() {
+    if (!leaveEdit()) return;
     trash = !trash;
     notice = '';
     // назад к списку: восстановленные из корзины — в нём
@@ -326,7 +348,7 @@
 
 <section class="journal questions" bind:this={root}>
   <div class="row bar">
-    <button type="button" class="toggle" aria-pressed={trash} disabled={!!editing} onclick={toggleTrash}>Корзина</button>
+    <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
   </div>
   <Notice text={notice} />
   {#if trash}
@@ -352,7 +374,7 @@
           {/if}
 
           {#if q.status === 'open' && editing === q.id}
-            <EditPanel {user} entry={q} onsaved={saved} oncancel={() => closeEdit(q.id)} onreread={reread} {onexpired} />
+            <EditPanel bind:this={editor} {user} entry={q} onsaved={saved} oncancel={() => closeEdit(q.id)} onreread={reread} {onexpired} />
           {:else if q.status === 'open'}
             {#if opts.length}
               <div class="row opts" role="group" aria-label="Варианты ответа">
@@ -421,7 +443,7 @@
                  вопросы различимы -->
             <div class="row acts" role="group" aria-label="Действия с вопросом">
               {#if q.status === 'open'}
-                <button type="button" class="small-btn" aria-label="Изменить «{q.title}»" disabled={!!editing} onclick={() => startEdit(q)}>Изменить</button>
+                <button type="button" class="small-btn" aria-label="Изменить «{q.title}»" onclick={() => startEdit(q)}>Изменить</button>
                 <button type="button" class="small-btn" aria-label="Неактуален «{q.title}»" onclick={() => askObsolete(q)}>Неактуален</button>
               {/if}
               <button type="button" class="small-btn danger" aria-label="Удалить «{q.title}»" onclick={() => askDelete(q)}>Удалить</button>

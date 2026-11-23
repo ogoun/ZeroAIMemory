@@ -690,6 +690,9 @@ test('entry_edit_stale_rev_rereads', async ({ page }) => {
 
 // ---- ревью задачи 10, круг 1 (M3, M5): релизы, корзины прочих журналов, участник `ro` ----
 
+/** Вопрос перед уходом из формы правки с несохранённым (`LEAVE_EDIT`, `web/src/lib/entryEdit.ts`). */
+const LEAVE_EDIT = 'В форме есть несохранённый текст. Закрыть её без сохранения?';
+
 /** Корзина журнала: переключатель на странице и область корзины. */
 const trashToggle = (page: Page) => page.locator('section.journal').getByRole('button', { name: 'Корзина', exact: true });
 const trashRegion = (page: Page) => page.getByRole('region', { name: 'Корзина' });
@@ -728,13 +731,21 @@ test('releases_edit_and_trash_restore', async ({ page }) => {
   await compare.getByRole('button', { name: 'Изменить', exact: true }).click();
   const form = compare.getByRole('form', { name: 'Правка релиза' });
   await expect(form.getByLabel('Заголовок')).toBeFocused();
-  // форма открыта — выбор другого релиза, «Сравнить с» и «Корзина» неактивны (набранное цело)
-  const list = page.getByRole('list', { name: 'Релизы' });
-  await expect(list.getByRole('button', { name: /1\.0\.0/ })).toBeDisabled();
-  await expect(page.getByLabel('Сравнить с')).toBeDisabled();
-  await expect(trashToggle(page)).toBeDisabled();
   await form.getByLabel('Заголовок').fill('Релиз 1.1.0 «Осень»');
   await form.getByLabel('Текст').fill('Второй, с правкой.');
+  // выбор другого релиза и «Корзина» при несохранённом — сначала вопрос; «Отмена» вопроса —
+  // релиз и форма с набранным на месте
+  const list = page.getByRole('list', { name: 'Релизы' });
+  for (const leave of [list.getByRole('button', { name: /1\.0\.0/ }), trashToggle(page)]) {
+    page.once('dialog', (d) => {
+      expect([d.type(), d.message()]).toEqual(['confirm', LEAVE_EDIT]);
+      void d.dismiss();
+    });
+    await leave.click();
+    await expect(page.getByRole('heading', { name: 'Релиз 1.1.0' })).toBeVisible();
+    await expect(form.getByLabel('Заголовок')).toHaveValue('Релиз 1.1.0 «Осень»');
+  }
+  await expect(trashToggle(page)).toHaveAttribute('aria-pressed', 'false');
   const saved = page.waitForResponse((r) => r.request().method() === 'PATCH' && r.url().endsWith(`/entries/${r2.id}`));
   await form.getByRole('button', { name: 'Сохранить' }).click();
   const resp = await saved;
@@ -813,6 +824,71 @@ test('journals_trash_insights_glossary_ideas_questions', async ({ page }) => {
   await expect(qcard).toHaveCount(0);
   await restoreFromTrash(page, q.id, 'Вопрос в корзину');
   await expect(qcard).toContainText('Вопрос в корзину');
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('changelog_edit_follows_entry', async ({ page }) => {
+  // ревью задачи 10, круг 2 (N1, N2): форма правки привязана к записи — переход к другой записи
+  // (адрес, Ctrl+K) её закрывает, кнопки журнала снова доступны; с несохранённым — сначала вопрос,
+  // «Отмена» вопроса оставляет запись и набранное; переход к записи выключает «Корзину»
+  const problems = watch(page);
+  const guid = await newSolution('форма и переход');
+  const post = (title: string) =>
+    agentApi<Rec>('POST', `spaces/${guid}/entries`, { kind: 'changelog', title, body: '', data: { kind: 'fix' } });
+  const x = await post('Запись X');
+  const y = await post('Запись Y');
+  const c = await pageCtx(page);
+  const at = (id: string) => `#/u/${c.user}/s/${guid}/j/changelog/${id}`;
+  const go = (h: string) => page.evaluate((hash) => (location.hash = hash), h);
+  const opened = page.locator('.focused');
+  await page.goto(`${base()}${at(x.id)}`);
+  await expect(opened.getByRole('heading')).toHaveText('Запись X');
+  await opened.getByRole('button', { name: 'Изменить «Запись X»' }).click();
+  await expect(opened.getByRole('form', { name: 'Правка записи' })).toBeVisible();
+
+  // без набранного: переход закрывает форму сразу, без вопроса; кнопки журнала доступны
+  page.on('dialog', (d) => {
+    problems.push(`неожиданный вопрос: ${d.message()}`);
+    void d.dismiss();
+  });
+  await go(at(y.id));
+  await expect(opened.getByRole('heading')).toHaveText('Запись Y');
+  await expect(page.getByRole('form', { name: 'Правка записи' })).toHaveCount(0);
+  for (const b of [
+    opened.getByRole('button', { name: 'Изменить «Запись Y»' }),
+    page.getByRole('feed', { name: 'Лента changelog' }).getByRole('button', { name: 'Изменить «Запись X»' }),
+    trashToggle(page),
+  ]) {
+    await expect(b).toBeEnabled();
+  }
+  page.removeAllListeners('dialog');
+
+  // с набранным: переход спрашивает; «Отмена» — адрес и форма с текстом на месте; согласие — форма
+  // закрыта, запись X открыта
+  await opened.getByRole('button', { name: 'Изменить «Запись Y»' }).click();
+  const form = opened.getByRole('form', { name: 'Правка записи' });
+  await form.getByLabel('Заголовок').fill('Y с правкой');
+  page.once('dialog', (d) => {
+    expect([d.type(), d.message()]).toEqual(['confirm', LEAVE_EDIT]);
+    void d.dismiss();
+  });
+  await go(at(x.id));
+  await expect(page).toHaveURL(new RegExp(`/j/changelog/${y.id}$`));
+  await expect(form.getByLabel('Заголовок')).toHaveValue('Y с правкой');
+  page.once('dialog', (d) => void d.accept());
+  await go(at(x.id));
+  await expect(opened.getByRole('heading')).toHaveText('Запись X');
+  await expect(page.getByRole('form', { name: 'Правка записи' })).toHaveCount(0);
+  await expect(opened.getByRole('button', { name: 'Изменить «Запись X»' })).toBeEnabled();
+  expect((await agentApi<Rec>('GET', `entries/${y.id}`)).title).toBe('Запись Y');
+
+  // при нажатой «Корзине» переход к записи показывает её: корзина выключается
+  await trashToggle(page).click();
+  await expect(trashRegion(page)).toBeVisible();
+  await go(at(y.id));
+  await expect(trashToggle(page)).toHaveAttribute('aria-pressed', 'false');
+  await expect(trashRegion(page)).toHaveCount(0);
+  await expect(opened.getByRole('heading')).toHaveText('Запись Y');
   expect(problems, problems.join('\n')).toEqual([]);
 });
 

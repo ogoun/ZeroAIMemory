@@ -761,7 +761,7 @@
         {/if}
         <button type="button" class="danger" onclick={() => askDelete(c)} disabled={busy}>Удалить</button>
       </div>
-      {#if notice}<p class="muted" role="status">{notice}</p>{/if}
+      <Notice text={notice} />
 
       {#if mode === 'supersede'}
         <form class="form" onsubmit={submitSupersede} aria-label="Замена insight">
@@ -1077,7 +1077,9 @@
   .small {
     font-size: 12px;
   }
+  /* «×» триггера — прежний кегль: общее `button.small-btn` (app.css) задаёт 12 px */
   .small-btn {
     padding: 0 6px;
+    font-size: inherit;
   }
 </style>

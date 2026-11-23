@@ -2,8 +2,8 @@
   // Ленивая часть журнала (M7.2, спецификация §5.9): форма правки `EntryEdit` и корзина
   // `JournalTrash` грузятся отдельными чанками при первом «Изменить» и «Корзина» — в основной
   // чанк не входят. Одна обёртка на все журналы: «Загрузка…», компонент с `props`, сбой загрузки —
-  // `LazyFail` (§5.1 п. 9) с «Отмена» (`oncancel`). `dirty()` — несохранённое загруженного компонента
-  // (у формы правки), пока он не пришёл — нет.
+  // `LazyFail` (§5.1 п. 9) с «Отмена» (`oncancel`). `instance()` — загруженный компонент (его
+  // экспорты: у формы правки — `dirty`, `leave`, `release`), пока он не пришёл — `undefined`.
   import type { Component, ComponentProps } from 'svelte';
   import LazyFail from './LazyFail.svelte';
 
@@ -19,11 +19,13 @@
 
   let { load, props, what, oncancel }: Props = $props();
 
-  let inner = $state<{ dirty?: () => boolean } | undefined>();
+  /** Экспорты загруженного компонента, которые читают обёртки (`EditPanel`). */
+  type Exports = { dirty?: () => boolean; leave?: () => boolean; release?: () => void };
+  let inner = $state<Exports | undefined>();
 
-  /** В загруженном компоненте есть несохранённое. */
-  export function dirty(): boolean {
-    return inner?.dirty?.() ?? false;
+  /** Загруженный компонент; пока чанк не пришёл — `undefined`. */
+  export function instance(): Exports | undefined {
+    return inner;
   }
 </script>
 

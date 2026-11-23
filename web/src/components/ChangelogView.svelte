@@ -4,8 +4,10 @@
   // спецификация §5.9): у записи — «Изменить» (`EntryEdit`: заголовок, текст, вид, теги, область;
   // 409 — запись перечитана) и «Удалить» (в корзину, с подтверждением); «Корзина» — удалённые
   // записи с «Восстановить» (`JournalTrash`). Форма и корзина — ленивые чанки.
-  // Пока форма открыта, действия, которые её закрыли бы (фильтры, «Корзина», «Изменить» другой
-  // записи), неактивны: набранное молча не теряется.
+  // Форма привязана к записи: переход к другой (Ctrl+K, пункт журнала) её закрывает, а действия,
+  // которые закрыли бы её на месте (фильтры, «Корзина», «Изменить» другой записи), — тоже; при
+  // несохранённом и то и другое сначала спрашивает (`EntryEdit`: проверка ухода и `leave()`).
+  // Переход к записи выключает «Корзину» (запись показывается).
   import { untrack } from 'svelte';
   import EditPanel from './EditPanel.svelte';
   import Notice from './Notice.svelte';
@@ -34,6 +36,8 @@
   let area = $state('');
   /** Область, по которой загружена лента. */
   let appliedArea = $state('');
+  /** Вид, по которому загружена лента (`kind` — значение списка). */
+  let appliedKind = '';
   let loading = $state(false);
   let error = $state('');
   let focused = $state<Entry | null>(null);
@@ -56,6 +60,7 @@
     const s = space;
     untrack(() => {
       kind = '';
+      appliedKind = '';
       area = '';
       appliedArea = '';
       if (scopeOf !== `${u}|${s}`) {
@@ -68,10 +73,19 @@
     });
   });
 
+  // переход: форма прежней записи закрывается (уход с несохранённым спросил `EntryEdit`), к записи —
+  // корзина выключается, прежний итог убирается
   $effect(() => {
     const id = entry;
     const u = user;
-    untrack(() => focus(u, id));
+    untrack(() => {
+      editing = '';
+      if (id) {
+        trash = false;
+        notice = '';
+      }
+      focus(u, id);
+    });
   });
 
   async function focus(u: string, id: string | null) {
@@ -116,8 +130,30 @@
 
   function applyArea(e: SubmitEvent) {
     e.preventDefault();
+    if (!leaveEdit()) return;
     appliedArea = area.trim();
     load(user, space, true);
+  }
+
+  function changeKind() {
+    if (!leaveEdit()) {
+      kind = appliedKind;
+      return;
+    }
+    appliedKind = kind;
+    load(user, space, true);
+  }
+
+  /** Открытая форма правки (`EditPanel`): её несохранённое — в `leaveEdit`. */
+  let editor = $state<{ leave: () => boolean; release: () => void } | null>(null);
+
+  /** Действие закроет открытую форму: при несохранённом — сначала вопрос; `false` — остаться. */
+  function leaveEdit(): boolean {
+    if (!editing) return true;
+    if (editor && !editor.leave()) return false;
+    editor?.release();
+    editing = '';
+    return true;
   }
 
   /** Запись `e` в ленте и в открытой — новой ревизией (после правки или перечитывания). */
@@ -127,6 +163,7 @@
   }
 
   function startEdit(e: Entry) {
+    if (editing !== e.id && !leaveEdit()) return;
     editing = e.id;
     cardError[e.id] = '';
     notice = '';
@@ -174,6 +211,7 @@
   }
 
   function toggleTrash() {
+    if (!leaveEdit()) return;
     trash = !trash;
     notice = '';
     // назад к ленте: восстановленные из корзины — в ней
@@ -215,10 +253,10 @@
       </div>
     {/each}
     {#if edit}
-      <EditPanel {user} entry={e} onsaved={saved} oncancel={() => closeEdit(e.id)} onreread={replace} {onexpired} />
+      <EditPanel bind:this={editor} {user} entry={e} onsaved={saved} oncancel={() => closeEdit(e.id)} onreread={replace} {onexpired} />
     {:else}
       <div class="row actions">
-        <button type="button" class="small-btn" aria-label="Изменить «{e.title}»" disabled={!!editing} onclick={() => startEdit(e)}>Изменить</button>
+        <button type="button" class="small-btn" aria-label="Изменить «{e.title}»" onclick={() => startEdit(e)}>Изменить</button>
         <button type="button" class="small-btn danger" aria-label="Удалить «{e.title}»" onclick={() => askDelete(e)}>Удалить</button>
       </div>
     {/if}
@@ -231,7 +269,7 @@
     {#if !trash}
       <label class="row">
         Вид
-        <select bind:value={kind} aria-label="Вид записи" disabled={!!editing} onchange={() => load(user, space, true)}>
+        <select bind:value={kind} aria-label="Вид записи" onchange={changeKind}>
           <option value="">все</option>
           {#each CHANGELOG_KINDS as k (k)}<option value={k}>{k}</option>{/each}
         </select>
@@ -240,9 +278,9 @@
         Область
         <input bind:value={area} placeholder="например, web" aria-label="Область" />
       </label>
-      <button type="submit" disabled={!!editing}>Применить</button>
+      <button type="submit">Применить</button>
     {/if}
-    <button type="button" class="toggle" aria-pressed={trash} disabled={!!editing} onclick={toggleTrash}>Корзина</button>
+    <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
   </form>
 
   <Notice text={notice} />

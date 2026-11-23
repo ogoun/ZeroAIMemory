@@ -962,10 +962,11 @@ test.describe('настольный', () => {
   });
 
   test('task_edit_stale_keeps_next_step', async ({ page }) => {
-    // ревью задачи 10, круг 1 (I1, M1, M3): пока форма правки открыта, агент меняет следующий шаг →
-    // 409 → карточка перечитана, поле «Следующий шаг» (его не трогали) — шаг агента, «Сохранить шаг»
-    // не затрёт его старым; смена статуса и шаг на время правки неактивны; «Отмена» — фокус на
-    // «Изменить», Esc закрывает панель без вопроса о несохранённом
+    // ревью задачи 10, круги 1–2 (I1, M1, M3, N1): пока форма правки открыта, агент меняет следующий
+    // шаг → 409 → карточка перечитана, поле «Следующий шаг» (его не трогали) — шаг агента,
+    // «Сохранить шаг» не затрёт его старым; смена статуса при набранном в форме — сначала вопрос
+    // («Отмена» вопроса — форма с текстом на месте); «Отмена» — фокус на «Изменить», Esc закрывает
+    // панель без вопроса о несохранённом
     const problems = watch(page, (path, status) => status === 409 && /\/entries\/[0-9A-Za-z]+$/.test(path));
     const guid = await newSolution('правка и шаг агента');
     const t = await api<{ id: string; rev: number }>('POST', `spaces/${guid}/entries`, {
@@ -983,9 +984,15 @@ test.describe('настольный', () => {
     await card.getByRole('button', { name: 'Изменить', exact: true }).click();
     const form = card.getByRole('form', { name: 'Правка задачи' });
     await expect(form.getByLabel('Заголовок')).toBeFocused();
-    await expect(step).toBeDisabled();
-    await expect(card.getByRole('group', { name: 'Смена статуса' }).getByRole('button').first()).toBeDisabled();
     await form.getByLabel('Заголовок').fill('Заголовок человека');
+    // кнопки карточки доступны (без отключений без причины), но закрыть форму с набранным молча нельзя
+    page.once('dialog', (d) => {
+      expect([d.type(), d.message()]).toEqual(['confirm', 'В форме есть несохранённый текст. Закрыть её без сохранения?']);
+      void d.dismiss();
+    });
+    await card.getByRole('group', { name: 'Смена статуса' }).getByRole('button').first().click();
+    await expect(form.getByLabel('Заголовок')).toHaveValue('Заголовок человека');
+    await expect(card.getByRole('form', { name: 'Смена статуса задачи' })).toHaveCount(0);
     const other = await api<{ rev: number }>('PATCH', `entries/${t.id}`, { next_step: 'шаг агента' }, { 'If-Match': `"${t.rev}"` });
     const stale = page.waitForResponse((r) => r.request().method() === 'PATCH' && r.url().endsWith(`/entries/${t.id}`));
     await form.getByRole('button', { name: 'Сохранить' }).click();

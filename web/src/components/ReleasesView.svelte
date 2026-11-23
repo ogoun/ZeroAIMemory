@@ -4,8 +4,9 @@
   // (M7.2, спецификация §5.9): у выбранного релиза — «Изменить» (`EntryEdit`: заголовок, текст,
   // теги, область; версия и коммиты — как есть) и «Удалить» (в корзину, с подтверждением);
   // «Корзина» — удалённые релизы с «Восстановить» (`JournalTrash`). Форма и корзина — ленивые чанки.
-  // Пока форма открыта, выбор другого релиза, «Сравнить с» и «Корзина» неактивны: набранное молча не
-  // теряется.
+  // Форма привязана к выбранному релизу: выбор другого, «Сравнить с», «Корзина» и переход по адресу
+  // её закрывают, при несохранённом — сначала вопрос (`EntryEdit`: проверка ухода и `leave()`).
+  // Переход к записи выключает «Корзину».
   import { untrack } from 'svelte';
   import DiffView from './DiffView.svelte';
   import EditPanel from './EditPanel.svelte';
@@ -68,6 +69,7 @@
   $effect(() => {
     const u = user;
     const s = space;
+    const id = entry;
     untrack(() => {
       if (scopeOf !== `${u}|${s}`) {
         scopeOf = `${u}|${s}`;
@@ -75,6 +77,8 @@
         editing = false;
         notice = '';
       }
+      // переход к записи (Ctrl+K, ссылка) — она показывается: корзина выключается
+      if (id) trash = false;
       load(u, s, true);
     });
   });
@@ -124,7 +128,29 @@
     }
   }
 
+  /** Открытая форма правки (`EditPanel`): её несохранённое — в `leaveEdit`. */
+  let editor = $state<{ leave: () => boolean; release: () => void } | null>(null);
+
+  /** Действие закроет открытую форму: при несохранённом — сначала вопрос; `false` — остаться. */
+  function leaveEdit(): boolean {
+    if (!editing) return true;
+    if (editor && !editor.leave()) return false;
+    editor?.release();
+    editing = false;
+    return true;
+  }
+
+  /** «Сравнить с»: сравнение перечитывается — открытая форма закрывается (с вопросом). */
+  function changeWith(el: HTMLSelectElement) {
+    if (!leaveEdit()) {
+      el.value = withId;
+      return;
+    }
+    withId = el.value;
+  }
+
   function pick(id: string) {
+    if (id !== selected && !leaveEdit()) return;
     withId = '';
     notice = '';
     go({ name: 'journal', user, space, journal: 'releases', entry: id }, { replace: true });
@@ -174,6 +200,7 @@
   }
 
   function toggleTrash() {
+    if (!leaveEdit()) return;
     trash = !trash;
     notice = '';
     // назад к списку: восстановленные из корзины — в нём
@@ -197,7 +224,7 @@
 
 <section class="journal releases" bind:this={root}>
   <div class="row bar">
-    <button type="button" class="toggle" aria-pressed={trash} disabled={editing} onclick={toggleTrash}>Корзина</button>
+    <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
   </div>
   <Notice text={notice} />
   {#if trash}
@@ -212,7 +239,6 @@
               type="button"
               class="rel"
               aria-current={r.id === selected ? 'true' : undefined}
-              disabled={editing}
               onclick={() => pick(r.id)}
             >
               <span class="ver">{version(r)}</span>
@@ -243,7 +269,7 @@
             </div>
             <label class="row with">
               Сравнить с
-              <select bind:value={withId} aria-label="Сравнить с" disabled={editing}>
+              <select value={withId} aria-label="Сравнить с" onchange={(e) => changeWith(e.currentTarget)}>
                 <option value="">предыдущим релизом</option>
                 {#each releases.filter((r) => r.id !== cmp?.to.id) as r (r.id)}
                   <option value={r.id}>{version(r)}</option>
@@ -264,6 +290,7 @@
           </header>
           {#if editing}
             <EditPanel
+              bind:this={editor}
               {user}
               entry={cmp.to}
               onsaved={(e) => refresh(`Релиз «${e.title}» сохранён.`)}

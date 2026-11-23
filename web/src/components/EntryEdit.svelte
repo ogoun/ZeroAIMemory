@@ -8,10 +8,18 @@
   // здесь, и в другом месте, названы; журнал получает перечитанную запись (`onreread`). Несохранённое
   // — `dirty()` (панель доски спрашивает перед закрытием). Ленивый чанк: грузится при первом
   // «Изменить», в основной чанк не входит.
-  import { untrack } from 'svelte';
+  //
+  // Уход с несохранённым (ревью задачи 10, круг 2): пока форма открыта, переход по адресу (запись
+  // из Ctrl+K, пункт журнала, «назад») сначала спрашивает `LEAVE_EDIT` (проверка ухода роутера, как у
+  // редактора заметок; закрытие вкладки — `beforeunload`); журнал закрывает форму на переходе, а
+  // действия, которые закрыли бы её на месте (фильтр, «Корзина», другая запись), спрашивают через
+  // `leave()`. `release()` — журнал уже спросил сам (вопрос панели доски) или закрывает форму.
+  import { onMount, untrack } from 'svelte';
   import { ApiError, errorText, getEntry, isStaleEntry, patchEntry, type Entry, type EntryKind } from '../lib/api';
   import { ESTIMATE_MAX, FIELD_TEXT, fieldsOf, isDirty, patchOf, rebase } from '../lib/entryEdit';
+  import { LEAVE_EDIT } from '../lib/leaveEdit';
   import { CHANGELOG_KINDS, PRIORITIES, PRIORITY_TEXT } from '../lib/journals';
+  import { setGuard } from '../lib/router';
 
   interface Props {
     user: string;
@@ -51,6 +59,31 @@
     return isDirty(f, base);
   }
 
+  /** Журнал уже решил закрыть форму (спросил сам или несохранённого нет): переход не спрашивает. */
+  let released = false;
+
+  /** Можно ли закрыть форму: несохранённого нет или человек согласился его оставить. */
+  export function leave(): boolean {
+    return released || !dirty() || window.confirm(LEAVE_EDIT);
+  }
+
+  /** Форма закрывается по решению журнала: проверка ухода больше не спрашивает. */
+  export function release(): void {
+    released = true;
+  }
+
+  onMount(() => {
+    const off = setGuard(() => leave());
+    const onbeforeunload = (e: BeforeUnloadEvent) => {
+      if (!released && dirty()) e.preventDefault();
+    };
+    window.addEventListener('beforeunload', onbeforeunload);
+    return () => {
+      off();
+      window.removeEventListener('beforeunload', onbeforeunload);
+    };
+  });
+
   /** Фокус на первом поле при открытии формы. */
   function focusOnOpen(node: HTMLElement) {
     node.focus();
@@ -68,7 +101,9 @@
     busy = true;
     error = '';
     try {
-      onsaved(await patchEntry(user, cur.id, cur.rev, r.patch));
+      const saved = await patchEntry(user, cur.id, cur.rev, r.patch);
+      released = true;
+      onsaved(saved);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) return onexpired?.();
       if (isStaleEntry(err)) await reread(errorText(err));
@@ -141,7 +176,7 @@
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   <div class="row end">
     <button type="submit" class="primary" disabled={busy}>Сохранить</button>
-    <button type="button" onclick={oncancel}>Отмена</button>
+    <button type="button" onclick={() => ((released = true), oncancel())}>Отмена</button>
   </div>
 </form>
 
