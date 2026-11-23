@@ -37,6 +37,7 @@
   import { NOTES_HINT, countDescription, countHint, formatCount, notesLabel, openLabel } from '../lib/counts';
   import { counts } from '../lib/counts.svelte';
   import IndexBadge from './IndexBadge.svelte';
+  import LazyFail from './LazyFail.svelte';
 
   interface Props {
     /** Пользователи; свой — первым. */
@@ -253,8 +254,33 @@
       );
     } else {
       items.push({ label: 'Экспорт (.zip)', action: () => void exportSpace(t) });
+      // импорт (§5.7 п. 1): свои пространства, у администратора — любого пользователя; в решение
+      // у участника — нет (сервер ответил бы 403: импорт пишет от имени владельца базы)
+      if (t.space.role !== 'member') items.push({ label: 'Импорт (.zip)…', action: () => void openImport(t) });
     }
     return items;
+  }
+
+  // ---- импорт архива (M7.2, §5.7): диалог — ленивый чанк `ImportDialog` ----
+
+  type ImportDialogType = typeof import('./ImportDialog.svelte').default;
+  let importDialog = $state.raw<ImportDialogType | null>(null);
+  let importing = $state.raw<Target | null>(null);
+  /** Чанк диалога не загрузился: текст под строкой пространства (`LazyFail`, §5.1 п. 9). */
+  let importFail = $state<{ key: string; error: unknown } | null>(null);
+  /** Итог закрытого окна (отправка прервана) — строкой под пространством до следующего импорта. */
+  let importNote = $state<{ key: string; text: string } | null>(null);
+  const kImport = (u: string, ref: string) => `i|${u}|${ref}`;
+
+  async function openImport(t: Target) {
+    importFail = null;
+    importNote = null;
+    try {
+      importDialog ??= (await import('./ImportDialog.svelte')).default;
+      importing = t;
+    } catch (e) {
+      importFail = { key: kImport(t.uid, spaceRef(t.space)), error: e };
+    }
   }
 
   const kExport = (u: string, ref: string) => `x|${u}|${ref}`;
@@ -552,6 +578,16 @@
       <button type="button" class="more" aria-label="Действия: {s.name}" onclick={(e) => menuBelow(e, target)}>⋯</button>
     </div>
     {@render status(kExport(uid, ref))}
+    {#if importNote?.key === kImport(uid, ref)}
+      <div class="tree-note muted" role="status" style:--depth={depth}>{importNote.text}</div>
+    {/if}
+    {#if importFail?.key === kImport(uid, ref)}
+      <div class="tree-note" style:--depth={depth}>
+        <LazyFail error={importFail.error} label="Окно импорта не загрузилось">
+          <button type="button" onclick={() => (importFail = null)}>Закрыть</button>
+        </LazyFail>
+      </div>
+    {/if}
     {#if open[k]}
       {@const js = journalsOf(s.kind)}
       {#if s.kind === 'rules' && rules[uid]?.warning === 'rules_heavy'}
@@ -699,6 +735,26 @@
   <ContextMenu x={menu.x} y={menu.y} items={menu.items} onclose={() => (menu = null)} />
 {/if}
 <Prompt bind:ask />
+{#if importing && importDialog}
+  {@const ImportDialog = importDialog}
+  {@const t = importing}
+  {@const ref = spaceRef(t.space)}
+  <!-- итог без `dry_run`: заметки и вложенные уровни пространства перечитываются; числа разделов
+       помечает устаревшими `importJob` (api.ts) -->
+  <ImportDialog
+    user={t.uid}
+    space={ref}
+    spaceName={t.space.name}
+    userName={t.uid === ownId ? '' : (users.find((u) => u.id === t.uid)?.name ?? t.uid)}
+    onclose={(note) => {
+      // до `importing = null`: `t` и `ref` — производные от него
+      if (note) importNote = { key: kImport(t.uid, ref), text: note };
+      importing = null;
+    }}
+    ondone={() => void refreshSpace(t.uid, ref)}
+    {onexpired}
+  />
+{/if}
 
 <style>
   .tree {
