@@ -77,16 +77,20 @@
   let tabEls = $state<HTMLButtonElement[]>([]);
   let previewPane = $state<HTMLDivElement | null>(null);
 
-  // Окно сузилось (поворот, окно) — выбранной становится панель с фокусом: иначе фокус ушёл бы со
-  // скрытой панели. До обновления DOM (`$effect.pre`): панель ещё видна и фокус на месте.
+  // Смена ширины (поворот, окно) не теряет фокус. Сузилось — выбранной становится панель с
+  // фокусом (иначе фокус ушёл бы со скрытой панели); расширилось с фокусом на вкладке — фокус в её
+  // панель (вкладки исчезают). До обновления DOM (`$effect.pre`): фокус ещё на месте.
   let wasTabbed = false;
   $effect.pre(() => {
     const t = tabbed;
     untrack(() => {
+      const a = document.activeElement;
       if (t && !wasTabbed) {
-        const a = document.activeElement;
         if (previewPane?.contains(a)) pane = 'preview';
         else if (host?.contains(a)) pane = 'source';
+      } else if (!t && wasTabbed && a instanceof HTMLElement && tabEls.includes(a as HTMLButtonElement)) {
+        const p = pane;
+        void tick().then(() => (p === 'source' ? cm?.focus() : previewPane?.focus()));
       }
       wasTabbed = t;
     });
@@ -415,7 +419,7 @@
       {#if !ready && !error}<p class="muted loading">Загрузка редактора…</p>{/if}
     </div>
     <!-- панель — в порядке Tab на узком окне (`tabindex="0"`, образец ARIA APG): в предпросмотре
-         может не быть ни одной цели -->
+         может не быть ни одной цели; на настольном (`-1`) — цель фокуса при расширении окна -->
     <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions, a11y_no_noninteractive_tabindex -->
     <div
       class="pane preview"
@@ -424,7 +428,7 @@
       role={tabbed ? 'tabpanel' : undefined}
       aria-labelledby={tabbed ? `${uid}-tab-preview` : undefined}
       aria-label={tabbed ? undefined : PANE_TITLE.preview}
-      tabindex={tabbed ? 0 : undefined}
+      tabindex={tabbed ? 0 : -1}
       hidden={tabbed && pane !== 'preview'}
       onclick={onpreviewclick}
     >

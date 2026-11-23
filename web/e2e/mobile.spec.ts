@@ -947,6 +947,8 @@ test('editor_phone_modes', async ({ browser }) => {
   const edited = editor.locator('.pane.source .cm-content');
   await page.setViewportSize(VIEWPORTS.desktop);
   await expect(editor.getByRole('tablist')).toHaveCount(0);
+  // фокус был на вкладке «Текст» — вкладки исчезли, фокус в тексте, а не в `body`
+  await expect(edited).toBeFocused();
   await expect(edited).toContainText(`правка-${run}`);
   await expect(editor.locator('.pane.preview')).toContainText(`правка-${run}`);
   await expect(editor.locator('.pane.preview')).toBeVisible();
@@ -958,6 +960,13 @@ test('editor_phone_modes', async ({ browser }) => {
   await expect(prev).toHaveAttribute('aria-selected', 'true');
   await expect(copy).toBeFocused();
   await expect(source).toBeHidden();
+  // расширение с фокусом на вкладке «Предпросмотр» — фокус в предпросмотр; снова узкое — та же вкладка
+  await prev.focus();
+  await page.setViewportSize(VIEWPORTS.desktop);
+  await expect(editor.locator('.pane.preview')).toBeFocused();
+  await page.setViewportSize(VIEWPORTS.phone);
+  await expect(prev).toHaveAttribute('aria-selected', 'true');
+  await expect(editor.locator('.pane.preview')).toBeFocused();
   await text.tap();
   await expect(edited).toContainText(`правка-${run}`);
   // история отмены цела: Ctrl+Z снимает правку (ввод — несколькими шагами), затем ввод заново
