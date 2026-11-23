@@ -59,6 +59,53 @@ async function api<T = Record<string, unknown>>(method: string, path: string, bo
   return (await r.json()) as T;
 }
 
+/** Новое решение администратора — свои записи сценария; возвращает его GUID. */
+async function newSolution(name: string): Promise<string> {
+  const guid = randomUUID();
+  await api('POST', 'solutions', { agent_solution_id: guid, name: `Мобильный E2E: ${name}` });
+  return guid;
+}
+
+/** Вопрос перед уходом из формы с несохранённым (`LEAVE_EDIT`, `web/src/lib/leaveEdit.ts`). */
+const LEAVE_EDIT = 'В форме есть несохранённый текст. Закрыть её без сохранения?';
+
+/**
+ * Несохранённое в карточке журнала на телефоне (финальное ревью M7.2, I1): набранное в `field` —
+ * «← <label>» спрашивает «Закрыть без сохранения?» (адрес `here` прежний), «Продолжить правку» —
+ * текст цел; уход по адресу `away` (ссылка, Ctrl+K, «назад») — вопрос `LEAVE_EDIT`, «Отмена» —
+ * адрес и текст на месте; снова «←» и «Закрыть без сохранения» — список `list`, формы нет.
+ */
+async function unsavedAsksPhone(
+  page: Page,
+  o: { label: string; field: Locator; typed: string; here: RegExp; away: string; list: Locator },
+): Promise<void> {
+  const back = page.getByRole('link', { name: `← ${o.label}` });
+  const ask = page.getByRole('alertdialog', { name: 'Несохранённый текст' });
+  await o.field.fill(o.typed);
+  await back.tap();
+  await expect(ask).toBeVisible();
+  await expect(ask).toHaveAccessibleDescription('В карточке есть несохранённый текст. Закрыть без сохранения?');
+  await expect(page).toHaveURL(o.here);
+  await ask.getByRole('button', { name: 'Продолжить правку' }).tap();
+  await expect(ask).toHaveCount(0);
+  await expect(o.field).toHaveValue(o.typed);
+  let asked = '';
+  page.once('dialog', (d) => {
+    asked = `${d.type()}: ${d.message()}`;
+    void d.dismiss();
+  });
+  await page.evaluate((h) => (location.hash = h), o.away);
+  await expect.poll(() => asked).toBe(`confirm: ${LEAVE_EDIT}`);
+  await expect(page).toHaveURL(o.here);
+  await expect(o.field).toHaveValue(o.typed);
+  await expect(o.list).toBeHidden();
+  await back.tap();
+  await ask.getByRole('button', { name: 'Закрыть без сохранения' }).tap();
+  await expect(o.list).toBeVisible();
+  await expect(ask).toHaveCount(0);
+  await expect(o.field).toHaveCount(0);
+}
+
 // По CSS, а не по роли: закрытая панель inert и выпадает из дерева доступности.
 const sidebar = (page: Page) => page.locator('#sidebar');
 const treeNav = (page: Page) => page.locator('nav[aria-label="Дерево заметок"]');
@@ -553,6 +600,112 @@ test.describe('телефон, сенсорный ввод', () => {
     await minTarget(answer.getByRole('button', { name: 'Ответить' }), 44);
     expect(await noHorizontalScroll(page)).toBe(true);
     await page.screenshot({ path: `${screens}phone-questions.png`, fullPage: true });
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+
+  // финальное ревью M7.2, I1: несохранённое в формах Insights, «Идей» и «Словаря» молча не теряется
+  // ни по «←», ни при уходе по адресу — как у доски задач и формы правки записи
+  test('insights_unsaved_back_asks_phone', async ({ page }) => {
+    // форма отзыва в карточке; без набранного «← Insights» уводит сразу
+    const problems = watch(page);
+    const guid = await newSolution('insights и несохранённое');
+    const e = await api<{ id: string }>('POST', `spaces/${guid}/entries`, {
+      kind: 'insight',
+      title: 'Insight под отзывом',
+      body: 'Суть.',
+      data: { kind: 'gotcha' },
+    });
+    const c = await pageCtx(page);
+    const listUrl = `#/u/${c.user}/s/${guid}/j/insights`;
+    await open(page, listUrl);
+    const table = page.getByRole('table', { name: 'Insights' });
+    const row = table.locator(`tr[data-entry="${e.id}"]`).getByRole('button').first();
+    const card = page.getByRole('article', { name: 'Карточка insight' });
+    const form = card.getByRole('form', { name: 'Отзыв insight' });
+    await row.tap();
+    await card.getByRole('button', { name: 'Отозвать', exact: true }).tap();
+    await unsavedAsksPhone(page, {
+      label: 'Insights',
+      field: form.getByLabel('Причина'),
+      typed: 'Опровергнуто замером',
+      here: new RegExp(`/j/insights/${e.id}$`),
+      away: `#/u/${c.user}/s/${guid}/j/glossary`,
+      list: table,
+    });
+    await expect(page).toHaveURL(/\/j\/insights$/);
+    await row.tap();
+    await card.getByRole('button', { name: 'Отозвать', exact: true }).tap();
+    await expect(form).toBeVisible();
+    await page.getByRole('link', { name: '← Insights' }).tap();
+    await expect(table).toBeVisible();
+    await expect(page.getByRole('alertdialog')).toHaveCount(0);
+    expect((await api<{ status: string }>('GET', `entries/${e.id}`)).status).toBe('active');
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+
+  test('ideas_unsaved_back_asks_phone', async ({ page }) => {
+    // форма правки идеи (`IdeaForm`, ленивый чанк); без набранного «← Идеи» уводит сразу
+    const problems = watch(page);
+    const guid = await newSolution('идеи и несохранённое');
+    const idea = await api<{ id: string }>('POST', `spaces/${guid}/entries`, {
+      kind: 'idea',
+      title: 'Идея под правкой',
+      body: 'Замысел.',
+      data: { origin: 'human' },
+    });
+    const c = await pageCtx(page);
+    await open(page, `#/u/${c.user}/s/${guid}/j/ideas`);
+    const feed = page.getByRole('feed', { name: 'Лента идей' });
+    const row = feed.locator(`[data-idea="${idea.id}"]`).getByRole('button', { name: 'Идея под правкой' });
+    const card = page.getByRole('article', { name: 'Карточка идеи' });
+    const form = card.getByRole('form', { name: 'Правка идеи' });
+    await row.tap();
+    await card.getByRole('button', { name: 'Изменить', exact: true }).tap();
+    await expect(form.getByLabel('Замысел')).toHaveValue('Замысел.');
+    await unsavedAsksPhone(page, {
+      label: 'Идеи',
+      field: form.getByLabel('Замысел'),
+      typed: 'Замысел, дописанный на телефоне.',
+      here: new RegExp(`/j/ideas/${idea.id}$`),
+      away: `#/u/${c.user}/s/${guid}/j/glossary`,
+      list: feed,
+    });
+    await expect(page).toHaveURL(/\/j\/ideas$/);
+    await row.tap();
+    await card.getByRole('button', { name: 'Изменить', exact: true }).tap();
+    await expect(form).toBeVisible();
+    await page.getByRole('link', { name: '← Идеи' }).tap();
+    await expect(feed).toBeVisible();
+    await expect(page.getByRole('alertdialog')).toHaveCount(0);
+    expect((await api<{ body: string }>('GET', `entries/${idea.id}`)).body).toBe('Замысел.');
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+
+  test('glossary_unsaved_back_asks_phone', async ({ page }) => {
+    // форма нового термина (карточки нет, адрес — список); без набранного «← Словарь» — сразу
+    const problems = watch(page);
+    const guid = await newSolution('словарь и несохранённое');
+    const c = await pageCtx(page);
+    await open(page, `#/u/${c.user}/s/${guid}/j/glossary`);
+    const add = page.getByRole('button', { name: 'Новый термин', exact: true });
+    const form = page.getByRole('form', { name: 'Новый термин' });
+    await add.tap();
+    await expect(form).toBeVisible();
+    await expect(add).toBeHidden();
+    await unsavedAsksPhone(page, {
+      label: 'Словарь',
+      field: form.getByLabel('Определение'),
+      typed: 'Определение, набранное на телефоне',
+      here: /\/j\/glossary$/,
+      away: `#/u/${c.user}/s/${guid}/j/insights`,
+      list: add,
+    });
+    await add.tap();
+    await expect(form).toBeVisible();
+    await page.getByRole('link', { name: '← Словарь' }).tap();
+    await expect(add).toBeVisible();
+    await expect(page.getByRole('alertdialog')).toHaveCount(0);
+    expect((await api<{ items: unknown[] }>('GET', `spaces/${guid}/glossary`)).items).toEqual([]);
     expect(problems, problems.join('\n')).toEqual([]);
   });
 });

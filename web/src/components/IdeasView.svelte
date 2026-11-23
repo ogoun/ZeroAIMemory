@@ -20,8 +20,11 @@
   // `<details>` (открыт первый непустой раздел, число — в заголовке); чипы статусов — полоса;
   // фильтры (приоритет, тег, поиск) на телефоне — под кнопкой «Фильтры»; сбой загрузки чанка формы
   // — `LazyFail`. «Корзина» (M7.2, спецификация §5.9 п. 3) — вместо ленты удалённые идеи с
-  // «Восстановить» (`JournalTrash`, ленивый чанк).
-  import { tick, untrack, type Snippet } from 'svelte';
+  // «Восстановить» (`JournalTrash`, ленивый чанк). Несохранённое в открытой форме (финальное ревью
+  // M7.2, I1) — `IdeaForm.dirty()`: «← Идеи» сначала спрашивает «Закрыть без сохранения?»
+  // (`JournalSplit`), уход по адресу, другая форма и решение кнопкой карточки — `LEAVE_EDIT`
+  // (`lib/leaveEdit.ts`).
+  import { onMount, tick, untrack, type Snippet } from 'svelte';
   import JournalSplit from './JournalSplit.svelte';
   import LazyFail from './LazyFail.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
@@ -85,6 +88,7 @@
     type IdeaPriority,
   } from '../lib/journals';
   import { SPLIT_MIN } from '../lib/layout';
+  import { LEAVE_EDIT, guardLeave } from '../lib/leaveEdit';
   import { snippetParts } from '../lib/snippet';
   import { go, href } from '../lib/router';
   import { onTabKey } from '../lib/tabs';
@@ -427,6 +431,8 @@
           }
           throw new Error(errorText(e));
         }
+        // идея удалена: открытая форма закрывается с карточкой, переход не спрашивает
+        mode = 'none';
         go({ name: 'journal', user, space, journal: 'ideas', entry: null }, { replace: true });
         await load(user, space, true);
         notice = `Идея «${c.title}» перемещена в корзину.`;
@@ -443,9 +449,20 @@
 
   /** Номер открытия формы: повторное нажатие той же кнопки создаёт форму заново (поля сброшены). */
   let opened = $state(0);
+  /** Загруженная открытая форма (`IdeaForm`): её несохранённое — в `unsaved()`. */
+  let ideaForm = $state<{ dirty: () => boolean } | null>(null);
+
+  /** В открытой форме есть несохранённое; форма, которую журнал уже закрыл (`mode`), — нет. */
+  const unsaved = (): boolean => mode !== 'none' && !!ideaForm?.dirty();
+
+  /** Действие закроет открытую форму: при несохранённом — сначала вопрос; `false` — остаться. */
+  const leaveForm = (): boolean => !unsaved() || window.confirm(LEAVE_EDIT);
+
+  onMount(() => guardLeave(unsaved));
 
   /** Открыть форму `m` (создание, правка, решение с полями). */
   function show(m: IdeaForm) {
+    if (!leaveForm()) return;
     actionError = '';
     opened++;
     mode = m;
@@ -458,13 +475,16 @@
 
   /** Кнопка карточки (`ideaButtons`): решение сразу, форма с полями или подтверждение удаления. */
   function press(a: IdeaAction, c: Entry) {
+    // решение сразу закроет открытую форму (`act`): при несохранённом — сначала вопрос
+    const now = a === 'adopt' || (a === 'start' && !knowledge);
+    if (now && !leaveForm()) return;
     if (a === 'adopt')
       act(async () => {
         await adoptIdea(user, c.id);
       }, 'Идея принята как своя.');
     else if (a === 'delete') askDelete(c);
     // «Начать» идеи решения — без формы; у идеи Knowledge — выбор пространства задачи
-    else if (a === 'start' && !knowledge) decide(c, 'accept');
+    else if (now) decide(c, 'accept');
     else show(a);
   }
 
@@ -503,6 +523,7 @@
     open={detailOpen}
     back={{ href: href({ name: 'journal', user, space, journal: 'ideas', entry: null }), label: JOURNAL_TITLE.ideas }}
     onclose={closeForm}
+    dirty={unsaved}
     {entry}
   >
     {#snippet list()}
@@ -808,6 +829,7 @@
   {:then { default: Form }}
     {#key opened}
       <Form
+        bind:this={ideaForm}
         {m}
         idea={cur}
         {targets}

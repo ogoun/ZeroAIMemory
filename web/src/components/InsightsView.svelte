@@ -12,7 +12,11 @@
   // Корзина (M7.2, спецификация §5.9 пп. 2–3): «Удалить» карточки — в корзину, с подтверждением
   // (отзыв оставляет запись в истории, удаление убирает её из журнала и поиска); «Корзина» — вместо
   // таблицы удалённые записи с «Восстановить» (`JournalTrash`, ленивый чанк).
-  import { tick, untrack } from 'svelte';
+  // Несохранённое (финальное ревью M7.2, I1): поля открытой формы карточки (замещение, ADR, отзыв,
+  // надёжность, триггеры) против их значений при открытии — `unsaved()`; «← Insights» сначала
+  // спрашивает «Закрыть без сохранения?» (`JournalSplit`), уход по адресу и действия карточки,
+  // которые закрыли бы форму (другая форма, «Пересмотреть»), — `LEAVE_EDIT` (`lib/leaveEdit.ts`).
+  import { onMount, tick, untrack } from 'svelte';
   import CertaintyBadge from './CertaintyBadge.svelte';
   import FileRefs from './FileRefs.svelte';
   import JournalSplit from './JournalSplit.svelte';
@@ -60,6 +64,7 @@
     type Adr,
   } from '../lib/journals';
   import { BP_TABLET } from '../lib/layout';
+  import { LEAVE_EDIT, guardLeave } from '../lib/leaveEdit';
   import { go, href } from '../lib/router';
   import { observeWidth } from '../lib/viewport.svelte';
   import { supersedeData } from '../lib/adrData';
@@ -133,6 +138,46 @@
   let tType = $state<TriggerType>('keyword');
   let tPattern = $state('');
   let tTools = $state('');
+
+  /** Поля открытой формы (без выбора типа нового триггера — он не уходит при сохранении). */
+  function formState(): string {
+    switch (mode) {
+      case 'supersede':
+        return JSON.stringify([sTitle, sBody, sKind, sCertainty, adr, adrOptions]);
+      case 'adr':
+        return JSON.stringify([adr, adrOptions]);
+      case 'retract':
+        return rReason;
+      case 'certainty':
+        return JSON.stringify([cTo, cReason, evChecked, evMethod, evResult]);
+      case 'triggers':
+        return JSON.stringify([tDraft, tPattern, tTools]);
+      default:
+        return '';
+    }
+  }
+  /** Поля формы при её открытии (из записи карточки). */
+  let pristine = '';
+
+  /** Открыть форму `m`: поля уже взяты из записи — их снимок для `unsaved()`. */
+  function openForm(m: Mode) {
+    mode = m;
+    pristine = formState();
+  }
+
+  /** В открытой форме карточки есть несохранённое. Карточка закрыта (удаление) — нет. */
+  const unsaved = (): boolean => mode !== 'none' && cur !== null && formState() !== pristine;
+
+  /** Действие закроет открытую форму: при несохранённом — сначала вопрос; `false` — остаться. */
+  const leaveForm = (): boolean => !unsaved() || window.confirm(LEAVE_EDIT);
+
+  onMount(() => guardLeave(unsaved));
+
+  /** «← Insights»: форма закрывается здесь (несохранённое `JournalSplit` уже спросил). */
+  function closeDetail() {
+    mode = 'none';
+    actionError = '';
+  }
 
   function emptyAdr(): Adr {
     return { context: '', options: [], chosen: '', rationale: '', consequences: '', decided_by: 'human', revisit_if: '' };
@@ -378,19 +423,25 @@
   }
 
   function startSupersede() {
-    if (!cur) return;
+    if (!cur || !leaveForm()) return;
     sTitle = cur.title;
     sBody = cur.body;
     sKind = dataStr(cur.data, 'kind') || 'discovery';
     sCertainty = '';
     loadAdr(cur.data);
-    mode = 'supersede';
+    openForm('supersede');
   }
 
   function startAdr() {
-    if (!cur) return;
+    if (!cur || !leaveForm()) return;
     loadAdr(cur.data);
-    mode = 'adr';
+    openForm('adr');
+  }
+
+  function startRetract() {
+    if (!leaveForm()) return;
+    rReason = '';
+    openForm('retract');
   }
 
   function submitAdr(e: SubmitEvent) {
@@ -442,7 +493,7 @@
 
   function toggleRevisit() {
     const c = cur;
-    if (!c) return;
+    if (!c || !leaveForm()) return;
     const to = c.status === 'revisit' ? 'active' : 'revisit';
     act(
       async () => {
@@ -453,14 +504,14 @@
   }
 
   function startCertainty() {
-    if (!cur) return;
+    if (!cur || !leaveForm()) return;
     cTo = cur.certainty ?? '';
     cReason = '';
     const ev = cur.data.evidence as Record<string, unknown> | undefined;
     evChecked = typeof ev?.checked === 'string' ? ev.checked : '';
     evMethod = typeof ev?.method === 'string' ? ev.method : '';
     evResult = typeof ev?.result === 'string' ? ev.result : '';
-    mode = 'certainty';
+    openForm('certainty');
   }
 
   function submitCertainty(e: SubmitEvent) {
@@ -487,11 +538,11 @@
   }
 
   function startTriggers() {
-    if (!cur) return;
+    if (!cur || !leaveForm()) return;
     tDraft = (cur.triggers ?? []).map((t) => ({ type: t.type, pattern: t.pattern, tools: t.tools }));
     tPattern = '';
     tTools = '';
-    mode = 'triggers';
+    openForm('triggers');
   }
 
   function addTrigger(e: SubmitEvent) {
@@ -523,7 +574,8 @@
     ask = trashAsk(user, c, {
       deleted: async (msg) => {
         // карточка закрывается сразу: иначе её «Связи» перечитались бы для удалённой записи (404),
-        // пока смена адреса и перечитывание оболочки ещё идут
+        // пока смена адреса и перечитывание оболочки ещё идут; форма карточки — вместе с ней
+        mode = 'none';
         cur = null;
         go({ name: 'journal', user, space, journal: 'insights', entry: null }, { replace: true });
         await reloadList();
@@ -560,6 +612,8 @@
   <JournalSplit
     open={detailOpen}
     back={{ href: href({ name: 'journal', user, space, journal: 'insights', entry: null }), label: JOURNAL_TITLE.insights }}
+    onclose={closeDetail}
+    dirty={unsaved}
     {entry}
   >
     {#snippet list()}
@@ -757,7 +811,7 @@
           {/if}
         {/if}
         {#if c.status !== 'retracted'}
-          <button type="button" class="danger" onclick={() => ((rReason = ''), (mode = 'retract'))}>Отозвать</button>
+          <button type="button" class="danger" onclick={startRetract}>Отозвать</button>
         {/if}
         <button type="button" class="danger" onclick={() => askDelete(c)} disabled={busy}>Удалить</button>
       </div>

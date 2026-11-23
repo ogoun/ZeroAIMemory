@@ -10,16 +10,16 @@
   // «Изменить», в основной чанк не входит.
   //
   // Уход с несохранённым (ревью задачи 10, круг 2): пока форма открыта, переход по адресу (запись
-  // из Ctrl+K, пункт журнала, «назад») сначала спрашивает `LEAVE_EDIT` (проверка ухода роутера, как у
-  // редактора заметок; закрытие вкладки — `beforeunload`); журнал закрывает форму на переходе, а
-  // действия, которые закрыли бы её на месте (фильтр, «Корзина», другая запись), спрашивают через
-  // `leave()`. `release()` — журнал уже спросил сам (вопрос панели доски) или закрывает форму.
+  // из Ctrl+K, пункт журнала, «назад») сначала спрашивает `LEAVE_EDIT` (общий помощник `guardLeave`:
+  // проверка ухода роутера, как у редактора заметок; закрытие вкладки — `beforeunload`); журнал
+  // закрывает форму на переходе, а действия, которые закрыли бы её на месте (фильтр, «Корзина»,
+  // другая запись), спрашивают через `leave()`. `release()` — журнал уже спросил сам (вопрос панели
+  // доски) или закрывает форму.
   import { onMount, untrack } from 'svelte';
   import { ApiError, errorText, getEntry, isStaleEntry, patchEntry, type Entry, type EntryKind } from '../lib/api';
   import { ESTIMATE_MAX, FIELD_TEXT, fieldsOf, isDirty, patchOf, rebase } from '../lib/entryEdit';
-  import { LEAVE_EDIT } from '../lib/leaveEdit';
+  import { LEAVE_EDIT, guardLeave } from '../lib/leaveEdit';
   import { CHANGELOG_KINDS, PRIORITIES, PRIORITY_TEXT } from '../lib/journals';
-  import { setGuard } from '../lib/router';
 
   interface Props {
     user: string;
@@ -72,17 +72,7 @@
     released = true;
   }
 
-  onMount(() => {
-    const off = setGuard(() => leave());
-    const onbeforeunload = (e: BeforeUnloadEvent) => {
-      if (!released && dirty()) e.preventDefault();
-    };
-    window.addEventListener('beforeunload', onbeforeunload);
-    return () => {
-      off();
-      window.removeEventListener('beforeunload', onbeforeunload);
-    };
-  });
+  onMount(() => guardLeave(() => !released && dirty()));
 
   /** Фокус на первом поле при открытии формы. */
   function focusOnOpen(node: HTMLElement) {

@@ -291,9 +291,18 @@ test('ideas_defer_with_date_and_decline', async ({ page }) => {
   await expectUtcDay(date, 1, 'min');
   await expectUtcDay(date, 30);
   await expect(form.getByText('UTC', { exact: true })).toBeVisible();
-  // повторное нажатие той же кнопки карточки открывает форму заново: введённое сброшено
+  // повторное нажатие той же кнопки карточки открывает форму заново: введённое сброшено; при
+  // введённом — сначала вопрос (финальное ревью M7.2, I1): «Отмена» — форма с введённым цела
   await date.fill(utc(7));
-  await card(page).getByRole('group', { name: 'Решение по идее' }).getByRole('button', { name: 'Отложить' }).click();
+  const again = card(page).getByRole('group', { name: 'Решение по идее' }).getByRole('button', { name: 'Отложить' });
+  for (const accept of [false, true]) {
+    page.once('dialog', (d) => {
+      expect([d.type(), d.message()]).toEqual(['confirm', 'В форме есть несохранённый текст. Закрыть её без сохранения?']);
+      void (accept ? d.accept() : d.dismiss());
+    });
+    await again.click();
+    if (!accept) await expect(date).toHaveValue(utc(7));
+  }
   await expectUtcDay(date, 30);
   await date.fill(utc(5));
   const sent = page.waitForRequest((r) => r.url().endsWith(`/entries/${idea.id}/decide`));
