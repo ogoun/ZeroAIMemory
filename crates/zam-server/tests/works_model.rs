@@ -1691,8 +1691,8 @@ async fn off_mode_zero_requests() {
         CallClass::Blocked
     );
     let r = b.adm(Method::POST, TEST, None, None).await;
-    ok(&r, StatusCode::CONFLICT);
-    assert_eq!(r.json()["code"], "works_disabled");
+    // как у ручных запусков (задача 3, решение 76)
+    common::api::problem(&r, StatusCode::CONFLICT, "works-disabled");
     // нулевой потолок сервера
     let c = server("zero-ceiling", |c| c.works.max_daily_tokens = 0).await;
     connect(&c, &m).await;

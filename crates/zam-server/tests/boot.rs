@@ -118,6 +118,8 @@ fn health_features_documented() {
         "space_counts",
         // корзина любого журнала `deleted=only` (задача 10 M7.2)
         "entries_trash",
+        // внутренние работы: настройки, очередь, пакет и итог, журнал отправок (задача 3 M7.3)
+        "works",
     ] {
         assert!(built.contains(f), "{f}");
     }

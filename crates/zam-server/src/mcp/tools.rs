@@ -117,9 +117,9 @@ impl ToolName {
             }
             ToolName::Log => {
                 "Запись журнала: kind changelog|release, insight (data.kind, triggers, scope, \
-                 certainty), term (data.definition, aliases), task, idea, question (data.options); \
-                 refs.files — файлы. report — отчёт пользователю, неизменяем: images [{name, \
-                 data base64}], большой — zam report. Дубль insight — 409: force."
+                 certainty), term, task, idea, question (поля data — в схеме); refs.files — \
+                 файлы. report — отчёт, неизменяем: images [{name, data base64}], большой — zam \
+                 report. work — итог работы (без title). Дубль insight — 409: force."
             }
             ToolName::UpdateEntry => {
                 "Правка записи: action supersede|retract|revisit|certify|append|status|triggers \
@@ -134,9 +134,9 @@ impl ToolName {
             }
             ToolName::Recall => {
                 "Подсказки памяти к событию: session_start — дайджест, prompt — к запросу, \
-                 post_tool — к ошибке инструмента (error, tool); повторы в сессии отсекаются. \
-                 Пакеты без отсева: recovery — после сжатия контекста, brief — под задачу task \
-                 (первый вызов субагента), idea_review — идеи на разбор (limit)."
+                 post_tool — к ошибке (error, tool); повторы в сессии отсекаются. Пакеты: \
+                 recovery — после сжатия, brief — под задачу task, idea_review — идеи на разбор \
+                 (limit), work — внутренняя работа (kind; итог — memory_log kind=work)."
             }
             ToolName::Vault => {
                 "Vault: list — без значений (name — поиск); get — по name или id v:<id> (раскрытие \
@@ -153,7 +153,9 @@ impl ToolName {
         }
     }
 
-    /// Только чтение памяти (подсказка клиенту; `memory_recall` пишет лишь учёт показов).
+    /// Только чтение памяти (подсказка клиенту; `memory_recall` пишет лишь учёт показов и захват
+    /// внутренней работы `event=work` — служебное состояние очереди, а не память; захват — только
+    /// токеном `rw`, M7.3 §6 «Общее», решение координатора 52).
     fn read_only(self) -> bool {
         matches!(
             self,
@@ -270,8 +272,8 @@ impl ToolName {
             ),
             ToolName::Log => (
                 json!({
-                    "kind": {"type": "string", "enum": ["changelog", "insight", "release", "term", "task", "idea", "question", "report"]},
-                    "title": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["changelog", "insight", "release", "term", "task", "idea", "question", "report", "work"]},
+                    "title": {"type": "string", "description": "обязателен у всех видов, кроме work"},
                     "body": {"type": "string"},
                     "data": log_data_schema(),
                     "images": {"type": "array", "description": "report: файлы по ссылкам тела ![…](figs/a.png); name — путь из ссылки, data — base64",
@@ -290,7 +292,9 @@ impl ToolName {
                     "idempotency_key": {"type": "string"},
                     "format": fmt,
                 }),
-                &["kind", "title"],
+                // у итога работы заголовка нет (решение координатора 71): `title` прочих видов
+                // проверяет обработчик
+                &["kind"],
             ),
             ToolName::UpdateEntry => (
                 json!({
@@ -374,7 +378,10 @@ impl ToolName {
             ),
             ToolName::Recall => (
                 json!({
-                    "event": {"type": "string", "enum": ["session_start", "prompt", "post_tool", "recovery", "brief", "idea_review"]},
+                    "event": {"type": "string", "enum": ["session_start", "prompt", "post_tool", "recovery", "brief", "idea_review", "work"]},
+                    "kind": {"type": "string",
+                        "enum": zam_store::works::WorkKind::ALL.iter().map(|k| k.as_str()).collect::<Vec<_>>(),
+                        "description": "work: вид работы (по умолчанию любой); пакет захватывает работу для сессии, токен rw"},
                     "limit": {"type": "integer", "minimum": 1,
                         "maximum": crate::api::recall::IDEA_REVIEW_LIMIT_MAX,
                         "description": format!("idea_review: идей в пакете (по умолчанию {})",
@@ -495,6 +502,11 @@ fn log_data_schema() -> Value {
                             "maxItems": DECISION_OPTIONS_MAX},
                 "decided_by": {"type": "string", "enum": ["human", "agent"]},
             }},
+        // итог внутренней работы (M7.3 §6.3 п. 4)
+        "work": {"type": "string", "description": "work: j:<id> работы из пакета memory_recall event=work"},
+        "items": {"type": "array", "items": {"type": "object"}, "description":
+            "work: итог по элементам пакета [{n, …}] по его схеме; отказ от элемента — {n, skip: причина}"},
+        "skip": {"type": "string", "description": "work: отказ от всей работы — причина, без items"},
     }})
 }
 
@@ -1386,9 +1398,13 @@ fn entry_line(e: &Value) -> String {
 async fn log(rest: &Rest, args: &mut JsonObject) -> Res {
     let f = fmt(args)?;
     let kind = req_str(args, "kind")?;
+    // итог внутренней работы (M7.3 §6.3 п. 4): без заголовка, не запись журнала
+    if kind == "work" {
+        return work_result(rest, args, f).await;
+    }
     if zam_store::EntryKind::parse(kind).is_none() {
         return Err(Fail::Invalid(
-            "kind: changelog, insight, release, term, task, idea, question или report".into(),
+            "kind: changelog, insight, release, term, task, idea, question, report или work".into(),
         ));
     }
     req_str(args, "title")?;
@@ -1449,6 +1465,63 @@ async fn log(rest: &Rest, args: &mut JsonObject) -> Res {
         s.push_str(&warnings_md(v));
         s
     })
+}
+
+/// Итог внутренней работы `memory_log {kind: "work", data: {work: "j:<id>", items: […],
+/// skip?}}` → `POST /works/{id}/result` (M7.3 §6.3 п. 4); `idempotency_key` — заголовок
+/// `Idempotency-Key`. Ответ — принято, отклонено с причинами, пропущено.
+async fn work_result(rest: &Rest, args: &JsonObject, f: Fmt) -> Res {
+    let data = args.get("data").and_then(Value::as_object).ok_or_else(|| {
+        Fail::Invalid("work: data {work: \"j:<id>\", items: […], skip?: \"<причина>\"}".into())
+    })?;
+    let work = data
+        .get("work")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Fail::Invalid("data.work: j:<id> работы из пакета".into()))?;
+    let id = work.strip_prefix("j:").unwrap_or(work);
+    let body: Map<String, Value> = ["items", "skip"]
+        .into_iter()
+        .filter_map(|k| {
+            data.get(k)
+                .filter(|v| !v.is_null())
+                .map(|v| (k.to_string(), v.clone()))
+        })
+        .collect();
+    let extra = idempotency_header(args)?;
+    let r = call_rest(
+        rest,
+        Method::POST,
+        &format!("/api/v1/works/{}/result", enc(id)),
+        Some(&Value::Object(body)),
+        &extra,
+    )
+    .await?;
+    done(f, &r, work_result_md)
+}
+
+/// Итог работы в Markdown: состояние, счёт и причины отказов.
+fn work_result_md(v: &Value) -> String {
+    let n = |k: &str| v[k].as_array().map_or(0, Vec::len);
+    let mut s = format!(
+        "Итог {} принят ({}): принято {}, отклонено {}, отказ {}, без итога {}",
+        v["work"].as_str().unwrap_or("?"),
+        v["state"].as_str().unwrap_or("?"),
+        n("accepted"),
+        n("rejected"),
+        n("skip"),
+        n("skipped"),
+    );
+    for r in v["rejected"].as_array().into_iter().flatten() {
+        s.push_str(&format!(
+            "\n- n {} {}: {}",
+            r["n"],
+            r["target"].as_str().unwrap_or(""),
+            r["reason"].as_str().unwrap_or("")
+        ));
+    }
+    s
 }
 
 /// Подсказка к отказу MCP-отчёта по размеру (413) или сроку чтения тела (408): большой отчёт
@@ -1830,6 +1903,7 @@ async fn recall(rest: &Rest, args: &JsonObject) -> Res {
             "source",
             "timeout_ms",
             "limit",
+            "kind",
         ],
     );
     let r = call_rest(

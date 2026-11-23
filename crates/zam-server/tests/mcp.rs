@@ -1366,13 +1366,15 @@ async fn mcp_descriptions_under_300() {
                 "report",
                 "images",
                 "zam report",
+                // итог внутренней работы (M7.3 §6.3 п. 4)
+                "work",
             ],
         ),
         (
             "memory_update_entry",
             &["status", "claim", "release", "answer"],
         ),
-        ("memory_recall", &["recovery", "brief"]),
+        ("memory_recall", &["recovery", "brief", "work"]),
         (
             "memory_search",
             &[
@@ -5697,4 +5699,134 @@ async fn mcp_log_data_schema_typed() {
         json!({"kind": "term", "title": "Выжимка", "data": {"definition": "Короткая сводка"}}),
     )
     .await;
+}
+
+// ---------- внутренние работы (M7.3 §6.3) ----------
+
+/// Режим агента у администратора, insight в Knowledge и ночь сегодняшней даты: работа `echo` в
+/// очереди.
+async fn queued_work(a: &Api) {
+    let r = a
+        .adm(
+            Method::PATCH,
+            "/api/v1/auth/settings",
+            Some(json!({"works": {"mode": "agent"}})),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    ok(
+        a,
+        &a.token,
+        &[],
+        "memory_log",
+        json!({"kind": "insight", "title": "Для работы", "body": "текст",
+               "data": {"kind": "gotcha"}}),
+    )
+    .await;
+    let ctx = zam_server::works::NightCtx::new(a.st.clone());
+    let until = zam_store::time::now() + jiff::SignedDuration::from_hours(1);
+    zam_server::works::queue::night(&ctx, zam_store::time::utc_today(), until)
+        .await
+        .unwrap();
+}
+
+/// §6.3 п. 3: `memory_recall event=work` — пакет внутренней работы (событие и `kind` в схеме,
+/// захват явной сессией); без явной сессии — ошибка с подсказкой.
+#[tokio::test]
+async fn mcp_recall_work_event() {
+    let a = api("mcp-work-recall", |_| {}).await;
+    queued_work(&a).await;
+    let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
+    let tool_of = |name: &str| {
+        list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    let recall = tool_of("memory_recall");
+    let events = recall["inputSchema"]["properties"]["event"]["enum"].clone();
+    assert!(
+        events.as_array().unwrap().contains(&json!("work")),
+        "{events}"
+    );
+    assert!(
+        recall["inputSchema"]["properties"]["kind"]["enum"].is_array(),
+        "{recall}"
+    );
+    let o = tool(&a, &a.token, &[], "memory_recall", json!({"event": "work"})).await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(o.text.contains("только в сессии"), "{}", o.text);
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_recall",
+        json!({"event": "work"}),
+    )
+    .await;
+    assert!(o.text.starts_with("## Внутренняя работа j:"), "{}", o.text);
+    assert!(o.text.contains("<record n=\"1\""), "{}", o.text);
+    assert!(o.text.contains("memory_log {kind: \"work\""), "{}", o.text);
+}
+
+/// §6.3 п. 4, решение 71: итог — `memory_log kind=work` **без** `title` (`required` схемы —
+/// `["kind"]`), уходит в `POST /works/{id}/result`; у прочих видов `title` по-прежнему нужен.
+#[tokio::test]
+async fn mcp_log_kind_work() {
+    let a = api("mcp-work-log", |_| {}).await;
+    queued_work(&a).await;
+    let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
+    let log = list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "memory_log")
+        .unwrap()
+        .clone();
+    assert_eq!(log["inputSchema"]["required"], json!(["kind"]), "{log}");
+    let kinds = log["inputSchema"]["properties"]["kind"]["enum"].clone();
+    assert!(
+        kinds.as_array().unwrap().contains(&json!("work")),
+        "{kinds}"
+    );
+    let pack = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_recall",
+        json!({"event": "work", "format": "json"}),
+    )
+    .await;
+    let work = pack.json()["work"].as_str().unwrap().to_string();
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_log",
+        json!({"kind": "work", "data": {"work": work, "items": [{"n": 1, "text": "Для работы"}]}}),
+    )
+    .await;
+    assert!(
+        o.text.contains(&format!("Итог {work} принят (done)")),
+        "{}",
+        o.text
+    );
+    assert!(o.text.contains("принято 1"), "{}", o.text);
+    // повтор — 409: работа закрыта
+    let o = tool(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_log",
+        json!({"kind": "work", "data": {"work": work, "items": []}}),
+    )
+    .await;
+    assert!(o.is_error && o.text.contains("409"), "{}", o.text);
+    // заголовок прочих видов проверяет обработчик
+    let o = tool(&a, &a.token, &[], "memory_log", json!({"kind": "insight"})).await;
+    assert!(o.is_error && o.text.contains("нужен title"), "{}", o.text);
 }

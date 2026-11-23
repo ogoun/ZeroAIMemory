@@ -26,6 +26,7 @@ pub mod task;
 pub mod transfer;
 pub mod tree;
 pub mod vault;
+pub mod work;
 pub mod write;
 
 use std::io::Write;
