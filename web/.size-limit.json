@@ -5,6 +5,8 @@
   { "name": "SessionsView (страница «Сессии»)", "path": "dist/assets/SessionsView-*.js", "gzip": true, "limit": "7.9 KB" },
   { "name": "IdeasView (журнал «Идеи»)", "path": "dist/assets/IdeasView-*.js", "gzip": true, "limit": "12 KB" },
   { "name": "IdeaForm (формы карточки идеи, по нажатию)", "path": "dist/assets/IdeaForm-*.js", "gzip": true, "limit": "2.5 KB" },
+  { "name": "EntryEdit (форма правки записи журнала, по нажатию)", "path": "dist/assets/EntryEdit-*.js", "gzip": true, "limit": "3.4 KB" },
+  { "name": "JournalTrash (корзина журнала, по нажатию)", "path": "dist/assets/JournalTrash-*.js", "gzip": true, "limit": "2 KB" },
   { "name": "CodeOverview (обзор карты кода)", "path": "dist/assets/CodeOverview-*.js", "gzip": true, "limit": "2 KB" },
   { "name": "print (печать и PDF отчёта)", "path": "dist/assets/print-*.js", "gzip": true, "limit": "3 KB" },
   { "name": "AttachmentView", "path": "dist/assets/AttachmentView-*.js", "gzip": true, "limit": "4 KB" },

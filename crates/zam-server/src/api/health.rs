@@ -45,6 +45,7 @@ pub const FEATURES: &[&str] = &[
     "task_subtasks",
     "sessions_parent",
     "space_counts",
+    "entries_trash",
     "agent_text_masked",
 ];
 

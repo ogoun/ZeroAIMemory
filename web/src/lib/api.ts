@@ -892,12 +892,15 @@ export interface EntryQuery {
   topLevel?: boolean;
   /** Только `kind: task`: прямые подзадачи задачи `<id>` в порядке шагов (курсор — позиция). */
   parent?: string;
+  /** Корзина вида `kind` (`deleted=only`, M7 §5.9 п. 3): удалённые записи, новые удаления первыми;
+   * права — как у восстановления (`ro` — 403). */
+  deleted?: boolean;
   cursor?: string | null;
   limit?: number;
 }
 
-/** Лента записей пространства (новые — первыми; `parent` — в порядке шагов), курсор —
- * `next_cursor`. */
+/** Лента записей пространства (новые — первыми; `parent` — в порядке шагов; корзина — по времени
+ * удаления), курсор — `next_cursor`. */
 export function listEntries(user: string, space: string, f: EntryQuery) {
   const p = new URLSearchParams();
   if (f.kind) p.set('kind', f.kind);
@@ -912,6 +915,7 @@ export function listEntries(user: string, space: string, f: EntryQuery) {
   if (f.fromIdea) p.set('from_idea', '1');
   if (f.topLevel) p.set('top_level', '1');
   if (f.parent) p.set('parent', f.parent);
+  if (f.deleted) p.set('deleted', 'only');
   if (f.cursor) p.set('cursor', f.cursor);
   if (f.limit) p.set('limit', String(f.limit));
   return call<{ items: Entry[]; next_cursor: string | null }>(
@@ -947,6 +951,8 @@ export interface EntryPatch {
   body?: string;
   data?: Record<string, unknown>;
   tags?: string[];
+  /** Область; `null` — снять. */
+  area?: string | null;
   status?: EntryStatus;
   /** Задача: что делать дальше; пустая строка снимает. */
   next_step?: string;

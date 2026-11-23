@@ -19,9 +19,11 @@
   // карточка вместо ленты); «Группировать по статусу» в узкой области (< SPLIT_MIN) — аккордеон
   // `<details>` (открыт первый непустой раздел, число — в заголовке); чипы статусов — полоса;
   // фильтры (приоритет, тег, поиск) на телефоне — под кнопкой «Фильтры»; сбой загрузки чанка формы
-  // — `LazyFail`.
+  // — `LazyFail`. «Корзина» (M7.2, спецификация §5.9 п. 3) — вместо ленты удалённые идеи с
+  // «Восстановить» (`JournalTrash`, ленивый чанк).
   import { tick, untrack, type Snippet } from 'svelte';
   import JournalSplit from './JournalSplit.svelte';
+  import Lazy from './Lazy.svelte';
   import LazyFail from './LazyFail.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
   import {
@@ -158,6 +160,18 @@
   let ask = $state<Ask | null>(null);
   /** Ссылка разбора, которую только что скопировали («скопировано» у кнопки). */
   let copied = $state('');
+  /** «Корзина» (M7.2, спецификация §5.9 п. 3): вместо ленты — удалённые идеи с «Восстановить». */
+  let trash = $state(false);
+
+  function toggleTrash() {
+    trash = !trash;
+    notice = '';
+    // назад к ленте: восстановленные из корзины — в ней (и в счётчиках чипов)
+    if (!trash) load(user, space, true);
+  }
+
+  /** Идея восстановлена из корзины: лента перечитается при возврате к ней (`toggleTrash`). */
+  const onrestored = () => {};
 
   function fail(e: unknown, set: (m: string) => void) {
     if (e instanceof ApiError && e.status === 401) return onexpired();
@@ -184,6 +198,7 @@
       tab = 'human';
       chip = 'active';
       priority = '';
+      trash = false;
       reset();
     });
   });
@@ -505,9 +520,19 @@
 <Prompt bind:ask />
 
 {#snippet ideasList()}
+  <!-- «Корзина» — одна кнопка в обоих видах: фокус на ней переживает переключение -->
   <div class="row bar">
-    <button type="button" class="primary" onclick={() => show('create')}>Новая идея</button>
+    {#if !trash}<button type="button" class="primary" onclick={() => show('create')}>Новая идея</button>{/if}
+    <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
   </div>
+  {#if trash}
+    <Lazy what="Корзина" load={() => import('./JournalTrash.svelte')} props={{ user, space, kind: 'idea', onrestored, onexpired }} />
+  {:else}
+    {@render liveIdeas()}
+  {/if}
+{/snippet}
+
+{#snippet liveIdeas()}
 
   <div class="tabs" role="tablist" aria-label="Происхождение идей">
     {#each TABS as t, i (t.id)}
@@ -817,6 +842,11 @@
   }
   .bar {
     margin-bottom: 8px;
+  }
+  .toggle[aria-pressed='true'] {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: var(--selected);
   }
   .tabs {
     display: flex;

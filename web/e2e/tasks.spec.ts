@@ -871,6 +871,95 @@ test.describe('настольный', () => {
     await expect(card.getByTestId('task-idle')).toHaveAttribute('title', `последнее обновление — ${local}`);
     expect(problems, problems.join('\n')).toEqual([]);
   });
+
+  test('task_edit_title_body_and_delete', async ({ page }) => {
+    // M7.2, спецификация §5.9 пп. 1–3: «Изменить» в карточке-панели — заголовок, текст, приоритет и
+    // оценка одним PATCH (`data` задачи — только изменённое, следующий шаг и ссылки целы);
+    // несохранённое в форме — вопрос перед закрытием панели; «Удалить» — с подтверждением, задачи нет
+    // на доске, она в «Корзине»
+    const problems = watch(page);
+    const guid = await newSolution('правка задачи');
+    const t = await api<{ id: string; rev: number }>('POST', `spaces/${guid}/entries`, {
+      kind: 'task',
+      title: 'Задача до правки',
+      body: 'Описание до правки.',
+      data: { next_step: 'прочитать код', links: ['https://example.com/spec'] },
+    });
+    await addTask(guid, 'Соседняя задача');
+    const c = await pageCtx(page);
+    await open(page, tasksUrl(c.user, guid));
+    const col = columnOf(page, 'открыт');
+    await expect(col.getByRole('heading')).toHaveText('открыт 2');
+    await col.getByRole('button', { name: 'Задача до правки' }).click();
+    const sheet = page.getByRole('dialog', { name: 'Задача', exact: true });
+    const card = sheet.getByRole('article', { name: 'Карточка задачи' });
+    await card.getByRole('button', { name: 'Изменить', exact: true }).click();
+    const form = card.getByRole('form', { name: 'Правка задачи' });
+    await expect(form.getByLabel('Заголовок')).toBeFocused();
+    await expect(form.getByLabel('Ссылки')).toHaveValue('https://example.com/spec');
+    await form.getByLabel('Заголовок').fill('Задача после правки');
+    await form.getByLabel('Текст').fill('Описание после правки.');
+    await form.getByLabel('Приоритет').selectOption('high');
+    await form.getByLabel('Оценка, минут').fill('90');
+    // несохранённое в форме молча не теряется: Esc — вопрос, «Продолжить правку» — назад в форму
+    await page.keyboard.press('Escape');
+    const unsaved = sheet.getByRole('alertdialog', { name: 'Несохранённый текст' });
+    await expect(unsaved).toBeVisible();
+    await unsaved.getByRole('button', { name: 'Продолжить правку' }).click();
+    await expect(unsaved).toHaveCount(0);
+    await expect(form.getByLabel('Оценка, минут')).toHaveValue('90');
+    const saved = page.waitForResponse((r) => r.request().method() === 'PATCH' && r.url().endsWith(`/entries/${t.id}`));
+    await form.getByRole('button', { name: 'Сохранить' }).click();
+    const resp = await saved;
+    expect(resp.status()).toBe(200);
+    expect(resp.request().headers()['if-match']).toBe(`"${t.rev}"`);
+    expect(resp.request().postDataJSON()).toEqual({
+      title: 'Задача после правки',
+      body: 'Описание после правки.',
+      data: { priority: 'high', estimate_min: 90 },
+    });
+    await expect(card.getByRole('status')).toHaveText('Задача сохранена.');
+    await expect(form).toHaveCount(0);
+    await expect(card.getByRole('heading', { level: 2 })).toHaveText('Задача после правки');
+    await expect(card).toContainText('Описание после правки.');
+    await expect(col.getByRole('button', { name: 'Задача после правки' })).toBeVisible();
+    const got = await api<{ title: string; body: string; data: Record<string, unknown> }>('GET', `entries/${t.id}`);
+    expect([got.title, got.body]).toEqual(['Задача после правки', 'Описание после правки.']);
+    expect(got.data).toMatchObject({
+      priority: 'high',
+      estimate_min: 90,
+      next_step: 'прочитать код',
+      links: ['https://example.com/spec'],
+    });
+    // сохранено — вопроса нет: Esc закрывает сразу
+    await page.keyboard.press('Escape');
+    await expect(sheet).toHaveCount(0);
+
+    // «Удалить» — с подтверждением: панель закрыта, задачи нет на доске, она в «Корзине»
+    await col.getByRole('button', { name: 'Задача после правки' }).click();
+    await card.getByRole('button', { name: 'Удалить', exact: true }).click();
+    const ask = page.getByRole('dialog', { name: 'Удалить задачу?' });
+    await expect(ask).toContainText('«Задача после правки» — в корзину журнала');
+    await ask.getByRole('button', { name: 'Удалить', exact: true }).click();
+    await expect(sheet).toHaveCount(0);
+    await expect(page).toHaveURL(/\/j\/tasks$/);
+    await expect(page.locator('section.journal').getByRole('status')).toHaveText('Задача «Задача после правки» перемещена в корзину.');
+    await expect(col.locator(`[data-task="${t.id}"]`)).toHaveCount(0);
+    await expect(col.getByRole('heading')).toHaveText('открыт 1');
+    const toggle = page.getByRole('button', { name: 'Корзина', exact: true });
+    await toggle.click();
+    await expect(page.getByRole('group', { name: 'Доска задач' })).toHaveCount(0);
+    const trash = page.getByRole('region', { name: 'Корзина' });
+    await expect(trash.locator('[data-trash]')).toHaveCount(1);
+    await expect(trash.locator(`[data-trash="${t.id}"]`).getByRole('heading')).toHaveText('Задача после правки');
+    await expect(trash.locator(`[data-trash="${t.id}"]`)).toContainText('открыт');
+    await page.screenshot({ path: `${screens}desktop-tasks-trash.png` });
+    // назад к доске — та же доска без удалённой
+    await toggle.click();
+    await expect(col.getByRole('heading')).toHaveText('открыт 1');
+    await expect(col.locator(`[data-task="${t.id}"]`)).toHaveCount(0);
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
 });
 
 test.describe('телефон, сенсорный ввод', () => {

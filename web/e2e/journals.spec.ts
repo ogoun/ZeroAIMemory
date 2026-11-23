@@ -3,7 +3,9 @@
 // вкладка «Связи» с обратной ссылкой, карточки записей в поиске Ctrl+K.
 // Данные — seedJournals (global-setup). Снимки — в .tmp/e2e/screens/ (под .gitignore).
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { pageCtx } from './mobile-pages';
 import { ADMIN_STATE } from './session';
 import { SOLUTION_GUID, SOLUTION_NAME, VAULT_SECRET } from './seed';
 
@@ -525,4 +527,163 @@ test('tree_and_tabs_show_counts', async ({ page }) => {
     }
     await agentApi('DELETE', `entries/${q.id}`, undefined, { 'If-Match': `"${q.rev}"` });
   }
+});
+
+// ---- правка журналов и корзина (M7.2, спецификация §5.9; задача 10) ----
+
+/** Новое решение администратора для сценария с точными числами (в решении E2E — записи сида и
+ * соседних спецификаций); возвращает его GUID. */
+async function newSolution(name: string): Promise<string> {
+  const guid = randomUUID();
+  await agentApi('POST', 'solutions', { agent_solution_id: guid, name: `Журналы E2E: ${name}` });
+  return guid;
+}
+
+interface Rec {
+  id: string;
+  rev: number;
+  title: string;
+  body: string;
+  status: string | null;
+  data: Record<string, unknown>;
+}
+
+test('changelog_edit_and_trash_restore', async ({ page }) => {
+  const problems = watch(page);
+  const guid = await newSolution('правка changelog');
+  await agentApi('POST', `spaces/${guid}/entries`, {
+    kind: 'changelog',
+    title: 'Соседняя запись',
+    body: 'Остаётся в ленте.',
+    data: { kind: 'docs' },
+  });
+  const e = await agentApi<Rec>('POST', `spaces/${guid}/entries`, {
+    kind: 'changelog',
+    title: 'Запись для правки',
+    body: 'Текст до правки.',
+    data: { kind: 'fix', refs: { commits: ['abc1234'] } },
+  });
+  const c = await pageCtx(page);
+  await page.goto(`${base()}#/u/${c.user}/s/${guid}/j/changelog`);
+  const journal = page.locator('section.journal');
+  const feed = page.getByRole('feed', { name: 'Лента changelog' });
+  const card = feed.locator(`[data-entry="${e.id}"]`);
+  await expect(card.getByRole('heading')).toHaveText('Запись для правки');
+  // число раздела в полосе журналов — 2 (задача 4): правка его не меняет, корзина — да
+  const num = page.getByRole('navigation', { name: 'Журналы пространства' }).locator('[data-count="changelog"]');
+  await expect(num).toHaveText('2');
+
+  // «Изменить»: заголовок и вид — одним PATCH с ревизией карточки, только изменённое
+  await card.getByRole('button', { name: 'Изменить «Запись для правки»' }).click();
+  const form = card.getByRole('form', { name: 'Правка записи' });
+  await expect(form.getByLabel('Заголовок')).toBeFocused();
+  await expect(form.getByLabel('Вид')).toHaveValue('fix');
+  await form.getByLabel('Заголовок').fill('Запись после правки');
+  await form.getByLabel('Вид').selectOption('feat');
+  const saved = page.waitForResponse((r) => r.request().method() === 'PATCH' && r.url().endsWith(`/entries/${e.id}`));
+  await form.getByRole('button', { name: 'Сохранить' }).click();
+  const resp = await saved;
+  expect(resp.status()).toBe(200);
+  expect(resp.request().headers()['if-match']).toBe(`"${e.rev}"`);
+  // `data` changelog сервер заменяет целиком: `refs` уходят вместе с новым видом
+  expect(resp.request().postDataJSON()).toEqual({
+    title: 'Запись после правки',
+    data: { kind: 'feat', refs: { commits: ['abc1234'] } },
+  });
+  await expect(journal.getByRole('status')).toHaveText('Запись «Запись после правки» сохранена.');
+  await expect(form).toHaveCount(0);
+  await expect(card.getByRole('heading')).toHaveText('Запись после правки');
+  await expect(card.locator('.kind')).toHaveText('feat');
+  await expect(card).toContainText('Коммиты:');
+  const after = await agentApi<Rec>('GET', `entries/${e.id}`);
+  expect([after.title, after.body, after.data]).toEqual([
+    'Запись после правки',
+    'Текст до правки.',
+    { kind: 'feat', refs: { commits: ['abc1234'] } },
+  ]);
+  await expect(num).toHaveText('2');
+
+  // «Удалить» — с подтверждением, в корзину: записи нет в ленте, число раздела — 1
+  await card.getByRole('button', { name: 'Удалить «Запись после правки»' }).click();
+  const ask = page.getByRole('dialog', { name: 'Удалить запись?' });
+  await expect(ask).toContainText('«Запись после правки» — в корзину журнала');
+  await ask.getByRole('button', { name: 'Удалить', exact: true }).click();
+  await expect(ask).toHaveCount(0);
+  await expect(journal.getByRole('status')).toHaveText('Запись «Запись после правки» перемещена в корзину.');
+  await expect(card).toHaveCount(0);
+  await expect(feed.locator('article')).toHaveCount(1);
+  await expect(num).toHaveText('1');
+
+  // «Корзина» — удалённая запись (`deleted=only` вида), «Восстановить» — снова в ленте
+  const trashReq = page.waitForRequest((r) => new URL(r.url()).searchParams.get('deleted') === 'only');
+  const toggle = journal.getByRole('button', { name: 'Корзина', exact: true });
+  await toggle.click();
+  const q = new URL((await trashReq).url());
+  expect([q.pathname.endsWith(`/spaces/${guid}/entries`), q.searchParams.get('kind')]).toEqual([true, 'changelog']);
+  await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+  await expect(feed).toHaveCount(0);
+  const trash = page.getByRole('region', { name: 'Корзина' });
+  const item = trash.locator(`[data-trash="${e.id}"]`);
+  await expect(trash.locator('[data-trash]')).toHaveCount(1);
+  await expect(item.getByRole('heading')).toHaveText('Запись после правки');
+  await expect(item).toContainText('удалено');
+  await page.screenshot({ path: `${screens}changelog-trash.png`, fullPage: true });
+  await item.getByRole('button', { name: 'Восстановить «Запись после правки»' }).click();
+  await expect(trash.getByRole('status')).toHaveText('Восстановлено: «Запись после правки» — снова в журнале.');
+  await expect(trash.locator('[data-trash]')).toHaveCount(0);
+  await expect(trash).toContainText('Корзина пуста.');
+  await expect(num).toHaveText('2');
+  await toggle.click();
+  await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+  await expect(feed.locator(`[data-entry="${e.id}"]`).getByRole('heading')).toHaveText('Запись после правки');
+  await expect(feed.locator('article')).toHaveCount(2);
+  expect((await agentApi<Rec & { deleted_at: string | null }>('GET', `entries/${e.id}`)).deleted_at).toBeNull();
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('entry_edit_stale_rev_rereads', async ({ page }) => {
+  const problems = watch(page);
+  const guid = await newSolution('устаревшая ревизия');
+  const e = await agentApi<Rec>('POST', `spaces/${guid}/entries`, {
+    kind: 'changelog',
+    title: 'Запись под правкой',
+    body: 'Исходный текст.',
+    data: { kind: 'fix' },
+  });
+  const c = await pageCtx(page);
+  await page.goto(`${base()}#/u/${c.user}/s/${guid}/j/changelog`);
+  const card = page.getByRole('feed', { name: 'Лента changelog' }).locator(`[data-entry="${e.id}"]`);
+  await card.getByRole('button', { name: 'Изменить «Запись под правкой»' }).click();
+  const form = card.getByRole('form', { name: 'Правка записи' });
+  await expect(form.getByLabel('Текст')).toHaveValue('Исходный текст.');
+  // пока форма открыта, запись правит агент (другая сессия): текст и вид
+  const other = await agentApi<Rec>('PATCH', `entries/${e.id}`, { body: 'Текст агента.', data: { kind: 'docs' } }, {
+    'If-Match': `"${e.rev}"`,
+  });
+  expect(other.rev).toBe(e.rev + 1);
+  await form.getByLabel('Заголовок').fill('Заголовок человека');
+  const stale = page.waitForResponse((r) => r.request().method() === 'PATCH' && r.url().endsWith(`/entries/${e.id}`));
+  await form.getByRole('button', { name: 'Сохранить' }).click();
+  expect((await stale).status()).toBe(409);
+  // запись перечитана: ошибка видна, карточка — новой ревизии, нетронутые поля формы — агента,
+  // набранный заголовок — человека
+  await expect(form.getByRole('alert')).toContainText(`Запись изменили в другом месте (сейчас ревизия ${other.rev})`);
+  await expect(card).toContainText(`ревизия ${other.rev}`);
+  await expect(card).toContainText('Текст агента.');
+  await expect(form.getByLabel('Текст')).toHaveValue('Текст агента.');
+  await expect(form.getByLabel('Вид')).toHaveValue('docs');
+  await expect(form.getByLabel('Заголовок')).toHaveValue('Заголовок человека');
+  // повтор — с перечитанной ревизией, только заголовок: правка агента не откатывается
+  const retry = page.waitForResponse((r) => r.request().method() === 'PATCH' && r.url().endsWith(`/entries/${e.id}`));
+  await form.getByRole('button', { name: 'Сохранить' }).click();
+  const ok = await retry;
+  expect(ok.status()).toBe(200);
+  expect(ok.request().headers()['if-match']).toBe(`"${other.rev}"`);
+  expect(ok.request().postDataJSON()).toEqual({ title: 'Заголовок человека' });
+  await expect(form).toHaveCount(0);
+  const final = await agentApi<Rec>('GET', `entries/${e.id}`);
+  expect([final.title, final.body, final.data.kind]).toEqual(['Заголовок человека', 'Текст агента.', 'docs']);
+  // 409 — ожидаемый ответ сценария
+  const expected = `HTTP 409 PATCH /api/v1/entries/${e.id}`;
+  expect(problems.filter((p) => p !== expected), problems.join('\n')).toEqual([]);
 });
