@@ -40,7 +40,7 @@ impl Srv {
             rt.block_on(async move {
                 let cfg = ServerConfig {
                     data_dir: data,
-                    ..ServerConfig::default()
+                    ..common::server_defaults()
                 };
                 let (app, st, _) = build(cfg, Some(PW.into())).await.unwrap();
                 let admin = st.admin_id;

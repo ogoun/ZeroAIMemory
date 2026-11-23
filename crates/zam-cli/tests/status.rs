@@ -15,7 +15,7 @@ fn tmp(name: &str) -> PathBuf {
 async fn start(name: &str) -> (String, String) {
     let cfg = ServerConfig {
         data_dir: tmp(&format!("{name}-data")),
-        ..ServerConfig::default()
+        ..common::server_defaults()
     };
     let (app, _st, rep) = build(cfg, Some("pw".into())).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

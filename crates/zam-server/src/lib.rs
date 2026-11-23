@@ -387,10 +387,12 @@ mod tests {
     #[tokio::test]
     async fn file_failure_hides_and_revokes_token() {
         let data = test_util::dir_in_target("initial-token-fail");
-        let cfg = ServerConfig {
+        let mut cfg = ServerConfig {
             data_dir: data.join("data"),
             ..ServerConfig::default()
         };
+        // без ночной проверки, как тестовые конфигурации `common::cfg_in` (M7.3, решение 67)
+        cfg.works.check = crate::config::CheckMode::Off;
         let (_app, st, rep) = build(cfg, Some("pw".into())).await.unwrap();
         let token = rep.initial_token.expect("первый старт");
         assert!(

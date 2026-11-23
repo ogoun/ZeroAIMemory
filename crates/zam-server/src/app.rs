@@ -116,8 +116,8 @@ impl AppState {
     /// Штатная остановка фоновых частей. Фоновые задачи, держащие `Db` (соединения SQLite), и как
     /// каждая останавливается (финальное ревью M4, M-5):
     /// - ночной исполнитель ([`crate::works::NightRunner::stop`], M7.3) — **первым**: признак
-    ///   остановки, ожидание шага ночи не дольше 5 с, затем снятие задачи; клон состояния ночи
-    ///   отпускается до остановки обслуживания и закрытия баз;
+    ///   остановки, ожидание шага ночи и учтённых ручных запусков не дольше 5 с, затем снятие;
+    ///   клон состояния ночи отпускается до остановки обслуживания и закрытия баз;
     /// - воркер обслуживания ([`Maintenance::stop`]) — с ожиданием конца задачи;
     /// - конвейер документов ([`crate::docs::DocIndexer::shutdown`]) — незаконченные разборы
     ///   ждём не дольше 5 с (задания вернутся в очередь при следующем запуске);
@@ -457,24 +457,13 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         #[cfg(feature = "test-hooks")]
         recall_delay_ms: Arc::default(),
     };
-    start_works(&state).await;
+    // внутренние работы (M7.3 §6.1 п. 5): шаги старта — в фоне раннера (сборку и роутер не
+    // задерживают), ночной цикл — при `[works] enabled`
+    state
+        .night
+        .start(crate::works::NightCtx::new(state.clone()));
     let router = router(state.clone());
     Ok((router, state, BootReport { initial_token }))
-}
-
-/// Внутренние работы после сборки состояния (M7.3 §6.1 п. 5): один раз, при любом `[works]
-/// enabled`, — возврат работ модели, оборванных остановкой, в очередь и пометка прерванных
-/// прогонов проверки; затем запуск ночного исполнителя (при `enabled`). Сбой шага старта — WARN,
-/// сервер работает.
-async fn start_works(state: &AppState) {
-    let ctx = crate::works::NightCtx::new(state.clone());
-    if let Err(e) = crate::works::queue::on_start(&ctx).await {
-        tracing::warn!(error = %e, "внутренние работы: возврат работ в очередь при старте не удался");
-    }
-    if let Err(e) = crate::check::on_start(&ctx).await {
-        tracing::warn!(error = %e, "проверка памяти: пометка прерванных прогонов не удалась");
-    }
-    state.night.start(ctx);
 }
 
 fn router(state: AppState) -> Router {

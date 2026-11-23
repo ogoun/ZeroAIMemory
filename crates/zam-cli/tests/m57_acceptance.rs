@@ -55,7 +55,7 @@ fn start(name: &str) -> (String, String) {
         rt.block_on(async move {
             let mut cfg = ServerConfig {
                 data_dir: data,
-                ..ServerConfig::default()
+                ..common::server_defaults()
             };
             cfg.recall.timeout_ms = 30_000;
             // приёмка M5.7 — режим идей `propose` (в `review` M6.5 `propose` новой идеи — 409)

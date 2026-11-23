@@ -78,7 +78,7 @@ fn start_db(name: &str) -> (String, String, PathBuf) {
         rt.block_on(async move {
             let mut cfg = ServerConfig {
                 data_dir: data,
-                ..ServerConfig::default()
+                ..common::server_defaults()
             };
             cfg.recall.timeout_ms = 30_000;
             let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();

@@ -194,7 +194,7 @@ impl Srv {
             rt.block_on(async move {
                 let mut cfg = ServerConfig {
                     data_dir: data.clone(),
-                    ..ServerConfig::default()
+                    ..common::server_defaults()
                 };
                 // отладочная сборка на HDD: сервер не обрезает сбор (бюджет — у клиента хука)
                 cfg.recall.timeout_ms = 30_000;

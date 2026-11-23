@@ -12,4 +12,4 @@ pub mod queue;
 pub mod schedule;
 pub mod settings;
 
-pub use night::{NightCtx, NightRunner};
+pub use night::{NightCtx, NightRunner, Stopping};

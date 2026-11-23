@@ -97,6 +97,11 @@ impl ServerProc {
     /// Общий запуск: исполняемый файл `exe` и дополнительные переменные окружения `env`.
     fn start_with(exe: &Path, conf: &Path, addr: SocketAddr, env: &[(&str, &str)]) -> ServerProc {
         let mut cmd = command_for(exe);
+        // без ночной проверки, как `common::cfg_in` (M7.3, решение 67); только у бинарника пакета:
+        // сервер тега до 0.0.16 ключа `works` не знает и с ним не стартует
+        if exe == Path::new(env!("CARGO_BIN_EXE_zam-server")) {
+            cmd.env("ZAM_WORKS__CHECK", "off");
+        }
         cmd.envs(env.iter().copied());
         let mut child = cmd
             .arg("serve")

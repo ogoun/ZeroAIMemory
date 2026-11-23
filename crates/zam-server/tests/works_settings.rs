@@ -236,6 +236,65 @@ async fn works_settings_patch_and_defaults() {
     assert!(u.check);
 }
 
+/// §6.2 п. 1 (ревью r1, Minor 2): пределы полей подключения — 422 с именем поля на каждой
+/// границе, значения на границе принимаются: `model` — 1..=200 символов (пусто и из пробелов —
+/// 422), `max_tokens` — 256..=32000, `body_extra` — JSON-объект не больше 4096 байт; лишнее поле
+/// входа `works.model` и `works.limits` — 400 (строгость входа).
+#[tokio::test]
+async fn works_model_field_bounds_422() {
+    let a = setup("bounds", |_| {}).await;
+    vault_item(&a, "llm").await;
+    let with = |field: &str, v: Value| {
+        let mut c = conn("llm");
+        c[field] = v;
+        json!({"works": {"model": c}})
+    };
+    // `{"k":"<n символов>"}` — 8 + n байт
+    let extra = |n: usize| json!({ "k": "x".repeat(n) });
+    for (body, field) in [
+        (with("model", json!("")), "works.model.model"),
+        (with("model", json!("   ")), "works.model.model"),
+        (with("model", json!("м".repeat(201))), "works.model.model"),
+        (with("max_tokens", json!(255)), "works.model.max_tokens"),
+        (with("max_tokens", json!(32_001)), "works.model.max_tokens"),
+        (
+            with("body_extra", json!("строка")),
+            "works.model.body_extra",
+        ),
+        (with("body_extra", json!([1, 2])), "works.model.body_extra"),
+        (with("body_extra", extra(4089)), "works.model.body_extra"),
+    ] {
+        let r = patch(&a, body.clone()).await;
+        ok(&r, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(r.text().contains(field), "{field}: {}", r.text());
+    }
+    assert!(stored(&a).await.is_empty(), "отказы ничего не пишут");
+    for body in [
+        with("model", json!("м".repeat(200))),
+        with("max_tokens", json!(256)),
+        with("max_tokens", json!(32_000)),
+        with("body_extra", extra(4088)),
+        with("body_extra", json!(null)),
+    ] {
+        ok(&patch(&a, body).await, StatusCode::OK);
+    }
+    // строгость входа: лишнее поле — 400
+    let mut c = conn("llm");
+    c["temperature"] = json!(0.2);
+    ok(
+        &patch(&a, json!({"works": {"model": c}})).await,
+        StatusCode::BAD_REQUEST,
+    );
+    ok(
+        &patch(
+            &a,
+            json!({"works": {"limits": {"daily_tokens": 1, "monthly_tokens": 2, "weekly": 3}}}),
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+    );
+}
+
 /// §6.1 п. 2: по токену `PATCH /auth/settings` (в том числе `works`) — 403, `GET` — 403, как
 /// прежде: агент не меняет ни режим, ни подключение.
 #[tokio::test]

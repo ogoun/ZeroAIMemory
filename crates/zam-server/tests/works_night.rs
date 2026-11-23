@@ -253,3 +253,168 @@ async fn night_runner_checks_before_works() {
         "{got:?}"
     );
 }
+
+/// Окно ночи вне прогона: `at` — через 6 ч (UTC).
+fn night_later(c: &mut ServerConfig) {
+    let at = (Timestamp::now() + SignedDuration::from_hours(6)).to_zoned(TimeZone::UTC);
+    c.works.at = at.strftime("%H:%M").to_string();
+    c.works.tz = "UTC".into();
+    c.works.window_min = 120;
+}
+
+/// Ревью r1, ⚠️2: ручные запуски (`POST /works/run`, `POST /check/run` — задачи 3 и 5) идут через
+/// `NightRunner::spawn_tracked`. `shutdown` дожидается запуска, который смотрит на остановку
+/// (`ctx.stopped()`), и снимает висящий — не дольше 5 с ожидания (+ 1 с запаса); после остановки
+/// новый запуск — `Stopping`; клоны состояния отпущены — повторная сборка на том же каталоге
+/// данных идёт без `DataDirLocked`.
+#[tokio::test]
+async fn manual_runs_tracked_by_stop() {
+    let _serial = SERIAL.lock().await;
+    let _reset = Reset;
+    let a = api("night-tracked", night_later).await;
+    let cfg = a.st.cfg.as_ref().clone();
+    let (entered, finished) = (
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    // смотрит на остановку: заканчивает шаг сам
+    let ctx = zam_server::works::NightCtx::new(a.st.clone());
+    let (e, f) = (entered.clone(), finished.clone());
+    a.st.night
+        .spawn_tracked(async move {
+            ctx.st().users.get(ctx.st().admin_id).await.unwrap();
+            e.fetch_add(1, Ordering::SeqCst);
+            ctx.stopped().await;
+            f.store(true, Ordering::SeqCst);
+        })
+        .unwrap();
+    // не смотрит на остановку: висит с клоном состояния
+    let ctx = zam_server::works::NightCtx::new(a.st.clone());
+    let e = entered.clone();
+    a.st.night
+        .spawn_tracked(async move {
+            let _hold = ctx;
+            e.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        })
+        .unwrap();
+    until(
+        "ручные запуски идут",
+        Duration::from_secs(20),
+        || entered.load(Ordering::SeqCst) == 2,
+    )
+    .await;
+    assert_eq!(a.st.night.tracked_running(), 2);
+    let t0 = Instant::now();
+    a.st.shutdown().await;
+    let took = t0.elapsed();
+    assert!(took <= Duration::from_secs(6), "shutdown {took:?}");
+    assert!(
+        finished.load(Ordering::SeqCst),
+        "запуск, смотревший на остановку, закончил шаг сам"
+    );
+    assert_eq!(a.st.night.tracked_running(), 0);
+    assert_eq!(
+        a.st.night.spawn_tracked(async {}),
+        Err(zam_server::works::Stopping)
+    );
+    drop(a);
+    // клоны состояния запусков отпущены: каталог данных свободен
+    let b = api_with(cfg).await;
+    b.st.shutdown().await;
+}
+
+/// Ревью r1, ⚠️3: шаги старта (`queue::on_start`, `check::on_start` — тела задач 3 и 5) идут в
+/// фоне раннера: сборка и роутер их не ждут (вход администратора проходит, пока шаги висят), а
+/// учтённый запуск начинается только после них.
+#[tokio::test]
+async fn startup_steps_run_in_background() {
+    let _serial = SERIAL.lock().await;
+    let _reset = Reset;
+    let (started, release) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let _unblock = Unblock(release.clone());
+    let (s, r) = (started.clone(), release.clone());
+    test_hooks::set_on_start(Arc::new(move |_ctx| -> JobFuture {
+        let (s, r) = (s.clone(), r.clone());
+        Box::pin(async move {
+            s.store(true, Ordering::SeqCst);
+            while !r.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(())
+        })
+    }));
+    // `api` — сборка и вход администратора через роутер: шаги старта висят, сборка не ждёт
+    let t0 = Instant::now();
+    let a = api("night-startup", night_later).await;
+    assert!(t0.elapsed() < Duration::from_secs(30), "{:?}", t0.elapsed());
+    until(
+        "шаги старта начаты",
+        Duration::from_secs(20),
+        || started.load(Ordering::SeqCst),
+    )
+    .await;
+    assert!(!release.load(Ordering::SeqCst), "шаги старта ещё висят");
+    let ran = Arc::new(AtomicBool::new(false));
+    let r2 = ran.clone();
+    a.st.night
+        .spawn_tracked(async move { r2.store(true, Ordering::SeqCst) })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !ran.load(Ordering::SeqCst),
+        "учтённый запуск ждёт конца шагов старта"
+    );
+    release.store(true, Ordering::SeqCst);
+    until(
+        "учтённый запуск после шагов старта",
+        Duration::from_secs(20),
+        || ran.load(Ordering::SeqCst),
+    )
+    .await;
+    a.st.shutdown().await;
+}
+
+/// Ревью r1, Minor 6: раннер запущен и уже провёл ночь (тик 50 мс, подменённая проверка), затем
+/// уходят все клоны состояния **без** `shutdown` — повторная сборка на том же каталоге данных
+/// идёт без `DataDirLocked`: задача между ночами держит только `Weak`, раннер и клон ночи
+/// уничтожаются вместе с последним внешним клоном.
+#[tokio::test]
+async fn drop_without_shutdown_releases_data_dir() {
+    let _serial = SERIAL.lock().await;
+    let _reset = Reset;
+    let nights = Arc::new(AtomicUsize::new(0));
+    let n = nights.clone();
+    test_hooks::set_tick(Duration::from_millis(50));
+    test_hooks::set_jobs(Jobs {
+        check: Some(job(move |_, _, _| {
+            let n = n.clone();
+            async move {
+                n.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })),
+        queue: None,
+    });
+    let mut cfg = common::cfg_in(common::tmp("night-drop"));
+    night_now(&mut cfg);
+    let (app, st, _) = zam_server::build(cfg.clone(), Some("pw".into()))
+        .await
+        .unwrap();
+    until("ночь прошла", Duration::from_secs(20), || {
+        nights.load(Ordering::SeqCst) >= 1
+    })
+    .await;
+    // между ночами: задача ждёт тика
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    drop(app);
+    drop(st);
+    let (_app, st, rep) = zam_server::build(cfg, Some("pw".into()))
+        .await
+        .expect("повторная сборка на том же каталоге — без DataDirLocked");
+    assert!(rep.initial_token.is_none(), "тот же каталог данных");
+    st.shutdown().await;
+}

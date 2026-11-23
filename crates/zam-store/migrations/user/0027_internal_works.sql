@@ -40,7 +40,8 @@ CREATE INDEX probes_active ON probes(space_id) WHERE status = 'active';
 
 -- ---------- прогоны ночной проверки (§6.5 пп. 1, 4, 5, 7) ----------
 -- Повод — `trigger_kind`, а не `trigger`: TRIGGER — ключевое слово SQL (как в 0025). `night` —
--- дата ночи (слот в поясе `[works] tz`, `yyyy-MM-dd`), у ручного прогона — сутки UTC запуска.
+-- дата ночи (слот в поясе `[works] tz`, `yyyy-MM-dd`) у ночного прогона, у ручного — `NULL`:
+-- ночной прогон ночи один (кроме прерванных), ищется по `(trigger_kind, night)`.
 -- `fingerprint`, `context`, `metrics`, `verdict` — JSON; `flags` — JSON-массив
 -- (`backup_overlap`, …); `episode` — id первого прогона эпизода регрессии. Хранение — 365 суток
 -- (воркер обслуживания), результаты уходят каскадом.

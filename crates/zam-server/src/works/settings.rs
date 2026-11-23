@@ -82,7 +82,6 @@ pub enum TokenField {
 /// Базовый адрес модели без `userinfo`, `?…` и `#…`: схема, хост, порт, путь. Хранит настройка
 /// (закрепление адреса записи Vault, §6.2 п. 1), разбирает клиент модели (задача 2 плана).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BaseUrl {
     pub scheme: String,
     pub host: String,
@@ -95,8 +94,12 @@ pub type PinnedAddr = BaseUrl;
 
 /// Подключение `works.model` (§6.2 п. 1). `vault` — id записи личного Vault (в JSON — `v:<id>`):
 /// адрес — её `data.url` (иначе `data.address`), ключ — её значение.
+///
+/// Хранимый формат (строка `user_settings`) читается **без** `deny_unknown_fields`, как и
+/// [`BaseUrl`] и [`Limits`]: строку, которую записала более новая версия с лишним полем, сервер
+/// после отката читает, а не теряет подключение. Строгость — на входе `PATCH`
+/// (`api::user_settings`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ModelConn {
     /// Протокол; в M7.3 — `openai` (OpenAI-совместимый Chat Completions).
     pub protocol: String,
@@ -144,7 +147,6 @@ mod vault_ref {
 
 /// Пределы токенов модели пользователя на сутки и месяц UTC (вход + выход).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Limits {
     pub daily_tokens: u64,
     pub monthly_tokens: u64,
@@ -522,5 +524,43 @@ mod tests {
         ]);
         assert!(v.kinds.is_empty() && v.mode.is_none());
         assert_eq!(v.value(WORKS_MODE, &s), json!("off"));
+    }
+
+    /// Ревью r1, Minor 3: хранимые строки, записанные более новой версией с лишними полями
+    /// (подключение, закреплённый адрес, пределы, пауза), читаются — подключение не пропадает
+    /// после отката; строгость — только у входа `PATCH`.
+    #[test]
+    fn stored_rows_tolerate_unknown_fields() {
+        let mut c = conn();
+        c.pinned = Some(BaseUrl {
+            scheme: "http".into(),
+            host: "192.0.2.10".into(),
+            port: 8080,
+            path: "/v1".into(),
+        });
+        let mut raw = json!(c);
+        raw["future_field"] = json!({"x": 1});
+        raw["pinned"]["ip"] = json!("192.0.2.10");
+        let rows = vec![
+            (WORKS_MODEL.to_string(), raw),
+            (
+                WORKS_LIMITS.to_string(),
+                json!({"daily_tokens": 1, "monthly_tokens": 2, "weekly_tokens": 3}),
+            ),
+            (
+                WORKS_PAUSE.to_string(),
+                json!({"class": "auth", "since": "2026-11-23T01:00:00.000000Z", "note": "x"}),
+            ),
+        ];
+        let u = UserWorks::from_rows(&rows);
+        assert_eq!(u.model, Some(c));
+        assert_eq!(
+            u.limits,
+            Some(Limits {
+                daily_tokens: 1,
+                monthly_tokens: 2
+            })
+        );
+        assert_eq!(u.pause, Some(pause()));
     }
 }

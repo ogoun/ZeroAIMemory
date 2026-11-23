@@ -457,13 +457,16 @@ fn parse_works(works: Map<String, Value>, out: &mut Vec<(String, Value)>) -> Res
                 let value = match v {
                     Value::Null => Value::Null,
                     other => {
-                        let l: Limits = serde_json::from_value(other).map_err(|e| {
+                        let l: LimitsInput = serde_json::from_value(other).map_err(|e| {
                             ApiError::BadRequest(format!(
                                 "works.limits: {{daily_tokens, monthly_tokens}} — целые ≥ 0 \
                                  или null: {e}"
                             ))
                         })?;
-                        json!(l)
+                        json!(Limits {
+                            daily_tokens: l.daily_tokens,
+                            monthly_tokens: l.monthly_tokens,
+                        })
                     }
                 };
                 out.push((WORKS_LIMITS.to_string(), value));
@@ -498,6 +501,14 @@ fn parse_works(works: Map<String, Value>, out: &mut Vec<(String, Value)>) -> Res
         }
     }
     Ok(())
+}
+
+/// Вход `works.limits`: строгий (неизвестное поле — 400), хранимый [`Limits`] — нет.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LimitsInput {
+    daily_tokens: u64,
+    monthly_tokens: u64,
 }
 
 /// Вход `works.model` (§6.2 п. 1): запись личного Vault — имя или `v:<id>`.
@@ -738,8 +749,15 @@ async fn apply(
                 )
                 .await?;
         }
-        if works_touched {
-            notify_mode_change(st, user, &works_cur).await?;
+        // режим уже записан: сбой снятия работ — WARN, а не ошибка `PATCH` (повтор того же
+        // `PATCH` — «без изменений» и снятия не позовёт); исполнитель всё равно сверяет
+        // действующий режим вида перед захватом и перед каждым обращением к модели (задача 3)
+        if works_touched && let Err(e) = notify_mode_change(st, user, &works_cur).await {
+            tracing::warn!(
+                user = %user,
+                error = %e,
+                "настройки works.*: снятие открытых работ при смене режима не удалось"
+            );
         }
     } else {
         // пользователь должен существовать и при правке без изменений

@@ -27,7 +27,7 @@ fn start(name: &str) -> (String, String, String) {
         rt.block_on(async move {
             let cfg = ServerConfig {
                 data_dir: data,
-                ..ServerConfig::default()
+                ..common::server_defaults()
             };
             let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();
             let mut tokens = Vec::new();
