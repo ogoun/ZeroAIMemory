@@ -1994,20 +1994,35 @@ async fn backup_tick_failure_keeps_copies_and_waits_slot() {
     std::fs::rename(&good, &yesterday).unwrap();
     let now = at("2026-11-08T04:00:00Z");
     let mut st = BackupState::default();
+    let (lock, system) = (&a.st.backups, &a.st.system);
     test_hooks::set_free_space(&cfg.data_dir, Some(1));
-    let o = backup_tick(&cfg, now, &mut st).await;
+    let o = backup_tick(&cfg, now, &mut st, lock, system).await;
     assert_eq!((o.backup, o.pruned), (Some(false), 0));
     assert!(
         yesterday.join(MANIFEST_FILE).is_file(),
         "хорошая копия цела"
     );
     // минута спустя — без новой попытки
-    let o = backup_tick(&cfg, now + jiff::SignedDuration::from_mins(1), &mut st).await;
+    let o = backup_tick(
+        &cfg,
+        now + jiff::SignedDuration::from_mins(1),
+        &mut st,
+        lock,
+        system,
+    )
+    .await;
     assert_eq!((o.backup, o.pruned), (None, 0));
     assert_eq!(st.failures, 1);
     test_hooks::set_free_space(&cfg.data_dir, None);
     // следующий срок — копия и ротация по фактическому списку
-    let o = backup_tick(&cfg, now + jiff::SignedDuration::from_hours(24), &mut st).await;
+    let o = backup_tick(
+        &cfg,
+        now + jiff::SignedDuration::from_hours(24),
+        &mut st,
+        lock,
+        system,
+    )
+    .await;
     assert_eq!((o.backup, o.pruned), (Some(true), 1));
     let left = zam_server::backup::list_copies(&dir);
     assert_eq!(left.len(), 1);
@@ -2546,4 +2561,620 @@ async fn restore_has_no_machine_bindings() {
         hits[0].contains("entries.body") && hits[0].contains(" см. "),
         "{hits:?}"
     );
+}
+
+// ---------------------------------------------------------------- M7.2 задача 7: копии из WebUI
+
+/// `GET /admin/backups` сессией администратора.
+async fn backups(a: &Api) -> Value {
+    let r = a
+        .adm(Method::GET, "/api/v1/admin/backups", None, None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()
+}
+
+/// Ждёт итога копии в процессе, начатой в `started`: `running = null` и `last_run` не раньше
+/// начала (строки времени одного формата сравниваются как строки).
+async fn wait_run(a: &Api, started: &str) -> Value {
+    let t0 = Instant::now();
+    loop {
+        let b = backups(a).await;
+        let done = b["running"].is_null()
+            && b["last_run"]["finished_at"]
+                .as_str()
+                .is_some_and(|f| f >= started);
+        if done {
+            return b;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(120),
+            "копия не закончилась: {b}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// `POST /admin/backups` → 202 (занято автокопией — повтор) и итог копии.
+async fn copy_via_api(a: &Api) -> Value {
+    let t0 = Instant::now();
+    let started = loop {
+        let r = a
+            .adm(Method::POST, "/api/v1/admin/backups", None, None)
+            .await;
+        if r.status == StatusCode::ACCEPTED {
+            break r.json()["started_at"].as_str().unwrap().to_string();
+        }
+        common::api::problem(&r, StatusCode::CONFLICT, "backup-running");
+        assert!(
+            t0.elapsed() < Duration::from_secs(120),
+            "замок не освободился"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    wait_run(a, &started).await
+}
+
+/// Копия держится в тестовой точке после первого снимка `system.db`, пока тест не отпустит.
+struct Hold {
+    data_dir: PathBuf,
+    entered: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+impl Hold {
+    fn new(data_dir: &Path) -> Hold {
+        let (etx, erx) = std::sync::mpsc::channel();
+        let (rtx, rrx) = std::sync::mpsc::channel::<()>();
+        let (etx, rrx) = (Mutex::new(etx), Mutex::new(rrx));
+        test_hooks::set_after_first_snapshot(
+            data_dir,
+            Some(Arc::new(move || {
+                let _ = etx.lock().unwrap().send(());
+                let _ = rrx.lock().unwrap().recv_timeout(Duration::from_secs(120));
+            })),
+        );
+        Hold {
+            data_dir: data_dir.to_path_buf(),
+            entered: erx,
+            release: rtx,
+        }
+    }
+
+    /// Копия дошла до точки и ждёт.
+    async fn entered(&self) {
+        let t0 = Instant::now();
+        while self.entered.try_recv().is_err() {
+            assert!(t0.elapsed() < Duration::from_secs(60), "копия не началась");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Отпустить копию; следующие копии каталога точку не проходят.
+    fn release(self) {
+        test_hooks::set_after_first_snapshot(&self.data_dir, None);
+        let _ = self.release.send(());
+    }
+}
+
+/// Сумма размеров файлов описи и самой описи — `bytes` копии.
+fn manifest_bytes(copy: &Path) -> u64 {
+    read_manifest(copy)
+        .files
+        .iter()
+        .map(|f| f.size)
+        .sum::<u64>()
+        + std::fs::metadata(copy.join(MANIFEST_FILE)).unwrap().len()
+}
+
+/// M7 §5.6 п. 1: `POST /admin/backups` → 202, копия — в процессе сервера; опрос `GET` до итога:
+/// копия в списке с числами описи, итог — без пути, путь каталога копий — только в `dir`;
+/// аудит `server.backup {by: "webui", ok: true}`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_api_run_and_list() {
+    let _g = CHUNKER.read().await;
+    let (a, _) = seeded("bk-api-run").await;
+    let cfg = cfg_of(&a);
+    let dir = cfg.backup.dir(&cfg.data_dir);
+    let b = backups(&a).await;
+    assert_eq!(b["items"], json!([]), "{b}");
+    assert_eq!(b["running"], Value::Null);
+    assert_eq!(b["last_run"], Value::Null);
+    assert_eq!(b["last_at"], Value::Null);
+    assert_eq!(b["warning"], "no_recent_backup");
+    assert_eq!(
+        (&b["schedule"], &b["at"], &b["keep"], &b["warn_days"]),
+        (&json!("off"), &json!("03:30"), &json!(7), &json!(7))
+    );
+    assert_eq!(b["dir"], dir.display().to_string());
+
+    let b = copy_via_api(&a).await;
+    let run = &b["last_run"];
+    assert_eq!(run["ok"], true, "{b}");
+    assert_eq!(run["error"], Value::Null);
+    let items = b["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{b}");
+    let it = &items[0];
+    let name = it["name"].as_str().unwrap();
+    assert!(zam_server::backup::copy_time(name).is_some(), "{name}");
+    let copy = dir.join(name);
+    let m = read_manifest(&copy);
+    assert_eq!(it["dbs"], 2, "system.db и база администратора: {it}");
+    assert_eq!(it["blobs"], 2, "два вложения: {it}");
+    assert_eq!(it["files"], m.files.len());
+    assert_eq!(it["bytes"], manifest_bytes(&copy));
+    assert_eq!(it["server_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(it["created_at"], m.created_at);
+    assert_eq!(it["drift"], json!([]));
+    // итог — строка отчёта без пути
+    let rep = &run["report"];
+    assert_eq!(rep["name"], name, "{rep}");
+    assert_eq!((&rep["dbs"], &rep["blobs"]), (&json!(2), &json!(2)));
+    assert_eq!(rep["bytes"], it["bytes"]);
+    assert!(rep.get("path").is_none(), "{rep}");
+    assert!(b["last_at"].is_string());
+    assert_eq!(b["warning"], Value::Null);
+    // путь каталога данных — только в `dir`
+    let mut no_dir = b.clone();
+    no_dir.as_object_mut().unwrap().remove("dir");
+    assert!(!no_dir.to_string().contains("api-bk-api-run"), "{no_dir}");
+
+    let rows = a.st.system.list_audit(50, None).await.unwrap();
+    let r = rows
+        .iter()
+        .find(|r| r.action == "server.backup")
+        .expect("аудит server.backup");
+    assert_eq!(r.actor, "admin");
+    assert_eq!(r.target.as_deref(), Some(name));
+    let d = &r.details;
+    assert_eq!(
+        (&d["by"], &d["ok"], &d["name"]),
+        (&json!("webui"), &json!(true), &json!(name))
+    );
+    assert_eq!(d["bytes"], it["bytes"]);
+    assert!(d["ms"].is_u64(), "{d}");
+    assert_eq!(d["error"], Value::Null);
+    assert!(!d.to_string().contains("api-bk-api-run"), "{d}");
+    stop(a).await;
+}
+
+/// M7 §5.6 п. 1: копия одна за раз — второй `POST`, пока первая держится тестовой точкой, —
+/// 409 `/problems/backup-running` с `running`; опрос `GET` во время копии её не ждёт.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_api_busy_409() {
+    let _g = CHUNKER.read().await;
+    let (a, _) = seeded("bk-api-busy").await;
+    let cfg = cfg_of(&a);
+    let hold = Hold::new(&cfg.data_dir);
+    let r = a
+        .adm(Method::POST, "/api/v1/admin/backups", None, None)
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    let started = r.json()["started_at"].as_str().unwrap().to_string();
+    hold.entered().await;
+    let r = a
+        .adm(Method::POST, "/api/v1/admin/backups", None, None)
+        .await;
+    common::api::problem(&r, StatusCode::CONFLICT, "backup-running");
+    let j = r.json();
+    assert_eq!(j["running"]["started_at"], started.as_str(), "{j}");
+    assert_eq!(j["running"]["by"], "webui");
+    let t0 = Instant::now();
+    let b = backups(&a).await;
+    assert!(t0.elapsed() < Duration::from_secs(5), "опрос ждал копию");
+    assert_eq!(b["running"]["started_at"], started.as_str(), "{b}");
+    assert_eq!(b["last_run"], Value::Null);
+    hold.release();
+    let b = wait_run(&a, &started).await;
+    assert_eq!(b["last_run"]["ok"], true, "{b}");
+    assert_eq!(
+        b["items"].as_array().unwrap().len(),
+        1,
+        "вторая копия не снималась"
+    );
+    stop(a).await;
+}
+
+/// M7 §5.6 п. 1: один замок у страницы и расписания. Пока копия из WebUI держит замок, шаг
+/// расписания в срок `at` копию не начинает, попытку не отмечает и лишних копий не удаляет;
+/// после её конца — снимает копию и удаляет лишние; аудит автокопии — `by: "schedule"`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_api_schedule_shares_lock() {
+    let _g = CHUNKER.read().await;
+    use zam_server::maintenance::{BackupState, backup_tick};
+    let (a, _) = seeded("bk-api-lock").await;
+    let mut cfg = cfg_of(&a);
+    cfg.backup.schedule = BackupSchedule::Daily;
+    cfg.backup.keep = 1;
+    let dir = cfg.backup.dir(&cfg.data_dir);
+    let old = ["2000-01-01_033000", "2000-01-02_033000"];
+    for o in old {
+        let p = run_backup(&cfg, BackupOpts::default()).await.unwrap().path;
+        std::fs::rename(&p, dir.join(o)).unwrap();
+    }
+    // срок `at` послезавтра (UTC): позже любой копии теста
+    let utc = jiff::tz::TimeZone::UTC;
+    let day = (zam_store::time::now() + jiff::SignedDuration::from_hours(48))
+        .to_zoned(utc.clone())
+        .date();
+    let now = day.at(4, 0, 0, 0).to_zoned(utc).unwrap().timestamp();
+    let (lock, system) = (&a.st.backups, &a.st.system);
+
+    let hold = Hold::new(&cfg.data_dir);
+    let r = a
+        .adm(Method::POST, "/api/v1/admin/backups", None, None)
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    let started = r.json()["started_at"].as_str().unwrap().to_string();
+    hold.entered().await;
+    let mut st = BackupState::default();
+    let o = backup_tick(&cfg, now, &mut st, lock, system).await;
+    assert_eq!(
+        (o.backup, o.pruned),
+        (None, 0),
+        "замок занят — шаг пропущен"
+    );
+    assert_eq!(st.last_attempt, None, "слот не занят");
+    for o in old {
+        assert!(dir.join(o).join(MANIFEST_FILE).is_file(), "{o} удалена");
+    }
+    assert_eq!(backups(&a).await["running"]["by"], "webui");
+    hold.release();
+    let b = wait_run(&a, &started).await;
+    assert_eq!(b["last_run"]["ok"], true, "{b}");
+    assert_eq!(
+        zam_server::backup::list_copies(&dir).len(),
+        3,
+        "при schedule = off у сервера копия из WebUI ротации не делает"
+    );
+
+    // замок свободен — копия по расписанию и удаление лишних (keep = 1)
+    let o = backup_tick(&cfg, now, &mut st, lock, system).await;
+    assert_eq!((o.backup, o.pruned), (Some(true), 3), "{o:?}");
+    assert_eq!(st.last_attempt, Some(now));
+    let left = zam_server::backup::list_copies(&dir);
+    assert_eq!(left.len(), 1, "{left:?}");
+    let auto = left[0].file_name().unwrap().to_str().unwrap().to_string();
+    let rows = a.st.system.list_audit(50, None).await.unwrap();
+    let runs: Vec<&zam_store::AuditRow> = rows
+        .iter()
+        .filter(|r| r.action == "server.backup")
+        .collect();
+    let by: Vec<&str> = runs
+        .iter()
+        .map(|r| r.details["by"].as_str().unwrap())
+        .collect();
+    assert_eq!(by, ["schedule", "webui"], "новые первыми");
+    assert_eq!(runs[0].actor, "system");
+    assert_eq!(runs[0].ip, None);
+    assert_eq!(runs[0].details["name"], auto.as_str());
+    assert_eq!(runs[0].details["ok"], true);
+    // итог автокопии виден странице
+    let b = backups(&a).await;
+    assert_eq!(b["running"], Value::Null);
+    assert_eq!(b["last_run"]["report"]["name"], auto.as_str(), "{b}");
+    stop(a).await;
+}
+
+/// M7 §5.6 п. 1, решение 24: ротация `keep` после копии из WebUI — только при
+/// `schedule = "daily"`; при `off` копии копятся до ручного удаления.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_api_rotation_only_daily() {
+    let _g = CHUNKER.read().await;
+    for (sched, want) in [(BackupSchedule::Daily, 2usize), (BackupSchedule::Off, 3)] {
+        let a = api(&format!("bk-api-rot-{sched:?}"), |c| {
+            c.backup.schedule = sched;
+            c.backup.keep = 2;
+        })
+        .await;
+        let mut names = Vec::new();
+        for _ in 0..3 {
+            let b = copy_via_api(&a).await;
+            assert_eq!(b["last_run"]["ok"], true, "{b}");
+            names.push(
+                b["last_run"]["report"]["name"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        let b = backups(&a).await;
+        let items: Vec<&str> = b["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["name"].as_str().unwrap())
+            .collect();
+        // новые первыми; при daily удалены старшие (и автокопия старта, если была)
+        let expect: Vec<&str> = names.iter().rev().take(want).map(String::as_str).collect();
+        assert_eq!(items, expect, "{sched:?}");
+        stop(a).await;
+    }
+}
+
+/// M7 §5.6 п. 1: `DELETE /admin/backups/{name}` удаляет только готовую копию каталога копий по
+/// имени-шаблону с описью; `..`, разделители, `*.partial`, `*.failed`, архив `--zip`, каталог
+/// без описи, файл, копия в другом каталоге и идущая сборка — 404, файлы целы; аудит
+/// `server.backup.delete {name}`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_api_delete_only_ready_copies() {
+    let _g = CHUNKER.read().await;
+    let (a, _) = seeded("bk-api-del").await;
+    let cfg = cfg_of(&a);
+    let dir = cfg.backup.dir(&cfg.data_dir);
+    let ready = run_backup(&cfg, BackupOpts::default()).await.unwrap().path;
+    let name = ready.file_name().unwrap().to_str().unwrap().to_string();
+    // не готовые копии каталога копий
+    let partial = dir.join("2026-01-01_000000.partial");
+    let failed = dir.join("2026-01-02_000000.failed");
+    let no_manifest = dir.join("2026-01-03_000000");
+    let file_named = dir.join("2026-01-04_000000");
+    for d in [&partial, &failed] {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::write(d.join(MANIFEST_FILE), "{}").unwrap();
+    }
+    std::fs::create_dir_all(&no_manifest).unwrap();
+    std::fs::write(no_manifest.join("system.db"), b"x").unwrap();
+    std::fs::write(&file_named, b"x").unwrap();
+    // архивы `--zip` в каталоге копий: с именем копии и с расширением
+    let zip_named = dir.join("2026-01-05_000000");
+    let zip = dir.join("2026-01-05_000001.zip");
+    for z in [&zip_named, &zip] {
+        run_backup(
+            &cfg,
+            BackupOpts {
+                dir: None,
+                zip: Some(z.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    // готовая копия в другом каталоге
+    let other = common::tmp("bk-api-del-other");
+    let outside = run_backup(
+        &cfg,
+        BackupOpts {
+            dir: Some(other.clone()),
+            zip: None,
+        },
+    )
+    .await
+    .unwrap()
+    .path;
+    let outside_name = "2026-01-06_000000";
+    std::fs::rename(&outside, other.join(outside_name)).unwrap();
+    let outside = other.join(outside_name);
+    #[cfg(unix)]
+    let link = {
+        let l = dir.join("2026-01-07_000000");
+        std::os::unix::fs::symlink(&outside, &l).unwrap();
+        l
+    };
+    // идущая сборка
+    let hold = Hold::new(&cfg.data_dir);
+    let r = a
+        .adm(Method::POST, "/api/v1/admin/backups", None, None)
+        .await;
+    assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text());
+    let started = r.json()["started_at"].as_str().unwrap().to_string();
+    hold.entered().await;
+    let building = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter_map(|n| n.strip_suffix(".partial").map(str::to_string))
+        .find(|n| n != "2026-01-01_000000")
+        .expect("сборка идущей копии");
+
+    let mut bad: Vec<String> = [
+        "..",
+        "%2E%2E",
+        ".",
+        "a%2Fb",
+        "..%2F..%2Fsystem.db",
+        "..%5Csystem.db",
+        "2026-01-01_000000.partial",
+        "2026-01-02_000000.failed",
+        "2026-01-03_000000",
+        "2026-01-04_000000",
+        "2026-01-05_000000",
+        "2026-01-05_000001.zip",
+        "2026-01-06_000000",
+        "2026-01-07_000000",
+        "2026-13-01_000000",
+        "backups",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    bad.push(building.clone());
+    bad.push(format!("{building}.partial"));
+    bad.push(format!("{name}%2F..%2F.."));
+    bad.push(format!("..%2F{name}"));
+    bad.push(format!("{name}%20"));
+    for n in &bad {
+        let r = a
+            .adm(
+                Method::DELETE,
+                &format!("/api/v1/admin/backups/{n}"),
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{n}: {}", r.text());
+    }
+    hold.release();
+    wait_run(&a, &started).await;
+    for p in [&partial, &failed] {
+        assert!(p.join(MANIFEST_FILE).is_file(), "{}", p.display());
+    }
+    assert!(no_manifest.join("system.db").is_file());
+    assert!(file_named.is_file() && zip_named.is_file() && zip.is_file());
+    assert!(outside.join(MANIFEST_FILE).is_file());
+    #[cfg(unix)]
+    assert!(link.exists());
+    assert!(ready.join(MANIFEST_FILE).is_file());
+    assert!(cfg.data_dir.join("system.db").is_file());
+    assert!(
+        !a.st
+            .system
+            .list_audit(50, None)
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.action == "server.backup.delete"),
+        "отказ — без аудита"
+    );
+
+    let del = format!("/api/v1/admin/backups/{name}");
+    let r = a.adm(Method::DELETE, &del, None, None).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    assert!(!ready.exists());
+    let rows = a.st.system.list_audit(50, None).await.unwrap();
+    let row = rows
+        .iter()
+        .find(|r| r.action == "server.backup.delete")
+        .expect("аудит server.backup.delete");
+    assert_eq!(row.details, json!({ "name": name }));
+    assert_eq!(row.target.as_deref(), Some(name.as_str()));
+    assert_eq!(row.actor, "admin");
+    let r = a.adm(Method::DELETE, &del, None, None).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "уже удалена");
+    let left: Vec<String> = backups(&a).await["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(!left.contains(&name), "{left:?}");
+    stop(a).await;
+}
+
+/// Запрос сессии WebUI `w` (cookie и CSRF) без тела.
+async fn web(a: &Api, w: &(String, String), m: Method, uri: &str) -> common::api::Resp {
+    let r = common::api::req(m, uri, None)
+        .header(axum::http::header::COOKIE, &w.0)
+        .header("x-csrf-token", &w.1)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    a.send(r).await
+}
+
+/// Сессия пользователя WebUI (не администратора) после обязательной смены пароля:
+/// (cookie, CSRF). Пароли — склейкой (правило фиктивных секретов в тестах).
+async fn user_web(a: &Api, uid: &str, name: &str) -> (String, String) {
+    let first = format!("{}{}", "first-", "pass-123");
+    let next = format!("{}{}", "second-", "pass-456");
+    let r = a
+        .adm(
+            Method::POST,
+            &format!("/api/v1/admin/users/{uid}/password"),
+            Some(json!({ "password": first })),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let body = json!({ "login": name, "password": first });
+    let r = a
+        .send(
+            common::api::req(Method::POST, "/api/v1/auth/login", Some(&body))
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let cookie = r
+        .header("set-cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let w = (cookie, r.json()["csrf"].as_str().unwrap().to_string());
+    let change = json!({ "old": first, "new": next });
+    let r = a
+        .send(
+            common::api::req(Method::POST, "/api/v1/auth/password", Some(&change))
+                .header(axum::http::header::COOKIE, &w.0)
+                .header("x-csrf-token", &w.1)
+                .body(axum::body::Body::from(change.to_string()))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    w
+}
+
+/// M7 §5.6 п. 1: API копий — только сессия администратора WebUI; пользователь WebUI и токены
+/// (в том числе первый токен администратора) — 403, копия не начинается и не удаляется.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_api_admin_only() {
+    let _g = CHUNKER.read().await;
+    let a = api("bk-api-admin", |_| {}).await;
+    let cfg = cfg_of(&a);
+    let ready = run_backup(&cfg, BackupOpts::default()).await.unwrap().path;
+    let name = ready.file_name().unwrap().to_str().unwrap().to_string();
+    let (uid, tok) = a.new_user("bob").await;
+    let w = user_web(&a, &uid, "bob").await;
+    let del = format!("/api/v1/admin/backups/{name}");
+    for (m, uri) in [
+        (Method::GET, "/api/v1/admin/backups"),
+        (Method::POST, "/api/v1/admin/backups"),
+        (Method::DELETE, del.as_str()),
+    ] {
+        for t in [&tok, &a.token] {
+            let r = a.tok(t, m.clone(), uri, None).await;
+            assert_eq!(r.status, StatusCode::FORBIDDEN, "{m} {uri}: {}", r.text());
+        }
+        let r = web(&a, &w, m.clone(), uri).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{m} {uri}: {}", r.text());
+        assert_eq!(r.json()["detail"], "только администратору");
+    }
+    assert!(ready.join(MANIFEST_FILE).is_file(), "копия не удалена");
+    let b = backups(&a).await;
+    assert_eq!(
+        (&b["running"], &b["last_run"]),
+        (&Value::Null, &Value::Null),
+        "{b}"
+    );
+    assert_eq!(b["items"].as_array().unwrap().len(), 1);
+    stop(a).await;
+}
+
+/// M7 §5.6 п. 1: `GET /index/status?only=backup` → только `{backup}` (лёгкий ответ плашки,
+/// как `only=rules`), то же значение, что у полного статуса; путей нет.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn index_status_only_backup() {
+    let _g = CHUNKER.read().await;
+    let a = api("bk-only-backup", |_| {}).await;
+    let empty = json!({"last_at": null, "schedule": "off", "warning": "no_recent_backup"});
+    let only = "/api/v1/index/status?only=backup";
+    for r in [
+        a.adm(Method::GET, only, None, None).await,
+        a.t(Method::GET, only, None).await,
+    ] {
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        assert_eq!(r.json(), json!({ "backup": empty }));
+    }
+    run_backup(&cfg_of(&a), BackupOpts::default())
+        .await
+        .unwrap();
+    let j = a.adm(Method::GET, only, None, None).await.json();
+    let full = a
+        .adm(Method::GET, "/api/v1/index/status", None, None)
+        .await
+        .json();
+    assert_eq!(j.as_object().unwrap().len(), 1, "{j}");
+    assert!(j["backup"]["last_at"].is_string(), "{j}");
+    assert_eq!(j["backup"]["warning"], Value::Null);
+    assert_eq!(j["backup"], full["backup"]);
+    assert!(!j.to_string().contains("bk-only-backup"), "{j}");
+    let r = a.t(Method::GET, "/api/v1/index/status?only=x", None).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(
+        r.json()["detail"].as_str().unwrap().contains("backup"),
+        "{}",
+        r.text()
+    );
+    stop(a).await;
 }

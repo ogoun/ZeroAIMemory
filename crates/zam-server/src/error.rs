@@ -102,6 +102,10 @@ pub enum ApiError {
     /// 409 `/problems/already-adopted` (M5.7 §5.4): идея уже человека.
     #[error("идея уже принята как своя")]
     AlreadyAdopted,
+    /// 409 `/problems/backup-running` (M7 §5.6): копия в процессе сервера уже идёт — со страницы
+    /// «Копии» или по расписанию (один замок); тело несёт `running {started_at, by}`.
+    #[error("копия уже идёт ({}): дождитесь её конца", backup_by_text(.0.by))]
+    BackupRunning(crate::backup::runner::Running),
     /// 422 `/problems/option-required` (M5.7 §5.3): ответ на вопрос-предложение без варианта.
     #[error("{0}")]
     OptionRequired(String),
@@ -270,6 +274,9 @@ impl ApiError {
                 "/problems/already-adopted",
                 "Conflict",
             ),
+            ApiError::BackupRunning(_) => {
+                (StatusCode::CONFLICT, "/problems/backup-running", "Conflict")
+            }
             ApiError::OptionRequired(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "/problems/option-required",
@@ -372,6 +379,14 @@ fn term_conflict_names(c: &[zam_store::TermConflict]) -> String {
     names.join(", ")
 }
 
+/// Кто снимает копию — для `detail` 409 `/problems/backup-running`.
+fn backup_by_text(by: crate::backup::runner::RunBy) -> &'static str {
+    match by {
+        crate::backup::runner::RunBy::WebUi => "из WebUI",
+        crate::backup::runner::RunBy::Schedule => "по расписанию",
+    }
+}
+
 /// Пояснение состояния запроса доступа для `detail`.
 fn access_state_text(state: &str) -> &'static str {
     match state {
@@ -441,6 +456,9 @@ impl IntoResponse for ApiError {
         }
         if let (ApiError::TaskClaimed(c), Value::Object(o)) = (&self, &mut body) {
             o.insert("claimed_by".into(), json!(c));
+        }
+        if let (ApiError::BackupRunning(r), Value::Object(o)) = (&self, &mut body) {
+            o.insert("running".into(), json!(r));
         }
         if let (ApiError::Certainty(c), Value::Object(o)) = (&self, &mut body) {
             o.insert("code".into(), json!(c.code()));

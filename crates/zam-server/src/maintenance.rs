@@ -10,7 +10,9 @@
 //!
 //! Автокопии (M6 §12б.4): раз в [`BACKUP_TICK`] — решение [`crate::backup::schedule::tick`]
 //! по `[backup]`; копию снимает тот же код, что `zam-server backup` (в блокирующем потоке),
-//! копии сверх `keep` удаляются, начиная с самых старых.
+//! копии сверх `keep` удаляются, начиная с самых старых. С M7.2 (§5.6) шаг идёт под замком
+//! [`crate::backup::runner::BackupRunner`], общим со страницей «Копии» WebUI: замок занят —
+//! шаг пропускается целиком до следующей минуты (ни копии, ни удаления, ни отметки попытки).
 //! Задача держит только `system.db` и кэш баз пользователей (открытые соединения SQLite);
 //! останавливается [`Maintenance::stop`] (с ожиданием: после него соединений **этой** задачи
 //! нет) или с последней копией состояния приложения. Другие держатели `Db` при остановке —
@@ -21,6 +23,7 @@ use jiff::{SignedDuration, Timestamp};
 use tokio::task::JoinHandle;
 use zam_store::{SystemStore, UserDbs};
 
+use crate::backup::runner::{BackupRunner, RunBy};
 use crate::backup::schedule::{self, Action};
 use crate::config::{BackupSchedule, CacheSection, ServerConfig};
 
@@ -44,23 +47,26 @@ pub struct Maintenance {
 }
 
 impl Maintenance {
-    /// Запускает задачу в текущем рантайме tokio; `cfg` — для автокопий (`[backup]`).
+    /// Запускает задачу в текущем рантайме tokio; `cfg` — для автокопий (`[backup]`), `backups`
+    /// — замок копий, общий со страницей «Копии» (`AppState::backups`).
     pub fn start(
         system: SystemStore,
         users: UserDbs,
         cache: CacheSection,
         cfg: ServerConfig,
+        backups: BackupRunner,
     ) -> Maintenance {
         let mut handles = Vec::new();
         let keep_days = cfg.snapshot.keep_days;
         if cfg.backup.schedule != BackupSchedule::Off {
+            let system = system.clone();
             handles.push(tokio::spawn(async move {
                 let mut tick = tokio::time::interval(BACKUP_TICK);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 let mut state = BackupState::default();
                 loop {
                     tick.tick().await;
-                    backup_tick(&cfg, zam_store::time::now(), &mut state).await;
+                    backup_tick(&cfg, zam_store::time::now(), &mut state, &backups, &system).await;
                 }
             }));
         }
@@ -237,66 +243,75 @@ pub struct TickOutcome {
 
 /// Один шаг расписания автокопий на момент `now`. Неудачная копия занимает слот (повтор — в
 /// следующий срок `backup.at`, а не каждую минуту), WARN — один на неудачу; лишние копии
-/// удаляются только после успешной копии (или когда копия не нужна), по фактическому списку.
+/// удаляются только после успешной копии (ротация `keep` в той же копии,
+/// [`crate::backup::runner::RunGuard::run`]) или когда копия не нужна, по фактическому списку.
+///
+/// Шаг с делом (копия или удаление) идёт под замком `backups`, общим со страницей «Копии»
+/// (M7 §5.6): занят — шаг пропущен целиком (ни копии, ни удаления, ни отметки попытки), следующая
+/// проверка — через минуту. Решение принимается заново под замком: копия из WebUI могла только
+/// что закончиться. Итог копии — аудит `server.backup {by: "schedule"}` в `system`.
 pub async fn backup_tick(
     cfg: &ServerConfig,
     now: Timestamp,
     state: &mut BackupState,
+    backups: &BackupRunner,
+    system: &SystemStore,
 ) -> TickOutcome {
     let dir = cfg.backup.dir(&cfg.data_dir);
-    let mut out = TickOutcome::default();
-    for round in 0..2 {
+    let plan = |state: &BackupState| {
         let existing = crate::backup::list_copies(&dir);
         let last = crate::backup::last_copy_at(&dir).max(state.last_attempt);
-        let mut again = false;
-        for a in schedule::tick(now, last, &existing, &cfg.backup) {
-            match a {
-                Action::Skip => {}
-                Action::Backup if round == 0 => {
-                    state.last_attempt = Some(now);
-                    let c = cfg.clone();
-                    let r = tokio::task::spawn_blocking(move || {
-                        crate::backup::backup(&c, &crate::backup::BackupOpts::default())
-                    })
-                    .await;
-                    let ok = matches!(r, Ok(Ok(_)));
-                    match r {
-                        Ok(Ok(rep)) => {
-                            state.failures = 0;
-                            tracing::info!("автокопия: {}", rep.line());
-                        }
-                        Ok(Err(e)) => {
-                            state.failures += 1;
-                            tracing::warn!(
-                                error = %e,
-                                failures = state.failures,
-                                "автокопия не снята: повтор в следующий срок backup.at"
-                            );
-                        }
-                        Err(e) => {
-                            state.failures += 1;
-                            tracing::warn!(
-                                error = %e,
-                                "автокопия завершилась аварийно: повтор в следующий срок backup.at"
-                            );
-                        }
+        schedule::tick(now, last, &existing, &cfg.backup)
+    };
+    let mut out = TickOutcome::default();
+    if plan(state).iter().all(|a| *a == Action::Skip) {
+        return out;
+    }
+    let guard = match backups.try_start(RunBy::Schedule) {
+        Ok(g) => g,
+        Err(busy) => {
+            tracing::debug!(
+                by = busy.0.by.as_str(),
+                "автокопия: идёт другая копия — шаг расписания отложен до следующей минуты"
+            );
+            return out;
+        }
+    };
+    let mut guard = Some(guard);
+    for a in plan(state) {
+        match a {
+            Action::Skip => {}
+            Action::Backup => {
+                let Some(g) = guard.take() else { continue };
+                state.last_attempt = Some(now);
+                let run = g.run(cfg, system, None).await;
+                match &run.result {
+                    Ok(rep) => {
+                        state.failures = 0;
+                        tracing::info!("автокопия: {}", rep.line());
                     }
-                    out.backup = Some(ok);
-                    // после успешной копии — ротация по новому списку
-                    again = ok;
+                    Err(_) => {
+                        // причина — строкой выше (`RunGuard::run`, с путями)
+                        state.failures += 1;
+                        tracing::warn!(
+                            failures = state.failures,
+                            "автокопия не снята: повтор в следующий срок backup.at"
+                        );
+                    }
                 }
-                Action::Backup => {}
-                Action::Prune(list) => {
-                    out.pruned += list.len();
-                    tokio::task::spawn_blocking(move || crate::backup::prune(&list))
-                        .await
-                        .ok();
-                }
+                out.backup = Some(run.result.is_ok());
+                out.pruned += run.pruned;
+            }
+            Action::Prune(list) => {
+                out.pruned += list.len();
+                tokio::task::spawn_blocking(move || crate::backup::prune(&list))
+                    .await
+                    .ok();
             }
         }
-        if !again {
-            break;
-        }
+    }
+    if let Some(g) = guard {
+        g.release();
     }
     out
 }

@@ -4,6 +4,7 @@
 // - `#/admin` — администрирование (пользователи и токены);
 // - `#/admin/index` — состояние векторного индекса и переиндексация;
 // - `#/admin/solutions` — реестр решений и запросы доступа; `#/admin/settings` — настройки;
+// - `#/admin/backups` — копии сервера, `#/admin/audit` — журнал аудита (M7.2, §5.6);
 // - `#/account` — свой аккаунт (смена пароля, свои токены); `#/my/solutions` — «Мои решения»:
 //   доступ к своим решениям (у пользователя, не администратора, §15.1);
 // - `#/agent-setup` — «Подключение агента» (§15.5); `#/cache` — «Кэш выжимок» (§15.4);
@@ -53,6 +54,8 @@ export type Route =
   | { name: 'index' }
   | { name: 'solutions' }
   | { name: 'settings' }
+  | { name: 'backups' }
+  | { name: 'audit' }
   | { name: 'account' }
   | { name: 'mysolutions' }
   | { name: 'agentsetup' }
@@ -103,6 +106,8 @@ export function parse(hash: string): Route {
     if (parts[1] === 'index') return { name: 'index' };
     if (parts[1] === 'solutions') return { name: 'solutions' };
     if (parts[1] === 'settings') return { name: 'settings' };
+    if (parts[1] === 'backups') return { name: 'backups' };
+    if (parts[1] === 'audit') return { name: 'audit' };
   }
   if (parts[0] === 'u' && parts[1]) {
     const user = dec(parts[1]);
@@ -147,6 +152,10 @@ export function href(r: Route): string {
       return '#/admin/solutions';
     case 'settings':
       return '#/admin/settings';
+    case 'backups':
+      return '#/admin/backups';
+    case 'audit':
+      return '#/admin/audit';
     case 'account':
       return '#/account';
     case 'mysolutions':

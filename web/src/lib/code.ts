@@ -3,6 +3,7 @@
 // (`symbol.ref`): id символа меняется при перезагрузке файла.
 import { call } from './api';
 import { plural } from './plural';
+import { ageText } from './time';
 
 export interface CodeCentral {
   id: number;
@@ -212,14 +213,9 @@ export const SKIP_TEXT: Record<string, string> = {
   lang: 'язык выключен',
 };
 
-/** Возраст снимка: «только что», «N мин назад», «N ч назад», «N дн. назад». */
-export function ageText(secs: number): string {
-  const s = Math.max(0, Math.floor(secs));
-  if (s < 60) return 'только что';
-  if (s < 3600) return `${Math.floor(s / 60)} мин назад`;
-  if (s < 172_800) return `${Math.floor(s / 3600)} ч назад`;
-  return `${Math.floor(s / 86_400)} дн. назад`;
-}
+/** Возраст снимка: «только что», «N мин назад», «N ч назад», «N дн. назад» — общее правило
+ * давности WebUI (`time.ts`, M7.2: им же — последняя копия сервера). */
+export { ageText };
 
 /** Склонение: 1 файл, 2 файла, 5 файлов — общее правило WebUI (`plural.ts`). */
 export { plural };

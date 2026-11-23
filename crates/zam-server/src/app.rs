@@ -52,6 +52,10 @@ pub struct AppState {
     pub vault: Arc<VaultKeys>,
     /// Воркер обслуживания (срок хранения сессий); снимается с последней копией состояния.
     pub maintenance: Arc<Maintenance>,
+    /// Копия в процессе сервера (M7 §5.6): замок, общий у страницы «Копии»
+    /// (`POST /admin/backups`) и автокопии воркера обслуживания (клон — в `Maintenance::start`),
+    /// идущая копия, последний итог и кэш сводок описей.
+    pub backups: Arc<crate::backup::runner::BackupRunner>,
     /// Кэш словаря доменных терминов по базам (M4.5, [`crate::glossary`]).
     pub glossary: Arc<crate::glossary::GlossaryCache>,
     /// Кэш настроек пользователей (M6.6 §5.3, [`api::user_settings::UserFlagsCache`]): `/recall`
@@ -382,14 +386,17 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         data_dir.previews_dir(),
     ));
     let rerank = Arc::new(RerankSlot::new(&cfg));
+    let backups = Arc::new(crate::backup::runner::BackupRunner::default());
     let maintenance = Arc::new(Maintenance::start(
         system.clone(),
         users.clone(),
         cfg.cache.clone(),
         cfg.clone(),
+        (*backups).clone(),
     ));
     let state = AppState {
         maintenance,
+        backups,
         glossary: Arc::default(),
         user_flags: Arc::default(),
         code: Arc::default(),

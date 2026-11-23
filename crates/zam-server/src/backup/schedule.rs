@@ -51,9 +51,17 @@ pub fn tick(
     if slot(now, cfg).is_some_and(|s| now >= s && last.is_none_or(|l| l < s)) {
         return vec![Action::Backup];
     }
-    let keep = cfg.keep as usize;
-    if existing.len() > keep {
-        return vec![Action::Prune(existing[..existing.len() - keep].to_vec())];
+    let extra = prune_list(existing, cfg.keep);
+    if !extra.is_empty() {
+        return vec![Action::Prune(extra)];
     }
     vec![Action::Skip]
+}
+
+/// Копии сверх `keep` из `existing` (от старых к новым, [`super::list_copies`]) — самые старые;
+/// не больше — пусто. Одна ротация у расписания и у копии из WebUI при `schedule = "daily"`
+/// (M7 §5.6 п. 1, [`super::runner`]).
+pub fn prune_list(existing: &[PathBuf], keep: u32) -> Vec<PathBuf> {
+    let keep = keep as usize;
+    existing[..existing.len().saturating_sub(keep)].to_vec()
 }

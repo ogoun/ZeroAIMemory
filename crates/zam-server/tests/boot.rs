@@ -112,6 +112,8 @@ fn health_features_documented() {
         "task_subtasks",
         // сессии субагентов `GET /sessions?parent=` (задача 9 M7.2)
         "sessions_parent",
+        // копии из WebUI `GET|POST /admin/backups`, `DELETE /admin/backups/{name}` (задача 7 M7.2)
+        "backup_api",
         // число записей разделов `GET /spaces/{space}/counts` (задача 4 M7.2)
         "space_counts",
     ] {
