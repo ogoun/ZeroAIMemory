@@ -247,6 +247,8 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
         )
         .route("/api/v1/spaces", get(spaces::list))
         .route("/api/v1/spaces/{space}/tree", get(spaces::tree))
+        // число записей разделов (M7 §5.3): чтение, не запись памяти
+        .route("/api/v1/spaces/{space}/counts", get(spaces::counts))
         // экспорт пространства (M6 §12б.5): чтение, не запись памяти
         .route(
             "/api/v1/spaces/{space}/export",

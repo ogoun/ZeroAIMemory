@@ -1,5 +1,6 @@
 //! Записи журналов (§7.2–7.5 ТЗ, задача 6 M3): хранение, ревизии, чанки и FTS, задания
-//! индексации `target_kind = 'entry'`, замещение и отзыв, лента с курсором, миграция v7 → v8.
+//! индексации `target_kind = 'entry'`, замещение и отзыв, лента с курсором, миграция v7 → v8;
+//! число записей разделов пространства (M7 §5.3, задача 4 M7.2).
 
 use std::path::PathBuf;
 
@@ -8,11 +9,13 @@ use serde_json::json;
 use zam_core::{Id, TargetKind};
 use zam_store::{
     Attribution, AuthorKind, Certainty, DataDir, Db, EntryFilter, EntryKind, EntryPatch,
-    EntryStatus, FtsQuery, IndexState, JobOp, JobOutcome, NewEntry, NewTrigger, SpaceKind,
-    StoreError, TargetFilter, TriggerKind, USER_MIGRATIONS, UserDbs, active_triggers, claim_jobs,
-    complete_job, create_entry, delete_entry, entry_chunks_for_index, entry_revisions,
+    EntryStatus, FtsQuery, IndexState, JobOp, JobOutcome, NewEntry, NewNote, NewTrigger, NodePath,
+    Space, SpaceCounts, SpaceKind, StoreError, TargetFilter, TriggerKind, USER_MIGRATIONS, UserDbs,
+    active_triggers, claim_jobs, complete_job, create_entry, create_folder, create_note,
+    create_solution, delete_entry, delete_node, entry_chunks_for_index, entry_revisions,
     entry_triggers, get_entry, list_entries, list_spaces, normalize_title, restore_entry,
-    retract_entry, search_fts, set_triggers, supersede_entry, title_duplicates, update_entry,
+    retract_entry, search_fts, set_triggers, space_counts, supersede_entry, title_duplicates,
+    update_entry,
 };
 
 fn datadir(name: &str) -> DataDir {
@@ -1634,4 +1637,178 @@ async fn term_names_unique_in_transaction() {
     assert_eq!(terms[0].title, "Дайджест");
     assert_eq!(terms[0].aliases, ["summary"]);
     assert_eq!(terms[0].definition, "Определение Дайджест");
+}
+
+// ---------- число записей разделов (M7 §5.3, задача 4 M7.2) ----------
+
+/// Запись вида `kind` без `data` в пространстве `space`.
+fn plain(space: Id, kind: EntryKind, title: &str) -> NewEntry {
+    NewEntry {
+        kind,
+        data: json!({}),
+        ..changelog(space, title)
+    }
+}
+
+async fn add(db: &Db, e: NewEntry) -> Id {
+    create_entry(db, e, &agent()).await.unwrap().0.id
+}
+
+async fn set_status(db: &Db, id: Id, status: EntryStatus) {
+    let patch = EntryPatch {
+        status: Some(status),
+        reason: Some("по ходу работы".into()),
+        ..EntryPatch::default()
+    };
+    update_entry(db, id, None, patch, &agent()).await.unwrap();
+}
+
+async fn note(db: &Db, space: Id, path: &str) -> Id {
+    let n = NewNote {
+        space_id: space,
+        path: NodePath::parse(path).unwrap(),
+        content: "Текст заметки.".into(),
+        l0: None,
+        attrib: agent(),
+    };
+    create_note(db, n).await.unwrap().id
+}
+
+/// Пространство вида `kind` базы `db`.
+async fn space_of(db: &Db, kind: SpaceKind) -> Space {
+    list_spaces(db)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == kind)
+        .unwrap()
+}
+
+/// [`space_counts`]: живые записи по журналам вида пространства (корзина не в счёт, все
+/// статусы), отчёты — только с `with_reports`, открытые вопросы (`open`) и задачи (`open`,
+/// `in_progress`, `blocked`), заметки без папок; записи другого пространства не в счёт; карта
+/// кода без снимка — 0; у Human журналов и открытых нет — только заметки.
+#[tokio::test]
+async fn space_counts_live_journals_open_and_notes() {
+    let (db, _, _) = setup("space-counts").await;
+    let (sol, _) = create_solution(&db, "g-space-counts", "Решение")
+        .await
+        .unwrap();
+    let (kn, human) = (
+        space_of(&db, SpaceKind::Knowledge).await,
+        space_of(&db, SpaceKind::Human).await,
+    );
+    for t in ["Первая", "Вторая"] {
+        add(&db, insight(sol.id, t, "Суть.")).await;
+    }
+    let gone = add(&db, insight(sol.id, "Третья", "Суть.")).await;
+    delete_entry(&db, gone, None, &agent()).await.unwrap();
+    add(&db, changelog(sol.id, "Изменение")).await;
+    let mut tasks = Vec::new();
+    for t in ["Открыта", "В работе", "Заблокирована", "Выполнена"]
+    {
+        tasks.push(add(&db, plain(sol.id, EntryKind::Task, t)).await);
+    }
+    set_status(&db, tasks[1], EntryStatus::InProgress).await;
+    set_status(&db, tasks[2], EntryStatus::Blocked).await;
+    set_status(&db, tasks[3], EntryStatus::Done).await;
+    let gone = add(&db, plain(sol.id, EntryKind::Task, "Удалена")).await;
+    delete_entry(&db, gone, None, &agent()).await.unwrap();
+    add(&db, plain(sol.id, EntryKind::Question, "Открыт")).await;
+    let old = add(&db, plain(sol.id, EntryKind::Question, "Устарел")).await;
+    set_status(&db, old, EntryStatus::Obsolete).await;
+    add(&db, plain(kn.id, EntryKind::Task, "Задача Knowledge")).await;
+    create_folder(&db, sol.id, NodePath::parse("папка").unwrap())
+        .await
+        .unwrap();
+    note(&db, sol.id, "папка/первая").await;
+    note(&db, sol.id, "вторая").await;
+    let gone = note(&db, sol.id, "третья").await;
+    delete_node(&db, gone, AuthorKind::Agent).await.unwrap();
+    note(&db, human.id, "человеку").await;
+
+    let c = space_counts(&db, &sol, false).await.unwrap();
+    let want = [
+        ("changelog", 1),
+        ("releases", 0),
+        ("code", 0),
+        ("insights", 2),
+        ("glossary", 0),
+        ("tasks", 4),
+        ("ideas", 0),
+        ("questions", 2),
+    ];
+    assert_eq!(c.journals, want.into_iter().collect());
+    assert_eq!((c.open_questions, c.open_tasks, c.notes), (1, 3, 2));
+    let with = space_counts(&db, &sol, true).await.unwrap();
+    assert_eq!(with.journals.get("reports"), Some(&0));
+    assert_eq!(with.journals.len(), c.journals.len() + 1);
+    let k = space_counts(&db, &kn, true).await.unwrap();
+    let want = [
+        ("insights", 0),
+        ("glossary", 0),
+        ("tasks", 1),
+        ("ideas", 0),
+        ("questions", 0),
+    ];
+    assert_eq!(k.journals, want.into_iter().collect());
+    assert_eq!((k.open_questions, k.open_tasks, k.notes), (0, 1, 0));
+    let h = space_counts(&db, &human, true).await.unwrap();
+    assert_eq!(
+        h,
+        SpaceCounts {
+            notes: 1,
+            ..SpaceCounts::default()
+        }
+    );
+}
+
+/// Цена [`space_counts`] на решении с 2 000 живых записей (по 500 insight, changelog, задач и
+/// вопросов), 80 записями в корзине и 200 заметками (план задачи 4 M7.2, шаг 4): медиана и
+/// наибольшее из 20 чтений — в журнал этапа. Запуск: `cargo test -p zam-store --test entries
+/// space_counts_2000_cost --release -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "замер для журнала этапа"]
+async fn space_counts_2000_cost() {
+    let (db, _, _) = setup("space-counts-2000").await;
+    let (sol, _) = create_solution(&db, "g-space-counts-2000", "Решение")
+        .await
+        .unwrap();
+    for i in 0..2_080 {
+        let title = format!("Запись {i}");
+        let e = match i % 4 {
+            0 => insight(sol.id, &title, "Суть."),
+            1 => changelog(sol.id, &title),
+            2 => plain(sol.id, EntryKind::Task, &title),
+            _ => plain(sol.id, EntryKind::Question, &title),
+        };
+        let id = add(&db, e).await;
+        if i >= 2_000 {
+            delete_entry(&db, id, None, &agent()).await.unwrap();
+        }
+    }
+    for i in 0..200 {
+        note(&db, sol.id, &format!("заметка-{i}")).await;
+    }
+    let mut times = Vec::new();
+    for _ in 0..20 {
+        let t = std::time::Instant::now();
+        let c = space_counts(&db, &sol, true).await.unwrap();
+        times.push(t.elapsed());
+        assert_eq!(
+            (
+                c.journals["insights"],
+                c.journals["tasks"],
+                c.open_tasks,
+                c.notes
+            ),
+            (500, 500, 500, 200)
+        );
+    }
+    times.sort();
+    println!(
+        "space_counts 2000 записей, 80 в корзине, 200 заметок: медиана {:?}, наибольшее {:?}",
+        times[times.len() / 2],
+        times[times.len() - 1]
+    );
 }

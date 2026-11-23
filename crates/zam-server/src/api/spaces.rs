@@ -3,13 +3,16 @@
 //! пространства чужих решений из баз владельцев (`role: member`, `access`, `owner`);
 //! `access_requests_pending` — ожидающие запросы к решениям пользователя.
 //! `GET /spaces/{space}/tree` — дерево узлов пространства.
+//! `GET /spaces/{space}/counts` — число записей разделов (журналы, открытые, заметки; M7 §5.3).
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use serde::Deserialize;
-use serde_json::{Value, json};
-use zam_store::{AccessState, NodePath, SpaceKind, get_node_by_path, list_children, list_spaces};
+use serde_json::{Map, Value, json};
+use zam_store::{
+    AccessState, NodePath, SpaceKind, get_node_by_path, list_children, list_spaces, space_counts,
+};
 
 use super::query;
 use super::scope::{Mode, Role, readable_areas, space_scope, token_can_read};
@@ -128,6 +131,41 @@ pub async fn tree(
     let mut items = json!(items);
     super::agent_view::view_json(&p, &mut items, super::agent_view::NODE_FIELDS);
     Ok(Json(json!({ "space": sc.space, "items": items })))
+}
+
+/// `GET /spaces/{space}/counts` → `{journals: {<журнал>: n}, open: {questions, tasks}, notes}` —
+/// число записей разделов для дерева и полосы журналов WebUI (спецификация M7 §5.3 п. 1, признак
+/// `space_counts`). Журналы вида пространства, число — живые записи без корзины, все статусы:
+/// длина ленты `GET …/entries?kind=` того же зрителя ([`space_counts`]); `code` — файлы карты
+/// кода (карта выключена — 0: её маршруты отвечают 404); `vault` — записи Vault зрителя тем же
+/// чтением и базой, что `GET …/vault` ([`super::vault::count_of`]: Vault участника — в его базе).
+/// Права — чтение пространства, как у ленты: участнику — только пространство решения; токену
+/// журнала `reports` нет (отчёт агенту не виден нигде, M5.5 §7).
+pub async fn counts(
+    State(st): State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    Path(space): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let sc = space_scope(&st, &p, &headers, &space, Mode::Read).await?;
+    let c = space_counts(&sc.db, &sc.space, p.is_human()).await?;
+    let mut journals = Map::new();
+    for (name, n) in c.journals {
+        let n = if name == "code" && !st.cfg.code.enabled {
+            0
+        } else {
+            n
+        };
+        journals.insert(name.into(), json!(n));
+    }
+    if let Some(n) = super::vault::count_of(&st, &sc.user, &sc.space).await? {
+        journals.insert("vault".into(), json!(n));
+    }
+    Ok(Json(json!({
+        "journals": journals,
+        "open": { "questions": c.open_questions, "tasks": c.open_tasks },
+        "notes": c.notes,
+    })))
 }
 
 /// Пространства, которые принципал может читать (для сводных списков).

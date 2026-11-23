@@ -44,6 +44,7 @@ pub const FEATURES: &[&str] = &[
     "post_tool_subject",
     "task_subtasks",
     "sessions_parent",
+    "space_counts",
     "agent_text_masked",
 ];
 

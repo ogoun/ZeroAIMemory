@@ -3263,6 +3263,95 @@ Important I1, I2, Minor M1–M11; решение координатора по �
 Прогоны круга 2: `npm run check` — 0/0; `npm run test:build` — 60/60; `npm run build`, `npx
 size-limit` — пределы, `entry` 82,61 КБ; `mobile.spec.ts` — 11/11 (32 с, release-сборка круга).
 
+### M7.2 · Задача 4 — Число записей в разделах
+
+Спецификация §5.3 (решения пре-флайта N3, N13, N17, N35, N40); worktree `.tmp/m72/wt-t4`, ветка
+`m7.2-t4` от `aec99ae5`. Задача идёт в два этапа: A — сервер (здесь), B — WebUI (числа в дереве и
+полосе журналов) после слияния задачи 2 (`web/src/lib/plural.ts`). Признак `space_counts`, раздел
+`docs/api-compat.md` «Число записей разделов».
+
+**Этап A: сервер.** Хранилище — новый модуль `zam_store::counts`: `space_counts(db, space,
+with_reports) -> SpaceCounts {journals, open_questions, open_tasks, notes}`; журналы вида
+пространства — таблица по `journalsOf` WebUI (решение — девять журналов без Vault, Knowledge —
+пять, Rules и Human — нет; модульный тест `journals_mirror_webui`). Четыре чтения в одном снимке
+базы (`unchecked_transaction`): `SELECT kind, count(*) … WHERE space_id = ?1 AND deleted_at IS NULL
+GROUP BY kind` — то же условие, что лента без фильтров; открытые вопросы (`open`) и задачи
+(`open`, `in_progress`, `blocked`) — двумя подзапросами по `(space_id, kind)`; заметки — `kind =
+'note'` живых узлов; файлы карты кода — `code_snapshots.files` по GUID. Сервер:
+`GET /spaces/{space}/counts` (`spaces::counts`, в `service_routes` рядом с `tree`: чтение, не
+запись памяти) — права `space_scope(Mode::Read)`, как у ленты; отчёты — только сессии WebUI
+(`p.is_human()`, как фильтр вида у ленты); Vault — `vault::count_of`: `vault_list` без `q` по базе
+пользователя запроса (решение N13 — та же функция и база, что `GET …/vault`; Vault участника — в
+его базе).
+
+`EXPLAIN QUERY PLAN` (модульный тест `counts::queries_use_indexes` печатает планы с
+`--nocapture`; схема миграций, SQLite сборки хранилища — те же строки, что у SQLite 3.51):
+- виды — `SEARCH entries USING INDEX entries_title (space_id=?)`, без `USE TEMP B-TREE FOR GROUP
+  BY` (группировка в порядке индекса `(space_id, kind, …)`); планировщик берёт `entries_title`, а
+  не `entries_feed` — оба частичные `WHERE deleted_at IS NULL` с тем же префиксом, тест принимает
+  любой из них. Покрывающим индекс не становится: `deleted_at` в столбцах частичного индекса нет,
+  и SQLite читает строку таблицы на каждую запись (цена — ниже);
+- открытые — `SEARCH entries USING INDEX entries_title (space_id=? AND kind=?)` на каждый из двух
+  подзапросов;
+- заметки — `SEARCH nodes USING INDEX nodes_live_children (space_id=?)`;
+- карта кода — `SEARCH code_snapshots USING INDEX sqlite_autoindex_code_snapshots_1
+  (solution_guid=?)`. Полного просмотра таблиц нет; миграций нет.
+
+Решения исполнителя:
+- **Модуль `counts.rs`, а не функция в `entries/read.rs`** [решение исполнителя, задача 4]:
+  числа разделов читают записи, узлы и снимок карты кода — это не лента записей; план разрешает
+  оба места.
+- **Vault — не в `SpaceCounts`, а на сервере** [решение исполнителя, задача 4]: по N13 число
+  Vault — функцией и базой `GET …/vault` зрителя (`vault_list` по базе пользователя запроса),
+  а хранилище получает только базу пространства (у участника — базу владельца). Область Vault по
+  пространству — `vault::scope_of` (Knowledge — личный, решение — по GUID, Rules и Human — нет;
+  модульный тест `scope_of_space_kinds`). Цена — чтение метаданных Vault области (без значений);
+  Vault пользователя — десятки записей.
+- **`code` при `code.enabled = false` — 0** [решение исполнителя, задача 4]: маршруты карты в
+  этом случае отвечают 404, журнал «Код» пуст — число равно его «ленте»; ключ остаётся (журналы
+  WebUI от настройки не зависят).
+- **`open` у пространства без журналов (Rules, Human) — нули без запроса** [решение исполнителя,
+  задача 4]: вопросов и задач там не бывает (их создание туда — 422), ключи ответа постоянные.
+- **Тестовые числа разные у каждого журнала** [решение исполнителя, задача 4]: план — «по две
+  записи каждого вида, одна в корзине»; в тесте живых 2–4 по видам (`LIVE`) и ещё по одной в
+  корзине — перепутанный ключ (например, `releases` ↔ `changelog`) не совпадёт случайно.
+
+Тесты (TDD): сервер `tests/journals.rs` — `space_counts_by_journal` (сессия владельца: решение —
+у каждого журнала число равно длине его ленты `GET …/entries?kind=` / `GET …/vault` /
+`files` из `GET /code/status`, явные числа, корзина записей, Vault и заметок не в счёт, папка — не
+заметка, `open`; то же по id пространства; Knowledge — свои журналы; Human — только заметки;
+неизвестное пространство — 404), `space_counts_token_without_reports` (токены владельца и
+участника `ro`: ключа `reports` нет, прочие — по их лентам; Human токену — 404; сессии — с
+отчётами), `space_counts_member_only_solution` (участники `ro` по сессии и токену и `rw`: журналы —
+как у владельца, `vault` — свой: 0, 0 и 1 при 2 у владельца; личные пространства владельца по id
+— 404; `knowledge` участника — его собственное), `space_counts_code_disabled_zero` (снимок карты с
+3 файлами в базе, `code.enabled = false`: `GET /code/status` — 404, `code` — 0); `tests/boot.rs` —
+`health_features_documented` (`space_counts`); хранилище — `tests/entries.rs`
+`space_counts_live_journals_open_and_notes`, модульные `counts::queries_use_indexes`,
+`counts::journals_mirror_webui`; `api::vault` — `scope_of_space_kinds`. RED:
+`health_features_documented` — таблица `docs/api-compat.md` с `space_counts` против `FEATURES`
+без него; три теста `journals.rs` — мир строится (записи всех видов, карта кода, Vault, заметки),
+`GET /spaces/{G}/counts` — 404; `space_counts_code_disabled_zero` (дописан после ветки
+выключенной карты) — проверен с ветвью, отключённой на время прогона: `code` 3 вместо 0.
+`queries_use_indexes` в первом виде запрещал любую строку `SCAN` и упал на `SCAN CONSTANT ROW`
+(внешний `SELECT` двух подзапросов без таблицы) — исключение для неё.
+
+**Цена** (`tests/entries.rs` `space_counts_2000_cost`, release, решение с 2 000 живых записей —
+по 500 insight, changelog, задач и вопросов, — 80 в корзине и 200 заметок, 20 чтений, база в кэше
+ОС): медиана 0,72 мс, наибольшее 2,44 мс — с чтением строки таблицы на запись (индекс не
+покрывающий, см. план выше). Vault зрителя (`vault_list` без `q`) — плюс чтение метаданных его
+записей области. Опроса по таймеру нет (§5.3 п. 3): запрос идёт при раскрытии пространства,
+открытии журнала и возврате на вкладку не чаще раза в 30 с.
+
+Прогоны этапа A: `cargo test -p zam-server --test journals` — 17/17, `--test boot` — 15/15,
+`--lib` — 323 прошли, 2 пропущены (`#[ignore]`), `--test vault` — 31/31; `cargo test -p zam-store
+--lib counts` — 2/2, `--test entries` — 23/23 (замер — `--ignored`); `cargo clippy --workspace
+--all-targets -- -D warnings` — без замечаний; `cargo fmt --all --check` — чисто.
+
+Этап B (WebUI: `web/src/lib/counts.ts` через `plural.ts`, `counts.svelte.ts`,
+`onEntriesChanged`, числа в `Tree.svelte` и `Shell.svelte`, `count_label_ru`,
+`tree_and_tabs_show_counts`) — после слияния задачи 2.
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

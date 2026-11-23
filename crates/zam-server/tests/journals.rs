@@ -1,8 +1,12 @@
 //! Changelog и Releases через REST (задача 7 M3, §7.2–7.4): CRUD записей, идемпотентность по
-//! автору, ревизии, проверки `data`, сравнение релизов, доступ участника общего решения.
+//! автору, ревизии, проверки `data`, сравнение релизов, доступ участника общего решения. Число
+//! записей разделов `GET /spaces/{space}/counts` (M7 §5.3, задача 4 M7.2) — против длины лент
+//! того же зрителя.
 //!
 //! Пользователи: A — владелец решения, B — участник. Серверы без моделей (FTS).
 mod common;
+
+use std::collections::BTreeSet;
 
 use axum::http::{Method, StatusCode};
 use common::api::{Api, Resp, api};
@@ -782,4 +786,489 @@ async fn empty_title_is_422_and_compare_not_truncated() {
     assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY);
     let r1 = w.release("1.0.0", "").await;
     assert_eq!(w.compare(&id_of(&r1), None).await["truncated"], false);
+}
+
+// ---------- число записей разделов (M7 §5.3, задача 4 M7.2) ----------
+
+/// Журналы WebUI решения и Knowledge — `journalsOf` (`web/src/lib/journals.ts`).
+const SOLUTION_JOURNALS: [&str; 10] = [
+    "changelog",
+    "releases",
+    "reports",
+    "code",
+    "insights",
+    "glossary",
+    "tasks",
+    "ideas",
+    "questions",
+    "vault",
+];
+const KNOWLEDGE_JOURNALS: [&str; 6] = [
+    "insights",
+    "glossary",
+    "tasks",
+    "ideas",
+    "questions",
+    "vault",
+];
+
+/// Живых записей каждого вида в решении мира чисел ([`counts_world`]); ещё одна — в корзине.
+/// Числа разные: перепутанный журнал не совпадёт случайно.
+const LIVE: [(&str, usize); 8] = [
+    ("changelog", 2),
+    ("release", 3),
+    ("report", 2),
+    ("insight", 2),
+    ("term", 3),
+    ("task", 4),
+    ("idea", 2),
+    ("question", 3),
+];
+
+/// Зритель: токен агента или сессия WebUI.
+#[derive(Clone, Copy)]
+enum Who<'a> {
+    Tok(&'a str),
+    Web(&'a common::reports::Web),
+}
+
+async fn get_as(a: &Api, who: Who<'_>, uri: &str) -> Resp {
+    match who {
+        Who::Tok(t) => a.tok(t, Method::GET, uri, None).await,
+        Who::Web(w) => common::reports::web(a, w, Method::GET, uri, None).await,
+    }
+}
+
+async fn get_ok_as(a: &Api, who: Who<'_>, uri: &str) -> Value {
+    let r = get_as(a, who, uri).await;
+    assert_eq!(r.status, StatusCode::OK, "{uri}: {}", r.text());
+    r.json()
+}
+
+/// Вид записей журнала WebUI (`JOURNAL_OF_KIND`, `web/src/lib/entryRefs.ts`); у Кода и Vault
+/// своих записей журнала нет.
+fn kind_of(journal: &str) -> Option<&'static str> {
+    Some(match journal {
+        "changelog" => "changelog",
+        "releases" => "release",
+        "reports" => "report",
+        "insights" => "insight",
+        "glossary" => "term",
+        "tasks" => "task",
+        "ideas" => "idea",
+        "questions" => "question",
+        _ => return None,
+    })
+}
+
+/// Длина ленты журнала `journal` пространства `space` у зрителя `who`: записи — `GET
+/// …/entries?kind=` одной страницей, Vault — `GET …/vault`, Код — `files` из `GET /code/status`.
+async fn feed_len(a: &Api, who: Who<'_>, space: &str, journal: &str) -> u64 {
+    let (uri, key) = match (journal, kind_of(journal)) {
+        ("vault", _) => (format!("/api/v1/spaces/{space}/vault"), "items"),
+        ("code", _) => (format!("/api/v1/code/status?solution={space}"), "files"),
+        (_, Some(k)) => (
+            format!("/api/v1/spaces/{space}/entries?kind={k}&limit=200"),
+            "items",
+        ),
+        (j, None) => panic!("журнал {j}"),
+    };
+    let v = get_ok_as(a, who, &uri).await;
+    match &v[key] {
+        Value::Array(items) => {
+            assert!(v["next_cursor"].is_null(), "{uri}: лента в одну страницу");
+            items.len() as u64
+        }
+        n => n.as_u64().unwrap_or_else(|| panic!("{uri}: {v}")),
+    }
+}
+
+/// `GET /spaces/{space}/counts` зрителя `who`: ключи журналов — ровно `journals`, число каждого
+/// — длина его ленты у того же зрителя ([`feed_len`]).
+async fn counts_match_feeds(a: &Api, who: Who<'_>, space: &str, journals: &[&str]) -> Value {
+    let c = get_ok_as(a, who, &format!("/api/v1/spaces/{space}/counts")).await;
+    let keys: BTreeSet<&str> = c["journals"]
+        .as_object()
+        .unwrap_or_else(|| panic!("{c}"))
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        journals.iter().copied().collect::<BTreeSet<_>>(),
+        "{space}: {c}"
+    );
+    for j in journals {
+        let feed = feed_len(a, who, space, j).await;
+        assert_eq!(c["journals"][j].as_u64(), Some(feed), "{space} {j}: {c}");
+    }
+    c
+}
+
+/// Запись вида `kind` с номером `i` токеном `tok` в пространство `space`; id.
+async fn log_entry(a: &Api, tok: &str, space: &str, kind: &str, i: usize) -> String {
+    let word = ["альфа", "бета", "гамма", "дельта", "эпсилон", "дзета"][i];
+    let title = format!("{kind} {word}");
+    let body = match kind {
+        "changelog" => json!({"kind": kind, "title": title, "body": "Подробности.",
+                              "data": {"kind": "feat"}}),
+        "release" => json!({"kind": kind, "title": title, "body": "Заметки.",
+                            "data": {"version": format!("1.{i}.0"),
+                                     "commits": [{"sha": "abc123", "subject": "feat: x"}]}}),
+        "insight" => json!({"kind": kind, "title": title, "body": "Суть.",
+                            "data": {"kind": "gotcha"}}),
+        "term" => json!({"kind": kind, "title": format!("Термин-{word}"), "body": "Подробности.",
+                         "data": {"definition": format!("Определение: {word}"), "aliases": []}}),
+        "idea" => json!({"kind": kind, "title": title, "body": "Замысел.",
+                         "data": {"origin": "agent"}}),
+        _ => json!({"kind": kind, "title": title, "body": "Контекст."}),
+    };
+    let r = a
+        .tok(
+            tok,
+            Method::POST,
+            &format!("/api/v1/spaces/{space}/entries"),
+            Some(body),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{kind}: {}", r.text());
+    id_of(&r.json())
+}
+
+/// Статус записи правкой с текущей ревизией.
+async fn set_status(a: &Api, tok: &str, id: &str, status: &str) {
+    let r = a
+        .tok_rev(
+            tok,
+            Method::PATCH,
+            &format!("/api/v1/entries/{id}"),
+            Some(json!({"status": status, "reason": "по ходу работы"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{status}: {}", r.text());
+}
+
+/// Запись — в корзину сессией владельца (отчёт удаляет только он в WebUI).
+async fn trash_entry(a: &Api, web: &common::reports::Web, id: &str) {
+    let uri = format!("/api/v1/entries/{id}");
+    let rev = get_ok_as(a, Who::Web(web), &uri).await["rev"].to_string();
+    let extra = [("if-match", rev.as_str())];
+    let r = common::reports::web_h(a, web, Method::DELETE, &uri, None, &extra).await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+}
+
+/// Запись Vault окружения (тип `host`, без значения) в области `space`; id.
+async fn vault_host(a: &Api, tok: &str, space: &str, title: &str) -> String {
+    let r = a
+        .tok(
+            tok,
+            Method::POST,
+            &format!("/api/v1/spaces/{space}/vault"),
+            Some(json!({"title": title, "data": {"type": "host", "address": "192.0.2.10"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    id_of(&r.json())
+}
+
+/// Узел `kind` (`note` | `folder`) по пути `path` пространства `space` зрителем `who`; id.
+async fn node(a: &Api, who: Who<'_>, space: &str, path: &str, kind: &str) -> String {
+    let mut body = json!({"space": space, "path": path, "kind": kind});
+    if kind == "note" {
+        body["content"] = json!("Текст заметки.");
+    }
+    let r = match who {
+        Who::Tok(t) => a.tok(t, Method::POST, "/api/v1/nodes", Some(body)).await,
+        Who::Web(w) => common::reports::web(a, w, Method::POST, "/api/v1/nodes", Some(body)).await,
+    };
+    assert_eq!(r.status, StatusCode::CREATED, "{path}: {}", r.text());
+    id_of(&r.json())
+}
+
+/// Карта кода решения `G` из файлов `paths` (синхронизация манифеста и загрузка).
+async fn code_map(a: &Api, tok: &str, paths: &[&str]) {
+    let hash = |i: usize| format!("{i:064x}");
+    let manifest: Vec<Value> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| json!({"path": p, "hash": hash(i)}))
+        .collect();
+    let r = a
+        .tok(
+            tok,
+            Method::POST,
+            "/api/v1/code/sync",
+            Some(json!({"solution": G, "commit": "abcdef1", "branch": "main",
+                        "manifest": manifest})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let files: Vec<Value> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            json!({"path": p, "lang": "rust", "hash": hash(i), "size": 100,
+                   "parse_state": "ok", "symbols": [], "refs": []})
+        })
+        .collect();
+    let r = a
+        .tok(
+            tok,
+            Method::PUT,
+            "/api/v1/code/files",
+            Some(json!({"solution": G, "commit": "abcdef1", "branch": "main",
+                        "machine": "box", "files": files})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}
+
+/// Мир чисел разделов: владелец `o` решения `G`, участники `rw` и `ro` (у всех — токен и сессия
+/// WebUI). В решении — записи каждого вида по [`LIVE`] и ещё по одной в корзине; задачи `open`,
+/// `in_progress`, `blocked`, `done`; вопросы `open`, `open`, `obsolete`; карта кода из 3 файлов;
+/// Vault владельца 2 и одна в корзине; 4 заметки, папка и заметка в корзине. В Knowledge — по
+/// записи каждого вида Knowledge и выполненная задача, Vault 1, заметка 1; в Human — заметка.
+async fn counts_world(name: &str) -> common::reports::W {
+    let w = common::reports::world(&format!("journals-counts-{name}")).await;
+    let (a, tok, web) = (&w.a, w.o.tok.as_str(), &w.o.web);
+    for (kind, live) in LIVE {
+        let mut ids = Vec::new();
+        for i in 0..=live {
+            ids.push(if kind == "report" {
+                let r = w
+                    .report_as(tok, G, &format!("Отчёт {i}"), "# Итог\n\nТекст.", &[])
+                    .await;
+                assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+                id_of(&r.json())
+            } else {
+                log_entry(a, tok, G, kind, i).await
+            });
+        }
+        // последняя — в корзину (статус живых не меняется)
+        trash_entry(a, web, &ids[live]).await;
+        let statuses: &[&str] = match kind {
+            "task" => &["open", "in_progress", "blocked", "done"],
+            "question" => &["open", "open", "obsolete"],
+            _ => &[],
+        };
+        for (id, s) in ids.iter().zip(statuses) {
+            if *s != "open" {
+                set_status(a, tok, id, s).await;
+            }
+        }
+    }
+    code_map(a, tok, &["src/a.rs", "src/b.rs", "src/c.rs"]).await;
+    vault_host(a, tok, G, "стенд").await;
+    vault_host(a, tok, G, "сборка").await;
+    let gone = vault_host(a, tok, G, "старый стенд").await;
+    let r = a
+        .tok(tok, Method::DELETE, &format!("/api/v1/vault/{gone}"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    node(a, Who::Tok(tok), G, "папка", "folder").await;
+    for p in ["папка/первая", "папка/вторая", "третья", "четвёртая"]
+    {
+        node(a, Who::Tok(tok), G, p, "note").await;
+    }
+    let gone = node(a, Who::Tok(tok), G, "пятая", "note").await;
+    let r = a
+        .tok(tok, Method::DELETE, &format!("/api/v1/nodes/{gone}"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    // Knowledge: номера 4–5 — термины и прочие заголовки не совпадают с живыми записями решения
+    for (kind, i) in [
+        ("insight", 5),
+        ("term", 5),
+        ("task", 4),
+        ("task", 5),
+        ("idea", 5),
+        ("question", 5),
+    ] {
+        log_entry(a, tok, "knowledge", kind, i).await;
+    }
+    let tasks = get_ok_as(
+        a,
+        Who::Tok(tok),
+        "/api/v1/spaces/knowledge/entries?kind=task",
+    )
+    .await;
+    set_status(a, tok, &id_of(&tasks["items"][0]), "done").await;
+    vault_host(a, tok, "knowledge", "личный стенд").await;
+    node(a, Who::Tok(tok), "knowledge", "заметка", "note").await;
+    node(a, Who::Web(web), "human", "человеку", "note").await;
+    w
+}
+
+/// Числа разделов (M7 §5.3 п. 1): у каждого журнала решения и Knowledge число равно длине ленты
+/// того же зрителя (сессия владельца), корзина не считается, папка — не заметка; открытые вопросы
+/// — `open`, задачи — `open`, `in_progress`, `blocked`. У Human журналов нет — только заметки.
+#[tokio::test]
+async fn space_counts_by_journal() {
+    let w = counts_world("by-journal").await;
+    let (a, me) = (&w.a, Who::Web(&w.o.web));
+    let c = counts_match_feeds(a, me, G, &SOLUTION_JOURNALS).await;
+    assert_eq!(
+        c["journals"],
+        json!({"changelog": 2, "releases": 3, "reports": 2, "code": 3, "insights": 2,
+               "glossary": 3, "tasks": 4, "ideas": 2, "questions": 3, "vault": 2})
+    );
+    assert_eq!(c["open"], json!({"questions": 2, "tasks": 3}), "{c}");
+    assert_eq!(c["notes"], 4, "{c}");
+    // то же по id пространства решения
+    let spaces = get_ok_as(a, me, "/api/v1/spaces").await;
+    let sol = spaces["spaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["agent_solution_id"] == G)
+        .unwrap();
+    let by_id = get_ok_as(
+        a,
+        me,
+        &format!("/api/v1/spaces/{}/counts", sol["id"].as_str().unwrap()),
+    )
+    .await;
+    assert_eq!(by_id, c);
+    let k = counts_match_feeds(a, me, "knowledge", &KNOWLEDGE_JOURNALS).await;
+    assert_eq!(
+        k["journals"],
+        json!({"insights": 1, "glossary": 1, "tasks": 2, "ideas": 1, "questions": 1, "vault": 1})
+    );
+    assert_eq!(k["open"], json!({"questions": 1, "tasks": 1}), "{k}");
+    assert_eq!(k["notes"], 1, "{k}");
+    let h = get_ok_as(a, me, "/api/v1/spaces/human/counts").await;
+    assert_eq!(
+        h,
+        json!({"journals": {}, "open": {"questions": 0, "tasks": 0}, "notes": 1})
+    );
+    let r = get_as(a, me, "/api/v1/spaces/nope/counts").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+}
+
+/// Токену отчёты не видны нигде (M5.5 §7): ключа `reports` нет, прочие числа — как у его лент;
+/// сессии того же пользователя — с отчётами; Human токену — 404, как его лента.
+#[tokio::test]
+async fn space_counts_token_without_reports() {
+    let w = counts_world("token").await;
+    let a = &w.a;
+    let no_reports: Vec<&str> = SOLUTION_JOURNALS
+        .into_iter()
+        .filter(|j| *j != "reports")
+        .collect();
+    for tok in [w.o.tok.as_str(), w.ro.tok.as_str()] {
+        let c = counts_match_feeds(a, Who::Tok(tok), G, &no_reports).await;
+        assert_eq!(c["journals"]["insights"], 2, "{c}");
+        assert_eq!(c["open"], json!({"questions": 2, "tasks": 3}), "{c}");
+        let r = get_as(a, Who::Tok(tok), "/api/v1/spaces/human/counts").await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    }
+    // лента отчётов токену — 400, как и раньше
+    let r = get_as(
+        a,
+        Who::Tok(&w.o.tok),
+        &format!("/api/v1/spaces/{G}/entries?kind=report"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    let web = get_ok_as(a, Who::Web(&w.o.web), &format!("/api/v1/spaces/{G}/counts")).await;
+    assert_eq!(web["journals"]["reports"], 2, "{web}");
+}
+
+/// Участнику — только пространство решения (M7 §5.3 п. 1): числа журналов — как у владельца,
+/// Vault — свой (Vault участника лежит в его базе: число равно длине его `GET …/vault`), личные
+/// пространства владельца по id — 404, `knowledge` участника — его собственное.
+#[tokio::test]
+async fn space_counts_member_only_solution() {
+    let w = counts_world("member").await;
+    let a = &w.a;
+    vault_host(a, &w.rw.tok, G, "стенд участника").await;
+    let owner = get_ok_as(a, Who::Web(&w.o.web), &format!("/api/v1/spaces/{G}/counts")).await;
+    assert_eq!(owner["journals"]["vault"], 2, "{owner}");
+    for (who, human, vault) in [
+        (Who::Web(&w.ro.web), true, 0),
+        (Who::Tok(&w.ro.tok), false, 0),
+        (Who::Web(&w.rw.web), true, 1),
+    ] {
+        let journals: Vec<&str> = SOLUTION_JOURNALS
+            .into_iter()
+            .filter(|j| human || *j != "reports")
+            .collect();
+        let c = counts_match_feeds(a, who, G, &journals).await;
+        assert_eq!(c["journals"]["vault"], vault, "{c}");
+        for j in journals.iter().filter(|j| **j != "vault") {
+            assert_eq!(c["journals"][j], owner["journals"][j], "{j}: {c}");
+        }
+        assert_eq!((&c["open"], &c["notes"]), (&owner["open"], &owner["notes"]));
+    }
+    // личные пространства владельца по id: владельцу — 200, участнику — 404
+    let spaces = get_ok_as(a, Who::Web(&w.o.web), "/api/v1/spaces").await;
+    let personal: Vec<&Value> = spaces["spaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["kind"] != "solution")
+        .collect();
+    assert_eq!(personal.len(), 3, "{spaces}");
+    for s in personal {
+        let uri = format!("/api/v1/spaces/{}/counts", s["id"].as_str().unwrap());
+        assert_eq!(
+            get_as(a, Who::Web(&w.o.web), &uri).await.status,
+            StatusCode::OK
+        );
+        for who in [Who::Web(&w.ro.web), Who::Tok(&w.ro.tok)] {
+            let r = get_as(a, who, &uri).await;
+            assert_eq!(r.status, StatusCode::NOT_FOUND, "{uri}: {}", r.text());
+        }
+    }
+    // `knowledge` участника — его собственное: записей владельца там нет
+    let k = counts_match_feeds(a, Who::Web(&w.ro.web), "knowledge", &KNOWLEDGE_JOURNALS).await;
+    assert_eq!(k["journals"]["insights"], 0, "{k}");
+    assert_eq!(k["notes"], 0, "{k}");
+}
+
+/// Карта кода выключена (`code.enabled = false`): её маршруты отвечают 404, журнал «Код» пуст —
+/// `code` 0, хотя снимок с файлами в базе остался (выключили после загрузки); ключ журнала есть.
+#[tokio::test]
+async fn space_counts_code_disabled_zero() {
+    let a = api("journals-counts-code-off", |c| c.code.enabled = false).await;
+    let (uid, tok) = a.new_user("Анна").await;
+    let r = a
+        .tok(
+            &tok,
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G, "name": "Общее"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let db = a.st.users.get(uid.parse().unwrap()).await.unwrap();
+    let at = zam_store::time::fmt_ts(zam_store::time::now());
+    db.write(move |tx| {
+        tx.execute(
+            "INSERT INTO code_snapshots (solution_guid, updated_at, files) VALUES (?1, ?2, 3)",
+            [G, at.as_str()],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let r = a
+        .tok(
+            &tok,
+            Method::GET,
+            &format!("/api/v1/code/status?solution={G}"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+    let r = a
+        .tok(
+            &tok,
+            Method::GET,
+            &format!("/api/v1/spaces/{G}/counts"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["journals"]["code"], 0, "{}", r.text());
 }

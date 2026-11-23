@@ -112,6 +112,8 @@ fn health_features_documented() {
         "task_subtasks",
         // сессии субагентов `GET /sessions?parent=` (задача 9 M7.2)
         "sessions_parent",
+        // число записей разделов `GET /spaces/{space}/counts` (задача 4 M7.2)
+        "space_counts",
     ] {
         assert!(built.contains(f), "{f}");
     }
