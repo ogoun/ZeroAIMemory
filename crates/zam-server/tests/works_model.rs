@@ -913,6 +913,20 @@ async fn http_external_refused() {
         "{}",
         r.text()
     );
+    // IPv6 с частным IPv4 внутри маршрутизируется наружу — вне LAN, `http` — 422 (ревью r2
+    // Important 1)
+    for (i, url) in [
+        "http://[::10.203.113.7]/v1",
+        "http://[64:ff9b::10.203.113.7]/v1",
+        "http://[2002:acb:7107::1]/v1",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let r = patch_url(&a, &format!("embedded-{i}"), url).await;
+        ok(&r, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(r.text().contains("https://"), "{url}: {}", r.text());
+    }
     let r = patch_url(&a, "ext-https", "https://203.0.113.10:8443/v1/").await;
     ok(&r, StatusCode::OK);
     let v = r.json();
@@ -1273,7 +1287,7 @@ async fn error_classes_reactions() {
 
 /// Пауза любого класса снимается сохранением подключения (и без изменений) и успешной
 /// проверкой; `vault_changed` — только сохранением **с подтверждением** хоста, который видел
-/// человек (`confirm_host`; проверка — 409 без обращения, сохранение без подтверждения — 409).
+/// человек (`confirm_url`; проверка — 409 без обращения, сохранение без подтверждения — 409).
 /// Снятие — в аудите от имени человека.
 #[tokio::test]
 async fn pause_cleared_by_patch_or_test() {
@@ -1311,7 +1325,7 @@ async fn pause_cleared_by_patch_or_test() {
     assert_eq!(r.json()["code"], "vault_changed");
     assert_eq!(pause_of(&a).await.unwrap().class, "vault_changed");
     let mut c = conn_input("llm");
-    c["confirm_host"] = json!(format!("127.0.0.1:{}", m.port()));
+    c["confirm_url"] = json!(m.base_url());
     ok(
         &patch(&a, json!({"works": {"model": c}})).await,
         StatusCode::OK,
@@ -1347,10 +1361,8 @@ async fn vault_url_change_by_token_pauses() {
     ok(&r, StatusCode::OK);
     let e = run(&a, manual(), &["з"]).await.unwrap_err();
     assert_eq!(e.class, CallClass::VaultChanged);
-    let (was, now) = (
-        format!("127.0.0.1:{}", m.port()),
-        format!("127.0.0.1:{}", other.port()),
-    );
+    // в паузе — полные адреса «был → стал», в аудите — хосты (§6.2 п. 1)
+    let (was, now) = (m.base_url(), other.base_url());
     let p = pause_of(&a).await.unwrap();
     assert_eq!(
         (p.class.as_str(), p.from.as_deref(), p.to.as_deref()),
@@ -1358,35 +1370,39 @@ async fn vault_url_change_by_token_pauses() {
     );
     assert_eq!(
         audits(&a, "works.model.vault_changed").await,
-        vec![json!({"from": was, "to": now})]
+        vec![json!({
+            "from": format!("127.0.0.1:{}", m.port()),
+            "to": format!("127.0.0.1:{}", other.port()),
+        })]
     );
     assert_eq!(
         audits(&a, "works.model.paused").await,
         vec![json!({"class": "vault_changed"})]
     );
     assert_eq!((m.count(), other.count()), (0, 0));
-    // подтверждение человека — сохранение подключения с хостом, который он видел
+    // подтверждение человека — сохранение подключения с адресом, который он видел
     let mut c = conn_input("llm");
-    c["confirm_host"] = json!(now);
+    c["confirm_url"] = json!(now);
     let r = patch(&a, json!({"works": {"model": c}})).await;
     ok(&r, StatusCode::OK);
     assert_eq!(r.json()["works"]["model"]["pinned"]["port"], other.port());
-    assert!(r.json()["works"]["model"].get("confirm_host").is_none());
+    assert!(r.json()["works"]["model"].get("confirm_url").is_none());
     other.push(json_reply(1, 1));
     run(&a, manual(), &["з"]).await.unwrap();
     assert_eq!((m.count(), other.count()), (0, 1));
 }
 
 /// «Подтвердить адрес» — только явно (§6.2 п. 1, ревью r1 Important 1): адрес правится дважды
-/// (A → B, затем B → C); подтверждение «B», которое человек видел, — 409 с «был A → стал C»,
-/// ничего не закреплено и пауза остаётся; подтверждение «C» — закреплено, пауза снята. Адрес
-/// изменён, а обращения ещё не было: сохранение без подтверждения — 409 и пауза.
+/// (A → B, затем B → C); пауза и 409 проверки подключения показывают актуальное «стал» C (ревью
+/// r2 Minor 1); подтверждение «B», которое человек видел, — 409 с «был A → стал C», ничего не
+/// закреплено и пауза остаётся; подтверждение «C» — закреплено, пауза снята. Адрес изменён, а
+/// обращения ещё не было: сохранение без подтверждения — 409 и пауза. Адреса — полные.
 #[tokio::test]
 async fn vault_confirm_requires_seen_host() {
     let (ma, mb, mc) = (MockModel::start(), MockModel::start(), MockModel::start());
     let a = server("vault-confirm", |_| {}).await;
     let id = connect(&a, &ma).await;
-    let host = |m: &MockModel| format!("127.0.0.1:{}", m.port());
+    let host = |m: &MockModel| m.base_url();
     let set_url = |url: String| {
         let a = &a;
         let id = id.clone();
@@ -1407,9 +1423,18 @@ async fn vault_confirm_requires_seen_host() {
         CallClass::VaultChanged
     );
     set_url(mc.base_url()).await;
+    // пауза уже стоит (A → B), адрес сменили ещё раз: проверка подключения — 409 со «стал» C,
+    // пауза обновлена
+    let r = a.adm(Method::POST, TEST, None, None).await;
+    ok(&r, StatusCode::CONFLICT);
+    assert_eq!(
+        (r.json()["was"].clone(), r.json()["now"].clone()),
+        (json!(host(&ma)), json!(host(&mc)))
+    );
+    assert_eq!(pause_of(&a).await.unwrap().to, Some(host(&mc)));
     let confirm = |h: String| {
         let mut c = conn_input("llm");
-        c["confirm_host"] = json!(h);
+        c["confirm_url"] = json!(h);
         json!({"works": {"model": c}})
     };
     let r = patch(&a, confirm(host(&mb))).await;
@@ -1447,6 +1472,53 @@ async fn vault_confirm_requires_seen_host() {
         )
     );
     assert_eq!(mb.count(), 0);
+}
+
+/// Подтверждение сверяет всю нормализованную базу — схему, хост, порт и путь (ревью r2 Minor 4):
+/// сменился только путь — «был …/v1 → стал …/v2»; подтверждение одним хостом или прежним
+/// адресом — 409, подтверждение нового адреса (и с завершающим `/`) — закреплено.
+#[tokio::test]
+async fn vault_confirm_full_address() {
+    let m = MockModel::start();
+    let a = server("vault-confirm-path", |_| {}).await;
+    let id = connect(&a, &m).await;
+    let v2 = format!("http://127.0.0.1:{}/v2", m.port());
+    ok(
+        &a.t(
+            Method::PATCH,
+            &format!("/api/v1/vault/{id}"),
+            Some(json!({"data": {"type": "token", "url": v2}})),
+        )
+        .await,
+        StatusCode::OK,
+    );
+    assert_eq!(
+        run(&a, manual(), &["з"]).await.unwrap_err().class,
+        CallClass::VaultChanged
+    );
+    let p = pause_of(&a).await.unwrap();
+    assert_eq!(
+        (p.from.as_deref(), p.to.as_deref()),
+        (Some(m.base_url().as_str()), Some(v2.as_str()))
+    );
+    let confirm = |u: String| {
+        let mut c = conn_input("llm");
+        c["confirm_url"] = json!(u);
+        json!({"works": {"model": c}})
+    };
+    for stale in [format!("127.0.0.1:{}", m.port()), m.base_url()] {
+        let r = patch(&a, confirm(stale.clone())).await;
+        ok(&r, StatusCode::CONFLICT);
+        assert_eq!(
+            (r.json()["was"].clone(), r.json()["now"].clone()),
+            (json!(m.base_url()), json!(v2)),
+            "{stale}"
+        );
+    }
+    let r = patch(&a, confirm(format!("{v2}/"))).await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["works"]["model"]["pinned"]["path"], "/v2");
+    assert!(pause_of(&a).await.is_none());
 }
 
 /// Смена одного ключа записи паузы не даёт: запрос идёт с новым ключом.
@@ -1495,8 +1567,8 @@ async fn model_test_409_on_vault_changed() {
         ok(&r, StatusCode::CONFLICT);
         let v = r.json();
         assert_eq!(v["code"], "vault_changed");
-        assert_eq!(v["was"], format!("127.0.0.1:{}", m.port()));
-        assert_eq!(v["now"], format!("127.0.0.1:{}", other.port()));
+        assert_eq!(v["was"], m.base_url());
+        assert_eq!(v["now"], other.base_url());
         assert!(v["detail"].as_str().unwrap().contains("был"), "{v}");
     }
     assert_eq!(pause_of(&a).await.unwrap().class, "vault_changed");

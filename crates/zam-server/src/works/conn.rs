@@ -19,9 +19,7 @@ use zam_store::work_calls;
 use zeroize::Zeroizing;
 
 use super::egress::{self, Policy, Route, RouteError};
-use super::exec::{
-    Meta, call, call_timeout, estimate, extract_json, fits_limits, journal, row_of, slot,
-};
+use super::exec::{Meta, call, call_timeout, estimate, extract_json, fits_limits, journal, slot};
 use super::model::{CallClass, CallError, ChatMessage, ModelConn};
 use super::night::NightCtx;
 use super::pause;
@@ -176,17 +174,17 @@ pub async fn prepare(
         (current, pinned) => {
             let from = pinned
                 .as_ref()
-                .map_or_else(|| "не закреплён".to_string(), egress::host_label);
+                .map_or_else(|| "не закреплён".to_string(), egress::address_label);
             let to = current
                 .as_ref()
-                .map_or_else(|_| "нет адреса".to_string(), egress::host_label);
+                .map_or_else(|_| "нет адреса".to_string(), egress::address_label);
             return Err(refuse_paused(
                 ctx,
                 user,
                 CallClass::VaultChanged,
                 format!(
                     "адрес подключения изменён: был {from} → стал {to} — подтвердите, сохранив \
-                     подключение с confirm_host"
+                     подключение с confirm_url"
                 ),
                 Some((from, to)),
                 who,
@@ -264,6 +262,25 @@ pub async fn prepare(
         host,
         key,
     })
+}
+
+/// «Был → стал» подключения сейчас (полные адреса, ревью r2 Minor 1, 4): закреплённый адрес и
+/// текущий адрес записи Vault; запись не читается (удалена, сбой) — `None`.
+pub(crate) async fn observed_change(
+    st: &crate::app::AppState,
+    user: Id,
+    conn: &ModelConn,
+) -> Option<(String, String)> {
+    let db = st.users.get(user).await.ok()?;
+    let (meta, _) = zam_store::vault_get(&db, conn.vault).await.ok()?;
+    let now = egress::vault_address(&meta.data)
+        .and_then(|a| egress::parse_base_url(a).ok())
+        .map_or_else(|| "нет адреса".to_string(), |b| egress::address_label(&b));
+    let was = conn
+        .pinned
+        .as_ref()
+        .map_or_else(|| "не закреплён".to_string(), egress::address_label);
+    Some((was, now))
 }
 
 /// Итог проверки подключения (§6.2 п. 9): `{ok, ms, class?, hint?, thinking?}`.
@@ -361,10 +378,32 @@ pub async fn test_connection(
         .as_ref()
         .filter(|p| p.class == CallClass::VaultChanged.as_str())
     {
-        return Err(TestRefusal::VaultChanged {
-            was: p.from.clone().unwrap_or_default(),
-            now: p.to.clone().unwrap_or_default(),
-        });
+        // «стал» — актуальный: адрес сменили ещё раз — пауза обновляется (ревью r2 Minor 1)
+        let observed = match &works.model {
+            Some(c) => observed_change(st, user, c).await,
+            None => None,
+        };
+        let (was, now) = match observed {
+            Some((was, now)) => {
+                if p.to.as_deref() != Some(now.as_str()) {
+                    pause::set_paused(
+                        st,
+                        user,
+                        CallClass::VaultChanged,
+                        Some((was.clone(), now.clone())),
+                        actor,
+                        ip,
+                    )
+                    .await;
+                }
+                (was, now)
+            }
+            None => (
+                p.from.clone().unwrap_or_default(),
+                p.to.clone().unwrap_or_default(),
+            ),
+        };
+        return Err(TestRefusal::VaultChanged { was, now });
     }
     let p = match prepare(ctx, user, &works, actor, ip).await {
         Ok(p) => p,
@@ -431,22 +470,12 @@ pub async fn test_connection(
         )));
     }
     let timeout = call_timeout(cfg).min(TEST_TIMEOUT_MAX);
-    let (r, ms) = call(ctx, &p, &convo, timeout).await;
-    let out = match r {
+    let called = call(ctx, &p, &convo, timeout).await;
+    journal(&db, called.row(&p, &meta)).await;
+    let ms = called.ms;
+    let out = match called.result {
         Ok(reply) => {
             let parsed = extract_json(&reply.text);
-            journal(
-                &db,
-                row_of(
-                    &p,
-                    &meta,
-                    work_calls::OUTCOME_OK,
-                    Some(reply.usage()),
-                    ms,
-                    Some(200),
-                ),
-            )
-            .await;
             match parsed {
                 Ok(_) => {
                     pause::clear_pause(st, user, &works, "test", actor, ip).await;
@@ -478,11 +507,6 @@ pub async fn test_connection(
             }
         }
         Err(e) => {
-            journal(
-                &db,
-                row_of(&p, &meta, e.class.as_str(), e.usage, ms, e.http_status),
-            )
-            .await;
             if matches!(e.class, CallClass::Auth | CallClass::NotFound) {
                 pause::set_paused(st, user, e.class, None, actor, ip).await;
             }

@@ -534,10 +534,10 @@ struct ModelInput {
     token_field: TokenField,
     #[serde(default)]
     body_extra: Option<Value>,
-    /// Подтверждение изменённого адреса записи (§6.2 п. 1): хост («стал»), который видел
-    /// человек; не хранится.
+    /// Подтверждение изменённого адреса записи (§6.2 п. 1): адрес («стал»), который видел
+    /// человек, — сверяется весь (схема, хост, порт, путь); не хранится.
     #[serde(default)]
-    confirm_host: Option<String>,
+    confirm_url: Option<String>,
 }
 
 fn protocol_default() -> String {
@@ -558,7 +558,8 @@ fn max_tokens_default() -> u32 {
 ///
 /// **Подтверждение адреса** (§6.2 п. 1; ревью r1 задачи 2, Important 1): та же запись Vault, а
 /// её адрес не совпал с закреплённым (или исполнитель на паузе `vault_changed`), — закрепляется
-/// только при `confirm_host`, равном текущему хосту записи («стал», который видел человек).
+/// только при `confirm_url`, равном текущему адресу записи («стал», который видел человек; вся
+/// нормализованная база). «Был → стал» — полные адреса; устаревшее «стал» паузы обновляется.
 /// Нет подтверждения или оно устарело — 409 `{code: vault_changed, was, now}`, ничего не
 /// записано, пауза `vault_changed` ставится (если её не было) и остаётся.
 async fn resolve_model(
@@ -617,7 +618,7 @@ async fn resolve_model(
         current,
         item.id,
         &base,
-        input.confirm_host.as_deref(),
+        input.confirm_url.as_deref(),
         who,
     )
     .await?;
@@ -656,15 +657,20 @@ async fn confirm_address(
     if paused.is_none() && old.pinned.as_ref() == Some(base) {
         return Ok(());
     }
-    let now = egress::host_label(base);
-    if confirm.is_some_and(|h| h.trim().eq_ignore_ascii_case(&now)) {
+    // сверяется вся нормализованная база — схема, хост, порт, путь (ревью r2 Minor 4)
+    if confirm
+        .and_then(|u| egress::parse_base_url(u).ok())
+        .is_some_and(|c| c == *base)
+    {
         return Ok(());
     }
+    let now = egress::address_label(base);
     let was = old
         .pinned
         .as_ref()
-        .map_or_else(|| "не закреплён".to_string(), egress::host_label);
-    if paused.is_none() {
+        .map_or_else(|| "не закреплён".to_string(), egress::address_label);
+    // паузы не было или в ней устаревшее «стал» — пауза с актуальным (ревью r2 Minor 1)
+    if paused.and_then(|p| p.to.as_deref()) != Some(now.as_str()) {
         crate::works::pause::set_paused(
             st,
             user,
@@ -682,7 +688,7 @@ async fn confirm_address(
     Err(ApiError::Conflict {
         detail: format!(
             "адрес подключения изменён: был {was} → стал {now} — подтвердите: сохраните \
-             подключение с confirm_host = \"{now}\""
+             подключение с confirm_url = \"{now}\""
         ),
         extra,
     })
@@ -919,7 +925,7 @@ async fn apply(
         st.user_flags.invalidate(user);
     }
     // и подключение без изменений: сохранение снимает паузу (у `vault_changed` сюда доходит
-    // только подтверждённое `confirm_host`, §6.2 п. 1); после снятия работ — пауза не режим вида
+    // только подтверждённое `confirm_url`, §6.2 п. 1); после снятия работ — пауза не режим вида
     if saved_model {
         crate::works::pause::clear_pause(st, user, &works_cur, "save", actor, Some(ip)).await;
     }

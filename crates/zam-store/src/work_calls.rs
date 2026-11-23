@@ -10,7 +10,8 @@
 //!   строкам **своего** запуска ([`calls_of_run`]; решение координатора 77): перезапуск в окне
 //!   стоп не теряет, ночь и ручной запуск друг друга не останавливают.
 //! - Строка без отправки — `ms = NULL` (запрос не ушёл: предел `limit`, имя не разрешилось);
-//!   `aborted` — запрос ушёл, ответа нет (остановка сервера), `ms = NULL` ([`CallRow::sent`]).
+//!   `aborted` — запрос ушёл, ответа нет (остановка сервера), `ms = NULL`; `internal` — сбой
+//!   сервера без отправки, `ms = NULL` ([`CallRow::sent`]).
 //! - Хранение — 180 суток от `ts` ([`gc`], воркер обслуживания).
 use jiff::Timestamp;
 use rusqlite::params;
@@ -23,8 +24,11 @@ use crate::{Db, StoreError};
 pub const KIND_TEST: &str = "test";
 /// Исход удачного обращения.
 pub const OUTCOME_OK: &str = "ok";
-/// Исход обращения, оборванного остановкой сервера.
+/// Исход обращения, оборванного остановкой сервера (запрос ушёл, ответа нет).
 pub const OUTCOME_ABORTED: &str = "aborted";
+/// Исход сбоя сервера без отправки (поток вызова не запустился или кончился без ответа; ревью r2
+/// задачи 2, Minor 3): отправкой не считается.
+pub const OUTCOME_INTERNAL: &str = "internal";
 
 /// Строка журнала отправок.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +45,7 @@ pub struct CallRow {
     pub estimated: bool,
     /// Длительность обращения, мс; `None` — запрос не отправлялся или ответа нет (`aborted`).
     pub ms: Option<u64>,
-    /// `ok`, класс ошибки или `aborted`.
+    /// `ok`, класс ошибки, `aborted` или `internal`.
     pub outcome: String,
     pub http_status: Option<u16>,
     pub external: bool,
@@ -181,4 +185,39 @@ pub async fn gc(db: &Db, cutoff: Timestamp) -> Result<u64, StoreError> {
         Ok(n as u64)
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(outcome: &str, ms: Option<u64>) -> CallRow {
+        CallRow {
+            ts: Timestamp::UNIX_EPOCH,
+            work_id: None,
+            kind: "probes".into(),
+            host: "h".into(),
+            model: "m".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            estimated: false,
+            ms,
+            outcome: outcome.into(),
+            http_status: None,
+            external: false,
+            items: None,
+            run: None,
+        }
+    }
+
+    /// Отправлено — есть длительность или обращение оборвано остановкой (`aborted`); сбой сервера
+    /// без отправки (`internal`), предел и «имя не разрешилось» — нет (ревью r2 Minor 3).
+    #[test]
+    fn sent_only_when_request_left() {
+        assert!(row(OUTCOME_OK, Some(5)).sent());
+        assert!(row(OUTCOME_ABORTED, None).sent());
+        assert!(!row(OUTCOME_INTERNAL, None).sent());
+        assert!(!row("limit", None).sent());
+        assert!(!row("unavailable", None).sent());
+    }
 }

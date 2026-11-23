@@ -5441,6 +5441,34 @@ or_test`, `http_external_refused`, `model_test_409_on_vault_changed`, `loopback_
   `works_calls_user_session_foreign_403`, `month_start_is_first_of_month`) прошли и до правок —
   они закрывают непокрытые пути, а не новое поведение.
 
+**Круг правок 2** (ревью r2: 1 Important / 4 Minor):
+- Important 1 — вложенный IPv4 (`::a.b.c.d`, `64:ff9b::/96`, `2002::/16`) только **ужесточает**
+  класс: петля, сам узел, link-local внутри — как IPv4; прочее (и частный IPv4) — класс самого
+  IPv6 (вне LAN): соединение идёт по адресу IPv6, а он маршрутизируется наружу (RFC 6052 §3.1
+  запрещает `64:ff9b::/96` для частных IPv4). `http://[::10.203.113.7]/v1` — 422. `::ffff:0:0/96`
+  — по-прежнему как IPv4 (соединение — по IPv4).
+- Minor 1 — пауза `vault_changed` держит актуальное «стал»: при новой смене адреса проверка
+  подключения и `PATCH` (неподтверждённый) переписывают паузу и пишут аудит `vault_changed`; 409
+  обоих — то же «был → стал».
+- Minor 2 — спецификация §6.2 п. 8 (столбец `run`, исходы `aborted`/`internal`), §12 п. 77 (индекс
+  `work_calls_run`).
+- Minor 3 — поток вызова не запустился или кончился без ответа — строка `internal` с `ms =
+  NULL` (`zam_store::work_calls::OUTCOME_INTERNAL`), `CallRow::sent()` её не считает; `aborted` —
+  только остановка после отправки.
+- Minor 4 — подтверждение — **`confirm_url`** (поле `confirm_host` переименовано: сверяется вся
+  нормализованная база — схема, хост, порт, путь — `parse_base_url` и равенство `BaseUrl`);
+  «был → стал» в паузе и 409 — полные адреса (`egress::address_label`), в аудите
+  `works.model.vault_changed` — хосты (§6.2 п. 1).
+- ⚠️ задача 8 — в план (Step 1, `works_pause_dot_and_confirm_address`): форма шлёт `v:<id>`,
+  показывает адрес записи, «Подтвердить адрес» — `confirm_url` из `pause.to`.
+- [решение исполнителя, задача 2, круг 2] Поле подтверждения переименовано в `confirm_url`: оно
+  несёт адрес, а не хост; выпуска с `confirm_host` не было.
+- TDD круга: RED — `zam-store --lib work_calls` не собирается (`OUTCOME_INTERNAL`), `works_model` 35
+  passed / 6 FAILED (`http_external_refused`, `pause_cleared_by_patch_or_test`,
+  `model_test_409_on_vault_changed`, `vault_confirm_full_address`, `vault_confirm_requires_seen_host`,
+  `vault_url_change_by_token_pauses`), `--lib works::` — `classify_embedded_ipv4` FAILED; GREEN —
+  в отчёте задачи.
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

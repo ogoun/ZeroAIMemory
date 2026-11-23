@@ -477,16 +477,52 @@ pub(crate) async fn slot(ctx: &NightCtx) -> Option<tokio::sync::OwnedSemaphorePe
     }
 }
 
+/// Итог одного обращения: ответ или ошибка, длительность (есть — ответ получен) и «сбой сервера
+/// без отправки» (поток вызова не запустился или кончился без ответа; ревью r2 Minor 3).
+pub(crate) struct Called {
+    pub(crate) result: Result<ModelReply, CallError>,
+    pub(crate) ms: Option<u64>,
+    internal: bool,
+}
+
+impl Called {
+    fn new(result: Result<ModelReply, CallError>, ms: Option<u64>, internal: bool) -> Called {
+        Called {
+            result,
+            ms,
+            internal,
+        }
+    }
+
+    /// Строка журнала обращения: `ok`, класс ошибки, `aborted` (остановка после отправки, без
+    /// `ms`) или `internal` (сбой без отправки, без `ms`; отправкой не считается).
+    pub(crate) fn row(&self, p: &Prepared, m: &Meta<'_>) -> CallRow {
+        match &self.result {
+            Ok(reply) => row_of(
+                p,
+                m,
+                work_calls::OUTCOME_OK,
+                Some(reply.usage()),
+                self.ms,
+                Some(200),
+            ),
+            Err(_) if self.internal => row_of(p, m, work_calls::OUTCOME_INTERNAL, None, None, None),
+            Err(e) => row_of(p, m, e.class.as_str(), e.usage, self.ms, e.http_status),
+        }
+    }
+}
+
 /// Одно обращение в **отвязанном** потоке `std::thread` (ни пул блокирующих задач рантайма, ни
-/// выход процесса он не держит); поток получает только данные запроса. Второе — мс обращения;
-/// остановка сервера (`ctx.stopped()`) — `aborted` без длительности, вызов брошен (поток доживёт
-/// до срока `ureq` и ответ выбросит).
+/// выход процесса он не держит); поток получает только данные запроса. Остановка сервера
+/// (`ctx.stopped()`) — `aborted` без длительности, вызов брошен (поток доживёт до срока `ureq` и
+/// ответ выбросит); поток не запустился или кончился без ответа — `aborted` вызывающему, в
+/// журнал — `internal`.
 pub(crate) async fn call(
     ctx: &NightCtx,
     p: &Prepared,
     convo: &[ChatMessage],
     timeout: Duration,
-) -> (Result<ModelReply, CallError>, Option<u64>) {
+) -> Called {
     let (conn, route, key) = (p.conn.clone(), p.route.clone(), p.key_clone());
     let convo = convo.to_vec();
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -503,22 +539,23 @@ pub(crate) async fn call(
             );
             let _ = tx.send(r);
         });
+    let aborted = || Err(CallError::new(CallClass::Aborted));
     if let Err(e) = spawned {
         tracing::warn!(error = %e, "внутренние работы: поток вызова модели не запущен");
-        return (Err(CallError::new(CallClass::Aborted)), None);
+        return Called::new(aborted(), None, true);
     }
     tokio::select! {
         r = rx => match r {
             Ok(r) => {
                 let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                (r, Some(ms))
+                Called::new(r, Some(ms), false)
             }
             Err(_) => {
                 tracing::warn!("внутренние работы: поток вызова модели завершился без ответа");
-                (Err(CallError::new(CallClass::Aborted)), None)
+                Called::new(aborted(), None, true)
             }
         },
-        () = ctx.stopped() => (Err(CallError::new(CallClass::Aborted)), None),
+        () = ctx.stopped() => Called::new(aborted(), None, false),
     }
 }
 
@@ -607,27 +644,9 @@ impl Run<'_> {
                 }
                 self.key_used = true;
             }
-            let (r, ms) = call(self.ctx, self.p, convo, timeout).await;
-            let row = match &r {
-                Ok(reply) => row_of(
-                    self.p,
-                    &self.meta,
-                    work_calls::OUTCOME_OK,
-                    Some(reply.usage()),
-                    ms,
-                    Some(200),
-                ),
-                Err(e) => row_of(
-                    self.p,
-                    &self.meta,
-                    e.class.as_str(),
-                    e.usage,
-                    ms,
-                    e.http_status,
-                ),
-            };
-            journal(self.db, row).await;
-            let e = match r {
+            let called = call(self.ctx, self.p, convo, timeout).await;
+            journal(self.db, called.row(self.p, &self.meta)).await;
+            let e = match called.result {
                 Ok(reply) => return Ok(reply),
                 Err(e) => e,
             };

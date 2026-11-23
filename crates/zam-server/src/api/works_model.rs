@@ -7,7 +7,7 @@
 //!   `kind = test`; успешная проверка снимает паузу (кроме `vault_changed`). На паузе
 //!   `vault_changed` (и при адресе записи Vault, изменённом после сохранения) — 409 «адрес
 //!   изменён: был <хост> → стал <хост> — подтвердите» `{code: vault_changed, was, now}` **без
-//!   обращения** (подтверждение — `PATCH works.model {confirm_host}`); `[works] enabled =
+//!   обращения** (подтверждение — `PATCH works.model {confirm_url}`); `[works] enabled =
 //!   false` или `model_access = "off"` — 409; у пользователя уже идёт обращение — 409; нет
 //!   подключения `works.model` — 422.
 //! - `GET /works/calls?days=&user=` → `{days, calls: […]}`: метаданные обращений за `days`
@@ -106,7 +106,7 @@ pub async fn test(
             "vault_changed",
             format!(
                 "адрес изменён: был {was} → стал {now} — подтвердите: сохраните подключение с \
-                 confirm_host = \"{now}\""
+                 confirm_url = \"{now}\""
             ),
             &[("was", json!(was)), ("now", json!(now))],
         )),

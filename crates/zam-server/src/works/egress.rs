@@ -9,7 +9,9 @@
 //!   `localhost`; сам узел — адрес, который маршрут выбирает исходящим (UDP `connect` без
 //!   отправки пакетов, `local_addr() == адрес`; `std`, без списка интерфейсов); link-local —
 //!   `169.254/16`, `fe80::/10`; LAN — `10/8`, `172.16/12`, `192.168/16`, `100.64/10`, `fc00::/7`;
-//!   прочее — вне LAN. IPv4-в-IPv6 (`::ffff:0:0/96`) — как IPv4.
+//!   прочее — вне LAN. IPv4-в-IPv6 (`::ffff:0:0/96`) — как IPv4; IPv4-совместимый `::a.b.c.d`,
+//!   NAT64 `64:ff9b::/96`, 6to4 `2002::/16` — петля, сам узел и link-local внутри — как IPv4,
+//!   прочее (в том числе частный IPv4) — класс самого IPv6, то есть вне LAN.
 //! - **Проверка** ([`check`], [`allowed`]): петля, сам узел и link-local — только при `[works]
 //!   allow_loopback = true` (администратор); вне LAN — не при `model_access = "lan"` и не по
 //!   `http://`; `model_access = "off"` — обращений нет. Проверяется **каждый** адрес имени.
@@ -157,6 +159,13 @@ pub fn vault_address(data: &serde_json::Value) -> Option<&str> {
         .find_map(|k| data.get(*k).and_then(serde_json::Value::as_str))
         .map(str::trim)
         .filter(|s| !s.is_empty())
+}
+
+/// Полный нормализованный адрес для «был → стал» паузы `vault_changed` и подтверждения (ревью
+/// r2 Minor 4): `<схема>://<хост>[:<порт>]<путь>` (порт схемы по умолчанию опущен) — разница
+/// только в схеме или пути видна.
+pub fn address_label(base: &BaseUrl) -> String {
+    endpoint(base, "")
 }
 
 /// Хост адреса для показа человеку и аудита (без пути и порта схемы по умолчанию): `host` или
@@ -403,9 +412,9 @@ fn canonical(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// IPv4, вложенный в адрес IPv6 (ревью r1 Minor 10; только для класса — соединение идёт по
-/// адресу IPv6): IPv4-совместимый `::a.b.c.d` (кроме `::` и `::1`), NAT64 `64:ff9b::/96`, 6to4
-/// `2002::/16` (биты 16..48).
+/// IPv4, вложенный в адрес IPv6 (ревью r1 Minor 10, r2 Important 1; только чтобы **ужесточить**
+/// класс — соединение идёт по адресу IPv6): IPv4-совместимый `::a.b.c.d` (кроме `::` и `::1`),
+/// NAT64 `64:ff9b::/96`, 6to4 `2002::/16` (биты 16..48).
 fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     let s = v6.segments();
     let tail = |a: u16, b: u16| Ipv4Addr::from((u32::from(a) << 16) | u32::from(b));
@@ -455,10 +464,16 @@ pub fn classify_ip(ip: IpAddr) -> Reach {
     if is_loopback_range(ip) {
         return Reach::Loopback;
     }
+    // вложенный IPv4 только ужесточает класс (ревью r2 Important 1): соединение идёт по адресу
+    // IPv6, а IPv4-совместимые, 6to4 и NAT64 маршрутизируются наружу — частный IPv4 внутри не
+    // делает адрес LAN
     if let IpAddr::V6(v6) = ip
         && let Some(v4) = embedded_v4(v6)
     {
-        return classify_ip(IpAddr::V4(v4));
+        let inner = classify_ip(IpAddr::V4(v4));
+        if inner.local_only() {
+            return inner;
+        }
     }
     if is_own(ip) {
         return Reach::SelfNode;
@@ -815,19 +830,23 @@ mod tests {
         }
     }
 
-    /// IPv6 со вложенным IPv4 (ревью r1 Minor 10) — по вложенному адресу: IPv4-совместимый
-    /// `::a.b.c.d`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`; `::` и `::1` — петля.
+    /// IPv6 со вложенным IPv4 (ревью r1 Minor 10, r2 Important 1) — вложенный адрес только
+    /// **ужесточает** класс: петля, сам узел, link-local внутри — как IPv4; прочее (в том числе
+    /// частный IPv4) — класс самого IPv6, то есть вне LAN: соединение идёт по адресу IPv6, а
+    /// IPv4-совместимые, 6to4 и NAT64 маршрутизируются наружу. `::` и `::1` — петля.
     #[test]
     fn classify_embedded_ipv4() {
         let cases = [
-            ("::10.203.113.7", Reach::Lan),
+            ("::10.203.113.7", Reach::External),
             ("::127.0.0.1", Reach::Loopback),
+            ("::169.254.0.1", Reach::LinkLocal),
             ("::203.0.113.10", Reach::External),
-            ("64:ff9b::10.203.113.7", Reach::Lan),
+            ("64:ff9b::10.203.113.7", Reach::External),
             ("64:ff9b::127.0.0.1", Reach::Loopback),
             ("64:ff9b::169.254.169.254", Reach::LinkLocal),
             ("64:ff9b::203.0.113.10", Reach::External),
-            ("2002:acb:7107::1", Reach::Lan),
+            ("2002:acb:7107::1", Reach::External),
+            ("2002:c0a8:cb0b::1", Reach::External),
             ("2002:7f00:1::5", Reach::Loopback),
             ("2002:cb00:710a::1", Reach::External),
             ("::", Reach::Loopback),

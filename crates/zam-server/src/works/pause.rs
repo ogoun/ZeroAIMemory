@@ -4,8 +4,9 @@
 //! - **Пауза** (`works.pause`, пишет только сервер через [`super::settings::set_pause`]):
 //!   `auth`, `not_found` — после ответа модели; `blocked`, `vault`, `vault_changed` — запрос не
 //!   отправляется. Снимают человек сохранением подключения и успешная проверка подключения; у
-//!   `vault_changed` — только сохранение **с подтверждением** хоста, который видел человек
-//!   (`PATCH works.model {confirm_host}`, ревью r1 задачи 2, Important 1).
+//!   `vault_changed` — только сохранение **с подтверждением** адреса, который видел человек
+//!   (`PATCH works.model {confirm_url}`, ревью r1–r2 задачи 2). «Был → стал» в паузе — полные
+//!   адреса, в аудите `works.model.vault_changed` — хосты.
 //! - **Аудит**: `works.model.paused {class}`, `works.model.vault_changed {from, to}`,
 //!   `works.model.pause_cleared {class, by, from?, to?}`, `works.model.key_use {vault, host}`.
 //!   Отказ записи аудита не глотается: WARN с действием и пользователем ([`audit`]); там, где без
@@ -17,6 +18,7 @@
 use serde_json::{Value, json};
 use zam_core::Id;
 
+use super::egress;
 use super::model::CallClass;
 use super::settings::{self, Pause, UserWorks};
 use crate::app::AppState;
@@ -83,16 +85,22 @@ pub async fn set_paused(
     )
     .await;
     if let Some((from, to)) = change {
+        // в паузе — полные адреса, в аудите — хосты без пути (§6.2 п. 1)
         audit(
             st,
             actor,
             ip,
             user,
             "works.model.vault_changed",
-            json!({"from": from, "to": to}),
+            json!({"from": host_of(&from), "to": host_of(&to)}),
         )
         .await;
     }
+}
+
+/// Хост адреса «был/стал» для аудита; не адрес («нет адреса», «не закреплён») — как есть.
+fn host_of(label: &str) -> String {
+    egress::parse_base_url(label).map_or_else(|_| label.to_string(), |b| egress::host_label(&b))
 }
 
 /// Снимает паузу исполнителя (если есть) с аудитом `works.model.pause_cleared {class, by,
