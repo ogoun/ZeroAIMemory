@@ -28,7 +28,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use zam_core::Id;
 use zam_store::check::{AcceptOutcome, CheckRun, RunStatus};
 use zam_store::probes::{Probe, ProbeFilter, ProbeKind, Split};
@@ -48,31 +48,6 @@ pub const RUNS_LIMIT_MAX: usize = 365;
 /// `GET /check/probes`: по умолчанию и предел.
 pub const PROBES_LIMIT_DEFAULT: usize = 200;
 pub const PROBES_LIMIT_MAX: usize = 1000;
-
-/// Тип problem: общий выключатель `[works] enabled = false`.
-pub const PROBLEM_WORKS_DISABLED: &str = "/problems/works-disabled";
-/// Тип problem: у пользователя уже идёт прогон.
-pub const PROBLEM_CHECK_RUNNING: &str = "/problems/check-running";
-/// Тип problem: принять как норму можно только последний ночной прогон открытого эпизода.
-pub const PROBLEM_ACCEPT_NOT_LATEST: &str = "/problems/check-accept-not-latest";
-
-fn typed(
-    status: StatusCode,
-    kind: &'static str,
-    detail: &str,
-    extra: &[(&str, Value)],
-) -> ApiError {
-    let mut m = Map::new();
-    for (k, v) in extra {
-        m.insert((*k).to_string(), v.clone());
-    }
-    ApiError::Typed {
-        status,
-        kind,
-        detail: detail.to_string(),
-        extra: m,
-    }
-}
 
 /// Пользователь запроса (несуществующий — 404).
 async fn user_of(st: &AppState, p: &Principal, h: &HeaderMap) -> Result<Id, ApiError> {
@@ -311,18 +286,11 @@ pub async fn start(
             Json(json!({"run": id.to_string(), "status": "running"})),
         )
             .into_response()),
-        Err(StartError::Disabled) => Err(typed(
-            StatusCode::CONFLICT,
-            PROBLEM_WORKS_DISABLED,
-            "внутренние работы и проверка памяти выключены на сервере ([works] enabled = false)",
-            &[],
+        // общий выключатель — тот же ответ, что у ручных запусков работ (решение координатора 76)
+        Err(StartError::Disabled) => Err(ApiError::WorksDisabled(
+            crate::api::works::WORKS_DISABLED_DETAIL.into(),
         )),
-        Err(StartError::Running(r)) => Err(typed(
-            StatusCode::CONFLICT,
-            PROBLEM_CHECK_RUNNING,
-            "прогон проверки памяти уже идёт — дождитесь его конца",
-            &[("run", json!(r.to_string()))],
-        )),
+        Err(StartError::Running(run)) => Err(ApiError::CheckRunning { run }),
         Err(StartError::Stopping) => Err(ApiError::ShuttingDown { retry_after_s: 5 }),
     }
 }
@@ -353,14 +321,7 @@ pub async fn accept(
     let by = p.actor();
     let verdict = match zam_store::check::accept_run(&db, run, &by).await? {
         AcceptOutcome::Accepted(v) => v,
-        AcceptOutcome::NotLatest => {
-            return Err(typed(
-                StatusCode::CONFLICT,
-                PROBLEM_ACCEPT_NOT_LATEST,
-                "принять как норму можно только последний ночной прогон идущего эпизода регрессии",
-                &[],
-            ));
-        }
+        AcceptOutcome::NotLatest => return Err(ApiError::CheckAcceptNotLatest),
     };
     st.system
         .audit(

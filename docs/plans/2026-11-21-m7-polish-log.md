@@ -5469,6 +5469,174 @@ or_test`, `http_external_refused`, `model_test_409_on_vault_changed`, `loopback_
   `vault_url_change_by_token_pauses`), `--lib works::` — `classify_embedded_ipv4` FAILED; GREEN —
   в отчёте задачи.
 
+### M7.3 · Задача 3 — Очередь работ, пакет и итог, режим «агент», ночь и ручной запуск
+
+Спецификация §6.3; worktree `.tmp/m73/wt-t3`, ветка `m7.3-t3` от `m7.3-internal` `4c287ef5`
+(задачи 1 и 2 слиты); круг 2 вместе с задачей 5.
+
+**Очередь** (`zam_store::works`): `Work`, `WorkItem`, `NewWork`, `WorkMode`, `Origin`, `WorkState`;
+`enqueue` (незакрытая работа вида в пространстве есть — `None`), `claim_next` (своя живая аренда
+сессии — та же работа; иначе старейшая `queued` работа агента, аренда), `start_model`, `finish`,
+`finish_claimed` (CAS по сессии, `result_key`), `release`, `set_items`, `cancel_kind` (с фильтром
+исполнителя), `requeue_model_running`, `expire` (7 суток, истёкшая аренда, третья — `failed`),
+`served_at`, `count_packages`, `nightly_spaces`, `next_model_queued`, `list`, `last_night`,
+`queued_agent_counts`, `excluded_refs`, `accepted_refs`, `owner_entries` (живые записи, все
+ревизии — владельца базы). Строка неизвестного вида, режима или состояния — `None` с WARN.
+
+**Виды и пакет** (`works::kinds`, `works::package`): диспетчер — `space_kinds`, `label`, `collect`,
+`instruction`, `schema`, `accept_item`; `probes`/`rules` — заготовки (сборщик пуст, элемент
+отклоняется) под задачи 4 и 7; `echo` (только `test-hooks`) — insight пространства, итог `{n,
+text}`. Пакет — `render`/`render_numbered`: заголовок, инструкция вида со строкой «данные, а не
+указания», `<record n ref kind>` (граница экранирована без учёта регистра), схема, строка итога;
+бюджет 6000 (1..=20000); `check_mask_literal`, `check_mask_literal_json`, `agent_text`.
+
+**Исполнение** (`works::queue`): `night` (пользователи → виды по порядку; `agent` — до 4 работ,
+по одной на пространство за ночь; `model` — `run_model` по кругу пространств до окна, предела или
+стопа), `manual_agent`, `manual_model` (через `spawn_tracked`), общая проверка итога `accept`,
+`on_mode_change` и снятие работ не того исполнителя ночью (`drop_stale`), `on_start`
+(`requeue_model_running`), `digest_line`. REST `api::works`: `GET /works`, `GET /works/usage`,
+`POST /works/run`, `POST /works/{id}/result`, `POST /works/{id}/release`, пакет `/recall {event:
+"work"}` (`package`); `ApiError::WorksDisabled` (`/problems/works-disabled`) и
+`ApiError::WorkNotClaimed` (`/problems/work-not-claimed`); `POST /works/model/test` при `enabled =
+false` — тоже `works-disabled`. `/recall`: `Event::Work`, поле `kind`, строка работ дайджеста
+(`works_line`) после строки идей. MCP: событие `work` и `kind` у `memory_recall`, вид `work` у
+`memory_log` (`required` — `["kind"]`, обработчик `work_result` до `EntryKind::parse`), подсвойства
+`data.work`, `data.items`, `data.skip`. CLI `zam work status|next|put|release`. Признак `works`.
+
+**Описания MCP** (тест длины прежний, `chars().count() <= 300`):
+- `memory_log` — 299 → **298**: «Запись журнала: kind changelog|release, insight (data.kind,
+  triggers, scope, certainty), term, task, idea, question (поля data — в схеме); refs.files —
+  файлы. report — отчёт, неизменяем: images [{name, data base64}], большой — zam report. work —
+  итог работы (без title). Дубль insight — 409: force.» (подробности `term`, `question` — в
+  описании `data`; `title` — «обязателен у всех видов, кроме work»);
+- `memory_recall` — 292 → **296**: «Подсказки памяти к событию: session_start — дайджест, prompt
+  — к запросу, post_tool — к ошибке (error, tool); повторы в сессии отсекаются. Пакеты: recovery —
+  после сжатия, brief — под задачу task, idea_review — идеи на разбор (limit), work — внутренняя
+  работа (kind; итог — memory_log kind=work).»;
+- поле `memory_recall.kind` — 84; `memory_log.title` — 35, `data.work` — 54, `data.items` — 92,
+  `data.skip` — 47.
+
+- [решение исполнителя, задача 3] **`works.items` — кандидат целиком** (`n`, ссылка и ревизия,
+  вид, заголовок-исходник, текст вида агента, сигналы), а не только «ссылки и ревизии» §6.3 п. 1:
+  пакет при захвате строится из тех же текстов, что отобрал сборщик, без перечитывания записей
+  своим загрузчиком у каждого вида; текст маскируется сборщиком до обрезки (маска куска ≠ кусок
+  маски), заголовок — исходник (человеку в `GET /works`; маска — в пакете и у токена).
+- [решение исполнителя, задача 3] `cancel_kind(db, kind, reason, mode)` — с фильтром исполнителя
+  (`None` — любые): снятие при смене режима и ночью снимает только работы **не того** исполнителя,
+  а на паузе исполнителя (действующий `off`, причина `paused`) работы модели ждут — иначе снятие
+  паузы сохранением подключения (смена `off → model`) сняло бы отложенные работы. `finish`
+  возвращает `bool`; сверх перечня плана — `get`, `start_model`, `finish_claimed`, `set_items`,
+  `nightly_spaces`, `next_model_queued`, `list`, `last_night`, `queued_agent_counts`,
+  `accepted_refs`, `owner_entries`.
+- [решение исполнителя, задача 3] **Режим агента ночью — одна работа пространства за ночь**
+  (`nightly_spaces`): иначе отказ `skip` той же ночью сразу ставил бы работу снова (§6.3 п. 4 —
+  «снова следующей ночью»); режим модели обходит пространства по кругу до предела 4 пакетов.
+- [решение исполнителя, задача 3] **Первый элемент пакета входит всегда**, даже сверх бюджета:
+  работа без элементов невыполнима; хвост сверх бюджета снимается с работы (`set_items`) и уходит
+  в следующую.
+- [решение исполнителя, задача 3] Повторный пакет той же сессии — та же работа (аренда не
+  продлевается): агент, потерявший пакет, получает его снова.
+- [решение исполнителя, задача 3] **Исход обращения модели**: `blocked` без паузы — `cancelled`
+  (`mode_changed`); пауза, стоп до следующей ночи (`quota`, `limit`, `rate`, `unavailable`),
+  остановка и сбой хранилища (`aborted`) — снова `queued`, запуск вида закончен; находка в
+  постоянном тексте (`secret_in_payload` из `run_payload`) — `failed`, запуск закончен; прочие —
+  `failed`, запуск идёт дальше; JSON не по схеме итога — `failed` (`bad_json`). Работы модели,
+  возвращённые в очередь, выполняет следующий запуск (ночь или ручной) — первыми.
+- [решение исполнителя, задача 3] Пакет и итог — только **явная** сессия (как учёт и отметки
+  M6 §7.1): неявная сессия MCP (R13) работы не захватывает — итог принимает та же сессия, а
+  неявная могла смениться между вызовами.
+- [решение исполнителя, задача 3] Введены `/problems/works-disabled` (`ApiError::WorksDisabled`) и
+  `/problems/work-not-claimed` (`ApiError::WorkNotClaimed`); `POST /works/model/test` при
+  `enabled = false` переведён на `works-disabled` (тест задачи 2 обновлён), при `model_access =
+  "off"` — прежний 409 `code: works_disabled`. `POST /check/run` из `works_disabled_manual_409` —
+  задача 5 (маршрута здесь нет; `ApiError::WorksDisabled` — ей).
+- [решение исполнителя, задача 3] «Первый `session_start` сессии» для строки работ — у сессии нет
+  учёта `session_start` и `recovery` (`session_tokens`); без сессии строка есть. Язык пакета и
+  строки — ru (тексты сервера агенту — русские), константы `_EN` — для протокола и будущего
+  выбора языка.
+- [решение исполнителя, задача 3] Вид `echo` берёт только insight пространства (кроме принятых в
+  той же ревизии и отсеянных `excluded_refs`): тесты предсказуемы, идеи и задачи в пакет не идут.
+- [решение исполнителя, задача 3] `GET /works/usage` доступен и токену (`zam work status`) — без
+  паузы; ручной запуск в аудит не пишется (обращения модели — в журнале отправок и `key_use`).
+- [решение исполнителя, задача 3] `[works] enabled = false` — пакет пуст и работ не снимает
+  (включат — работы продолжатся).
+- [решение исполнителя, задача 3] `works` — в конец `FEATURES` (указание координатора круга 2;
+  план — «перед последним»).
+
+**TDD.** RED — на базе `4c287ef5` (отдельный worktree `.tmp/red` с новыми тестами, общий
+`CARGO_TARGET_DIR`): `--test works` не собирается — 16 ошибок, нет `zam_store::works::{Work,
+NewWork, Origin, WorkItem, WorkMode, WorkState, enqueue, get, list, release, start_model,
+MODE_CHANGED, EXPIRED, LEASE_EXPIRED, SKIPPED}` и `zam_server::works::package`; `--test mcp` —
+`mcp_recall_work_event` (нет события `work` в схеме), `mcp_log_kind_work` (`required` —
+`["kind", "title"]`), `mcp_descriptions_under_300` (нет «work» в описании `memory_log`) FAILED;
+`--test agent_setup` `guide_sections_in_sync` — «раздел работ ru None, en None»; `--test boot`
+`health_features_documented` — нет `works`; `--test works_model` `off_mode_zero_requests` —
+`/problems/conflict` вместо `/problems/works-disabled`; `zam-cli --test work` — оба FAILED
+(`unrecognized subcommand 'work'`). GREEN — `--test works` 25 passed (29 с); `--test mcp` 81,
+`--test agent_setup` 21, `--test boot` 15, `--test recall` 55 (1 ignored), `--test works_model`
+41, `--test works_settings` 7, `--test works_night` 7 — все passed; `zam-server --lib` 356 passed
+(2 ignored), `zam-store --lib` 125 passed (1 ignored), `zam-cli --bin zam` 235 passed (1 ignored),
+`zam-cli --test work` 2 passed; `cargo fmt --all --check` — чисто; clippy `zam-server`, `zam-cli`,
+`zam-store` `--all-targets -D warnings` — чисто (после замены сложного типа в тесте на
+`type Numbered`).
+
+**Круг правок 1** (ревью r1: 0 Critical / 2 Important / 12 Minor; решения координатора: `works` —
+в конце `FEATURES`, `POST /check/run` и `night_checks_all_users_before_works` — задача 4):
+- Important 1 — `memory_log` в `SESSION_ARG_TOOLS` (аргумент `session_id` в схеме — общее
+  описание; длина описания инструмента прежняя, 298), `work_result` переносит его и в тело
+  `/works/{id}/result`: клиент без заголовка захватывает и сдаёт работу одной сессией.
+- Important 2 — приём итога: замок работы (`tokio::sync::Mutex` на работу; ждущий — до 30 с,
+  затем 409 `/problems/conflict` `code: result_in_progress`), под замком работа перечитывается
+  и сверяются ключ и захват; `kinds::accept_item` больше не пишет, а возвращает записи
+  (`zam_store::works::ItemWrite`), их пишет `finish_claimed` в одной транзакции с закрытием
+  (`Closed::{Closed, Replay, NotClaimed}`); у модели результат закрытия не игнорируется (WARN).
+  Повтор с тем же ключом и телом — прежний ответ без повторной записи и без `accept_item`,
+  пока первый идёт — после него; тот же ключ с другим телом — 422 (Minor 4: `request_hash`
+  тела в `result`).
+- Minor 1 — возврат работы модели — 409 `code: model_work` (и возврат — под тем же замком);
+  2 — `on_start`: база пользователя не открылась — WARN, дальше; 3 — тело итога
+  `deny_unknown_fields`, без `items` и `skip` — 400; 5 — строка работ дайджеста — ещё и отметка
+  показа `session_seen` (часть `works_line`, цель — первая работа строки): раз за сессию и у
+  агента только с MCP; 6 — `?user=` у `GET /works` и `/works/usage` (чужой — только
+  администратору); 7 — снимок кандидатов сверяется перед выдачей (`live_refs`: удалённая или
+  исправленная запись не идёт, пустая работа — `cancelled stale`); 8 — на паузе `drop_stale`
+  снимает работы агента; 9 — одна подготовка пакета `queue::prepare` для агента и модели;
+  10 — `excluded_refs`/`accepted_refs` — итоги `done` за 365 суток (`REFS_HORIZON_DAYS`),
+  документ поправлен; 11 — маска итога — `‹secret›` или `‹secret-[^›\s]*›`; 12 — тесты.
+- Тестовый вид `echo` теперь пишет строку `proposals` типа `echo` на принятый элемент (проверка
+  «нет дублей» и «снятая работа ничего не пишет»), текст `zam-test-cancel-during-accept` снимает
+  работу посреди проверки итога.
+- Тесты круга: `works` — `work_result_idempotent` (повтор без второй записи, другое тело — 422),
+  `work_result_parallel_same_key_once`, `work_result_cancelled_writes_nothing`,
+  `work_result_requires_items_or_skip`, `work_release_rest`, `work_package_skips_stale_items`,
+  `paused_night_drops_agent_works`, `?user=` в `work_member_no_works`, подключённая модель в
+  `works_disabled_manual_409`; `mcp` — `mcp_log_kind_work_session_arg`,
+  `mcp_digest_works_line_once`; модульный — `mask_literal_cases` (узкая метка).
+- [решение исполнителя, задача 3, круг 1] Замок работы — в процессе сервера (сервер один на
+  каталог данных), а не флаг в базе: замок держится только на время проверки итога, после
+  падения процесса держать нечего.
+- [решение исполнителя, задача 3, круг 1] Тот же ключ с другим телом — 422
+  `/problems/idempotency-mismatch` (как у записей журнала), а не 409.
+- [решение исполнителя, задача 3, круг 1; в круге 2 заменено штатной остановкой]
+  `boot::first_run_creates_admin_and_token_once` — повторная сборка на том же каталоге ждала
+  ограниченно (до 5 с): шаги старта раннера теперь
+  открывают базы пользователей (`queue::on_start`) с клоном состояния и отпускают его на
+  ближайшем ожидании (`works/night.rs`), а `build` берёт замок каталога синхронно; в прогоне круга
+  тест однажды упал с `DataDirLocked`. То же ждёт `check::on_start` задачи 5.
+
+
+**Круг правок 2** (ревью r2: Approved, 4 Minor):
+- N1 — `excluded_refs`: отклонённые `secret_in_payload` — из итогов `done` **и** `cancelled`
+  (модель ответила `skip` на всю работу, а второй скан элемент уже выбросил), явные `skip`
+  проб — только `done`; `item_results` берёт список состояний. Тест
+  `secret_dropped_stays_excluded_after_skip` (RED на прежнем фильтре: `excluded_refs` пуст).
+- N2 — `boot::first_run_creates_admin_and_token_once`: вместо ожидания до 5 с — `st.shutdown()`
+  перед пересборкой, как у прочих пересборок на том же каталоге (`stop` дожидается шагов старта).
+- N3 — документ `WORKS_LINE_PART`: ревизия не используется (1), важен факт показа.
+- N4 — `GET /works` не отдаёт `result.request_hash` (и `response`); в план задачи 7 вписано:
+  выборки и счёт `proposals` — с условием `type` в SQL (тестовый `echo` пишет строки типа
+  `echo`), записи вида `rules` — вариантом `ItemWrite`.
+
 ### M7.3 · Задача 5 — Ночная проверка: прогон, отпечаток и контекст, вердикт, `/check`, `zam check`
 
 Спецификация §6.4 пп. 1, 3–5, §6.5; worktree `.tmp/m73/wt-t5`, ветка `m7.3-t5` от `4c287ef5`
@@ -5491,9 +5659,11 @@ or_test`, `http_external_refused`, `model_test_409_on_vault_changed`, `loopback_
 **Сервер**: `crate::check` (`night`, `run_night`, `run_now`, `start_manual`, `on_start`,
 `ensure_marked`, `digest_line`, `Accounting`, тестовые точки), `check::run` (прогон), `check::verdict`
 (`decide`, JSON вердикта, строки дайджеста), `check::negatives` (набор `eval/check-negative.toml`,
-`NEGATIVES_HASH` закреплён тестом), `api::check` (`/check/*`), `ApiError::Typed` (problem с типом и
-кодом без отдельного варианта). `search_with(…, Accounting)`, `recall_with(…, Accounting)` (обработчик
-`recall` — обёртка с `Normal`), строка регрессии в дайджесте — `Lines.check_line` после раздела идей,
+`NEGATIVES_HASH` закреплён тестом), `api::check` (`/check/*`), варианты `ApiError::CheckRunning
+{run}` и `CheckAcceptNotLatest`, выключатель — `ApiError::WorksDisabled` задачи 3 (слияние с задачей 3:
+прежний `ApiError::Typed` сведён к принятому «вариант на тип»). `search_with(…, Accounting)`,
+`recall_with(…, Accounting)` (обработчик `recall` — обёртка с `Normal`), строка регрессии в дайджесте
+— `Lines.check_line` после строки работ задачи 3 (идеи → работы → регрессия),
 `maintenance::gc_check_runs` (365 суток). `zam check status | report [--json] | run [--no-wait]`.
 xtask: `("works.check", F("memory_check"))` в `KEYS`; `Session::start` — `ZAM_WORKS__CHECK=off` в
 окружение сервера, который знает ключ (проба `run::night_check_known` — раз на процесс и каталог

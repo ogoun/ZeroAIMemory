@@ -283,6 +283,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: IdeaCmd,
     },
+    /// Внутренние работы памяти (агент): состояние, пакет работы, итог, возврат в очередь
+    Work {
+        #[command(subcommand)]
+        cmd: WorkCmd,
+    },
     /// Словарь домена: список терминов «имя — определение» или карточка по имени или псевдониму
     Glossary {
         /// Имя или псевдоним термина (без него — весь список)
@@ -1027,6 +1032,61 @@ enum IdeaCmd {
         #[command(flatten)]
         common: Common,
     },
+}
+
+/// `zam work` (M7.3 §6.3 п. 8).
+#[derive(Subcommand)]
+enum WorkCmd {
+    /// Режимы видов, очередь, последняя ночь, расход токенов модели
+    Status {
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Пакет внутренней работы для сессии агента (ZAM_SESSION или сессия хуков): захват
+    /// старейшей работы; итог — zam work put
+    Next {
+        /// Вид работы: probes, rules (иначе любой)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Бюджет пакета, токенов (1–20000; по умолчанию 6000)
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=20000))]
+        budget: Option<u32>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Итог работы из файла JSON {work: "j:<id>", items: […], skip?} той же сессией
+    Put {
+        /// Файл итога (как data у memory_log kind=work)
+        file: PathBuf,
+        /// Ключ идемпотентности: повтор с тем же ключом — прежний ответ
+        #[arg(long)]
+        key: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Вернуть захваченную работу в очередь без итога
+    Release {
+        /// j:<id> работы
+        work: String,
+        #[command(flatten)]
+        common: Common,
+    },
+}
+
+fn work(c: WorkCmd) -> Result<(), CliError> {
+    use cmd::work as w;
+    match c {
+        WorkCmd::Status { common } => w::status(&cmd::connect(&common)?),
+        WorkCmd::Next {
+            kind,
+            budget,
+            common,
+        } => w::next(&cmd::connect(&common)?, kind.as_deref(), budget),
+        WorkCmd::Put { file, key, common } => {
+            w::put(&cmd::connect(&common)?, &file, key.as_deref())
+        }
+        WorkCmd::Release { work, common } => w::release(&cmd::connect(&common)?, &work),
+    }
 }
 
 #[derive(Subcommand)]
@@ -2354,6 +2414,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
         Cmd::Task { cmd } => task(cmd),
         Cmd::Question { cmd } => question(cmd),
         Cmd::Idea { cmd } => idea(cmd),
+        Cmd::Work { cmd } => work(cmd),
         Cmd::Cache { cmd } => cache(cmd),
         Cmd::Sessions { cmd } => sessions(cmd),
         Cmd::Check { cmd } => check(cmd),

@@ -48,6 +48,7 @@ pub const FEATURES: &[&str] = &[
     "backup_api",
     "entries_trash",
     "agent_text_masked",
+    "works",
     "memory_check",
 ];
 

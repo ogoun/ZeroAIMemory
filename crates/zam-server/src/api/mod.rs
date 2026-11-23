@@ -41,6 +41,7 @@ pub mod transfer;
 pub mod triggers;
 pub mod user_settings;
 pub mod vault;
+pub mod works;
 pub mod works_model;
 
 use axum::Router;
@@ -258,6 +259,13 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
         // подключённая модель исполнителя (M7.3 §6.2 пп. 8, 9): только человек, токену — 403
         .route("/api/v1/works/model/test", post(works_model::test))
         .route("/api/v1/works/calls", get(works_model::calls))
+        // очередь внутренних работ (M7.3 §6.3): итог — пробы и предложения, не знания (вне
+        // `memory_routes`); ручной запуск — только человек
+        .route("/api/v1/works", get(works::list))
+        .route("/api/v1/works/usage", get(works::usage))
+        .route("/api/v1/works/run", post(works::run))
+        .route("/api/v1/works/{id}/result", post(works::result))
+        .route("/api/v1/works/{id}/release", post(works::release))
         .route("/api/v1/spaces", get(spaces::list))
         .route("/api/v1/spaces/{space}/tree", get(spaces::tree))
         // число записей разделов (M7 §5.3): чтение, не запись памяти

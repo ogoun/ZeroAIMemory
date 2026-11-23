@@ -32,7 +32,10 @@ async fn first_run_creates_admin_and_token_once() {
     let t = rep.initial_token.unwrap();
     assert!(t.starts_with("zam_"));
     assert!(st.system.verify_token(&t, None).await.unwrap().is_some());
-    // роутер держит клон состояния (и лок каталога данных)
+    // штатная остановка, как у прочих пересборок на том же каталоге: шаги старта ночного
+    // исполнителя (M7.3: возврат работ модели в очередь открывает базы в фоне) `shutdown`
+    // дожидается; затем роутер и состояние отпускают лок каталога данных
+    st.shutdown().await;
     drop(app);
     drop(st);
     let (_, _, rep2) = build(cfg_in(d), Some("pw".into())).await.unwrap();
@@ -118,6 +121,8 @@ fn health_features_documented() {
         "space_counts",
         // корзина любого журнала `deleted=only` (задача 10 M7.2)
         "entries_trash",
+        // внутренние работы: настройки, очередь, пакет и итог, журнал отправок (задача 3 M7.3)
+        "works",
     ] {
         assert!(built.contains(f), "{f}");
     }

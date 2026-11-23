@@ -102,20 +102,26 @@ pub enum ApiError {
     /// 409 `/problems/already-adopted` (M5.7 §5.4): идея уже человека.
     #[error("идея уже принята как своя")]
     AlreadyAdopted,
+    /// 409 `/problems/works-disabled` (M7.3 §6.1, решение координатора 76): `[works] enabled =
+    /// false` — ручные запуски внутренних работ и проверки памяти, проверка подключения модели.
+    #[error("{0}")]
+    WorksDisabled(String),
+    /// 409 `/problems/work-not-claimed` (M7.3 §6.3 п. 4): итог или возврат работы не от сессии,
+    /// захватившей её (`running`), — работа снята, истекла, закрыта или захвачена другой сессией.
+    #[error("{0}")]
+    WorkNotClaimed(String),
     /// 409 `/problems/backup-running` (M7 §5.6): копия в процессе сервера уже идёт — со страницы
     /// «Копии» или по расписанию (один замок); тело несёт `running {started_at, by}`.
     #[error("копия уже идёт ({}): дождитесь её конца", backup_by_text(.0.by))]
     BackupRunning(crate::backup::runner::Running),
-    /// Ошибка с типом problem `kind` и кодом `status` без отдельного варианта на каждый тип
-    /// (M7.3: `/problems/works-disabled`, `/problems/check-running`,
-    /// `/problems/check-accept-not-latest`); `extra` — поля тела рядом с `detail`.
-    #[error("{detail}")]
-    Typed {
-        status: StatusCode,
-        kind: &'static str,
-        detail: String,
-        extra: Map<String, Value>,
-    },
+    /// 409 `/problems/check-running` (M7.3 §6.5 п. 1): у пользователя уже идёт прогон проверки
+    /// памяти; тело несёт `run` — идущий прогон.
+    #[error("прогон проверки памяти уже идёт — дождитесь его конца")]
+    CheckRunning { run: zam_core::Id },
+    /// 409 `/problems/check-accept-not-latest` (M7.3 §6.5 п. 5): принять как норму можно только
+    /// последний ночной прогон идущего эпизода регрессии.
+    #[error("принять как норму можно только последний ночной прогон идущего эпизода регрессии")]
+    CheckAcceptNotLatest,
     /// 422 `/problems/option-required` (M5.7 §5.3): ответ на вопрос-предложение без варианта.
     #[error("{0}")]
     OptionRequired(String),
@@ -284,12 +290,25 @@ impl ApiError {
                 "/problems/already-adopted",
                 "Conflict",
             ),
+            ApiError::WorksDisabled(_) => {
+                (StatusCode::CONFLICT, "/problems/works-disabled", "Conflict")
+            }
+            ApiError::WorkNotClaimed(_) => (
+                StatusCode::CONFLICT,
+                "/problems/work-not-claimed",
+                "Conflict",
+            ),
             ApiError::BackupRunning(_) => {
                 (StatusCode::CONFLICT, "/problems/backup-running", "Conflict")
             }
-            ApiError::Typed { status, kind, .. } => {
-                (*status, kind, status.canonical_reason().unwrap_or("Error"))
+            ApiError::CheckRunning { .. } => {
+                (StatusCode::CONFLICT, "/problems/check-running", "Conflict")
             }
+            ApiError::CheckAcceptNotLatest => (
+                StatusCode::CONFLICT,
+                "/problems/check-accept-not-latest",
+                "Conflict",
+            ),
             ApiError::OptionRequired(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "/problems/option-required",
@@ -449,9 +468,7 @@ impl IntoResponse for ApiError {
             "detail": self.to_string(),
         });
         if let (
-            ApiError::Conflict { extra, .. }
-            | ApiError::PossibleDuplicate { extra, .. }
-            | ApiError::Typed { extra, .. },
+            ApiError::Conflict { extra, .. } | ApiError::PossibleDuplicate { extra, .. },
             Value::Object(o),
         ) = (&self, &mut body)
         {
@@ -459,6 +476,9 @@ impl IntoResponse for ApiError {
                 // стандартные поля problem не перекрываются
                 o.entry(k.clone()).or_insert_with(|| v.clone());
             }
+        }
+        if let (ApiError::CheckRunning { run }, Value::Object(o)) = (&self, &mut body) {
+            o.insert("run".into(), json!(run.to_string()));
         }
         if let (ApiError::TermConflict(c), Value::Object(o)) = (&self, &mut body) {
             o.insert("conflicts".into(), json!(c));

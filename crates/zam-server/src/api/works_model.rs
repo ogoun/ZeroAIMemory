@@ -8,8 +8,9 @@
 //!   `vault_changed` (и при адресе записи Vault, изменённом после сохранения) — 409 «адрес
 //!   изменён: был <хост> → стал <хост> — подтвердите» `{code: vault_changed, was, now}` **без
 //!   обращения** (подтверждение — `PATCH works.model {confirm_url}`); `[works] enabled =
-//!   false` или `model_access = "off"` — 409; у пользователя уже идёт обращение — 409; нет
-//!   подключения `works.model` — 422.
+//!   false` — 409 `/problems/works-disabled` (как у ручных запусков, решение 76; задача 3),
+//!   `model_access = "off"` — 409 `code: works_disabled`; у пользователя уже идёт обращение —
+//!   409; нет подключения `works.model` — 422.
 //! - `GET /works/calls?days=&user=` → `{days, calls: […]}`: метаданные обращений за `days`
 //!   суток (1..=180, по умолчанию 7; не больше [`CALLS_LIMIT`] строк, новые первыми) — без
 //!   текста пакета и ответа.
@@ -87,6 +88,12 @@ pub async fn test(
 ) -> Result<Json<Value>, ApiError> {
     let q = query(q)?;
     let user = target_user(&st, &p, q.user.as_deref()).await?;
+    // общий выключатель — тот же ответ, что у ручных запусков (решение координатора 76)
+    if !st.cfg.works.enabled {
+        return Err(ApiError::WorksDisabled(
+            crate::api::works::WORKS_DISABLED_DETAIL.into(),
+        ));
+    }
     let ctx = NightCtx::new(st.clone());
     let ip = client.ip.to_string();
     match conn::test_connection(&ctx, user, &p.actor(), Some(&ip)).await {
