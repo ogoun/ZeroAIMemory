@@ -66,6 +66,10 @@ export const PAGES: MobilePage[] = [
   { name: 'пользователи', path: () => '#/admin', buttons: ['Токены'] },
   { name: 'решения', path: () => '#/admin/solutions', buttons: ['Доступ'] },
   { name: 'настройки', path: () => '#/admin/settings' },
+  // «Копии» и «Аудит» администратора (задача 7, §5.6 пп. 2, 4): плашка `no_recent_backup`, таблицы
+  // копий и событий — карточками на телефоне
+  { name: 'копии', path: () => '#/admin/backups' },
+  { name: 'аудит', path: () => '#/admin/audit' },
   { name: 'индекс', path: () => '#/admin/index' },
   { name: 'подключение-агента', path: () => '#/agent-setup' },
   { name: 'кэш', path: () => '#/cache' },

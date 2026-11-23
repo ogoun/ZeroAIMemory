@@ -7,11 +7,13 @@
   // (POST /admin/reindex) с подтверждением; баннер перенарезки баз после смены настроек
   // нарезки («Идёт перенарезка: изменились <ключи>, N из M», §8.2) — общий RechunkBanner;
   // плашка `rules_heavy` по базам, где Rules больше 10 или их L1 в сумме больше 1500 токенов
-  // (M6 §8: дайджест выдаёт Rules сверх бюджета).
+  // (M6 §8: дайджест выдаёт Rules сверх бюджета); блок «Копии» (M7.2, §5.6 п. 3): последняя
+  // копия, автокопии и `no_recent_backup` — по полю `backup` того же статуса, без второго опроса.
   import { Dialog } from 'bits-ui';
   import { onMount } from 'svelte';
   import RechunkBanner from '../components/RechunkBanner.svelte';
   import { ApiError, indexStatus, reindex, rulesHeavyText, type IndexStatus, type User } from '../lib/api';
+  import { bannerText, dateTime, sinceText } from '../lib/backups';
   import { hintParts, reasonText, transient } from '../lib/indexing';
   import { href } from '../lib/router';
 
@@ -194,6 +196,28 @@
         </dd>
       </div>
     </dl>
+
+    {#if st.backup}
+      {@const b = st.backup}
+      {@const stale = bannerText(b, updated?.getTime() ?? Date.now())}
+      <section class="backups" aria-labelledby="index-backups" data-testid="index-backups">
+        <h3 id="index-backups">Копии</h3>
+        {#if stale}
+          <div class="alert alert-warn" role="note" aria-label="Копии сервера">
+            <p class="alert-title">{stale} (no_recent_backup)</p>
+            <p>
+              Снимите копию на странице «Копии» или включите автокопии в конфигурации сервера:
+              <code class="cmd">[backup] schedule = "daily"</code>.
+            </p>
+          </div>
+        {/if}
+        <p class="small">
+          <span>последняя копия: {b.last_at ? `${dateTime(b.last_at)} (${sinceText(b.last_at, updated?.getTime() ?? Date.now())})` : 'нет'}</span>
+          · <span class="kv">автокопии: {b.schedule === 'daily' ? 'ежедневно' : 'выключены'}</span>
+          · <a href={href({ name: 'backups' })}>Копии</a>
+        </p>
+      </section>
+    {/if}
 
     <RechunkBanner dbs={st.dbs ?? []} names={userNames} />
 

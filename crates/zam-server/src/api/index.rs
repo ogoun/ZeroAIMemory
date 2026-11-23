@@ -20,6 +20,9 @@
 //!   [`RULES_HEAVY_L1_TOKENS`] токенов; администратору без `X-Zam-User` — `null`. То же поле
 //!   (без `solution`) — у каждой базы `dbs[]`. `?only=rules` — лёгкий ответ `{rules}` (плашка у
 //!   Rules в дереве WebUI). Сбой чтения Rules ответ не валит: `rules` — `null` (WARN).
+//!   **Копии** (M6 §12б.4): `backup: {last_at, schedule, warning}` — любому аутентифицированному,
+//!   без путей; `?only=backup` — лёгкий ответ `{backup}` (плашка `no_recent_backup` над
+//!   страницами администратора WebUI, M7 §5.6 п. 3): без Qdrant, очередей и баз пользователей.
 //! - `POST /admin/reindex {user?, space?, full?}` — только администратор, аудит
 //!   `index.reindex`, ответ 202 с `job_count` (заметок области). Без `full` — точки
 //!   области удаляются и пишутся заново из кэша `embeddings` без инференса (промахи кэша —
@@ -284,7 +287,8 @@ fn header_solution(headers: &HeaderMap) -> Option<String> {
 /// Лишние параметры запроса игнорируются (как до `only`): строгий разбор сломал бы клиентов.
 #[derive(Deserialize)]
 pub struct StatusQuery {
-    /// `rechunk` — только ход перенарезки баз (`dbs`); `rules` — только Rules (`rules`).
+    /// `rechunk` — только ход перенарезки баз (`dbs`); `rules` — только Rules (`rules`);
+    /// `backup` — только копии (`backup`).
     only: Option<String>,
 }
 
@@ -296,6 +300,10 @@ pub async fn status(
     q: Result<Query<StatusQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let q = crate::api::query(q)?;
+    // копии — без баз пользователей: опрос плашки не открывает их
+    if q.only.as_deref() == Some("backup") {
+        return Ok(Json(json!({ "backup": backup_status(&st).await })));
+    }
     let (users, all) = status_users(&st, &p, &headers).await?;
     match q.only.as_deref() {
         None | Some("") => {}
@@ -319,7 +327,11 @@ pub async fn status(
             };
             return Ok(Json(json!({ "rules": rules })));
         }
-        Some(_) => return Err(ApiError::BadRequest("only: rechunk | rules".into())),
+        Some(_) => {
+            return Err(ApiError::BadRequest(
+                "only: rechunk | rules | backup".into(),
+            ));
+        }
     }
     let rt = &st.index;
     // очередь и неудавшиеся задания видимых пользователей
@@ -450,15 +462,7 @@ pub async fn status(
         }
         Principal::Token(_) | Principal::User { .. } => Value::Null,
     };
-    // копии сервера (M6 §12б.4): время последней, расписание, `no_recent_backup`
-    let backup = {
-        let cfg = st.cfg.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::backup::status_json(&cfg, zam_store::time::now())
-        })
-        .await
-        .unwrap_or(Value::Null)
-    };
+    let backup = backup_status(&st).await;
     Ok(Json(json!({
         "backup": backup,
         "docs": docs,
@@ -598,6 +602,15 @@ pub async fn reindex_scope(
         job_count,
         unavailable,
     })
+}
+
+/// Копии сервера (M6 §12б.4): время последней, расписание, `no_recent_backup` (каталог копий —
+/// в блокирующем потоке; сбой потока — `null`).
+async fn backup_status(st: &AppState) -> Value {
+    let cfg = st.cfg.clone();
+    tokio::task::spawn_blocking(move || crate::backup::status_json(&cfg, zam_store::time::now()))
+        .await
+        .unwrap_or(Value::Null)
 }
 
 /// `POST /admin/reindex`.

@@ -4051,6 +4051,224 @@ N3 — все в этом круге.
 test:build` — 75/75; `npm run build`, `npx size-limit` — пределы (`entry` 90,13 КБ);
 `tasks.spec.ts` + `mobile.spec.ts` — 29/29; полный e2e — 155 passed (3,0 мин).
 
+### M7.2 · Задача 7 — Администрирование: копии, `no_recent_backup`, журнал аудита
+
+Спецификация §5.6 (решения координатора 24, 25); пре-флайт `N17`, `N18`, `N20`, `N21`. Ветка
+`m7.2-t7` (база `cf174464`), worktree `.tmp/m72/wt-t7`. Задача владельца
+`k:01M7GAQQHMEHP9QEHB950K9G2J` — «страница бэкапа должна работать внутри процесса сервера».
+Признак `backup_api`, раздел `docs/api-compat.md` «Копии из WebUI»; миграций нет.
+
+**Сервер.**
+- `backup/runner.rs` — замок и состояние копии в процессе: `BackupRunner` (`Arc` в
+  `AppState::backups`, клон — в `Maintenance::start`), `RunBy {WebUi, Schedule}`,
+  `try_start(&self, by) -> Result<RunGuard, Busy>`, `state() -> RunState {running, last}`.
+  `RunGuard::run(cfg, system, ip)` — копия тем же `backup::backup(&cfg, &BackupOpts::default())`
+  в `spawn_blocking` (как была автокопия), после успеха при `schedule = "daily"` — ротация
+  `schedule::prune_list(list_copies, keep)` + `backup::prune`, аудит `server.backup {by, ok, name,
+  bytes, ms, error}`, итог в `last`; `release()` — снять замок без итога; уничтожение без итога
+  (паника потока, снятая задача) — итог «прервана».
+- `backup/mod.rs` — `pub mod runner`; `copy_summary(path) -> Option<CopySummary {name,
+  created_at, server_version, bytes, files, dbs, blobs, drift}>` (опись, частичный разбор);
+  `delete_copy(dir, name)` — имя только из цифр, `-`, `_` и по `copy_time`, сам каталог (не
+  ссылка) с описью, иначе `BackupError::NotACopy` (новый вариант, в ответе 404); удаление —
+  общий `remove_copy` (`remove_dir_all`), им же — `prune`; `last_at`/`warning` страницы — из
+  `status_json` (N18).
+- `backup/schedule.rs` — чистая `prune_list(existing, keep)` вынесена из ветки `Prune` `tick`
+  (N18): одна ротация у расписания и у копии из WebUI.
+- `maintenance.rs` — `backup_tick(cfg, now, state, backups, system)` (N21): шаг с делом — под
+  замком, занят — шаг пропущен целиком (ни копии, ни удаления, ни `last_attempt`), решение —
+  заново под замком; копия — `RunGuard::run` (ротация — в ней же, второго круга шага больше нет).
+- `api/backups.rs` — `GET|POST /admin/backups`, `DELETE /admin/backups/{name}` (`AdminOnly`);
+  `error.rs` — `ApiError::BackupRunning(Running)` → 409 `/problems/backup-running` с `running`;
+  `api/index.rs` — `only=backup` → `{backup}` до выбора баз пользователей (общий `backup_status`
+  с полным статусом); `health.rs` — `backup_api`.
+
+**WebUI.**
+- `router.ts` — `{name: 'backups'}` (`#/admin/backups`), `{name: 'audit'}` (`#/admin/audit`);
+  `Shell.svelte` — `isAdmin` с ними, подменю «Пользователи · Решения · Настройки · Копии · Аудит»
+  (полоса `.strip` с `revealSelected`), ленивые `Backups.svelte`, `Audit.svelte` (`LazyFail`),
+  плашка `BackupBanner` над страницами администратора, кроме «Копий».
+- `Backups.svelte` — §5.6 п. 2; `Audit.svelte` — §5.6 п. 4 (по 100, `listAudit(before?)` —
+  `limit=100`); `IndexStatus.svelte` — блок «Копии» по полю `backup` того же статуса (без второго
+  опроса); `api.ts` — `listBackups`, `startBackup`, `deleteBackup`, `backupStatus`, `listAudit`,
+  типы, `IndexStatus.backup`.
+- `lib/backups.ts` (без runtime-импортов, кроме `.ts`; `test/backups.test.ts` в `test:build`) —
+  тексты плашки, расписания с местным временем срока, строки отчёта, размеров; давность —
+  `ageText`, перенесённая из `code.ts` в `time.ts` (`code.ts` реэкспортирует; N17 — одно правило).
+
+Решения исполнителя:
+- **Замок живёт в потоке копии** [решение исполнителя, задача 7]: `RunGuard` уходит в замыкание
+  `spawn_blocking` и возвращается из него. Снятая задача (остановка сервера, `Maintenance::stop`)
+  не отпускает замок раньше конца копии (поток копии не прерывается), паника копии снимает замок с
+  итогом «прервана». Цена — итог копии, дошедшей до конца после снятия задачи, — «прервана», без
+  аудита (только при остановке сервера).
+- **Шаг без дела замок не берёт** [решение исполнителя, задача 7]: сначала решение
+  `schedule::tick` без замка; `Skip` — выход, иначе `try_start(Schedule)` и решение заново под
+  замком (копия из WebUI могла только что закончиться — её время учитывается в `last`). Иначе
+  каждую минуту замок занимался бы на чтение каталога копий, и `POST` в этот миг получал ложный
+  409 «по расписанию». Шаг только с удалением сверх `keep` держит замок на время удаления —
+  `running.by = "schedule"` виден странице эти миллисекунды.
+- **`backup_tick` получает и `system`** [решение исполнителя, задача 7]: аудит автокопии
+  `server.backup {by: "schedule"}` (N21) пишется тем же `RunGuard::run`; сигнатура
+  `backup_tick(cfg, now, state, backups, system)`.
+- **Аудит**: копия из WebUI — `actor: "admin"`, адрес клиента; автокопия — `actor: "system"`,
+  без адреса; `user_id` — нет (событие сервера), `target` — имя копии [решение исполнителя,
+  задача 7].
+- **Тексты ошибок — без путей** [решение исполнителя, задача 7]: «путь — только `name`» (шаг 3
+  плана) у ошибок `BackupError` с путями (`ReadOnly`, `StageBusy`, `NoData`…) выполняется заменой
+  каталога данных и каталога копий на `<data_dir>` и `<backup.dir>` (обе записи разделителя);
+  полный текст — WARN в журнале сервера.
+- **`last_run.by`** [решение исполнителя, задача 7]: сверх §5.6 п. 1 — кто снимал; страница пишет
+  «Готово … (по расписанию)».
+- **Опрос лёгкий** [решение исполнителя, задача 7]: сводки копий — по описи, опись каждой копии
+  читается один раз (кэш в `BackupRunner` по размеру и времени изменения описи), разбор частичный
+  (суммы файлов пропускаются, пути — без копий строк); `GET /admin/backups` читает диск в
+  блокирующем потоке. У копии с десятками тысяч блобов опись — мегабайты, а страница опрашивает
+  сервер раз в 3 с.
+- **`bytes` копии** — сумма размеров файлов описи и самой описи [решение исполнителя, задача 7]:
+  совпадает с `bytes` отчёта копии (`finish` считает так же), строка итога и строка списка
+  показывают одно число.
+- **`DELETE` с нечитаемым именем** (не UTF-8 после percent-decoding) — 404, не 400 axum
+  [решение исполнителя, задача 7]: «ни одного пути из запроса» — любой отказ одинаков.
+- **Сервер останавливается** — `POST` → 503 `/problems/busy` с `Retry-After: 5` (как экспорт).
+- **`only=backup`** — любому аутентифицированному, как поле `backup` полного статуса (путей нет,
+  решение 13c M6); WebUI показывает его только администратору.
+- **Плашка — компонент `BackupBanner.svelte`** (в Files плана нет, как `RechunkBanner`): `role="note"`
+  (не `status` — на «Настройках» `access.spec.ts` ищет единственный `status`), перечитывается при
+  каждом переходе (`key = nav`); на «Копиях» её нет — то же текстом страницы; на «Индексе» —
+  блок «Копии» вместо плашки. Ссылка плашки — цветом её текста с подчёркиванием: акцентный на
+  `--warn-bg` светлой темы — около 4,2 : 1.
+- **Аудит**: в фильтре пользователя — «без пользователя»; в столбце «Пользователь» у события без
+  пользователя — `actor` (`system`, `anonymous`); детали `{}` — без «JSON».
+- **Ссылка на руководство** — `README-install.md` комплекта (в репозитории —
+  `deploy/README-install.md`), без внешней ссылки (круг правок 1, m7).
+- **Окружение тестов**: модели и Qdrant тестов `tests/backup.rs` (`restore_external_qdrant_*`,
+  `restore_then_serve_*`, pdfium у `restore_has_no_machine_bindings`) ищутся в
+  `<worktree>/target/deps`; каталоги `onnxruntime`, `pdfium`, `qdrant` скопированы туда из
+  основного `target/deps/windows-x64` (не junction — инцидент удаления worktree).
+
+Тесты (TDD: сначала RED — `tests/backup.rs` не собирался без `AppState::backups` и новой
+сигнатуры `backup_tick`, `boot::health_features_documented` падал на `backup_api`):
+- сервер `tests/backup.rs` — `backup_api_run_and_list`, `backup_api_busy_409`,
+  `backup_api_schedule_shares_lock` (копия из WebUI держит замок тестовой точкой — шаг расписания
+  в срок `at` послезавтра: `(None, 0)`, `last_attempt` нет, две старые копии целы; после
+  освобождения — `(Some(true), 3)`, остаётся одна; аудит `["schedule", "webui"]`, `actor`
+  `system`), `backup_api_rotation_only_daily` (`keep = 2`, три копии: `daily` — две новых, `off` —
+  три; занято автокопией старта — повтор `POST`), `backup_api_delete_only_ready_copies` (21 имя —
+  `..`, `%2E%2E`, `.`, `a%2Fb`, `..%2F..%2Fsystem.db`, `..%5Csystem.db`, `*.partial`, `*.failed`,
+  каталог без описи, файл с именем копии, архив `--zip` с именем копии и с `.zip`, копия в другом
+  каталоге, ссылка (Linux), месяц 13, `backups`, идущая сборка и её `.partial`, `<имя>%2F..%2F..`,
+  `..%2F<имя>`, `<имя>%20` — 404, файлы целы, аудита нет; готовая — 204 и
+  `server.backup.delete {name}`, повтор — 404), `backup_api_admin_only` (токены пользователя и
+  администратора, сессия пользователя — 403 на все три маршрута), `index_status_only_backup`;
+  в `backup_tick_failure_keeps_copies_and_waits_slot` — новая сигнатура; модульные
+  `backup::runner::tests::{runner_lock_and_abort, redact_paths_of_config}`; `tests/boot.rs` —
+  `health_features_documented` (`backup_api`);
+- WebUI `test/backups.test.ts` — `backup_banner_text`, `backup_schedule_local_time`,
+  `backup_report_line`, `age_text_shared`;
+- e2e `web/e2e/backups.spec.ts` — `admin_no_recent_backup_banner`, `admin_backups_run_list_delete`,
+  `admin_audit_feed` (выпуск токена и 110 правок имени пользователя — выпуск уходит за первую
+  сотню и виден после «Показать ещё»; вход администратора global-setup и прежних спек — «Показать
+  ещё», пока не найдётся); «Копии» и «Аудит» — в `mobile-pages.ts`. Лимит входа (5 в минуту на
+  IP, скользящее окно) общий у всех спек, а входы `code.spec.ts` (`memberRw`), `reports.spec.ts`,
+  `mobile.spec.ts` повтора при 429 не делают: в прогоне набора `access, admin, backups, code,
+  index, mobile` `code_clear_owner_only` получал 429 — и с тремя входами `backups.spec.ts`, и с
+  двумя. Поэтому у спеки своего входа администратора нет, вход пользователя (два запроса под
+  лимитом) — с повтором после `Retry-After`, а `test.afterAll` ждёт, пока её входы выйдут из окна
+  (до ~50 с) [решение исполнителя, задача 7]: спека возвращает окно свободным и не меняет чужие
+  спеки.
+
+Прогоны (Windows, `target\m72-t7`): `cargo test -p zam-server --features test-hooks --test
+backup` — 51/51 (с `ZAM_REQUIRE_ML=1`; первый прогон — 48 + 3 упавших теста моделей и pdfium: в
+`target/deps` worktree их не было, после копирования — 3/3), `--test boot` — 15/15, `--lib` —
+325 (2 ignored; первый прогон — `redact_paths_of_config` упал: на Windows `join` даёт `\` в пути
+каталога копий — замена учитывает обе записи разделителя); `cargo clippy --workspace
+--all-targets -- -D warnings`, `cargo fmt --all --check` — чисто. WebUI: `npm run check` — 0/0,
+`npm run test:build` — 80/80, `npm run build`, `npx size-limit` — пределы: `entry` 89,27 КБ (103),
+`Backups` 4,8 КБ (предел 5,3), `Audit` 2,59 КБ (2,9), `CodeView` 7,91 КБ (`ageText` — в `time.ts`
+основного чанка). e2e на release-сборке worktree: `backups.spec.ts` — 3/3 (первый прогон:
+`admin_audit_feed` ждал один выпуск токена пользователя, а их два — первый выпускается при
+создании пользователя); набор `access, admin, backups, code, index, mobile` — 43/43 (до правок:
+`all_pages_no_horizontal_scroll` — список «Пользователь» «Аудита» на 360 px шире области, 383 px:
+списки фильтров сжимаются; `code_clear_owner_only` — 429, см. выше); полный `npm run e2e` —
+156/156 (5,3 мин).
+
+#### Круг правок 1
+
+Ревью r1 (`task-7-review-r1.md`): спецификация соблюдена, качество — Approved, Critical и
+Important нет; Minor m1–m7 — в этом круге (правило владельца).
+- **m1** — `GET /admin/backups` читает состояние копии (`state()`) **до** каталога копий: итог
+  копии пишется после переименования её каталога, поэтому ответ с `last_run.ok` всегда несёт и
+  эту копию в `items` (раньше в узком окне — итог без копии в списке, и страница переставала
+  опрашивать). Проверка — `wait_run` тестов: на каждом дождавшемся итоге `ok` копия итога есть в
+  `items` (`backup_api_run_and_list`, `_busy_409`, `_schedule_shares_lock`, `_rotation_only_daily`,
+  `_delete_only_ready_copies`); детерминированно гонку не воспроизвести — тестовой точки между
+  переименованием и итогом нет, а порядок чтения теперь исключает её по построению.
+- **m2** — общий помощник входа с повтором при 429 `web/e2e/login.ts` (`postLimited`,
+  `loginChangingPassword`): при 429 ждёт `Retry-After`, **продлевает таймаут сценария** на время
+  ожидания (`test.info().setTimeout`) и повторяет запрос один раз. Им входят все спеки, входившие
+  по API без повтора: `backups.spec.ts` (пользователь плашки), `code.spec.ts` и `reports.spec.ts`
+  (`memberRw`), `mobile.spec.ts` (`userSession`); `user-login.spec.ts` входит формой — у неё свой
+  `submitRetry429`. Ожидание в `test.afterAll` `backups.spec.ts` убрано: соседний вход больше не
+  падает на 429, а ждёт [решение исполнителя, круг правок 1 задачи 7]. Сессия пользователя из
+  global-setup отвергнута: два лишних входа в начале каждого прогона уже вместе с входом
+  администратора и `admin.spec.ts` близки к пределу 5 в минуту для узких наборов.
+- **m3** — удаления копий идут по одному: замок удаления `BackupRunner::removal` (отдельный от
+  замка копии — удалять готовые копии во время копии можно) у `DELETE` (`BackupRunner::delete`),
+  у ротации после копии (список копий — под тем же замком) и у `Prune` расписания
+  (`BackupRunner::prune`, в круге 2 — `rotate`); копии не стало во время удаления — `NotACopy` (404), `prune` такую
+  пропускает без WARN. Тест `backup_api_delete_concurrent_once`: три раза по два одновременных
+  `DELETE` одной копии — 204 и 404, аудит удаления — один на копию.
+- **m4** — руководство «Копии из WebUI»: второй запуск не ждёт, а получает «копия уже идёт»;
+  автокопия откладывается до следующей минуты, а копия из WebUI, начатая после сегодняшнего срока
+  `at` (время копии — из её имени, то есть начало), засчитывается как сегодняшняя автокопия;
+  шаблон имени — `yyyy-MM-dd_HHmmss[-N]`; ссылки на каталоги копий страница не видит и не удаляет.
+- **m5** — тест `backup_api_busy_by_schedule_and_stopping`: шаг расписания держит копию тестовой
+  точкой — `POST` 409 с `running.by = "schedule"` и «по расписанию» в `detail`; после
+  `begin_stop` — 503 `/problems/busy` с `Retry-After: 5`, копия не начинается. Junction на
+  Windows: `backup_api_delete_only_ready_copies` создаёт ссылку с именем копии на готовую копию в
+  другом каталоге — на Linux symlink, на Windows `mklink /J` (junction не требует прав
+  администратора); `DELETE` — 404, цель цела.
+- **m6** — правило готовой копии одно (`backup::ready_copy`): имя по шаблону из цифр, `-`, `_`,
+  сам каталог (не ссылка: `symlink_metadata`, `!is_symlink()` — на Windows это и junction) с
+  описью — у `list_copies` (список страницы, ротация, `no_recent_backup`, предыдущая копия для
+  жёстких ссылок) и у `delete_copy`. Ссылка на копию больше не попадает ни в список, ни в
+  ротацию. Тест — тот же сценарий удаления: `list_copies` и `items` — только готовая копия;
+  проверено RED: с прежним правилом списка (опись по ссылке) junction попадал в список.
+- **m7** — комментарий `AppState::shutdown`: задача копии из WebUI держит клон `SystemStore` до
+  конца копии и аудита, её не ждём (как автокопию). Страница «Копии»: ссылка на GitHub (`main`)
+  заменена на путь — `README-install.md` комплекта, в репозитории — `deploy/README-install.md`.
+- Документы: `docs/api-compat.md` (ссылки — не копии; одновременные удаления — 404), ТЗ §15.4
+  (отсылка к руководству без внешней ссылки), §16.4 (одно правило готовой копии, замок удаления,
+  порядок чтения `GET`, новые тесты), руководство (m4).
+
+Прогоны круга 1: `--test backup` — 53/53 (`ZAM_REQUIRE_ML=1`; первый полный прогон —
+`backup_api_delete_only_ready_copies` красный на устаревшей сборке: после пробы RED исходник
+`backup/mod.rs` вернули копией со старым временем изменения, и cargo его не пересобрал — `touch`,
+повтор зелёный), `--test boot` — 15/15, `--lib` — 325 (2 ignored); clippy — одно замечание в тесте
+(`cloned_ref_to_slice_refs`), исправлено, затем чисто; fmt — чисто. WebUI: `npm run check` — 0/0,
+`test:build` — 80/80, `size-limit` — `entry` 89,28 КБ, `Backups` 4,68 КБ (5,3), `Audit` 2,59 КБ
+(2,9). e2e на release-сборке worktree: `access, admin, backups, code, mobile, reports` — 55/55
+(без ожидания в `afterAll`), полный `npm run e2e` — 156/156 (4,3 мин; было 5,3 с ожиданием).
+
+#### Круг правок 2
+
+Повторное ревью r2 (`task-7-review-r2.md`): Approved, порядок замков проверен; две правки перед
+слиянием.
+- **n1** — руководство и журнал: копия из WebUI засчитывается как сегодняшняя автокопия, если она
+  **начата** после срока `at` (время копии — из её имени, `copy_name(dest, now)` в начале
+  `backup()`), а не «закончена»; копия, шедшая в срок `at`, автокопию не заменяет — расписание
+  снимет её следующей минутой (так и проверяет `backup_api_schedule_shares_lock`).
+- **n2** — `Prune` расписания перечитывает список копий под замком удаления, как ротация после
+  копии: одна функция `runner::rotate(removal, dir, keep)` (`prune_list(list_copies(dir), keep)` и
+  удаление — под замком) у обоих путей, `BackupRunner::prune(paths)` заменён на
+  `BackupRunner::rotate(dir, keep)`; `backup::prune` возвращает число удалённых, `out.pruned`
+  шага расписания — по фактически удалённым (ТЗ §16.4: «по фактическому списку»).
+- Нит ревью: `login.ts` продлевает таймаут сценария, только если он конечен (`timeout > 0`).
+
+Прогоны круга 2: `--test backup` — 53/53 (`ZAM_REQUIRE_ML=1`), `--lib` — 325 (2 ignored);
+`cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check` — чисто.
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

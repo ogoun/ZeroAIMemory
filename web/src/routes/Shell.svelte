@@ -2,8 +2,10 @@
   // Оболочка после входа: шапка, дерево слева, справа — документ, стартовый экран пользователя
   // или администрирование. У пользователя (не администратора, §15.1) нет разделов
   // «Пользователи», «Администрирование», «Настройки» и полного «Индекса»: есть «Мои решения»,
-  // «Аккаунт» и баннер перенарезки своей базы. «Подключение агента», «Кэш выжимок» и «Сессии»
-  // (M6 §8) — у обоих (страницы грузятся лениво, §15.4; сбой загрузки — `LazyFail`).
+  // «Аккаунт» и баннер перенарезки своей базы. «Администрирование» с M7.2 (§5.6) — ещё «Копии» и
+  // «Аудит» (ленивые чанки) и плашка `no_recent_backup` над его страницами. «Подключение
+  // агента», «Кэш выжимок» и «Сессии» (M6 §8) — у обоих (страницы грузятся лениво, §15.4; сбой
+  // загрузки — `LazyFail`).
   // Классы ширины (M7.2, §5.1, `layout.ts`): телефон — ☰, заголовок раздела, поиск и меню
   // аккаунта в шапке, разделы и дерево — в выдвижной панели; планшет — разделы в шапке короткими
   // подписями, дерево — в панели; настольный — дерево постоянное (260 px до 1279, 300 px дальше).
@@ -21,6 +23,7 @@
   import ReleasesView from '../components/ReleasesView.svelte';
   import VaultView from '../components/VaultView.svelte';
   import RechunkBanner from '../components/RechunkBanner.svelte';
+  import BackupBanner from '../components/BackupBanner.svelte';
   import Account from './Account.svelte';
   import IndexStatus from './IndexStatus.svelte';
   import Settings from './Settings.svelte';
@@ -181,8 +184,9 @@
     }
   }
 
-  /** Разделы администрирования (подменю «Пользователи», «Решения», «Настройки»). */
-  const isAdmin = (r: Route) => r.name === 'admin' || r.name === 'solutions' || r.name === 'settings';
+  /** Разделы администрирования (подменю «Пользователи», «Решения», «Настройки», «Копии», «Аудит»). */
+  const isAdmin = (r: Route) =>
+    r.name === 'admin' || r.name === 'solutions' || r.name === 'settings' || r.name === 'backups' || r.name === 'audit';
 
   // Пространство открытого журнала: имя и вид — для заголовка и вкладок журналов.
   let journalSpaces = $state<{ user: string; spaces: Space[] } | null>(null);
@@ -358,15 +362,35 @@
     {/if}
     {#if isAdmin(route) && admin}
       <div class="admin">
-        <nav class="subnav strip" aria-label="Администрирование">
+        <nav class="subnav strip" aria-label="Администрирование" use:revealSelected={route.name}>
           <a href={href({ name: 'admin' })} aria-current={route.name === 'admin' ? 'page' : undefined}>Пользователи</a>
           <a href={href({ name: 'solutions' })} aria-current={route.name === 'solutions' ? 'page' : undefined}>Решения</a>
           <a href={href({ name: 'settings' })} aria-current={route.name === 'settings' ? 'page' : undefined}>Настройки</a>
+          <a href={href({ name: 'backups' })} aria-current={route.name === 'backups' ? 'page' : undefined}>Копии</a>
+          <a href={href({ name: 'audit' })} aria-current={route.name === 'audit' ? 'page' : undefined}>Аудит</a>
         </nav>
+        <!-- плашка `no_recent_backup` (§5.6 п. 3): на «Копиях» то же — текстом страницы -->
+        {#if route.name !== 'backups'}<BackupBanner key={nav} {onexpired} />{/if}
         {#if route.name === 'solutions'}
           <Solutions {onexpired} />
         {:else if route.name === 'settings'}
           <Settings {onexpired} />
+        {:else if route.name === 'backups'}
+          {#await import('./Backups.svelte')}
+            <p class="muted">Загрузка…</p>
+          {:then { default: Backups }}
+            <Backups {onexpired} />
+          {:catch e}
+            <LazyFail error={e} />
+          {/await}
+        {:else if route.name === 'audit'}
+          {#await import('./Audit.svelte')}
+            <p class="muted">Загрузка…</p>
+          {:then { default: Audit }}
+            <Audit {users} {onexpired} />
+          {:catch e}
+            <LazyFail error={e} />
+          {/await}
         {:else}
           <Users onExpired={onexpired} />
         {/if}

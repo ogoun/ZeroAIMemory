@@ -52,6 +52,10 @@ pub struct AppState {
     pub vault: Arc<VaultKeys>,
     /// Воркер обслуживания (срок хранения сессий); снимается с последней копией состояния.
     pub maintenance: Arc<Maintenance>,
+    /// Копия в процессе сервера (M7 §5.6): замок, общий у страницы «Копии»
+    /// (`POST /admin/backups`) и автокопии воркера обслуживания (клон — в `Maintenance::start`),
+    /// идущая копия, последний итог и кэш сводок описей.
+    pub backups: Arc<crate::backup::runner::BackupRunner>,
     /// Кэш словаря доменных терминов по базам (M4.5, [`crate::glossary`]).
     pub glossary: Arc<crate::glossary::GlossaryCache>,
     /// Кэш настроек пользователей (M6.6 §5.3, [`api::user_settings::UserFlagsCache`]): `/recall`
@@ -118,10 +122,14 @@ impl AppState {
     ///   секретов; `zam_store::UserDbs`) — ждём перенарезку не дольше 10 с, затем выходим без
     ///   неё: задача может держать `Db` до выхода процесса и дорабатывает возобновляемо при
     ///   следующем открытии базы (идемпотентна, отметка в `meta`);
+    /// - копия из WebUI (`POST /admin/backups`, [`crate::backup::runner`], M7 §5.6) — не ждём:
+    ///   её задача держит клон `SystemStore` до конца копии и аудита `server.backup`, поток копии
+    ///   дорабатывает до выхода процесса — как автокопия, чью задачу снимает
+    ///   [`Maintenance::stop`]; брошенную сборку `*.partial` убирает следующая копия;
     /// - затем Qdrant (ожидание подтверждения WAL и остановка процесса).
     ///
     /// Поэтому «после `shutdown` соединений нет» верно для обслуживания и воркера индексации,
-    /// но не для незаконченной задачи открытия базы.
+    /// но не для незаконченной задачи открытия базы и идущей копии из WebUI.
     /// Начало остановки: долгие потоки ответа (экспорт пространства) обрываются между файлами
     /// и кусками тела. Зовётся по сигналу остановки до штатного завершения HTTP.
     pub fn begin_stop(&self) {
@@ -382,14 +390,17 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         data_dir.previews_dir(),
     ));
     let rerank = Arc::new(RerankSlot::new(&cfg));
+    let backups = Arc::new(crate::backup::runner::BackupRunner::default());
     let maintenance = Arc::new(Maintenance::start(
         system.clone(),
         users.clone(),
         cfg.cache.clone(),
         cfg.clone(),
+        (*backups).clone(),
     ));
     let state = AppState {
         maintenance,
+        backups,
         glossary: Arc::default(),
         user_flags: Arc::default(),
         code: Arc::default(),

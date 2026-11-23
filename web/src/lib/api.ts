@@ -674,6 +674,9 @@ export interface IndexStatus {
   /** Rules пользователя запроса (токен, пользователь, администратор с `X-Zam-User`); у
    * администратора по всем базам — `null` (Rules каждой — в `dbs`). */
   rules?: RulesStatus | null;
+  /** Копии сервера (M6 §12б.4): последняя готовая копия каталога копий, расписание и
+   * `no_recent_backup`; WebUI показывает с M7.2 (блок «Копии» на «Индексе»). */
+  backup?: BackupStatus | null;
 }
 
 /** Перенарезка базы (§8.2): `reason` — `params` | `algorithm` | `tokenizer` | `unknown`;
@@ -696,6 +699,92 @@ export const reindex = (full: boolean) =>
     'POST',
     'admin/reindex',
     { full },
+  );
+
+// ---- копии сервера и аудит (администратор, M7.2: спецификация M7 §5.6) ----
+
+/** Поле `backup` статуса (`GET /index/status`, `?only=backup`): время последней готовой копии,
+ * расписание и `no_recent_backup` (копии нет или она старше `[backup] warn_days`). Путей нет. */
+export interface BackupStatus {
+  last_at: string | null;
+  schedule: 'off' | 'daily';
+  warning: 'no_recent_backup' | null;
+}
+
+/** Кто снимает копию: страница «Копии» или автокопия по расписанию. */
+export type BackupBy = 'webui' | 'schedule';
+
+/** Итог копии без пути: имя каталога копии и числа отчёта. */
+export interface BackupReport {
+  name: string;
+  dbs: number;
+  blobs: number;
+  /** Блобов связано жёсткой ссылкой с предыдущей копией и скопировано. */
+  linked: number;
+  copied: number;
+  bytes: number;
+  ms: number;
+  drift: string[];
+}
+
+/** Готовая копия каталога копий — по описи (`bytes` — сумма размеров описи). */
+export interface BackupCopy {
+  name: string;
+  created_at: string;
+  server_version: string;
+  bytes: number;
+  files: number;
+  dbs: number;
+  blobs: number;
+  drift: string[];
+}
+
+/** `GET /admin/backups`: `dir` — каталог копий (только администратору), `at` — `HH:MM` UTC;
+ * `items` — новые первыми. */
+export interface Backups extends BackupStatus {
+  dir: string;
+  at: string;
+  keep: number;
+  warn_days: number;
+  running: { started_at: string; by: BackupBy } | null;
+  last_run: {
+    finished_at: string;
+    by?: BackupBy;
+    ok: boolean;
+    error: string | null;
+    report: BackupReport | null;
+  } | null;
+  items: BackupCopy[];
+}
+
+export const listBackups = () => call<Backups>('GET', 'admin/backups');
+/** Копия в процессе сервера: 202 `{started_at}`; идёт другая — 409 `/problems/backup-running`
+ * с `running` в problem. */
+export const startBackup = () => call<{ started_at: string }>('POST', 'admin/backups');
+/** Удаление готовой копии по имени: 204; не копия каталога копий — 404. */
+export const deleteBackup = (name: string) => call<void>('DELETE', `admin/backups/${q(name)}`);
+/** Лёгкий статус копий для плашки `no_recent_backup` (только `{backup}`). */
+export const backupStatus = () => call<{ backup: BackupStatus }>('GET', 'index/status?only=backup');
+
+/** Событие журнала аудита (`GET /admin/audit`); `details` — JSON события. */
+export interface AuditRow {
+  id: number;
+  ts: string;
+  actor: string;
+  user_id: string | null;
+  action: string;
+  target: string | null;
+  ip: string | null;
+  details: unknown;
+}
+
+/** Страница аудита: события новые первыми, по 100 (сервер по умолчанию отдаёт 50); `before` —
+ * `next` прошлой страницы, `next` — `null` на последней. */
+export const AUDIT_PAGE = 100;
+export const listAudit = (before?: number) =>
+  call<{ items: AuditRow[]; next: number | null }>(
+    'GET',
+    `admin/audit?limit=${AUDIT_PAGE}` + (before !== undefined ? `&before=${before}` : ''),
   );
 
 // ---- журналы решения: Changelog, Releases, Insights (§7.2–7.5) ----

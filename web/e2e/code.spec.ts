@@ -7,6 +7,7 @@
 // владельцем, маска секрета в сигнатуре, тёмная тема и печать. Данные — seedCodeMap/seedCodeKnowledge (global-setup).
 import { expect, test, type Browser, type Locator, type Page } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
+import { loginChangingPassword } from './login';
 import { ADMIN_STATE } from './session';
 import {
   CODE_BOTH_TITLE,
@@ -640,14 +641,8 @@ async function memberRw(browser: Browser, page: Page) {
   expect(req.status()).toBe(202);
   await call('POST', `solutions/${SOLUTION_GUID}/access/${u.user.id}/approve`, { access: 'rw' });
   await call('POST', `admin/users/${u.user.id}/password`, { password: PASS });
-  const login = await ctx.request.post(`${base()}api/v1/auth/login`, { data: { login: name, password: PASS } });
-  expect(login.status()).toBe(200);
-  const mc = ((await login.json()) as { csrf: string }).csrf;
-  const pw = await ctx.request.post(`${base()}api/v1/auth/password`, {
-    headers: { 'X-CSRF-Token': mc },
-    data: { old: PASS, new: PASS2 },
-  });
-  expect(pw.status()).toBe(204);
+  // лимит входа общий у спек прогона — вход с повтором при 429 (`login.ts`)
+  await loginChangingPassword(ctx.request, base(), name, PASS, PASS2);
   return { ctx, id: u.user.id };
 }
 

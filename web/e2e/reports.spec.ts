@@ -7,6 +7,7 @@
 import { expect, test, type Browser, type Page } from '@playwright/test';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { loginChangingPassword } from './login';
 import { ADMIN_STATE } from './session';
 import {
   LINK_FILE,
@@ -622,14 +623,8 @@ async function member(browser: Browser, page: Page, access: 'rw' | 'ro') {
 async function memberRw(browser: Browser, page: Page) {
   const { ctx, call, name, id } = await member(browser, page, 'rw');
   await call('POST', `admin/users/${id}/password`, { password: PASS });
-  const login = await ctx.request.post(`${base()}api/v1/auth/login`, { data: { login: name, password: PASS } });
-  expect(login.status()).toBe(200);
-  const mc = ((await login.json()) as { csrf: string }).csrf;
-  const pw = await ctx.request.post(`${base()}api/v1/auth/password`, {
-    headers: { 'X-CSRF-Token': mc },
-    data: { old: PASS, new: PASS2 },
-  });
-  expect(pw.status()).toBe(204);
+  // лимит входа общий у спек прогона — вход с повтором при 429 (`login.ts`)
+  const mc = await loginChangingPassword(ctx.request, base(), name, PASS, PASS2);
   return { ctx, id, csrf: mc };
 }
 
