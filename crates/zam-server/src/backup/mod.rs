@@ -199,7 +199,9 @@ pub fn copy_time(name: &str) -> Option<jiff::Timestamp> {
 
 /// Готовые копии каталога копий (с описью), от старых к новым. Сюда входят и копии,
 /// снятые вручную `zam-server backup` в тот же каталог: ротация автокопий (`keep`) считает
-/// и удаляет их наравне с автокопиями.
+/// и удаляет их наравне с автокопиями. Готовая копия — [`ready_copy`]: ссылка (symlink,
+/// junction) на каталог с описью копией не считается — её нет ни в списке страницы «Копии», ни в
+/// ротации, ни в `no_recent_backup`, и `DELETE` её не удаляет (M7 §5.6, ревью r1 задачи 7).
 pub fn list_copies(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -208,13 +210,27 @@ pub fn list_copies(dir: &Path) -> Vec<PathBuf> {
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
-            let t = copy_time(&name)?;
-            let p = e.path();
-            p.join(MANIFEST_FILE).is_file().then_some((t, name, p))
+            let (t, p) = ready_copy(dir, &name)?;
+            Some((t, name, p))
         })
         .collect();
     v.sort();
     v.into_iter().map(|(_, _, p)| p).collect()
+}
+
+/// Готовая копия `name` каталога копий `dir`: имя только из цифр, `-`, `_` по шаблону
+/// [`copy_time`] (ни разделителей пути, ни `..`, ни суффиксов `.partial`, `.failed`, ни
+/// расширения архива), сам каталог — не ссылка (symlink, junction) — с описью. Одно правило у
+/// списка копий ([`list_copies`]) и удаления ([`delete_copy`]).
+fn ready_copy(dir: &Path, name: &str) -> Option<(jiff::Timestamp, PathBuf)> {
+    let plain = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b'-' || b == b'_');
+    let t = copy_time(name).filter(|_| plain)?;
+    let p = dir.join(name);
+    let ft = std::fs::symlink_metadata(&p).ok()?.file_type();
+    (ft.is_dir() && !ft.is_symlink() && p.join(MANIFEST_FILE).is_file()).then_some((t, p))
 }
 
 /// Время последней готовой копии каталога копий.
@@ -302,27 +318,18 @@ pub fn copy_summary(path: &Path) -> Option<CopySummary> {
 }
 
 /// Удаляет готовую копию `name` каталога копий `dir` (`DELETE /admin/backups/{name}`, M7 §5.6):
-/// имя — только по шаблону [`copy_time`] (цифры, `-`, `_`: ни разделителей пути, ни `..`, ни
-/// суффиксов `.partial`, `.failed`, ни расширения архива), сам каталог (не ссылка) с описью.
-/// Иначе — [`BackupError::NotACopy`], на диске ничего не меняется. Путь из запроса не
-/// используется: только `dir` и проверенное имя.
+/// только [`ready_copy`], иначе — [`BackupError::NotACopy`], на диске ничего не меняется. Путь
+/// из запроса не используется: только `dir` и проверенное имя. Копии не стало во время удаления
+/// (её удалил кто-то ещё) — тоже `NotACopy`; удаления самого сервера разводит замок удаления
+/// [`runner::BackupRunner::delete`].
 pub fn delete_copy(dir: &Path, name: &str) -> Result<(), BackupError> {
     let not = || BackupError::NotACopy(name.to_string());
-    let plain = !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_digit() || b == b'-' || b == b'_');
-    if !plain || copy_time(name).is_none() {
-        return Err(not());
+    let (_, p) = ready_copy(dir, name).ok_or_else(not)?;
+    match remove_copy(&p) {
+        Ok(()) => {}
+        Err(_) if !p.exists() => return Err(not()),
+        Err(e) => return Err(e.into()),
     }
-    let p = dir.join(name);
-    let ft = std::fs::symlink_metadata(&p)
-        .map_err(|_| not())?
-        .file_type();
-    if !ft.is_dir() || ft.is_symlink() || !p.join(MANIFEST_FILE).is_file() {
-        return Err(not());
-    }
-    remove_copy(&p)?;
     tracing::info!(path = %p.display(), "копия удалена (WebUI)");
     Ok(())
 }
@@ -1174,6 +1181,8 @@ pub fn prune(paths: &[PathBuf]) {
     for p in paths {
         match remove_copy(p) {
             Ok(()) => tracing::info!(path = %p.display(), "копия удалена (сверх backup.keep)"),
+            // уже удалена (из WebUI между решением и удалением) — не сбой
+            Err(_) if !p.exists() => tracing::debug!(path = %p.display(), "копии уже нет"),
             Err(e) => tracing::warn!(path = %p.display(), error = %e, "копия не удалена"),
         }
     }

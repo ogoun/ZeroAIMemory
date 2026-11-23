@@ -5,6 +5,7 @@
 // Каталог копий сервера E2E — `<data>/backups`: сценарии начинают с пустого (готовые копии прежних
 // прогонов удаляются через API) и оставляют его пустым.
 import { expect, test, type APIRequestContext, type Browser, type Page } from '@playwright/test';
+import { loginChangingPassword } from './login';
 import { ADMIN_STATE } from './session';
 
 const env = (k: string) => {
@@ -15,9 +16,6 @@ const env = (k: string) => {
 const base = () => env('E2E_BASE_URL');
 
 test.use({ storageState: ADMIN_STATE });
-
-/** Пути под общим лимитом входа (5 в минуту на IP): 429 на них — повод для одного повтора. */
-const LIMITED = ['/api/v1/auth/login', '/api/v1/auth/password'];
 
 /** Ошибки JS, CSP и неожиданные HTTP-ответы страницы. */
 function watch(page: Page): string[] {
@@ -71,34 +69,8 @@ async function clearCopies(call: Call): Promise<void> {
   }
 }
 
-/** Окно лимита входа сервера (`auth/rate.rs`: 5 попыток в минуту на IP, скользящее окно), мс. */
-const LOGIN_WINDOW_MS = 60_000;
-/** Время последнего запроса спеки под лимитом входа (0 — не было). */
-let lastLimited = 0;
-
-/** POST под лимитом входа: при 429 — ждать `Retry-After` и повторить один раз. */
-async function limited(rc: APIRequestContext, url: string, data: unknown, headers: Record<string, string> = {}) {
-  let r = await rc.post(url, { data, headers });
-  if (r.status() === 429) {
-    const wait = Number(r.headers()['retry-after'] ?? '60');
-    await new Promise((res) => setTimeout(res, wait * 1000 + 500));
-    r = await rc.post(url, { data, headers });
-  }
-  lastLimited = Date.now();
-  return r;
-}
-
-// Лимит входа общий у всех спек прогона, а входы `code.spec.ts`, `reports.spec.ts` и
-// `mobile.spec.ts` повтора при 429 не делают: спека возвращает окно свободным — ждёт, пока её
-// входы из него выйдут (в прогоне набора `access, admin, backups, code` без ожидания `code.spec.ts`
-// получал 429).
-test.afterAll(async () => {
-  test.setTimeout(LOGIN_WINDOW_MS + 30_000);
-  const rest = lastLimited + LOGIN_WINDOW_MS + 1000 - Date.now();
-  if (lastLimited && rest > 0) await new Promise((res) => setTimeout(res, rest));
-});
-
-/** Сессия пользователя WebUI (не администратора) после обязательной смены пароля. */
+/** Сессия пользователя WebUI (не администратора) после обязательной смены пароля; вход — с
+ * повтором при 429 (`login.ts`: лимит входа общий у спек прогона). */
 async function userState(browser: Browser) {
   const pass = ['e2e-backup-pass-1', 'e2e-backup-pass-2'];
   const ac = await browser.newContext({ storageState: ADMIN_STATE });
@@ -108,13 +80,7 @@ async function userState(browser: Browser) {
   await call('POST', `admin/users/${u.user.id}/password`, { password: pass[0] });
   await ac.close();
   const uc = await browser.newContext({ storageState: { cookies: [], origins: [] } });
-  const login = await limited(uc.request, `${base()}api/v1/auth/login`, { login: name, password: pass[0] });
-  expect(login.status(), 'вход пользователя').toBe(200);
-  const { csrf } = (await login.json()) as { csrf: string };
-  const pw = await limited(uc.request, `${base()}api/v1/auth/password`, { old: pass[0], new: pass[1] }, {
-    'X-CSRF-Token': csrf,
-  });
-  expect(pw.status(), 'смена пароля').toBe(204);
+  await loginChangingPassword(uc.request, base(), name, pass[0], pass[1]);
   const state = await uc.storageState();
   await uc.close();
   return state;

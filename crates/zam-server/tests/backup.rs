@@ -2585,6 +2585,19 @@ async fn wait_run(a: &Api, started: &str) -> Value {
                 .as_str()
                 .is_some_and(|f| f >= started);
         if done {
+            // ревью r1 (m1): итог пишется после переименования каталога копии, а `GET` читает
+            // состояние раньше каталога — ответ с итогом `ok` несёт и эту копию
+            if b["last_run"]["ok"] == true {
+                let name = &b["last_run"]["report"]["name"];
+                assert!(
+                    b["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|i| &i["name"] == name),
+                    "итог без копии в списке: {b}"
+                );
+            }
             return b;
         }
         assert!(
@@ -2655,6 +2668,16 @@ impl Hold {
         test_hooks::set_after_first_snapshot(&self.data_dir, None);
         let _ = self.release.send(());
     }
+}
+
+/// Срок `at` (03:30 UTC) послезавтра, 04:00: позже любой копии теста — шаг расписания снимает
+/// копию.
+fn slot_after_tomorrow() -> jiff::Timestamp {
+    let utc = jiff::tz::TimeZone::UTC;
+    let day = (zam_store::time::now() + jiff::SignedDuration::from_hours(48))
+        .to_zoned(utc.clone())
+        .date();
+    day.at(4, 0, 0, 0).to_zoned(utc).unwrap().timestamp()
 }
 
 /// Сумма размеров файлов описи и самой описи — `bytes` копии.
@@ -2792,12 +2815,7 @@ async fn backup_api_schedule_shares_lock() {
         let p = run_backup(&cfg, BackupOpts::default()).await.unwrap().path;
         std::fs::rename(&p, dir.join(o)).unwrap();
     }
-    // срок `at` послезавтра (UTC): позже любой копии теста
-    let utc = jiff::tz::TimeZone::UTC;
-    let day = (zam_store::time::now() + jiff::SignedDuration::from_hours(48))
-        .to_zoned(utc.clone())
-        .date();
-    let now = day.at(4, 0, 0, 0).to_zoned(utc).unwrap().timestamp();
+    let now = slot_after_tomorrow();
     let (lock, system) = (&a.st.backups, &a.st.system);
 
     let hold = Hold::new(&cfg.data_dir);
@@ -2945,12 +2963,39 @@ async fn backup_api_delete_only_ready_copies() {
     let outside_name = "2026-01-06_000000";
     std::fs::rename(&outside, other.join(outside_name)).unwrap();
     let outside = other.join(outside_name);
+    // ссылка с именем копии на готовую копию в другом каталоге: Linux — symlink, Windows —
+    // junction (`mklink /J` — без прав администратора, в отличие от symlink)
+    let link = dir.join("2026-01-07_000000");
     #[cfg(unix)]
-    let link = {
-        let l = dir.join("2026-01-07_000000");
-        std::os::unix::fs::symlink(&outside, &l).unwrap();
-        l
-    };
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    #[cfg(windows)]
+    {
+        let out = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "mklink /J: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(link.join(MANIFEST_FILE).is_file(), "ссылка ведёт на копию");
+    // ревью r1 (m6): ссылка — не копия и в списке (а значит, и в ротации)
+    assert_eq!(
+        zam_server::backup::list_copies(&dir),
+        vec![ready.clone()],
+        "в списке — только готовая копия"
+    );
+    let listed: Vec<String> = backups(&a).await["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(listed, std::slice::from_ref(&name));
     // идущая сборка
     let hold = Hold::new(&cfg.data_dir);
     let r = a
@@ -3012,8 +3057,7 @@ async fn backup_api_delete_only_ready_copies() {
     assert!(no_manifest.join("system.db").is_file());
     assert!(file_named.is_file() && zip_named.is_file() && zip.is_file());
     assert!(outside.join(MANIFEST_FILE).is_file());
-    #[cfg(unix)]
-    assert!(link.exists());
+    assert!(link.join(MANIFEST_FILE).is_file(), "ссылка и её цель целы");
     assert!(ready.join(MANIFEST_FILE).is_file());
     assert!(cfg.data_dir.join("system.db").is_file());
     assert!(
@@ -3176,5 +3220,85 @@ async fn index_status_only_backup() {
         "{}",
         r.text()
     );
+    stop(a).await;
+}
+
+/// Ревью r1 (m3): удаления копий идут по одному — два одновременных `DELETE` одной копии дают
+/// 204 и 404 (не 500), аудит удаления — один на копию.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_api_delete_concurrent_once() {
+    let _g = CHUNKER.read().await;
+    let (a, _) = seeded("bk-api-del-twice").await;
+    let cfg = cfg_of(&a);
+    for _ in 0..3 {
+        let copy = run_backup(&cfg, BackupOpts::default()).await.unwrap().path;
+        let name = copy.file_name().unwrap().to_str().unwrap().to_string();
+        let uri = format!("/api/v1/admin/backups/{name}");
+        let (r1, r2) = tokio::join!(
+            a.adm(Method::DELETE, &uri, None, None),
+            a.adm(Method::DELETE, &uri, None, None)
+        );
+        let mut got = [r1.status.as_u16(), r2.status.as_u16()];
+        got.sort();
+        assert_eq!(got, [204, 404], "{} / {}", r1.text(), r2.text());
+        assert!(!copy.exists());
+    }
+    let deletes =
+        a.st.system
+            .list_audit(50, None)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.action == "server.backup.delete")
+            .count();
+    assert_eq!(deletes, 3);
+    stop(a).await;
+}
+
+/// Ревью r1 (m5): копия по расписанию держит замок — `POST /admin/backups` получает 409 с
+/// `running.by = "schedule"`; сервер останавливается — `POST` 503 `/problems/busy` с
+/// `Retry-After`, копия не начинается.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_api_busy_by_schedule_and_stopping() {
+    let _g = CHUNKER.read().await;
+    use zam_server::maintenance::{BackupState, backup_tick};
+    let (a, _) = seeded("bk-api-busy-sched").await;
+    let mut cfg = cfg_of(&a);
+    cfg.backup.schedule = BackupSchedule::Daily;
+    let dir = cfg.backup.dir(&cfg.data_dir);
+    let now = slot_after_tomorrow();
+    let hold = Hold::new(&cfg.data_dir);
+    let (runner, system) = ((*a.st.backups).clone(), a.st.system.clone());
+    let tick = tokio::spawn(async move {
+        let mut st = BackupState::default();
+        backup_tick(&cfg, now, &mut st, &runner, &system).await
+    });
+    hold.entered().await;
+    let r = a
+        .adm(Method::POST, "/api/v1/admin/backups", None, None)
+        .await;
+    common::api::problem(&r, StatusCode::CONFLICT, "backup-running");
+    let j = r.json();
+    assert_eq!(j["running"]["by"], "schedule", "{j}");
+    assert!(j["running"]["started_at"].is_string(), "{j}");
+    assert!(
+        j["detail"].as_str().unwrap().contains("по расписанию"),
+        "{j}"
+    );
+    hold.release();
+    let o = tick.await.unwrap();
+    assert_eq!(o.backup, Some(true), "{o:?}");
+    assert_eq!(zam_server::backup::list_copies(&dir).len(), 1);
+
+    a.st.begin_stop();
+    let r = a
+        .adm(Method::POST, "/api/v1/admin/backups", None, None)
+        .await;
+    common::api::problem(&r, StatusCode::SERVICE_UNAVAILABLE, "busy");
+    assert_eq!(r.header("retry-after"), "5");
+    let b = backups(&a).await;
+    assert_eq!(b["running"], Value::Null, "{b}");
+    assert_eq!(b["last_run"]["by"], "schedule", "копия не начиналась: {b}");
+    assert_eq!(zam_server::backup::list_copies(&dir).len(), 1);
     stop(a).await;
 }

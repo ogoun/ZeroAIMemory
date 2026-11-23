@@ -15,14 +15,16 @@
 //!   останавливается — 503 `/problems/busy`. После успеха при `schedule = "daily"` — ротация
 //!   `keep`, при `off` — без ротации. Аудит `server.backup {by, ok, name, bytes, ms, error}`.
 //! - `DELETE /admin/backups/{name}` → 204: только готовая копия каталога копий по имени-шаблону
-//!   с описью ([`crate::backup::delete_copy`]); иначе — 404, путей из запроса нет. Аудит
-//!   `server.backup.delete {name}`.
+//!   с описью ([`crate::backup::delete_copy`]); иначе — 404, путей из запроса нет. Удаления копий
+//!   и ротация `keep` идут по одному ([`BackupRunner::delete`]): копия, которую уже удалили, —
+//!   404, а не сбой. Аудит `server.backup.delete {name}`.
 //!
 //! **Восстановления и скачивания копии из WebUI нет:** `restore` — только на остановленном
 //! сервере (ТЗ §16.4), а скачивание отдало бы через браузер хэши токенов и шифротексты Vault;
 //! перенос — `zam-server backup --zip` на машине сервера.
 //!
 //! [`BackupRunner::summaries`]: crate::backup::runner::BackupRunner::summaries
+//! [`BackupRunner::delete`]: crate::backup::runner::BackupRunner::delete
 
 use axum::Json;
 use axum::extract::rejection::PathRejection;
@@ -42,6 +44,10 @@ const STOPPING_RETRY_S: u64 = 5;
 
 /// `GET /admin/backups`.
 pub async fn list(_: AdminOnly, State(st): State<AppState>) -> Result<Json<Value>, ApiError> {
+    // состояние — до чтения каталога: итог копии пишется после переименования её каталога, так
+    // что ответ с итогом всегда несёт и эту копию в `items` (страница перестаёт опрашивать по
+    // `running = null` и иначе показала бы список без неё)
+    let run = st.backups.state();
     let cfg = st.cfg.clone();
     let runner = st.backups.clone();
     // каталог копий — на диске (HDD): чтение — в блокирующем потоке
@@ -55,7 +61,6 @@ pub async fn list(_: AdminOnly, State(st): State<AppState>) -> Result<Json<Value
     })
     .await
     .map_err(|e| ApiError::aborted("список копий", &e))?;
-    let run = st.backups.state();
     let b = &st.cfg.backup;
     Ok(Json(json!({
         "dir": b.dir(&st.cfg.data_dir).display().to_string(),
@@ -115,7 +120,8 @@ pub async fn remove(
     };
     let dir = st.cfg.backup.dir(&st.cfg.data_dir);
     let n = name.clone();
-    let r = tokio::task::spawn_blocking(move || crate::backup::delete_copy(&dir, &n))
+    let runner = st.backups.clone();
+    let r = tokio::task::spawn_blocking(move || runner.delete(&dir, &n))
         .await
         .map_err(|e| ApiError::aborted("удаление копии", &e))?;
     match r {

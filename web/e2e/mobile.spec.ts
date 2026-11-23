@@ -10,6 +10,7 @@ import { expect, test, type Browser, type BrowserContext, type Locator, type Pag
 import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { loginChangingPassword } from './login';
 import { PAGES, env, pageCtx } from './mobile-pages';
 import { IDEAS_GUID, SOLUTION_GUID } from './seed';
 import { ADMIN_STATE } from './session';
@@ -789,14 +790,8 @@ async function userSession(browser: Browser): Promise<StorageState> {
   expect(set.ok(), `пароль: HTTP ${set.status()}`).toBe(true);
   await ac.close();
   const uc = await browser.newContext({ storageState: { cookies: [], origins: [] } });
-  const login = await uc.request.post(`${base()}api/v1/auth/login`, { data: { login: name, password: pass[0] } });
-  expect(login.status(), 'вход пользователя').toBe(200);
-  const mc = ((await login.json()) as { csrf: string }).csrf;
-  const pw = await uc.request.post(`${base()}api/v1/auth/password`, {
-    headers: { 'X-CSRF-Token': mc },
-    data: { old: pass[0], new: pass[1] },
-  });
-  expect(pw.status(), 'смена пароля').toBe(204);
+  // лимит входа общий у спек прогона — вход с повтором при 429 (`login.ts`)
+  await loginChangingPassword(uc.request, base(), name, pass[0], pass[1]);
   userState = await uc.storageState();
   await uc.close();
   return userState;

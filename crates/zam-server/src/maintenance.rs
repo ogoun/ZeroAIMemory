@@ -304,7 +304,8 @@ pub async fn backup_tick(
             }
             Action::Prune(list) => {
                 out.pruned += list.len();
-                tokio::task::spawn_blocking(move || crate::backup::prune(&list))
+                let b = backups.clone();
+                tokio::task::spawn_blocking(move || b.prune(&list))
                     .await
                     .ok();
             }

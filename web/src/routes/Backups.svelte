@@ -25,10 +25,6 @@
 
   let { onexpired }: { onexpired: () => void } = $props();
 
-  /** Раздел руководства о переносе и восстановлении (тот же файл лежит в комплекте сервера). */
-  const GUIDE_URL =
-    'https://github.com/ogoun/ZeroAIMemory/blob/main/deploy/README-install.md#перенос-на-другую-машину';
-
   let st = $state<Backups | null>(null);
   let error = $state('');
   /** Время ответа: давность считается от него, а не от часов отрисовки. */
@@ -260,8 +256,8 @@
       <li>Запустите сервер и войдите заново: вход в WebUI после восстановления сбрасывается, токены агентов прежние.</li>
     </ol>
     <p class="small">
-      Порядок целиком — руководство <code>README-install.md</code> комплекта сервера, раздел «Перенос на другую машину»
-      (<a href={GUIDE_URL} target="_blank" rel="noopener noreferrer">на GitHub</a>).
+      Порядок целиком — руководство <code>README-install.md</code> комплекта сервера (в репозитории —
+      <code>deploy/README-install.md</code>), раздел «Перенос на другую машину».
     </p>
   {:else if !error}
     <p class="muted">Загрузка…</p>

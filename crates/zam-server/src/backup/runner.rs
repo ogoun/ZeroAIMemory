@@ -28,7 +28,7 @@ use serde_json::json;
 use zam_store::SystemStore;
 use zam_store::time::ser_ts;
 
-use super::{BackupOpts, BackupReport, CopySummary};
+use super::{BackupError, BackupOpts, BackupReport, CopySummary};
 use crate::config::{BackupSchedule, ServerConfig};
 
 /// Кто начал копию.
@@ -125,6 +125,10 @@ struct Inner {
 pub struct BackupRunner {
     inner: Arc<Mutex<Inner>>,
     summaries: Arc<Mutex<SummaryCache>>,
+    /// Удаление копий — по одному: `DELETE /admin/backups/{name}` и ротация `keep` одной и той же
+    /// копии не идут одновременно — второе видит, что копии уже нет (404), а не сбой удаления.
+    /// Отдельно от замка копии: удалить готовую копию можно и во время копии.
+    removal: Arc<Mutex<()>>,
 }
 
 impl BackupRunner {
@@ -145,9 +149,24 @@ impl BackupRunner {
         g.running = Some(running.clone());
         Ok(RunGuard {
             inner: self.inner.clone(),
+            removal: self.removal.clone(),
             running,
             done: false,
         })
+    }
+
+    /// Удаляет готовую копию `name` каталога копий `dir` ([`super::delete_copy`]) под замком
+    /// удаления. Блокирующая: звать вне потоков runtime.
+    pub fn delete(&self, dir: &Path, name: &str) -> Result<(), BackupError> {
+        let _one = lock_removal(&self.removal);
+        super::delete_copy(dir, name)
+    }
+
+    /// Удаляет копии сверх `keep` ([`super::prune`]) под замком удаления — `Prune` расписания.
+    /// Блокирующая: звать вне потоков runtime.
+    pub fn prune(&self, paths: &[PathBuf]) {
+        let _one = lock_removal(&self.removal);
+        super::prune(paths);
     }
 
     /// Идущая копия и последний итог (снимок под мьютексом, без ввода-вывода).
@@ -190,10 +209,16 @@ impl BackupRunner {
     }
 }
 
+/// Замок удаления копий (отравленный — тот же: удаление идемпотентно).
+fn lock_removal(m: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Замок взят; снимается при итоге или уничтожении (без итога — «прервана»).
 #[derive(Debug)]
 pub struct RunGuard {
     inner: Arc<Mutex<Inner>>,
+    removal: Arc<Mutex<()>>,
     running: Running,
     done: bool,
 }
@@ -246,6 +271,8 @@ impl RunGuard {
             let r = super::backup(&c, &BackupOpts::default());
             let mut pruned = Vec::new();
             if rotate && r.is_ok() {
+                // список — под замком удаления: копия, удалённая из WebUI, в него уже не попадёт
+                let _one = lock_removal(&self.removal);
                 let dir = c.backup.dir(&c.data_dir);
                 pruned = super::schedule::prune_list(&super::list_copies(&dir), c.backup.keep);
                 super::prune(&pruned);
