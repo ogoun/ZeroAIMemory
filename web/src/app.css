@@ -76,6 +76,9 @@ input, select {
   border: 1px solid var(--border);
   border-radius: 6px;
 }
+/* ширина списка — по самому длинному пункту (имя решения): не шире своей области, иначе на узком
+   экране раздвигает страницу (финальное ревью M7.2, обход узких экранов) */
+select { max-width: 100%; }
 button {
   padding: 6px 14px;
   color: var(--text);
