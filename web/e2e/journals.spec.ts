@@ -5,6 +5,7 @@
 import { expect, test, type Browser, type Locator, type Page } from '@playwright/test';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { loginChangingPassword } from './login';
 import { pageCtx } from './mobile-pages';
 import { ADMIN_STATE } from './session';
 import { SOLUTION_GUID, SOLUTION_NAME, VAULT_SECRET } from './seed';
@@ -690,7 +691,7 @@ test('entry_edit_stale_rev_rereads', async ({ page }) => {
 
 // ---- ревью задачи 10, круг 1 (M3, M5): релизы, корзины прочих журналов, участник `ro` ----
 
-/** Вопрос перед уходом из формы правки с несохранённым (`LEAVE_EDIT`, `web/src/lib/entryEdit.ts`). */
+/** Вопрос перед уходом из формы правки с несохранённым (`LEAVE_EDIT`, `web/src/lib/leaveEdit.ts`). */
 const LEAVE_EDIT = 'В форме есть несохранённый текст. Закрыть её без сохранения?';
 
 /** Корзина журнала: переключатель на странице и область корзины. */
@@ -922,11 +923,8 @@ async function member(browser: Browser, page: Page, guid: string, access: 'ro' |
   expect(req.status()).toBe(202);
   await admin('POST', `solutions/${guid}/access/${u.user.id}/approve`, { access });
   await admin('POST', `admin/users/${u.user.id}/password`, { password: pass });
-  const login = await ctx.request.post(`${base()}api/v1/auth/login`, { data: { login: name, password: pass } });
-  expect(login.status()).toBe(200);
-  const mc = ((await login.json()) as { csrf: string }).csrf;
-  const pw = await ctx.request.post(`${base()}api/v1/auth/password`, { headers: { 'X-CSRF-Token': mc }, data: { old: pass, new: pass2 } });
-  expect(pw.status()).toBe(204);
+  // лимит входа общий у спек прогона — вход и смена пароля с повтором при 429 (`login.ts`)
+  await loginChangingPassword(ctx.request, base(), name, pass, pass2);
   return { ctx, id: u.user.id };
 }
 

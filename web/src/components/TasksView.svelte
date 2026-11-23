@@ -1033,7 +1033,8 @@
   }
   /* нажатый переключатель — `button.toggle[aria-pressed='true']` (app.css) */
   .toggle[aria-disabled='true'] {
-    opacity: 0.6;
+    /* как у прочих неактивных кнопок (`button:disabled`, app.css) */
+    opacity: 0.5;
     cursor: default;
   }
   .from-idea,

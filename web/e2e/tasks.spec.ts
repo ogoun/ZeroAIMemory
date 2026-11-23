@@ -810,6 +810,9 @@ test.describe('настольный', () => {
     // причина — видимой строкой и описанием кнопки; кнопка в порядке Tab, нажатие ничего не меняет
     await expect(toggle).toHaveAccessibleDescription('с «Из идей» — все задачи из идей, и шаги тоже');
     await expect(page.getByText('с «Из идей» — все задачи из идей, и шаги тоже')).toBeVisible();
+    // неактивный — как прочие неактивные кнопки (`button:disabled`, `.more[aria-disabled]`): 0,5
+    // (финальное ревью M7.2, M5)
+    expect(await toggle.evaluate((e) => getComputedStyle(e).opacity)).toBe('0.5');
     await toggle.focus();
     await expect(toggle).toBeFocused();
     await page.keyboard.press('Enter');
@@ -1082,6 +1085,51 @@ test.describe('настольный', () => {
       await expect(page).toHaveURL(/\/j\/tasks$/);
       await expect.poll(place).toBe(boardIdx);
       expect((await api<{ title: string }>('GET', `entries/${umbrella}`)).title).toBe('Общая под правкой');
+      expect(problems, problems.join('\n')).toEqual([]);
+    });
+
+    test(`task_edit_cancelled_relayout_closes_back${suffix}`, async ({ page }) => {
+      // финальное ревью M7.2, M2: роутер подписан на `hashchange` при загрузке модуля — раньше
+      // панели журнала при любом порядке монтирования; отменённый переход и откат до панели не
+      // доходят («откуда пришли» — прежнее). После смены раскладки (панель → вместо доски → панель)
+      // панель, открытая с доски, закрывается «назад» на её запись, а не заменой адреса (иначе
+      // «назад» потом один раз пустой). Страж поведения: до правки порядок держался на том, что
+      // журнал монтируется после загрузки пространств, — RED через интерфейс не получить
+      if (noNavApi) await hideNavApi(page);
+      const problems = watch(page);
+      const guid = await newSolution('отмена и раскладка');
+      const task = await addTask(guid, 'Задача под правкой');
+      const other = await addTask(guid, 'Другая задача');
+      const c = await pageCtx(page);
+      await open(page, tasksUrl(c.user, guid));
+      await navApiIs(page, noNavApi);
+      const place = placeOf(page);
+      const boardIdx = await place();
+      const split = page.locator('.jsplit');
+      const sheet = page.getByRole('dialog', { name: 'Задача', exact: true });
+      const card = sheet.getByRole('article', { name: 'Карточка задачи' });
+      const form = card.getByRole('form', { name: 'Правка задачи' });
+      await columnOf(page, 'открыт').getByRole('button', { name: 'Задача под правкой', exact: true }).click();
+      await expect(page).toHaveURL(new RegExp(`/j/tasks/${task}$`));
+      await card.getByRole('button', { name: 'Изменить', exact: true }).click();
+      await form.getByLabel('Заголовок').fill('Черновик');
+      page.once('dialog', (d) => void d.dismiss());
+      await page.evaluate((h) => (location.hash = h), tasksUrl(c.user, guid, other));
+      await expect(page).toHaveURL(new RegExp(`/j/tasks/${task}$`));
+      await expect.poll(place).toBe((boardIdx ?? 0) + 1);
+      await expect(form.getByLabel('Заголовок')).toHaveValue('Черновик');
+      // поворот: карточка вместо доски и снова панель
+      await page.setViewportSize(VIEWPORTS.phone);
+      await expect(split).toHaveAttribute('data-layout', 'stack');
+      await page.setViewportSize(VIEWPORTS.desktop);
+      await expect(split).toHaveAttribute('data-layout', 'overlay');
+      await expect(form.getByLabel('Заголовок')).toHaveValue('Черновик');
+      await form.getByRole('button', { name: 'Отмена' }).click();
+      await page.keyboard.press('Escape');
+      await expect(sheet).toHaveCount(0);
+      await expect(page).toHaveURL(/\/j\/tasks$/);
+      await expect.poll(place).toBe(boardIdx);
+      expect((await api<{ title: string }>('GET', `entries/${task}`)).title).toBe('Задача под правкой');
       expect(problems, problems.join('\n')).toEqual([]);
     });
 
