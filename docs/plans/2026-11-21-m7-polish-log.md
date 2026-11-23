@@ -5580,6 +5580,50 @@ MODE_CHANGED, EXPIRED, LEASE_EXPIRED, SKIPPED}` и `zam_server::works::package`;
 `zam-store` `--all-targets -D warnings` — чисто (после замены сложного типа в тесте на
 `type Numbered`).
 
+**Круг правок 1** (ревью r1: 0 Critical / 2 Important / 12 Minor; решения координатора: `works` —
+в конце `FEATURES`, `POST /check/run` и `night_checks_all_users_before_works` — задача 4):
+- Important 1 — `memory_log` в `SESSION_ARG_TOOLS` (аргумент `session_id` в схеме — общее
+  описание; длина описания инструмента прежняя, 298), `work_result` переносит его и в тело
+  `/works/{id}/result`: клиент без заголовка захватывает и сдаёт работу одной сессией.
+- Important 2 — приём итога: замок работы (`tokio::sync::Mutex` на работу; ждущий — до 30 с,
+  затем 409 `/problems/conflict` `code: result_in_progress`), под замком работа перечитывается
+  и сверяются ключ и захват; `kinds::accept_item` больше не пишет, а возвращает записи
+  (`zam_store::works::ItemWrite`), их пишет `finish_claimed` в одной транзакции с закрытием
+  (`Closed::{Closed, Replay, NotClaimed}`); у модели результат закрытия не игнорируется (WARN).
+  Повтор с тем же ключом и телом — прежний ответ без повторной записи и без `accept_item`,
+  пока первый идёт — после него; тот же ключ с другим телом — 422 (Minor 4: `request_hash`
+  тела в `result`).
+- Minor 1 — возврат работы модели — 409 `code: model_work` (и возврат — под тем же замком);
+  2 — `on_start`: база пользователя не открылась — WARN, дальше; 3 — тело итога
+  `deny_unknown_fields`, без `items` и `skip` — 400; 5 — строка работ дайджеста — ещё и отметка
+  показа `session_seen` (часть `works_line`, цель — первая работа строки): раз за сессию и у
+  агента только с MCP; 6 — `?user=` у `GET /works` и `/works/usage` (чужой — только
+  администратору); 7 — снимок кандидатов сверяется перед выдачей (`live_refs`: удалённая или
+  исправленная запись не идёт, пустая работа — `cancelled stale`); 8 — на паузе `drop_stale`
+  снимает работы агента; 9 — одна подготовка пакета `queue::prepare` для агента и модели;
+  10 — `excluded_refs`/`accepted_refs` — итоги `done` за 365 суток (`REFS_HORIZON_DAYS`),
+  документ поправлен; 11 — маска итога — `‹secret›` или `‹secret-[^›\s]*›`; 12 — тесты.
+- Тестовый вид `echo` теперь пишет строку `proposals` типа `echo` на принятый элемент (проверка
+  «нет дублей» и «снятая работа ничего не пишет»), текст `zam-test-cancel-during-accept` снимает
+  работу посреди проверки итога.
+- Тесты круга: `works` — `work_result_idempotent` (повтор без второй записи, другое тело — 422),
+  `work_result_parallel_same_key_once`, `work_result_cancelled_writes_nothing`,
+  `work_result_requires_items_or_skip`, `work_release_rest`, `work_package_skips_stale_items`,
+  `paused_night_drops_agent_works`, `?user=` в `work_member_no_works`, подключённая модель в
+  `works_disabled_manual_409`; `mcp` — `mcp_log_kind_work_session_arg`,
+  `mcp_digest_works_line_once`; модульный — `mask_literal_cases` (узкая метка).
+- [решение исполнителя, задача 3, круг 1] Замок работы — в процессе сервера (сервер один на
+  каталог данных), а не флаг в базе: замок держится только на время проверки итога, после
+  падения процесса держать нечего.
+- [решение исполнителя, задача 3, круг 1] Тот же ключ с другим телом — 422
+  `/problems/idempotency-mismatch` (как у записей журнала), а не 409.
+- [решение исполнителя, задача 3, круг 1] `boot::first_run_creates_admin_and_token_once` —
+  повторная сборка на том же каталоге ждёт ограниченно (до 5 с): шаги старта раннера теперь
+  открывают базы пользователей (`queue::on_start`) с клоном состояния и отпускают его на
+  ближайшем ожидании (`works/night.rs`), а `build` берёт замок каталога синхронно; в прогоне круга
+  тест однажды упал с `DataDirLocked`. То же ждёт `check::on_start` задачи 5.
+
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

@@ -18,7 +18,7 @@
 
 use serde_json::Value;
 use zam_core::Id;
-use zam_store::works::WorkKind;
+use zam_store::works::{ItemWrite, WorkKind};
 use zam_store::{Db, SpaceKind, StoreError};
 
 use super::night::NightCtx;
@@ -199,14 +199,17 @@ pub fn schema(kind: WorkKind) -> &'static str {
     }
 }
 
-/// Проверка элемента итога `item` номер `n` и запись принятого (пробы, кандидаты) — у агента и
-/// модели одна (§6.3 пп. 4, 7). Общие проверки (номер, маска секрета, явный `skip`) уже прошли.
+/// Проверка элемента итога `item` номер `n` — у агента и модели одна (§6.3 пп. 4, 7). Общие
+/// проверки (номер, маска секрета, явный `skip`) уже прошли. **Без записи**: принятый элемент
+/// возвращает свои записи ([`ItemWrite`]: пробы, кандидаты), их пишет закрытие работы
+/// (`zam_store::works::finish_claimed`) в той же транзакции — снятая, истёкшая или уже закрытая
+/// работа ничего не записывает, повтор итога по `Idempotency-Key` — тоже.
 pub async fn accept_item(
     kind: WorkKind,
     ctx: &ItemCtx<'_>,
     n: usize,
     item: &Value,
-) -> Result<(), Reject> {
+) -> Result<Vec<ItemWrite>, Reject> {
     let _ = (ctx, n, item);
     match kind {
         // заготовки: проверки видов — задачи 4 и 7 плана
@@ -214,9 +217,12 @@ pub async fn accept_item(
             "вид ещё не принимает итог: обновите zam-server",
         )),
         #[cfg(feature = "test-hooks")]
-        WorkKind::Echo => echo::accept(ctx, n, item),
+        WorkKind::Echo => echo::accept(ctx, n, item).await,
     }
 }
+
+#[cfg(feature = "test-hooks")]
+pub use echo::TEST_CANCEL_DURING_ACCEPT;
 
 /// Тестовый вид `echo` (фича `test-hooks`).
 #[cfg(feature = "test-hooks")]
@@ -225,7 +231,7 @@ mod echo {
     use zam_core::Id;
     use zam_store::StoreError;
 
-    use super::{Candidate, ItemCtx, NightCtx, Reject};
+    use super::{Candidate, ItemCtx, ItemWrite, NightCtx, Reject};
     use crate::works::package::{ITEM_TEXT_MAX_CHARS, agent_text};
 
     /// Кандидаты — живые insight пространства владельца, кроме принятых в той же ревизии и
@@ -255,9 +261,18 @@ mod echo {
             .collect())
     }
 
+    /// Текст элемента, при котором тестовая точка снимает работу посреди проверки итога (до
+    /// закрытия): проверка «снятая работа ничего не записывает».
+    pub const TEST_CANCEL_DURING_ACCEPT: &str = "zam-test-cancel-during-accept";
+
     /// Элемент `{n, target?, text}`: `text` — непустая строка до [`ITEM_TEXT_MAX_CHARS`];
-    /// `target`, если есть, — ссылка элемента пакета.
-    pub(super) fn accept(ctx: &ItemCtx<'_>, n: usize, item: &Value) -> Result<(), Reject> {
+    /// `target`, если есть, — ссылка элемента пакета. Принятый — строка `proposals` типа `echo`
+    /// (`ItemWrite::Echo`).
+    pub(super) async fn accept(
+        ctx: &ItemCtx<'_>,
+        n: usize,
+        item: &Value,
+    ) -> Result<Vec<ItemWrite>, Reject> {
         if let Some(t) = item.get("target").and_then(Value::as_str)
             && ctx.work.item(n).is_some_and(|i| i.target != t)
         {
@@ -274,6 +289,31 @@ mod echo {
                 "text длиннее {ITEM_TEXT_MAX_CHARS} символов"
             )));
         }
-        Ok(())
+        if text == TEST_CANCEL_DURING_ACCEPT {
+            // работу снимают, пока проверяется итог: закрытие её уже не застанет `running`
+            let _ = zam_store::works::finish(
+                ctx.db,
+                ctx.work.id,
+                zam_store::works::WorkState::Cancelled,
+                Value::Null,
+                Some(zam_store::works::MODE_CHANGED),
+            )
+            .await;
+        }
+        let target = ctx
+            .work
+            .item(n)
+            .map(|i| i.target.clone())
+            .unwrap_or_default();
+        Ok(vec![ItemWrite::Echo {
+            target,
+            text: text.to_string(),
+            author_kind: ctx.author.kind(),
+            author: ctx.author.label(),
+            session: match ctx.author {
+                super::Author::Agent(s) => Some(s.clone()),
+                super::Author::Model(_) => None,
+            },
+        }])
     }
 }

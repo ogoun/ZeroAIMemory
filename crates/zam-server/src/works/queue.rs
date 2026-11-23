@@ -88,7 +88,8 @@ fn numbered(cands: Vec<Candidate>) -> Vec<WorkItem> {
 }
 
 /// Незакрытые работы вида, чей исполнитель не совпал с действующим режимом `mode` (причина
-/// `why`), — `cancelled` (`mode_changed`); на паузе исполнителя работы ждут.
+/// `why`), — `cancelled` (`mode_changed`); на паузе исполнителя (выбран `model`) ждут только
+/// работы модели, работы агента снимаются.
 async fn drop_stale(
     db: &Db,
     kind: WorkKind,
@@ -98,7 +99,7 @@ async fn drop_stale(
     let other = match mode {
         WorksMode::Agent => Some(WorkMode::Model),
         WorksMode::Model => Some(WorkMode::Agent),
-        WorksMode::Off if why == Some(OFF_PAUSED) => return Ok(0),
+        WorksMode::Off if why == Some(OFF_PAUSED) => Some(WorkMode::Agent),
         WorksMode::Off => None,
     };
     store::cancel_kind(db, kind, store::MODE_CHANGED, other).await
@@ -317,31 +318,80 @@ pub async fn run_model(ctx: &NightCtx, db: &Db, plan: &Plan) -> Result<(), Store
     }
 }
 
-/// Одна работа модели: пакет, обращение, та же проверка итога, что у агента.
-async fn execute(
-    ctx: &NightCtx,
-    db: &Db,
-    plan: &Plan,
-    works: &UserWorks,
-    mut w: Work,
-) -> Result<Step, StoreError> {
-    let st = ctx.st();
-    if !store::start_model(db, w.id).await? {
-        return Ok(Step::Next);
+/// Пакет работы к выдаче (агенту или модели) — одна подготовка для обоих: снимок кандидатов
+/// сверяется с базой (удалённые и исправленные записи — `zam_store::works::live_refs` — не
+/// идут), пакет строится в бюджете `budget`, хвост сверх него и устаревшие элементы снимаются с
+/// работы (`set_items`). Живых кандидатов нет — `None`: вызывающий снимает работу
+/// ([`store::STALE`]).
+pub struct Prepared {
+    /// Работа с кандидатами, вошедшими в пакет.
+    pub work: Work,
+    /// Markdown пакета агенту.
+    pub text: String,
+    /// Запрос модели.
+    pub payload: super::exec::Payload,
+}
+
+/// [`Prepared`] работы `w`.
+pub async fn prepare(db: &Db, mut w: Work, budget: usize) -> Result<Option<Prepared>, StoreError> {
+    let refs: Vec<(String, i64)> = w.items.iter().map(|i| (i.target.clone(), i.rev)).collect();
+    let live = store::live_refs(db, &refs).await?;
+    let before = w.items.len();
+    w.items
+        .retain(|i| live.contains(&(i.target.clone(), i.rev)));
+    if w.items.is_empty() {
+        return Ok(None);
     }
     let cands: Vec<(usize, Candidate)> = w
         .items
         .iter()
         .map(|i| (i.n, Candidate::from_item(i)))
         .collect();
-    let (_, payload, rest) =
-        package::render_numbered(&w, &cands, plan.kind, Lang::Ru, package::PACKAGE_BUDGET);
+    let (text, payload, rest) = package::render_numbered(&w, &cands, w.kind, Lang::Ru, budget);
     if !rest.is_empty() {
         // хвост сверх бюджета — в следующую работу
         let keep: HashSet<usize> = payload.items.iter().map(|i| i.n).collect();
         w.items.retain(|i| keep.contains(&i.n));
+    }
+    if w.items.len() != before {
         store::set_items(db, w.id, w.items.clone()).await?;
     }
+    Ok(Some(Prepared {
+        work: w,
+        text,
+        payload,
+    }))
+}
+
+/// Одна работа модели: пакет, обращение, та же проверка итога, что у агента; записи принятого —
+/// одной транзакцией с закрытием работы.
+async fn execute(
+    ctx: &NightCtx,
+    db: &Db,
+    plan: &Plan,
+    works: &UserWorks,
+    w: Work,
+) -> Result<Step, StoreError> {
+    let st = ctx.st();
+    if !store::start_model(db, w.id).await? {
+        return Ok(Step::Next);
+    }
+    let id = w.id;
+    let Some(Prepared {
+        work: w, payload, ..
+    }) = prepare(db, w, package::PACKAGE_BUDGET).await?
+    else {
+        // все кандидаты удалены или исправлены — сборщик предложит новые ревизии
+        store::finish(
+            db,
+            id,
+            WorkState::Cancelled,
+            Value::Null,
+            Some(store::STALE),
+        )
+        .await?;
+        return Ok(Step::Next);
+    };
     let model_name = works
         .model
         .as_ref()
@@ -362,21 +412,36 @@ async fn execute(
             } else {
                 out.json
             };
-            let (state, result, class) = match accept(&ictx, &data, &out.dropped).await {
-                Ok(a) => (a.state, a.result, None),
+            let a = match accept(&ictx, &data, &out.dropped).await {
+                Ok(a) => a,
                 // ответ — JSON, но не по схеме итога
-                Err(e) => (
-                    WorkState::Failed,
-                    json!({"error": e}),
-                    Some(CallClass::BadJson.as_str()),
-                ),
+                Err(e) => {
+                    let class = CallClass::BadJson.as_str();
+                    let closed = store::finish(
+                        db,
+                        w.id,
+                        WorkState::Failed,
+                        json!({"error": e}),
+                        Some(class),
+                    )
+                    .await?;
+                    if !closed {
+                        tracing::warn!(work = %w.id, "внутренние работы: работа модели уже закрыта другим путём");
+                    }
+                    return Ok(Step::Next);
+                }
             };
-            if class.is_some() {
-                store::finish(db, w.id, state, result, class).await?;
-            } else {
-                store::finish_claimed(db, w.id, None, state, result, None).await?;
+            let state = a.state;
+            match store::finish_claimed(db, w.id, None, state, a.result, None, a.writes).await? {
+                store::Closed::Closed => {
+                    tracing::debug!(work = %w.id, state = state.as_str(), "внутренние работы: работа модели закрыта");
+                }
+                // работу сняли или вернули, пока шло обращение: итог и записи не приняты
+                store::Closed::Replay(_) | store::Closed::NotClaimed(_) => {
+                    tracing::warn!(work = %w.id, "внутренние работы: итог модели не принят — работа уже не выполняется");
+                    return Ok(Step::Next);
+                }
             }
-            tracing::debug!(work = %w.id, state = state.as_str(), "внутренние работы: работа модели закрыта");
             Ok(if state == WorkState::Cancelled {
                 Step::DropSpace
             } else {
@@ -476,17 +541,20 @@ pub async fn manual_model(ctx: NightCtx, plan: Plan) {
 }
 
 /// Итог работы после проверки: состояние (`done` или `cancelled`), JSON `result` (с ответом
-/// исполнителю `result.response`) и сам ответ.
+/// исполнителю `result.response`), сам ответ и записи принятых элементов — их пишет закрытие
+/// работы (`store::finish_claimed`) в той же транзакции.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Accepted {
     pub state: WorkState,
     pub result: Value,
     pub response: Value,
+    pub writes: Vec<store::ItemWrite>,
 }
 
 /// Общая проверка итога агента и модели (§6.3 пп. 4, 7) для работы `ctx.work`: `data` —
 /// `{items: [{n, …}], skip?}`; `dropped` — номера, выброшенные вторым сканом. `Err` — итог не по
-/// схеме (не объект, `items` не массив, `skip` не строка).
+/// схеме (не объект, `items` не массив, `skip` не строка). Ничего не пишет: записи принятого —
+/// в [`Accepted::writes`].
 pub async fn accept(
     ctx: &ItemCtx<'_>,
     data: &Value,
@@ -515,6 +583,7 @@ pub async fn accept(
         })
     };
     let (mut accepted, mut rejected, mut skip) = (Vec::new(), Vec::new(), Vec::new());
+    let mut writes: Vec<store::ItemWrite> = Vec::new();
     let mut seen: HashSet<usize> = HashSet::new();
     for item in items {
         let n = item
@@ -551,8 +620,9 @@ pub async fn accept(
             continue;
         }
         match kinds::accept_item(w.kind, ctx, n, item).await {
-            Ok(()) => {
-                accepted.push(json!({"n": n, "target": it.target, "rev": it.rev, "item": item}))
+            Ok(rows) => {
+                writes.extend(rows);
+                accepted.push(json!({"n": n, "target": it.target, "rev": it.rev, "item": item}));
             }
             Err(Reject { reason }) => rejected.push(reject(Some(n), Some(it), &reason)),
         }
@@ -600,12 +670,13 @@ pub async fn accept(
         state,
         result,
         response,
+        writes,
     })
 }
 
 /// Действующий режим вида сменился (`PATCH` настроек, §6.1 п. 2): открытые работы видов `kinds`,
 /// чей исполнитель не совпал с новым режимом, снимаются (`cancelled`, `mode_changed`; на паузе
-/// исполнителя работы модели ждут).
+/// исполнителя ждут только работы модели).
 pub async fn on_mode_change(
     ctx: &NightCtx,
     user: Id,
@@ -627,50 +698,62 @@ pub async fn on_mode_change(
 }
 
 /// Один раз после сборки состояния, при любом `[works] enabled`, в фоне задачи раннера (§6.1 п. 5;
-/// сборку не задерживает): работы модели `running`, оборванные остановкой, — снова `queued`.
+/// сборку не задерживает): работы модели `running`, оборванные остановкой, — снова `queued`. База
+/// пользователя не открылась — WARN, остальные пользователи — дальше.
 pub async fn on_start(ctx: &NightCtx) -> Result<(), StoreError> {
     let st = ctx.st();
     for u in st.system.list_users().await? {
         if ctx.stopping() {
             break;
         }
-        let db = st.users.get(u.id).await?;
-        let n = store::requeue_model_running(&db).await?;
-        if n > 0 {
-            tracing::info!(user = %u.id, works = n, "внутренние работы: работы модели возвращены в очередь");
+        let requeued = async {
+            let db = st.users.get(u.id).await?;
+            store::requeue_model_running(&db).await
+        };
+        match requeued.await {
+            Ok(0) => {}
+            Ok(n) => {
+                tracing::info!(user = %u.id, works = n, "внутренние работы: работы модели возвращены в очередь");
+            }
+            Err(e) => {
+                tracing::warn!(user = %u.id, error = %e, "внутренние работы: работы модели пользователя не возвращены в очередь");
+            }
         }
     }
     Ok(())
 }
 
 /// Строка дайджеста (§6.3 п. 5): работы агента `queued` в пространствах `spaces` у видов с
-/// действующим режимом `agent`; нет — `None`.
+/// действующим режимом `agent` и старейшая из них (цель отметки показа
+/// [`store::WORKS_LINE_PART`]); нет — `None`.
 pub async fn digest_line(
     st: &crate::app::AppState,
     user: Id,
     db: &Db,
     spaces: &[Id],
     lang: Lang,
-) -> Result<Option<String>, StoreError> {
+) -> Result<Option<(String, Id)>, StoreError> {
     let works = settings::load(&st.system, user).await?;
-    let counts: Vec<(WorkKind, u32)> = store::queued_agent_counts(db, spaces)
+    let counts: Vec<(WorkKind, u32, Id)> = store::queued_agent_counts(db, spaces)
         .await?
         .into_iter()
-        .filter(|(k, _)| settings::effective_mode(*k, &works, &st.cfg.works).0 == WorksMode::Agent)
+        .filter(|(k, _, _)| {
+            settings::effective_mode(*k, &works, &st.cfg.works).0 == WorksMode::Agent
+        })
         .collect();
     if counts.is_empty() {
         return Ok(None);
     }
     let list = counts
         .iter()
-        .map(|(k, n)| format!("{} {n}", kinds::label(*k, lang)))
+        .map(|(k, n, _)| format!("{} {n}", kinds::label(*k, lang)))
         .collect::<Vec<_>>()
         .join(", ");
     let line = match lang {
         Lang::Ru => WORKS_DIGEST_LINE_RU,
         Lang::En => WORKS_DIGEST_LINE_EN,
     };
-    Ok(Some(line.replace("{list}", &list)))
+    Ok(Some((line.replace("{list}", &list), counts[0].2)))
 }
 
 /// Тестовые точки очереди (фича `test-hooks`): журнал вызовов [`on_mode_change`].

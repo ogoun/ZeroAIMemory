@@ -290,6 +290,7 @@ impl ToolName {
                     "force": {"type": "boolean"},
                     "message": {"type": "string"},
                     "idempotency_key": {"type": "string"},
+                    "session_id": session_id(),
                     "format": fmt,
                 }),
                 // у итога работы заголовка нет (решение координатора 71): `title` прочих видов
@@ -629,8 +630,15 @@ pub async fn call(tool: ToolName, rest: &Rest, mut args: JsonObject) -> Output {
     }
 }
 
-/// Инструменты с аргументом `session_id` — явной сессией вызова (M6 §16 п. 19, CR-8).
-pub const SESSION_ARG_TOOLS: [ToolName; 3] = [ToolName::Recall, ToolName::Search, ToolName::Read];
+/// Инструменты с аргументом `session_id` — явной сессией вызова (M6 §16 п. 19, CR-8); у
+/// `memory_log` — с M7.3: итог внутренней работы принимает только захватившая сессия, а клиент
+/// без заголовка захватывает работу `memory_recall {event: "work", session_id}`.
+pub const SESSION_ARG_TOOLS: [ToolName; 4] = [
+    ToolName::Recall,
+    ToolName::Search,
+    ToolName::Read,
+    ToolName::Log,
+];
 
 /// Аргумент `session_id` инструмента из [`SESSION_ARG_TOOLS`] без пробелов по краям (пусто или
 /// нет — `None`; у прочих инструментов не читается). Не строка — текст ошибки.
@@ -1481,7 +1489,7 @@ async fn work_result(rest: &Rest, args: &JsonObject, f: Fmt) -> Res {
         .filter(|s| !s.is_empty())
         .ok_or_else(|| Fail::Invalid("data.work: j:<id> работы из пакета".into()))?;
     let id = work.strip_prefix("j:").unwrap_or(work);
-    let body: Map<String, Value> = ["items", "skip"]
+    let mut body: Map<String, Value> = ["items", "skip"]
         .into_iter()
         .filter_map(|k| {
             data.get(k)
@@ -1489,6 +1497,13 @@ async fn work_result(rest: &Rest, args: &JsonObject, f: Fmt) -> Res {
                 .map(|v| (k.to_string(), v.clone()))
         })
         .collect();
+    // явная сессия аргументом (как у `memory_recall`): она же стала `X-Zam-Session` вызова
+    if let Some(s) = opt_str(args, "session_id")?
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        body.insert("session_id".into(), json!(s));
+    }
     let extra = idempotency_header(args)?;
     let r = call_rest(
         rest,

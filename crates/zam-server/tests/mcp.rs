@@ -5830,3 +5830,88 @@ async fn mcp_log_kind_work() {
     let o = tool(&a, &a.token, &[], "memory_log", json!({"kind": "insight"})).await;
     assert!(o.is_error && o.text.contains("нужен title"), "{}", o.text);
 }
+
+/// Ревью r1, Important 1: клиент без заголовка `X-Zam-Session` (нативный, ZeroAgent) задаёт
+/// сессию аргументом `session_id` — и у пакета `memory_recall event=work`, и у итога `memory_log
+/// kind=work`: итог принят той же сессией; без аргумента — ошибка с подсказкой.
+#[tokio::test]
+async fn mcp_log_kind_work_session_arg() {
+    let a = api("mcp-work-session-arg", |_| {}).await;
+    queued_work(&a).await;
+    let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
+    let log = list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "memory_log")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        log["inputSchema"]["properties"]["session_id"]["type"], "string",
+        "{log}"
+    );
+    let pack = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_recall",
+        json!({"event": "work", "session_id": "arg-session", "format": "json"}),
+    )
+    .await;
+    let work = pack.json()["work"].as_str().unwrap().to_string();
+    let data = json!({"work": work, "items": [{"n": 1, "text": "Для работы"}]});
+    // без сессии — итог не принят
+    let o = tool(
+        &a,
+        &a.token,
+        &[],
+        "memory_log",
+        json!({"kind": "work", "data": data}),
+    )
+    .await;
+    assert!(
+        o.is_error && o.text.contains("только в сессии"),
+        "{}",
+        o.text
+    );
+    let o = ok(
+        &a,
+        &a.token,
+        &[],
+        "memory_log",
+        json!({"kind": "work", "session_id": "arg-session", "data": data}),
+    )
+    .await;
+    assert!(
+        o.text.contains(&format!("Итог {work} принят (done)")),
+        "{}",
+        o.text
+    );
+}
+
+/// Ревью r1, Minor 5: строка внутренних работ дайджеста — раз за сессию и у агента только с MCP
+/// (учёт вызова — событие `mcp`, а не `session_start`): отметка показа строки.
+#[tokio::test]
+async fn mcp_digest_works_line_once() {
+    let a = api("mcp-work-digest-once", |_| {}).await;
+    queued_work(&a).await;
+    let line = "Внутренние работы ждут: echo 1";
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_recall",
+        json!({"event": "session_start"}),
+    )
+    .await;
+    assert!(o.text.contains(line), "{}", o.text);
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_recall",
+        json!({"event": "session_start"}),
+    )
+    .await;
+    assert!(!o.text.contains("Внутренние работы"), "{}", o.text);
+}

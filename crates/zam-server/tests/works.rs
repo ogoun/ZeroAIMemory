@@ -183,6 +183,21 @@ async fn echo_works(a: &Api) -> Vec<store::Work> {
         .unwrap()
 }
 
+/// Строк `proposals` тестового вида `echo` (записи принятых элементов).
+async fn echo_rows(a: &Api) -> i64 {
+    db(a)
+        .await
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM proposals WHERE type = ?1",
+                [store::ECHO_PROPOSAL_TYPE],
+                |r| r.get::<_, i64>(0),
+            )?)
+        })
+        .await
+        .unwrap()
+}
+
 /// Пакет работы по токену `tok` в сессии `session` (`None` — без сессии); `extra` — поля тела.
 async fn package(a: &Api, tok: &str, session: Option<&str>, extra: Value) -> Resp {
     let mut body = json!({"event": "work"});
@@ -548,8 +563,9 @@ async fn work_result_mask_literal_rejected() {
     assert_eq!(r.json()["accepted"], json!([]));
 }
 
-/// §6.3 п. 4, решение 70: повтор итога с тем же `Idempotency-Key` — прежний ответ; другой ключ
-/// после итога — 409.
+/// §6.3 п. 4, решение 70: повтор итога с тем же `Idempotency-Key` и тем же телом — прежний ответ
+/// без повторной записи (у `echo` принятый элемент — строка `proposals`); тот же ключ с другим
+/// телом — 422; другой ключ после итога — 409.
 #[tokio::test]
 async fn work_result_idempotent() {
     let _g = SERIAL.lock().await;
@@ -562,13 +578,271 @@ async fn work_result_idempotent() {
     let body = json!({"items": [{"n": 1, "text": "Повтор"}]});
     let first = put_result(&a, S1, &work, body.clone(), Some("k-1")).await;
     ok(&first, StatusCode::OK);
+    assert_eq!(echo_rows(&a).await, 1);
     let again = put_result(&a, S1, &work, body.clone(), Some("k-1")).await;
     ok(&again, StatusCode::OK);
     assert_eq!(again.json(), first.json());
+    assert_eq!(echo_rows(&a).await, 1, "повтор не пишет второй раз");
+    let changed = json!({"items": [{"n": 1, "text": "Другой итог"}]});
+    let r = put_result(&a, S1, &work, changed, Some("k-1")).await;
+    problem(&r, StatusCode::UNPROCESSABLE_ENTITY, "idempotency-mismatch");
     let other = put_result(&a, S1, &work, body, Some("k-2")).await;
     problem(&other, StatusCode::CONFLICT, "work-not-claimed");
+    assert_eq!(echo_rows(&a).await, 1);
     let w = echo_works(&a).await.remove(0);
     assert_eq!(w.result_key.as_deref(), Some("k-1"));
+}
+
+/// Ревью r1, Important 2: два одновременных итога с одним ключом — оба 200 с одним ответом,
+/// проверка и запись — один раз (записей принятого — столько же, сколько элементов).
+#[tokio::test]
+async fn work_result_parallel_same_key_once() {
+    let _g = SERIAL.lock().await;
+    let a = server("parallel-key", |_| {}).await;
+    set_mode(&a, "agent").await;
+    insight(&a, "knowledge", "Раз", "текст").await;
+    insight(&a, "knowledge", "Два", "текст").await;
+    night(&a).await;
+    let r = package(&a, &a.token, Some(S1), json!({})).await;
+    let work = r.json()["work"].as_str().unwrap().to_string();
+    let body = json!({"items": [{"n": 1, "text": "Раз"}, {"n": 2, "text": "Два"}]});
+    let (x, y) = tokio::join!(
+        put_result(&a, S1, &work, body.clone(), Some("k-par")),
+        put_result(&a, S1, &work, body.clone(), Some("k-par")),
+    );
+    ok(&x, StatusCode::OK);
+    ok(&y, StatusCode::OK);
+    assert_eq!(x.json(), y.json());
+    assert_eq!(x.json()["accepted"], json!([1, 2]));
+    assert_eq!(echo_rows(&a).await, 2);
+}
+
+/// Ревью r1, Important 2: итог снятой работы ничего не записывает — и когда её сняли посреди
+/// проверки итога (тестовая точка `echo`), и когда сняли до итога: записи принятого и закрытие —
+/// одна транзакция.
+#[tokio::test]
+async fn work_result_cancelled_writes_nothing() {
+    let _g = SERIAL.lock().await;
+    let a = server("cancelled-writes", |_| {}).await;
+    set_mode(&a, "agent").await;
+    insight(&a, "knowledge", "Снятая", "текст").await;
+    night(&a).await;
+    let r = package(&a, &a.token, Some(S1), json!({})).await;
+    let work = r.json()["work"].as_str().unwrap().to_string();
+    let text = zam_server::works::kinds::TEST_CANCEL_DURING_ACCEPT;
+    let r = put_result(
+        &a,
+        S1,
+        &work,
+        json!({"items": [{"n": 1, "text": text}]}),
+        None,
+    )
+    .await;
+    problem(&r, StatusCode::CONFLICT, "work-not-claimed");
+    assert_eq!(echo_rows(&a).await, 0);
+    let w = echo_works(&a).await.remove(0);
+    assert_eq!(w.state, WorkState::Cancelled);
+    assert!(w.result.is_none(), "{w:?}");
+    // снятая до итога
+    night_of(&a, zam_store::time::utc_today().tomorrow().unwrap()).await;
+    let r = package(&a, &a.token, Some(S2), json!({})).await;
+    let work = r.json()["work"].as_str().unwrap().to_string();
+    ok(
+        &patch(&a, json!({"works": {"kinds": {"echo": "off"}}})).await,
+        StatusCode::OK,
+    );
+    let r = put_result(
+        &a,
+        S2,
+        &work,
+        json!({"items": [{"n": 1, "text": "x"}]}),
+        None,
+    )
+    .await;
+    problem(&r, StatusCode::CONFLICT, "work-not-claimed");
+    assert_eq!(echo_rows(&a).await, 0);
+}
+
+/// Ревью r1, Minor 3: итог без `items` и `skip` и итог с неизвестным полем — 400, работа
+/// по-прежнему у сессии.
+#[tokio::test]
+async fn work_result_requires_items_or_skip() {
+    let _g = SERIAL.lock().await;
+    let a = server("items-or-skip", |_| {}).await;
+    set_mode(&a, "agent").await;
+    insight(&a, "knowledge", "Пустой итог", "текст").await;
+    night(&a).await;
+    let r = package(&a, &a.token, Some(S1), json!({})).await;
+    let work = r.json()["work"].as_str().unwrap().to_string();
+    ok(
+        &put_result(&a, S1, &work, json!({}), None).await,
+        StatusCode::BAD_REQUEST,
+    );
+    let r = put_result(
+        &a,
+        S1,
+        &work,
+        json!({"item": [{"n": 1, "text": "x"}]}),
+        None,
+    )
+    .await;
+    ok(&r, StatusCode::BAD_REQUEST);
+    assert_eq!(echo_works(&a).await[0].state, WorkState::Running);
+}
+
+/// §6.3 п. 4, ревью r1, Minor 1 и 12: возврат в очередь — своей сессией (200), чужой — 409,
+/// человеком — любую работу агента своего пользователя; работа модели — 409 `code: model_work`.
+#[tokio::test]
+async fn work_release_rest() {
+    let _g = SERIAL.lock().await;
+    let a = server("release", |_| {}).await;
+    set_mode(&a, "agent").await;
+    insight(&a, "knowledge", "Вернуть", "текст").await;
+    night(&a).await;
+    let r = package(&a, &a.token, Some(S1), json!({})).await;
+    let work = r.json()["work"].as_str().unwrap().to_string();
+    let uri = format!("{WORKS}/{work}/release");
+    let as_session = |s: &'static str| {
+        let (a, uri) = (&a, uri.clone());
+        async move {
+            a.tok_h(&a.token, Method::POST, &uri, None, &[("x-zam-session", s)])
+                .await
+        }
+    };
+    problem(
+        &as_session(S2).await,
+        StatusCode::CONFLICT,
+        "work-not-claimed",
+    );
+    let r = as_session(S1).await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["state"], "queued");
+    assert_eq!(echo_works(&a).await[0].state, WorkState::Queued);
+    // не захвачена — 409
+    problem(
+        &as_session(S1).await,
+        StatusCode::CONFLICT,
+        "work-not-claimed",
+    );
+    // человек — без сессии
+    ok(
+        &package(&a, &a.token, Some(S2), json!({})).await,
+        StatusCode::OK,
+    );
+    ok(&a.adm(Method::POST, &uri, None, None).await, StatusCode::OK);
+    // работа модели — её выполняет сервер
+    ok(&register(&a, &a.token, G1).await, StatusCode::CREATED);
+    let space = zam_store::list_spaces(&db(&a).await)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == zam_store::SpaceKind::Solution)
+        .unwrap()
+        .id;
+    let w = store::enqueue(
+        &db(&a).await,
+        NewWork {
+            kind: WorkKind::Echo,
+            space,
+            mode: WorkMode::Model,
+            origin: Origin::Manual,
+            night: None,
+            items: Vec::new(),
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(store::start_model(&db(&a).await, w.id).await.unwrap());
+    let r = a
+        .adm(
+            Method::POST,
+            &format!("{WORKS}/j:{}/release", w.id),
+            None,
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::CONFLICT);
+    assert_eq!(r.json()["code"], "model_work");
+}
+
+/// Ревью r1, Minor 7: снимок кандидатов сверяется перед выдачей — удалённая и исправленная
+/// записи в пакет не идут; не осталось ни одной — работа `cancelled` (`stale`), пакета нет.
+#[tokio::test]
+async fn work_package_skips_stale_items() {
+    let _g = SERIAL.lock().await;
+    let a = server("stale", |_| {}).await;
+    set_mode(&a, "agent").await;
+    let keep = insight(&a, "knowledge", "Живая", "текст").await;
+    let edited = insight(&a, "knowledge", "Исправленная", "текст").await;
+    let gone = insight(&a, "knowledge", "Удалённая", "текст").await;
+    night(&a).await;
+    let id = |r: &str| r.split_once(':').unwrap().1.to_string();
+    let entry = |r: &str| format!("/api/v1/entries/{}", id(r));
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &entry(&edited),
+            Some(json!({"body": "новый текст"})),
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    let r = a
+        .tok_rev(&a.token, Method::DELETE, &entry(&gone), None)
+        .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let r = package(&a, &a.token, Some(S1), json!({})).await;
+    let text = r.json()["text"].as_str().unwrap().to_string();
+    assert!(text.contains(&keep), "{text}");
+    assert!(!text.contains(&edited) && !text.contains(&gone), "{text}");
+    let w = echo_works(&a).await.remove(0);
+    assert_eq!(w.items.len(), 1);
+    // последняя живая удалена — работа снята, пакета нет
+    store::release(&db(&a).await, w.id).await.unwrap();
+    let r = a
+        .tok_rev(&a.token, Method::DELETE, &entry(&keep), None)
+        .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    let r = package(&a, &a.token, Some(S1), json!({})).await;
+    assert_eq!(r.json()["text"], WORKS_PACKAGE_EMPTY, "{}", r.text());
+    let w = echo_works(&a).await.remove(0);
+    assert_eq!(w.state, WorkState::Cancelled);
+    assert_eq!(w.error_class.as_deref(), Some(store::STALE));
+}
+
+/// Ревью r1, Minor 8: на паузе исполнителя (выбран `model`) ночь снимает работы агента вида.
+#[tokio::test]
+async fn paused_night_drops_agent_works() {
+    let _g = SERIAL.lock().await;
+    let m = MockModel::start();
+    let a = server("paused-drop", |_| {}).await;
+    connect(&a, &m).await;
+    set_mode(&a, "agent").await;
+    insight(&a, "knowledge", "На паузе", "текст").await;
+    night(&a).await;
+    assert_eq!(echo_works(&a).await[0].mode, WorkMode::Agent);
+    // режим `model` и пауза — мимо `PATCH` (как если бы снятие при смене режима не прошло)
+    let since = zam_store::time::fmt_ts(zam_store::time::now());
+    a.st.system
+        .set_user_settings(
+            a.st.admin_id,
+            vec![
+                ("works.mode".into(), json!("model")),
+                (
+                    "works.pause".into(),
+                    json!({"class": "auth", "since": since}),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    a.st.user_flags.invalidate(a.st.admin_id);
+    night_of(&a, zam_store::time::utc_today().tomorrow().unwrap()).await;
+    let w = echo_works(&a).await.remove(0);
+    assert_eq!(w.state, WorkState::Cancelled);
+    assert_eq!(w.error_class.as_deref(), Some(store::MODE_CHANGED));
+    assert_eq!(m.count(), 0);
 }
 
 /// §6.3 п. 4: `skip` без элементов — работа `cancelled`; ночь той же даты её не ставит снова,
@@ -625,6 +899,26 @@ async fn work_member_no_works() {
     ok(&r, StatusCode::OK);
     assert_eq!(r.json()["text"], WORKS_PACKAGE_EMPTY, "{}", r.text());
     assert_eq!(echo_works(&a).await[0].state, WorkState::Queued);
+    // `?user=` (ревью r1, Minor 6): администратору — очередь пользователя, токену чужой — 403
+    let r = a
+        .adm(Method::GET, &format!("{WORKS}?user={member}"), None, None)
+        .await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["works"], json!([]), "{}", r.text());
+    let own = format!("{WORKS}?user={}", a.admin_id());
+    let r = a.adm(Method::GET, &own, None, None).await;
+    assert_eq!(
+        r.json()["works"].as_array().unwrap().len(),
+        1,
+        "{}",
+        r.text()
+    );
+    ok(
+        &a.tok(&tok, Method::GET, &own, None).await,
+        StatusCode::FORBIDDEN,
+    );
+    let mine = format!("/api/v1/works/usage?user={member}");
+    ok(&a.tok(&tok, Method::GET, &mine, None).await, StatusCode::OK);
     let h = [("x-zam-session", S1), ("x-zam-solution", G1)];
     let r = a
         .tok_h(
@@ -1084,6 +1378,8 @@ async fn works_disabled_manual_409() {
     let m = MockModel::start();
     let a = server("disabled", |c| c.works.enabled = false).await;
     insight(&a, "knowledge", "Выключено", "текст").await;
+    // подключение и режим `model` есть — «ноль запросов» не вакуумна (ревью r1, Minor 12)
+    connect(&a, &m).await;
     let r = a
         .adm(Method::POST, RUN, Some(json!({"kind": "echo"})), None)
         .await;

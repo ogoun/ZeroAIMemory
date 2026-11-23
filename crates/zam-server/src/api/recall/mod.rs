@@ -276,10 +276,11 @@ use zam_search::recall::{
 use zam_search::truncate_marked;
 use zam_store::{
     Certainty, Entry, EntryFilter, EntryKind, EntryStatus, FtsQuery, NodeKind, RECALL_PART,
-    SeenItem, SeenKey, SpaceKind, StoreError, TargetFilter, TokenCount, TriggerKind, UsageEvent,
-    UsageKind, UsageSource, active_triggers, bump_epoch, count_tokens, insight_term_docs,
-    list_children, list_entries, mark_seen_with_tokens, node_content, record_usages,
-    search_fts_channels, seen_revs, seen_revs_any_epoch, session_holdout, touch_session,
+    SeenItem, SeenKey, SeenTarget, SpaceKind, StoreError, TargetFilter, TokenCount, TriggerKind,
+    UsageEvent, UsageKind, UsageSource, active_triggers, bump_epoch, count_tokens,
+    insight_term_docs, list_children, list_entries, mark_seen_with_tokens, node_content,
+    record_usages, search_fts_channels, seen_revs, seen_revs_any_epoch, session_holdout,
+    touch_session,
 };
 
 use super::json_body;
@@ -3437,9 +3438,11 @@ const OMIT_PLAN: Omit = ("строк плана из идей", "memory_search k
 const OMIT_WORKS: Omit = ("строк внутренних работ", "memory_recall event=work");
 
 /// Строка внутренних работ дайджеста (M7.3 §6.3 п. 5): работы агента `queued` пространств личной
-/// базы запроса у видов с действующим режимом `agent` ([`crate::works::queue::digest_line`]) —
-/// только на **первом** `session_start` сессии (у сессии ещё нет учёта `session_start` и
-/// `recovery`; без сессии — строка есть); к запросу и после сжатия — нет. Сбой чтения — WARN и
+/// базы запроса у видов с действующим режимом `agent` ([`crate::works::queue::digest_line`]) и
+/// старейшая из них (цель отметки показа) — только на **первом** `session_start` сессии: у
+/// сессии ещё нет учёта `session_start` и `recovery` (хуки) и нет отметки показа строки
+/// [`zam_store::works::WORKS_LINE_PART`] (её ставит учёт ответа — и у вызова из MCP, где учёт —
+/// событие `mcp`); без сессии — строка есть. К запросу и после сжатия — нет. Сбой чтения — WARN и
 /// строки нет.
 async fn works_line(
     st: &AppState,
@@ -3447,7 +3450,7 @@ async fn works_line(
     health: &Health<'_>,
     session: Option<&RequestSession>,
     deadline: &mut Deadline,
-) -> Option<String> {
+) -> Option<(String, Id)> {
     if !st.cfg.works.enabled {
         return None;
     }
@@ -3460,6 +3463,16 @@ async fn works_line(
             Ok(_) => return None,
             Err(e) => {
                 tracing::warn!(error = %e, "recall: учёт сессии не прочитан, без строки работ");
+                return None;
+            }
+        }
+        let shown =
+            zam_store::seen_entry_ids(&s.db, &s.touch.id, user, zam_store::works::WORKS_LINE_PART);
+        match deadline.step(shown).await? {
+            Ok(ids) if ids.is_empty() => {}
+            Ok(_) => return None,
+            Err(e) => {
+                tracing::warn!(error = %e, "recall: показ строки работ не прочитан, без строки");
                 return None;
             }
         }
@@ -3827,6 +3840,8 @@ pub async fn recall(
     // строка очереди разбора к `prompt` (M7.1 §4.5 п. 1): свой учёт показа — раз за эпоху
     // ([`ideas::review_queue_line`]), а не общий фильтр идей «любая эпоха»
     let mut queue_line: Option<QueueLine> = None;
+    // строка внутренних работ дайджеста и её первая работа — отметка показа (M7.3 §6.3 п. 5)
+    let mut works_mark: Option<(String, Id)> = None;
     let (mut lines, sections, repeatable) = match req.event {
         _ if !enabled => (Lines::default(), Vec::new(), true),
         // дайджест повторяется: после `/compact` и `resume` Claude Code шлёт тот же
@@ -3852,8 +3867,8 @@ pub async fn recall(
             }
             // строка внутренних работ (M7.3 §6.3 п. 5) — только первый `session_start` сессии
             if req.event == Event::SessionStart && !recovery {
-                l.works_line =
-                    works_line(&st, user, &health, session.as_ref(), &mut deadline).await;
+                works_mark = works_line(&st, user, &health, session.as_ref(), &mut deadline).await;
+                l.works_line = works_mark.as_ref().map(|(line, _)| line.clone());
             }
             (l, s, true)
         }
@@ -4053,7 +4068,23 @@ pub async fn recall(
         }
         // показ очереди разбора дайджеста — длина очереди его раздела (M7.1 §4.5 п. 1)
         let digest_queue = (req.event == Event::SessionStart).then_some(review_total);
-        let seen = seen_items(&targets, &shown_now, queue_line.as_ref(), digest_queue);
+        let mut seen = seen_items(&targets, &shown_now, queue_line.as_ref(), digest_queue);
+        // строка внутренних работ вошла в ответ — отметка показа: раз за сессию (M7.3 §6.3 п. 5)
+        if let Some((line, first)) = &works_mark
+            && text.contains(line.as_str())
+        {
+            seen.push(SeenItem {
+                key: SeenKey {
+                    owner_id: user,
+                    target: SeenTarget::Ref(TargetRef {
+                        kind: TargetKind::Entry,
+                        id: *first,
+                    }),
+                    part: zam_store::works::WORKS_LINE_PART.to_string(),
+                },
+                rev: 1,
+            });
+        }
         record(
             session.as_ref(),
             &targets,

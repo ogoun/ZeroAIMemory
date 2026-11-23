@@ -5,9 +5,12 @@
 //!   paused?}` — очередь и последние работы с итогами, новые первыми (`limit` 1..=200, по
 //!   умолчанию 50). Человеку — исходник, пауза исполнителя; токену — работы его пользователя с
 //!   маской `‹secret›`, без паузы (снять её агент не может, §6.2 п. 5). Сначала — сроки работ
-//!   агента (истёкшие аренды, 7 суток без итога).
-//! - `GET /works/usage` → `{day: {tokens, limit}, month: {tokens, limit}, ceiling, last_night,
-//!   modes, paused?}` — расход токенов модели суток и месяца UTC по журналу отправок, пределы.
+//!   агента (истёкшие аренды, 7 суток без итога). `?user=` — чужой пользователь только
+//!   администратору (как `GET /works/calls`); без него — пользователь запроса (`X-Zam-User`
+//!   администратора).
+//! - `GET /works/usage?user=` → `{day: {tokens, limit}, month: {tokens, limit}, ceiling,
+//!   last_night, night, modes, paused?}` — расход токенов модели суток и месяца UTC по журналу
+//!   отправок, пределы.
 //! - `POST /works/run {kind, space?}` — ручной запуск вида (§6.3 п. 2), **только человек**
 //!   (токену — 403); `[works] enabled = false` — 409 `/problems/works-disabled` (решение 76);
 //!   действующий режим вида `off` — 409 `code: works_off` с причиной; предел ручных запусков
@@ -16,14 +19,22 @@
 //!   агента); `model` — 202 `{mode, run: "manual:<id>", queued: []}`: выполнение сразу, вне окна,
 //!   учтённым запуском ночного исполнителя (`NightRunner::spawn_tracked`; сервер
 //!   останавливается — 503).
-//! - `POST /works/{id}/result {items, skip?}` (`id` — `j:<id>` или id) — итог работы (§6.3 п. 4):
-//!   только от сессии, захватившей её (`running`; `X-Zam-Session`), иначе 409
+//! - `POST /works/{id}/result {items?, skip?, session_id?}` (`id` — `j:<id>` или id; нужно
+//!   `items` или `skip`, прочие поля — 400) — итог работы (§6.3 п. 4): только от сессии,
+//!   захватившей её (`running`; `X-Zam-Session` или `session_id`), иначе 409
 //!   `/problems/work-not-claimed`; токен `ro` — 403; без сессии — 400
 //!   `/problems/session-required`. Ответ `{work, state, accepted: [n], rejected: [{n, target,
-//!   reason}], skipped: [n], skip: [{n, target, why}], skip_reason}`; повтор с тем же
-//!   `Idempotency-Key` — прежний ответ, второй итог — 409.
-//! - `POST /works/{id}/release` — вернуть работу `running` в очередь без итога: токен — только
-//!   захватившая сессия, человек — любую работу своего пользователя.
+//!   reason}], skipped: [n], skip: [{n, target, why}], skip_reason}`. Итоги одной работы
+//!   принимаются по одному (замок работы; ждущий — не дольше [`FINISH_WAIT`], затем 409
+//!   `code: result_in_progress`); под замком работа перечитывается. Повтор с тем же
+//!   `Idempotency-Key` и тем же телом — прежний ответ без повторной проверки и записи (и пока
+//!   первый ещё идёт — после него); тот же ключ с другим телом — 422
+//!   `/problems/idempotency-mismatch`; второй итог с другим ключом — 409. Записи принятого и
+//!   закрытие работы — одна транзакция (`zam_store::works::finish_claimed`): снятая, истёкшая
+//!   или закрытая работа ничего не записывает.
+//! - `POST /works/{id}/release` — вернуть работу агента `running` в очередь без итога: токен —
+//!   только захватившая сессия, человек — любую работу агента своего пользователя; работу модели
+//!   выполняет сервер — 409 `code: model_work`.
 //! - Пакет `POST /recall {event: "work", kind?, budget_tokens?}` ([`package`]): захват
 //!   старейшей работы агента `queued` пространств сессии (решение сессии, если пользователь — его
 //!   владелец; Knowledge; Rules) и Markdown пакета; работ нет — «Внутренних работ нет.».
@@ -32,8 +43,9 @@
 //! Работы — служебные данные (ссылка `j:`): `memory_read` их не читает, в экспорт и архив
 //! пространства не входят; маршруты — вне `memory_routes` (итог не меняет знания).
 
-use std::collections::HashSet;
-use std::sync::{LazyLock, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
 
 use axum::Extension;
 use axum::Json;
@@ -52,13 +64,12 @@ use super::scope::require_rw;
 use super::search::targets::{ScopeReq, resolve_targets};
 use super::sessions::{McpOrigin, RequestSession, explicit_only, request_session};
 use super::{json_body, query};
-use crate::agent_setup::Lang;
 use crate::app::AppState;
 use crate::auth::Principal;
 use crate::config::WorksMode;
 use crate::error::ApiError;
 use crate::works::kinds::{Author, ItemCtx};
-use crate::works::package::{self, PACKAGE_BUDGET, PACKAGE_BUDGET_MAX, WORKS_PACKAGE_EMPTY};
+use crate::works::package::{PACKAGE_BUDGET, PACKAGE_BUDGET_MAX, WORKS_PACKAGE_EMPTY};
 use crate::works::queue::{self, LEASE, Plan};
 use crate::works::{NightCtx, settings};
 
@@ -168,6 +179,36 @@ pub struct ListQuery {
     state: Option<String>,
     kind: Option<String>,
     limit: Option<usize>,
+    user: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct UserQuery {
+    user: Option<String>,
+}
+
+/// Пользователь очереди: `?user=` — чужой только администратору (токену и сессии пользователя —
+/// свой id или 403, как `GET /works/calls`); без него — пользователь запроса ([`crate::auth::
+/// target_user`]: владелец токена, пользователь сессии, у администратора — `X-Zam-User` или он
+/// сам). Несуществующий — 404.
+async fn works_user(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    user: Option<&str>,
+) -> Result<Id, ApiError> {
+    let Some(raw) = user.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(crate::auth::target_user(st, p, headers).await?.id);
+    };
+    let id = super::parse_id(raw)?;
+    match p {
+        Principal::Admin { .. } => {
+            st.system.get_user(id).await?.ok_or(ApiError::NotFound)?;
+            Ok(id)
+        }
+        _ if p.bound_user() == Some(id) => Ok(id),
+        _ => Err(ApiError::Forbidden),
+    }
 }
 
 /// `GET /works?state=&kind=&limit=` → `{works, modes, paused?}`.
@@ -196,7 +237,7 @@ pub async fn list(
             "limit: от 1 до {LIST_LIMIT_MAX}"
         )));
     }
-    let user = crate::auth::target_user(&st, &p, &headers).await?.id;
+    let user = works_user(&st, &p, &headers, q.user.as_deref()).await?;
     let db = st.users.get(user).await?;
     store::expire(&db, zam_store::time::now()).await?;
     let works = store::list(&db, state, kind, limit).await?;
@@ -219,13 +260,15 @@ fn month_start(t: jiff::Timestamp) -> jiff::Timestamp {
         .map_or(t, |z| z.timestamp())
 }
 
-/// `GET /works/usage` → `{day, month, ceiling, last_night, modes, paused?}`.
+/// `GET /works/usage?user=` → `{day, month, ceiling, last_night, night, modes, paused?}`.
 pub async fn usage(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
+    q: Result<Query<UserQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
-    let user = crate::auth::target_user(&st, &p, &headers).await?.id;
+    let q = query(q)?;
+    let user = works_user(&st, &p, &headers, q.user.as_deref()).await?;
     let db = st.users.get(user).await?;
     let now = zam_store::time::now();
     let day = zam_store::work_calls::tokens_since(&db, zam_store::time::day_start_utc(now)).await?;
@@ -362,39 +405,81 @@ pub async fn run(
     ))
 }
 
-/// Работы, итог которых сейчас принимается (одна проверка итога на работу за раз).
-static FINISHING: LazyLock<Mutex<HashSet<Id>>> = LazyLock::new(Default::default);
+/// Сколько итог ждёт замка работы, пока принимается другой итог той же работы.
+pub const FINISH_WAIT: Duration = Duration::from_secs(30);
 
-/// Работа в [`FINISHING`] до уничтожения.
-struct Finishing(Id);
+/// Замки работ: итоги и возврат одной работы — по одному (повтор с тем же ключом ждёт первый и
+/// получает его ответ). Запись — пока замок кто-то держит или ждёт.
+static FINISHING: LazyLock<Mutex<HashMap<Id, Arc<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(Default::default);
+
+/// Захваченный замок работы; при уничтожении запись снимается, если её больше никто не ждёт.
+struct Finishing {
+    id: Id,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
 
 impl Finishing {
-    fn take(id: Id) -> Option<Finishing> {
-        FINISHING
+    /// Замок работы `id`: ждёт не дольше [`FINISH_WAIT`], иначе 409 `code: result_in_progress`.
+    async fn take(id: Id) -> Result<Finishing, ApiError> {
+        let lock = FINISHING
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(id)
-            .then_some(Finishing(id))
+            .entry(id)
+            .or_default()
+            .clone();
+        // и при неудаче — та же уборка записи, что после итога
+        let mut f = Finishing { id, guard: None };
+        match tokio::time::timeout(FINISH_WAIT, lock.lock_owned()).await {
+            Ok(g) => {
+                f.guard = Some(g);
+                Ok(f)
+            }
+            Err(_) => Err(conflict(
+                "result_in_progress",
+                format!("итог работы j:{id} ещё принимается — повторите позже"),
+            )),
+        }
     }
 }
 
 impl Drop for Finishing {
     fn drop(&mut self) {
-        FINISHING
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.0);
+        drop(self.guard.take());
+        let mut map = FINISHING.lock().unwrap_or_else(|e| e.into_inner());
+        if map.get(&self.id).is_some_and(|l| Arc::strong_count(l) == 1) {
+            map.remove(&self.id);
+        }
     }
 }
 
+/// Тело итога: `items` и/или `skip` (хотя бы одно), `session_id` — явная сессия (как
+/// `X-Zam-Session`); прочие поля — 400.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResultBody {
     #[serde(default)]
     items: Value,
     #[serde(default)]
     skip: Value,
-    /// Явная сессия (как `X-Zam-Session`; MCP передаёт заголовок).
     session_id: Option<String>,
+}
+
+/// Отпечаток тела итога (`items`, `skip`) для сверки повтора по `Idempotency-Key`.
+fn request_hash(items: &Value, skip: &Value) -> String {
+    let body = json!({"items": items, "skip": skip}).to_string();
+    blake3::hash(body.as_bytes()).to_hex().to_string()
+}
+
+/// Повтор итога с тем же ключом: прежний ответ, если тело то же; другое тело — 422.
+fn replay(result: &Value, hash: &str) -> Result<Json<Value>, ApiError> {
+    if result.get("request_hash").and_then(Value::as_str) != Some(hash) {
+        return Err(ApiError::IdempotencyMismatch(
+            "Idempotency-Key уже использован другим итогом этой работы: новому итогу — новый ключ"
+                .into(),
+        ));
+    }
+    Ok(Json(result.get("response").cloned().unwrap_or(Value::Null)))
 }
 
 /// Сессия итога и возврата: явная (`X-Zam-Session` или `session_id`), иначе 400.
@@ -418,7 +503,13 @@ fn not_claimed(w: &Work) -> ApiError {
     ))
 }
 
-/// `POST /works/{id}/result {items, skip?}` → итог работы.
+/// Работа с повтором по ключу: тот же ключ — прежний ответ (или 422), иначе `None`.
+fn replayed(w: &Work, key: Option<&str>, hash: &str) -> Option<Result<Json<Value>, ApiError>> {
+    let (k, rk) = (key?, w.result_key.as_deref()?);
+    (k == rk).then(|| replay(w.result.as_ref().unwrap_or(&Value::Null), hash))
+}
+
+/// `POST /works/{id}/result {items?, skip?, session_id?}` → итог работы.
 pub async fn result(
     State(st): State<AppState>,
     p: Principal,
@@ -430,6 +521,11 @@ pub async fn result(
     require_rw(&p).map_err(|_| ApiError::Denied(RW_REQUIRED_DETAIL.into()))?;
     let id = work_id(&raw)?;
     let b: ResultBody = json_body(body)?;
+    if b.items.is_null() && b.skip.is_null() {
+        return Err(ApiError::BadRequest(
+            "итог — items: [{n, …}] или skip: \"<причина>\" (отказ от всей работы)".into(),
+        ));
+    }
     let s = work_session(
         &st,
         &p,
@@ -439,29 +535,24 @@ pub async fn result(
     )
     .await?;
     let key = super::entries::idempotency_key(&headers)?;
+    let hash = request_hash(&b.items, &b.skip);
     let user = crate::auth::target_user(&st, &p, &headers).await?.id;
     let db = st.users.get(user).await?;
-    let w = store::get(&db, id).await?.ok_or(ApiError::NotFound)?;
-    // повтор с тем же ключом — прежний ответ (решение координатора 70)
-    if let (Some(k), Some(rk)) = (key.as_deref(), w.result_key.as_deref())
-        && k == rk
-        && let Some(resp) = w.result.as_ref().and_then(|r| r.get("response"))
-    {
-        return Ok(Json(resp.clone()));
-    }
+    store::get(&db, id).await?.ok_or(ApiError::NotFound)?;
+    // итоги одной работы — по одному: под замком работа перечитывается
+    let _lock = Finishing::take(id).await?;
     store::expire(&db, zam_store::time::now()).await?;
     let w = store::get(&db, id).await?.ok_or(ApiError::NotFound)?;
+    // повтор с тем же ключом — прежний ответ без проверки и записи (решение координатора 70)
+    if let Some(r) = replayed(&w, key.as_deref(), &hash) {
+        return r;
+    }
     if w.state != WorkState::Running
         || w.mode != WorkMode::Agent
         || w.claimed_session.as_deref() != Some(s.touch.id.as_str())
     {
         return Err(not_claimed(&w));
     }
-    let Some(_guard) = Finishing::take(id) else {
-        return Err(ApiError::WorkNotClaimed(format!(
-            "итог работы j:{id} уже принимается — дождитесь ответа"
-        )));
-    };
     let author = Author::Agent(s.touch.id.clone());
     let ictx = ItemCtx {
         st: &st,
@@ -471,9 +562,12 @@ pub async fn result(
         author: &author,
     };
     let data = json!({"items": b.items, "skip": b.skip});
-    let a = queue::accept(&ictx, &data, &[])
+    let mut a = queue::accept(&ictx, &data, &[])
         .await
         .map_err(ApiError::BadRequest)?;
+    a.result["request_hash"] = json!(hash);
+    // записи принятого и закрытие — одна транзакция: работа, снятая между проверкой и закрытием,
+    // ничего не записывает
     let closed = store::finish_claimed(
         &db,
         id,
@@ -481,16 +575,19 @@ pub async fn result(
         a.state,
         a.result,
         key.as_deref(),
+        a.writes,
     )
     .await?;
-    if !closed {
-        let w = store::get(&db, id).await?.ok_or(ApiError::NotFound)?;
-        return Err(not_claimed(&w));
+    match closed {
+        store::Closed::Closed => Ok(Json(a.response)),
+        store::Closed::Replay(prev) => replay(&prev, &hash),
+        store::Closed::NotClaimed(Some(w)) => Err(not_claimed(&w)),
+        store::Closed::NotClaimed(None) => Err(ApiError::NotFound),
     }
-    Ok(Json(a.response))
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseBody {
     session_id: Option<String>,
 }
@@ -512,7 +609,19 @@ pub async fn release(
     };
     let user = crate::auth::target_user(&st, &p, &headers).await?.id;
     let db = st.users.get(user).await?;
+    store::get(&db, id).await?.ok_or(ApiError::NotFound)?;
+    // не посреди приёма итога той же работы
+    let _lock = Finishing::take(id).await?;
     let w = store::get(&db, id).await?.ok_or(ApiError::NotFound)?;
+    if w.mode == WorkMode::Model {
+        return Err(conflict(
+            "model_work",
+            format!(
+                "работу j:{id} выполняет подключённая модель на сервере — вернуть её в очередь \
+                 нельзя"
+            ),
+        ));
+    }
     if w.state != WorkState::Running {
         return Err(not_claimed(&w));
     }
@@ -600,16 +709,17 @@ pub(crate) async fn package(
     let db = st.users.get(user).await?;
     store::expire(&db, zam_store::time::now()).await?;
     let works = settings::load(&st.system, user).await?;
-    let mut claimed: Option<Work> = None;
+    let mut claimed: Option<(Id, String)> = None;
     // общий выключатель — «ничего»: работы не выдаются и не снимаются (включат — продолжатся)
     while st.cfg.works.enabled
         && let Some(w) = store::claim_next(&db, &spaces, kind, &s.touch.id, LEASE).await?
     {
+        let id = w.id;
         // действующий режим — перед выдачей (снятие при смене режима могло не пройти)
         if settings::effective_mode(w.kind, &works, &st.cfg.works).0 != WorksMode::Agent {
             store::finish(
                 &db,
-                w.id,
+                id,
                 WorkState::Cancelled,
                 Value::Null,
                 Some(store::MODE_CHANGED),
@@ -617,32 +727,27 @@ pub(crate) async fn package(
             .await?;
             continue;
         }
-        claimed = Some(w);
-        break;
-    }
-    let text = match &claimed {
-        None => WORKS_PACKAGE_EMPTY.to_string(),
-        Some(w) => {
-            let cands: Vec<(usize, crate::works::kinds::Candidate)> = w
-                .items
-                .iter()
-                .map(|i| (i.n, crate::works::kinds::Candidate::from_item(i)))
-                .collect();
-            let (md, payload, rest) = package::render_numbered(w, &cands, w.kind, Lang::Ru, budget);
-            if !rest.is_empty() {
-                // хвост сверх бюджета — в следующую работу
-                let keep: HashSet<usize> = payload.items.iter().map(|i| i.n).collect();
-                let items = w
-                    .items
-                    .iter()
-                    .filter(|i| keep.contains(&i.n))
-                    .cloned()
-                    .collect();
-                store::set_items(&db, w.id, items).await?;
+        match queue::prepare(&db, w, budget).await? {
+            Some(pk) => {
+                claimed = Some((id, pk.text));
+                break;
             }
-            md
+            // все кандидаты удалены или исправлены — работа снята, следующая
+            None => {
+                store::finish(
+                    &db,
+                    id,
+                    WorkState::Cancelled,
+                    Value::Null,
+                    Some(store::STALE),
+                )
+                .await?;
+            }
         }
-    };
+    }
+    let text = claimed
+        .as_ref()
+        .map_or_else(|| WORKS_PACKAGE_EMPTY.to_string(), |(_, md)| md.clone());
     let tokens = zam_store::count_tokens(&text);
     let collect_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
     // учёт — событие `work` (вызов из MCP учитывает сам инструмент, событием `mcp`)
@@ -665,6 +770,6 @@ pub(crate) async fn package(
             "total_ms": u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
         },
         "warnings": warnings,
-        "work": claimed.as_ref().map(|w| format!("j:{}", w.id)),
+        "work": claimed.as_ref().map(|(id, _)| format!("j:{id}")),
     }))
 }

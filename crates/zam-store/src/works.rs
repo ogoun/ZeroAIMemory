@@ -106,6 +106,16 @@ pub const SKIPPED: &str = "skip";
 /// Причина отказа элемента, выброшенного вторым сканом (§6.2 п. 6): запись не берётся в пакеты до
 /// новой ревизии ([`excluded_refs`]).
 pub const SECRET_IN_PAYLOAD: &str = "secret_in_payload";
+/// `error_class` работы, все кандидаты которой к выдаче удалены или исправлены ([`live_refs`]).
+pub const STALE: &str = "stale";
+/// Сколько суток назад итоги работ ещё отсеивают кандидатов ([`excluded_refs`],
+/// [`accepted_refs`]): чтение итогов не растёт без предела; отсев старше — снова отбирается и, если
+/// повод остался, отсеивается заново.
+pub const REFS_HORIZON_DAYS: i64 = 365;
+/// `part` отметки показа строки внутренних работ дайджеста в `session_seen` (§6.3 п. 5): цель —
+/// первая работа строки (`target_kind = entry`, id работы), ревизия — число работ; строка — раз
+/// за сессию (любая эпоха). Подсказки записей ([`crate::RECALL_PART`]) такая отметка не задевает.
+pub const WORKS_LINE_PART: &str = "works_line";
 
 /// Кто выполняет работу (`works.mode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -456,9 +466,80 @@ pub async fn finish(
     .await
 }
 
-/// Итог исполнителя (§6.3 п. 4) — закрывает работу `running`, захваченную сессией `session`
-/// (у модели — `None`: работа модели), с итогом `result` и ключом `Idempotency-Key`. `false` —
-/// работа не `running` у этой сессии (снята, истекла, закрыта).
+/// Запись принятого элемента итога (пробы, кандидаты) — в **той же транзакции**, что закрытие
+/// работы ([`finish_claimed`]): работу сняли, она истекла или закрыта другим итогом — не
+/// записано ничего. Варианты добавляют виды работ (задачи 4 и 7 плана M7.3); без фичи
+/// `test-hooks` перечисление пока пусто.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ItemWrite {
+    /// Тестовый вид `echo` (фича `test-hooks`): строка `proposals` типа [`ECHO_PROPOSAL_TYPE`]
+    /// (читатели предложений пропускают неизвестный тип с WARN).
+    #[cfg(feature = "test-hooks")]
+    Echo {
+        target: String,
+        text: String,
+        /// `agent` | `model`.
+        author_kind: &'static str,
+        author: String,
+        session: Option<String>,
+    },
+}
+
+/// `proposals.type` записей тестового вида `echo`.
+#[cfg(feature = "test-hooks")]
+pub const ECHO_PROPOSAL_TYPE: &str = "echo";
+
+/// Одна запись принятого элемента работы `w` (транзакция закрытия).
+fn apply_write(t: &rusqlite::Transaction<'_>, w: &Work, x: &ItemWrite) -> Result<(), StoreError> {
+    let _ = (t, w);
+    match *x {
+        #[cfg(feature = "test-hooks")]
+        ItemWrite::Echo {
+            ref target,
+            ref text,
+            author_kind,
+            ref author,
+            ref session,
+        } => {
+            t.execute(
+                "INSERT INTO proposals (id, space_id, type, targets, payload, author_kind, author,
+                                        work_id, session_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    Id::new(),
+                    w.space_id,
+                    ECHO_PROPOSAL_TYPE,
+                    serde_json::json!([target]).to_string(),
+                    serde_json::json!({"text": text}).to_string(),
+                    author_kind,
+                    author,
+                    w.id,
+                    session,
+                    fmt_ts(now()),
+                ],
+            )?;
+            Ok(())
+        }
+    }
+}
+
+/// Исход [`finish_claimed`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Closed {
+    /// Работа закрыта итогом, записи принятого — в той же транзакции.
+    Closed,
+    /// Работа уже закрыта итогом с этим `Idempotency-Key`: прежний `result` (сверку тела и
+    /// прежний ответ берёт вызывающий), ничего не записано.
+    Replay(Value),
+    /// Работа не `running` у этого исполнителя (снята, истекла, закрыта, захвачена другой
+    /// сессией) или её нет: ничего не записано.
+    NotClaimed(Option<Box<Work>>),
+}
+
+/// Итог исполнителя (§6.3 п. 4) — одной транзакцией: работа `running`, захваченная сессией
+/// `session` (у модели — `None`: работа модели), закрывается с итогом `result` и ключом
+/// `Idempotency-Key`, записи принятого `writes` ([`ItemWrite`]) — в той же транзакции. Повтор с
+/// тем же ключом после закрытия — [`Closed::Replay`] без записей.
 pub async fn finish_claimed(
     db: &Db,
     id: Id,
@@ -466,28 +547,80 @@ pub async fn finish_claimed(
     state: WorkState,
     result: Value,
     key: Option<&str>,
-) -> Result<bool, StoreError> {
+    writes: Vec<ItemWrite>,
+) -> Result<Closed, StoreError> {
     let session = session.map(str::to_string);
     let key = key.map(str::to_string);
     let result = result.to_string();
     db.write(move |t| {
+        let Some(w) = get_tx(t, id)? else {
+            return Ok(Closed::NotClaimed(None));
+        };
+        if let (Some(k), Some(rk)) = (key.as_deref(), w.result_key.as_deref())
+            && k == rk
+        {
+            return Ok(Closed::Replay(w.result.clone().unwrap_or(Value::Null)));
+        }
+        let claimed = w.state == WorkState::Running
+            && match session.as_deref() {
+                None => w.mode == WorkMode::Model,
+                Some(s) => w.mode == WorkMode::Agent && w.claimed_session.as_deref() == Some(s),
+            };
+        if !claimed {
+            return Ok(Closed::NotClaimed(Some(Box::new(w))));
+        }
+        for x in &writes {
+            apply_write(t, &w, x)?;
+        }
         let error_class = (state == WorkState::Cancelled).then_some(SKIPPED);
-        let n = t.execute(
-            "UPDATE works SET state = ?3, result = ?4, result_key = ?5, error_class = ?6,
-                    finished_at = ?7
-             WHERE id = ?1 AND state = 'running'
-               AND ((?2 IS NULL AND mode = 'model') OR claimed_session = ?2)",
-            params![
-                id,
-                session,
-                state.as_str(),
-                result,
-                key,
-                error_class,
-                fmt_ts(now())
-            ],
+        t.execute(
+            "UPDATE works SET state = ?2, result = ?3, result_key = ?4, error_class = ?5,
+                    finished_at = ?6
+             WHERE id = ?1",
+            params![id, state.as_str(), result, key, error_class, fmt_ts(now())],
         )?;
-        Ok(n > 0)
+        Ok(Closed::Closed)
+    })
+    .await
+}
+
+/// Пары «ссылка, ревизия» из `refs`, которые ещё живы: запись журнала (`i:`, `c:`, `r:`, `t:`,
+/// `k:`, `q:`, `w:`, `e:`) или заметка (`n:`) не удалена и её текущая ревизия — та же. Ссылки
+/// других видов считаются живыми. Снимок кандидатов работы перед выдачей сверяется по ним:
+/// удалённая или исправленная запись в пакет не идёт (сборщик предложит новую ревизию).
+pub async fn live_refs(
+    db: &Db,
+    refs: &[(String, i64)],
+) -> Result<HashSet<(String, i64)>, StoreError> {
+    let refs = refs.to_vec();
+    db.read(move |c| {
+        let mut out = HashSet::new();
+        for (target, rev) in refs {
+            let (letter, raw) = target.split_once(':').unwrap_or(("", ""));
+            let table = if letter == "n" {
+                Some("nodes")
+            } else if crate::is_entry_ref_letter(letter) {
+                Some("entries")
+            } else {
+                None
+            };
+            let live = match (table, raw.parse::<Id>()) {
+                (Some(table), Ok(id)) => {
+                    let mut st = c.prepare_cached(&format!(
+                        "SELECT current_rev FROM {table} WHERE id = ?1 AND deleted_at IS NULL"
+                    ))?;
+                    st.query_row([id], |r| r.get::<_, i64>(0))
+                        .optional()?
+                        .is_some_and(|cur| cur == rev)
+                }
+                (Some(_), Err(_)) => false,
+                (None, _) => true,
+            };
+            if live {
+                out.insert((target, rev));
+            }
+        }
+        Ok(out)
     })
     .await
 }
@@ -716,32 +849,39 @@ pub async fn last_night(db: &Db) -> Result<Option<civil::Date>, StoreError> {
 }
 
 /// Незакрытые работы агента `queued` по видам в пространствах `spaces` (строка дайджеста, §6.3
-/// п. 5).
+/// п. 5): вид, число работ и старейшая работа вида; виды — в порядке [`WorkKind::ALL`].
 pub async fn queued_agent_counts(
     db: &Db,
     spaces: &[Id],
-) -> Result<Vec<(WorkKind, u32)>, StoreError> {
+) -> Result<Vec<(WorkKind, u32, Id)>, StoreError> {
     let spaces = spaces.to_vec();
     db.read(move |c| {
         let mut st = c.prepare_cached(
-            "SELECT kind, space_id FROM works WHERE state = 'queued' AND mode = 'agent'",
+            "SELECT kind, space_id, id FROM works WHERE state = 'queued' AND mode = 'agent'
+             ORDER BY created_at, id",
         )?;
-        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Id>(1)?)))?;
-        let mut counts: Vec<(WorkKind, u32)> = Vec::new();
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Id>(1)?,
+                r.get::<_, Id>(2)?,
+            ))
+        })?;
+        let mut counts: Vec<(WorkKind, u32, Id)> = Vec::new();
         for r in rows {
-            let (k, space) = r?;
+            let (k, space, id) = r?;
             let Some(k) = WorkKind::parse(&k) else {
                 continue;
             };
             if !spaces.contains(&space) {
                 continue;
             }
-            match counts.iter_mut().find(|(x, _)| *x == k) {
-                Some((_, n)) => *n += 1,
-                None => counts.push((k, 1)),
+            match counts.iter_mut().find(|(x, _, _)| *x == k) {
+                Some((_, n, _)) => *n += 1,
+                None => counts.push((k, 1, id)),
             }
         }
-        counts.sort_by_key(|(k, _)| WorkKind::ALL.iter().position(|x| x == k));
+        counts.sort_by_key(|(k, _, _)| WorkKind::ALL.iter().position(|x| x == k));
         Ok(counts)
     })
     .await
@@ -749,7 +889,8 @@ pub async fn queued_agent_counts(
 
 /// Пары «ссылка, ревизия», которые сборщик вида не берёт до новой ревизии записи (решение 72):
 /// отклонённые с причиной [`SECRET_IN_PAYLOAD`] (`result.rejected`) и, у вида `probes`, явные
-/// `skip` исполнителя (`result.skip`).
+/// `skip` исполнителя (`result.skip`) — из итогов работ `done` за последние
+/// [`REFS_HORIZON_DAYS`] суток.
 pub async fn excluded_refs(db: &Db, kind: WorkKind) -> Result<HashSet<(String, i64)>, StoreError> {
     let results = item_results(db, kind).await?;
     let mut out = HashSet::new();
@@ -772,8 +913,8 @@ pub async fn excluded_refs(db: &Db, kind: WorkKind) -> Result<HashSet<(String, i
     Ok(out)
 }
 
-/// Пары «ссылка, ревизия» принятых элементов закрытых итогом (`done`) работ вида: элемент с
-/// итогом в той же ревизии сборщик не предлагает снова.
+/// Пары «ссылка, ревизия» принятых элементов закрытых итогом (`done`) работ вида за последние
+/// [`REFS_HORIZON_DAYS`] суток: элемент с итогом в той же ревизии сборщик не предлагает снова.
 pub async fn accepted_refs(db: &Db, kind: WorkKind) -> Result<HashSet<(String, i64)>, StoreError> {
     let results = item_results(db, kind).await?;
     let mut out = HashSet::new();
@@ -787,12 +928,20 @@ pub async fn accepted_refs(db: &Db, kind: WorkKind) -> Result<HashSet<(String, i
     Ok(out)
 }
 
-/// Итоги (`result`) работ вида.
+/// Итоги (`result`) работ вида, закрытых итогом (`done`) за последние [`REFS_HORIZON_DAYS`]
+/// суток.
 async fn item_results(db: &Db, kind: WorkKind) -> Result<Vec<Value>, StoreError> {
+    let at = now();
+    let since = fmt_ts(
+        at.checked_sub(SignedDuration::from_hours(24 * REFS_HORIZON_DAYS))
+            .unwrap_or(at),
+    );
     db.read(move |c| {
-        let mut st =
-            c.prepare_cached("SELECT result FROM works WHERE kind = ?1 AND result IS NOT NULL")?;
-        let rows = st.query_map([kind.as_str()], |r| r.get::<_, String>(0))?;
+        let mut st = c.prepare_cached(
+            "SELECT result FROM works
+             WHERE kind = ?1 AND state = 'done' AND result IS NOT NULL AND finished_at >= ?2",
+        )?;
+        let rows = st.query_map(params![kind.as_str(), since], |r| r.get::<_, String>(0))?;
         let mut out = Vec::new();
         for s in rows {
             if let Ok(v) = serde_json::from_str::<Value>(&s?) {

@@ -230,7 +230,12 @@ pub fn check_mask_literal(text: &str) -> Result<(), Reject> {
     let mut rest = text;
     while let Some(i) = rest.find(OPEN) {
         let after = &rest[i + OPEN.len()..];
-        if after.starts_with('›') || (after.starts_with('-') && after.contains('›')) {
+        // `‹secret›` или метка `‹secret-[^›\s]*›`: до `›` — без пробелов
+        let label = after.strip_prefix('-').and_then(|l| {
+            let end = l.find(|c: char| c == '›' || c.is_whitespace())?;
+            l[end..].starts_with('›').then_some(())
+        });
+        if after.starts_with('›') || label.is_some() {
             return Err(Reject::new(MASK_LITERAL_REASON));
         }
         rest = after;
@@ -268,6 +273,9 @@ mod tests {
         assert!(check_mask_literal("ключ ‹secret-a1b2c3-1›").is_err());
         assert!(check_mask_literal("слово ‹secretary").is_ok());
         assert!(check_mask_literal("‹secret- без конца").is_ok());
+        // `›` дальше в тексте, после пробела, — не метка (ревью r1, Minor 11)
+        assert!(check_mask_literal("‹secret-набросок и потом › где-то").is_ok());
+        assert!(check_mask_literal("‹secret-›").is_err());
         assert!(check_mask_literal_json(&serde_json::json!({"a": ["x", "‹secret›"]})).is_err());
     }
 
