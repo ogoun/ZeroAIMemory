@@ -77,8 +77,12 @@
         editing = false;
         notice = '';
       }
-      // переход к записи (Ctrl+K, ссылка) — она показывается: корзина выключается
-      if (id) trash = false;
+      // переход к записи (Ctrl+K, ссылка) — она показывается: корзина выключается, прежний итог
+      // убирается (после удаления адрес — без записи, итог остаётся)
+      if (id) {
+        trash = false;
+        notice = '';
+      }
       load(u, s, true);
     });
   });
@@ -150,7 +154,8 @@
   }
 
   function pick(id: string) {
-    if (id !== selected && !leaveEdit()) return;
+    // уже выбранный — ничего (форма цела); другой — открытая форма закрывается, с вопросом
+    if (id === selected || !leaveEdit()) return;
     withId = '';
     notice = '';
     go({ name: 'journal', user, space, journal: 'releases', entry: id }, { replace: true });

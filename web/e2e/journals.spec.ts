@@ -868,12 +868,22 @@ test('changelog_edit_follows_entry', async ({ page }) => {
   await opened.getByRole('button', { name: 'Изменить «Запись Y»' }).click();
   const form = opened.getByRole('form', { name: 'Правка записи' });
   await form.getByLabel('Заголовок').fill('Y с правкой');
+  const place = () => page.evaluate(() => (history.state as { zamIdx?: number } | null)?.zamIdx);
+  const yIdx = await place();
   page.once('dialog', (d) => {
     expect([d.type(), d.message()]).toEqual(['confirm', LEAVE_EDIT]);
     void d.dismiss();
   });
   await go(at(x.id));
   await expect(page).toHaveURL(new RegExp(`/j/changelog/${y.id}$`));
+  await expect(form.getByLabel('Заголовок')).toHaveValue('Y с правкой');
+  // отменённый переход историю не меняет (круг 3, N6): прежняя запись, а не её копия; отменённое
+  // «назад» — тоже, а «назад» потом ведёт на X (запись до Y), а не на копию Y
+  await expect.poll(place).toBe(yIdx);
+  page.once('dialog', (d) => void d.dismiss());
+  await page.goBack();
+  await expect(page).toHaveURL(new RegExp(`/j/changelog/${y.id}$`));
+  await expect.poll(place).toBe(yIdx);
   await expect(form.getByLabel('Заголовок')).toHaveValue('Y с правкой');
   page.once('dialog', (d) => void d.accept());
   await go(at(x.id));

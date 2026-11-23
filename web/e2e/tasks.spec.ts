@@ -1014,10 +1014,105 @@ test.describe('настольный', () => {
     expect([got.title, got.data.next_step]).toEqual(['Задача под правкой', 'шаг агента']);
     expect(problems, problems.join('\n')).toEqual([]);
   });
+
+  test('task_edit_cancelled_leave_keeps_history', async ({ page }) => {
+    // ревью задачи 10, круг 3 (N5): отменённый переход историю не меняет — панель потом закрывается
+    // и возвращает на доску. (а) ссылка в карточке («Подзадачи») при набранном → «Отмена» вопроса →
+    // форма цела → «Отмена» формы → Esc — панели нет, адрес — доска; (б) «назад» браузера при
+    // набранном → «Отмена» → «Закрыть» → «Закрыть без сохранения» — доска, а не страница до неё
+    const problems = watch(page);
+    const guid = await newSolution('отменённый уход');
+    const umbrella = await addTask(guid, 'Общая под правкой');
+    const step = await addTask(guid, 'Шаг общей');
+    await partOf(step, umbrella);
+    const c = await pageCtx(page);
+    await open(page, tasksUrl(c.user, guid));
+    const place = () => page.evaluate(() => (history.state as { zamIdx?: number } | null)?.zamIdx);
+    const boardIdx = await place();
+    const tile = columnOf(page, 'открыт').getByRole('button', { name: 'Общая под правкой', exact: true });
+    const sheet = page.getByRole('dialog', { name: 'Задача', exact: true });
+    const card = sheet.getByRole('article', { name: 'Карточка задачи' });
+    const form = card.getByRole('form', { name: 'Правка задачи' });
+    const leave = (accept: boolean) =>
+      page.once('dialog', (d) => {
+        expect([d.type(), d.message()]).toEqual(['confirm', 'В форме есть несохранённый текст. Закрыть её без сохранения?']);
+        void (accept ? d.accept() : d.dismiss());
+      });
+
+    // (а) ссылка карточки
+    await tile.click();
+    await expect(page).toHaveURL(new RegExp(`/j/tasks/${umbrella}$`));
+    const taskIdx = await place();
+    await card.getByRole('button', { name: 'Изменить', exact: true }).click();
+    await form.getByLabel('Заголовок').fill('Черновик заголовка');
+    leave(false);
+    await card.getByTestId('task-subtasks').getByRole('link', { name: 'Шаг общей' }).click();
+    await expect(page).toHaveURL(new RegExp(`/j/tasks/${umbrella}$`));
+    await expect(form.getByLabel('Заголовок')).toHaveValue('Черновик заголовка');
+    await expect.poll(place).toBe(taskIdx);
+    await form.getByRole('button', { name: 'Отмена' }).click();
+    await page.keyboard.press('Escape');
+    await expect(sheet).toHaveCount(0);
+    await expect(page).toHaveURL(/\/j\/tasks$/);
+    await expect.poll(place).toBe(boardIdx);
+
+    // (б) «назад» браузера
+    await tile.click();
+    await card.getByRole('button', { name: 'Изменить', exact: true }).click();
+    await form.getByLabel('Заголовок').fill('Другой черновик');
+    leave(false);
+    await page.goBack();
+    await expect(page).toHaveURL(new RegExp(`/j/tasks/${umbrella}$`));
+    await expect(form.getByLabel('Заголовок')).toHaveValue('Другой черновик');
+    await expect.poll(place).toBe(taskIdx);
+    await sheet.getByRole('button', { name: 'Закрыть', exact: true }).click();
+    await sheet.getByRole('alertdialog', { name: 'Несохранённый текст' }).getByRole('button', { name: 'Закрыть без сохранения' }).click();
+    await expect(sheet).toHaveCount(0);
+    await expect(page).toHaveURL(/\/j\/tasks$/);
+    await expect.poll(place).toBe(boardIdx);
+    expect((await api<{ title: string }>('GET', `entries/${umbrella}`)).title).toBe('Общая под правкой');
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
 });
 
 test.describe('телефон, сенсорный ввод', () => {
   test.use({ viewport: VIEWPORTS.phone, ...touch });
+
+  test('task_edit_back_link_asks_phone', async ({ page }) => {
+    // ревью задачи 10, круг 3 (решение координатора): на узкой области «← Задачи» при набранном
+    // тексте — тот же вопрос, что у панели; «Продолжить правку» — текст цел, «Закрыть без
+    // сохранения» — доска; без набранного «←» уводит сразу
+    const problems = watch(page);
+    const guid = await newSolution('назад на телефоне');
+    const t = await addTask(guid, 'Задача на телефоне');
+    const c = await pageCtx(page);
+    await open(page, tasksUrl(c.user, guid, t));
+    const card = page.getByRole('article', { name: 'Карточка задачи' });
+    const back = page.getByRole('link', { name: '← Задачи' });
+    await card.getByRole('button', { name: 'Изменить', exact: true }).tap();
+    const form = card.getByRole('form', { name: 'Правка задачи' });
+    await form.getByLabel('Заголовок').fill('Черновик с телефона');
+    await back.tap();
+    const ask = page.getByRole('alertdialog', { name: 'Несохранённый текст' });
+    await expect(ask).toBeVisible();
+    await expect(page).toHaveURL(new RegExp(`/j/tasks/${t}$`));
+    await ask.getByRole('button', { name: 'Продолжить правку' }).tap();
+    await expect(ask).toHaveCount(0);
+    await expect(form.getByLabel('Заголовок')).toHaveValue('Черновик с телефона');
+    await back.tap();
+    await ask.getByRole('button', { name: 'Закрыть без сохранения' }).tap();
+    await expect(page).toHaveURL(/\/j\/tasks$/);
+    await expect(tablist(page)).toBeVisible();
+    await expect(card).toHaveCount(0);
+    // без набранного — сразу
+    await tabOf(page, 'Открыт').tap();
+    await page.getByRole('tabpanel').getByRole('button', { name: 'Задача на телефоне' }).tap();
+    await back.tap();
+    await expect(page).toHaveURL(/\/j\/tasks$/);
+    await expect(ask).toHaveCount(0);
+    expect((await api<{ title: string }>('GET', `entries/${t}`)).title).toBe('Задача на телефоне');
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
 
   test('tasks_tabs_phone', async ({ page }) => {
     test.setTimeout(120_000);

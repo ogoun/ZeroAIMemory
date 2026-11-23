@@ -187,6 +187,43 @@ let guard: Guard | null = null;
 /** Адрес, на котором стоит приложение (для отката запрещённого перехода). */
 let shown = location.hash;
 
+// ---- место в истории (M7.2, ревью задачи 10, круг 3) ----
+//
+// Отменённый переход не должен менять историю. `hashchange` не говорит, чем он вызван, поэтому
+// каждая запись истории приложения несёт свой номер (`history.state.zamIdx`): запись без номера —
+// новая (ссылка `<a href>`, `location.hash =`), с номером — переход по истории («назад», «вперёд»).
+// Откат: новая запись — «назад» на прежнюю (дубля прежнего адреса нет, отменённая остаётся
+// «впереди»); «назад»/«вперёд» — обратный шаг на ту же разницу номеров (прежняя запись цела).
+// Событие отката (`hashchange` возврата) роутер поглощает; подписчики `onCancel` узнают об отмене
+// (панель журнала снимает «идёт закрытие»).
+
+/** Номер текущей записи истории. */
+let idx = 0;
+/** Ждём `hashchange` возврата после отката (адрес, на который вернёмся). */
+let restoring: string | null = null;
+
+const numbered = (): number | null => {
+  const s = history.state as { zamIdx?: unknown } | null;
+  return s && typeof s.zamIdx === 'number' ? s.zamIdx : null;
+};
+
+/** Номер записи — в её `history.state` (адрес прежний). */
+const stamp = (n: number) => history.replaceState({ ...(history.state ?? {}), zamIdx: n }, '', location.href);
+
+{
+  const n = numbered();
+  if (n === null) stamp(idx);
+  else idx = n;
+}
+
+const cancelled = new Set<() => void>();
+
+/** Подписка на отмену перехода проверкой ухода; возвращает отписку. */
+export function onCancel(cb: () => void): () => void {
+  cancelled.add(cb);
+  return () => cancelled.delete(cb);
+}
+
 /** Ставит проверку ухода; возвращает снятие. */
 export function setGuard(g: Guard): () => void {
   guard = g;
@@ -205,8 +242,8 @@ export function go(r: Route, opts: { replace?: boolean; silent?: boolean } = {})
   const target = href(r);
   if (!opts.silent && !allowed(r)) return;
   if (opts.replace || opts.silent) {
-    // replaceState не порождает hashchange: событие — вручную
-    history.replaceState(null, '', target);
+    // replaceState не порождает hashchange: событие — вручную; номер записи сохраняется
+    history.replaceState({ zamIdx: idx }, '', target);
     shown = location.hash;
     if (!opts.silent) emit();
   } else if (location.hash === target) {
@@ -229,13 +266,40 @@ function emit() {
   for (const l of listeners) l(r);
 }
 
-function onHashChange() {
+/** `hashchange`: проверка ухода, откат или событие маршрута. Отменённый переход и возврат после
+ * отката до прочих слушателей окна (панель журнала, они подписаны позже) не доходят — для них
+ * адрес не менялся. */
+function onHashChange(e: HashChangeEvent) {
+  // возврат после отката: прежний адрес, событие маршрута не нужно
+  if (restoring !== null && location.hash === restoring) {
+    restoring = null;
+    e.stopImmediatePropagation();
+    return;
+  }
+  restoring = null;
   const skip = skipGuard;
   skipGuard = false;
+  const n = numbered();
   if (!skip && !allowed(current())) {
-    // остаться: вернуть прежний адрес без нового события
-    history.replaceState(null, '', shown || location.pathname + location.search);
+    // остаться, не меняя историю: новая запись — «назад» на прежнюю (дубля нет); шаг по истории —
+    // обратный шаг (прежняя запись цела)
+    const delta = n === null ? -1 : idx - n;
+    if (delta === 0) {
+      // номер не различает записи (история до номеров): прежний адрес на месте этой записи
+      history.replaceState(history.state, '', shown || location.pathname + location.search);
+    } else {
+      restoring = shown;
+      history.go(delta);
+    }
+    e.stopImmediatePropagation();
+    for (const cb of cancelled) cb();
     return;
+  }
+  if (n === null) {
+    idx += 1;
+    stamp(idx);
+  } else {
+    idx = n;
   }
   shown = location.hash;
   emit();

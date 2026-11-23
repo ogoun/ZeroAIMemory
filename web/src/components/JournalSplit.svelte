@@ -4,8 +4,9 @@
   // - `split` (область ≥ SPLIT_MIN): список слева, карточка справа (44 %, не уже 380 px),
   //   карточка `position: sticky` со своей прокруткой; без открытой карточки список — во всю ширину;
   // - `stack` (уже): открытая карточка или форма — вместо списка, над ней «← <журнал>» (ссылка
-  //   журнала без записи, `onclose` — тоже). Список скрыт, но не размонтирован: фильтры, вкладки и
-  //   загруженные страницы целы; позиция прокрутки запоминается и восстанавливается;
+  //   журнала без записи, `onclose` — тоже; несохранённое (`dirty()`) — сначала тот же вопрос
+  //   «Закрыть без сохранения?», что у панели). Список скрыт, но не размонтирован: фильтры, вкладки
+  //   и загруженные страницы целы; позиция прокрутки запоминается и восстанавливается;
   // - `overlay` (`mode='overlay'`, область ≥ SPLIT_MIN; доска задач, §5.2 п. 1): карточка — боковая
   //   панель 480 px поверх списка (окно `role="dialog"` у правого края под шапкой, своя прокрутка),
   //   список не сужается; фон, Esc и «Закрыть» закрывают (`onclose` и адрес журнала без записи —
@@ -21,9 +22,9 @@
   // строку списка, иначе на строку записи (`[data-entry="<entry>"]` в списке), иначе на сам список.
   // Смена раскладки при открытой карточке (поворот, изменение окна) фокус не трогает, а прокрутку —
   // только если фокус не в карточке. Атрибут `data-layout` — текущая раскладка (для e2e).
-  import { tick, untrack, type Snippet } from 'svelte';
+  import { onDestroy, tick, untrack, type Snippet } from 'svelte';
   import { SPLIT_MIN } from '../lib/layout';
-  import { go, parse } from '../lib/router';
+  import { go, onCancel, parse } from '../lib/router';
   import { observeWidth } from '../lib/viewport.svelte';
 
   interface Props {
@@ -149,6 +150,8 @@
     const p = sheet && measured;
     untrack(() => {
       if (o && (!wasOpen || isNewRecord(e))) fresh = true;
+      // вопрос «Закрыть без сохранения?» — о показанной карточке: закрыли её или открыли другую
+      if (!o || isNewRecord(e)) confirming = false;
       if (!o) fresh = false;
       wasOpen = o;
       lastEntry = e;
@@ -307,9 +310,43 @@
     onclose?.();
     const h = location.hash;
     if (h === back.href) return;
-    if (opened?.pops && opened.hash === h) history.back();
-    else go(parse(back.href), { replace: true });
+    if (opened?.pops && opened.hash === h) {
+      history.back();
+      // запасной путь: «назад» без смены адреса (соседняя запись с тем же адресом — история до
+      // номеров роутера) не даёт `hashchange` — тогда заменой адреса, «идёт закрытие» не залипает
+      window.addEventListener(
+        'popstate',
+        () => {
+          if (location.hash !== h) return;
+          closing = false;
+          go(parse(back.href), { replace: true });
+        },
+        { once: true },
+      );
+    } else go(parse(back.href), { replace: true });
   }
+
+  /** «← <журнал>» в `stack`: несохранённое — сначала тот же вопрос, что у панели; без него — обычный
+   * переход ссылки (`onclose` и адрес журнала). */
+  function backClick(e: MouseEvent) {
+    if (dirty?.()) {
+      e.preventDefault();
+      void requestClose();
+      return;
+    }
+    onclose?.();
+  }
+
+  /** «Закрыть без сохранения»: в `stack` — как ссылка «←» (новая запись истории), в панели — `close`. */
+  function discard() {
+    if (layout !== 'stack') return close();
+    confirming = false;
+    onclose?.();
+    go(parse(back.href));
+  }
+
+  // переход отменила проверка ухода (несохранённая правка): адрес прежний — закрытие не идёт
+  onDestroy(onCancel(() => (closing = false)));
 
   /** Закрыть по фону, Esc или «Закрыть»: несохранённое — сначала вопрос в панели; пока он на
    * экране, фон и «Закрыть» только возвращают к нему фокус (закрывает «Закрыть без сохранения»). */
@@ -441,24 +478,24 @@
         onkeydown={trap}
       >
         {#if layout === 'stack'}
-          <a class="jsplit-back" href={back.href} onclick={() => onclose?.()}>← {back.label}</a>
+          <a class="jsplit-back" href={back.href} onclick={backClick}>← {back.label}</a>
         {:else if sheet}
           <div class="jsplit-bar"><button type="button" onclick={requestClose}>Закрыть</button></div>
-          {#if confirming}
-            <div
-              class="jsplit-confirm warn"
-              role="alertdialog"
-              aria-label="Несохранённый текст"
-              aria-describedby={`${uid}-ask`}
-              bind:this={confirmEl}
-            >
-              <p id={`${uid}-ask`}>В карточке есть несохранённый текст. Закрыть без сохранения?</p>
-              <div class="row">
-                <button type="button" onclick={keepEditing}>Продолжить правку</button>
-                <button type="button" class="danger" onclick={close}>Закрыть без сохранения</button>
-              </div>
+        {/if}
+        {#if confirming && (layout === 'stack' || sheet)}
+          <div
+            class="jsplit-confirm warn"
+            role="alertdialog"
+            aria-label="Несохранённый текст"
+            aria-describedby={`${uid}-ask`}
+            bind:this={confirmEl}
+          >
+            <p id={`${uid}-ask`}>В карточке есть несохранённый текст. Закрыть без сохранения?</p>
+            <div class="row">
+              <button type="button" onclick={keepEditing}>Продолжить правку</button>
+              <button type="button" class="danger" onclick={discard}>Закрыть без сохранения</button>
             </div>
-          {/if}
+          </div>
         {/if}
         {@render detail()}
       </div>
