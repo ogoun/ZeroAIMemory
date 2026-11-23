@@ -1466,6 +1466,27 @@ export const entryLinks = (user: string, id: string) =>
 export const entryBacklinks = (user: string, id: string) =>
   call<EdgeList>('GET', `entries/${q(id)}/backlinks`, undefined, user);
 
+/** Подграф вокруг узла или записи (M7.2, локальный граф §5.10): узлы — ближние к началу первыми. */
+export interface Graph {
+  nodes: GraphNode[];
+  /** Рёбра между узлами подграфа (`dst` у них не `null`). */
+  edges: EdgeView[];
+  /** Подграф обрезан пределами сервера (500 узлов, 2000 рёбер). */
+  truncated: boolean;
+}
+
+/** `GET /graph?node=|entry=&depth=&types=`: `depth` шагов (1..3, по умолчанию 1) в обе стороны по
+ * рёбрам типов `types` (пусто — любые). */
+export function graph(
+  user: string,
+  o: ({ node: string } | { entry: string }) & { depth?: number; types?: string[] },
+): Promise<Graph> {
+  const p = new URLSearchParams('node' in o ? { node: o.node } : { entry: o.entry });
+  if (o.depth) p.set('depth', String(o.depth));
+  if (o.types?.length) p.set('types', o.types.join(','));
+  return call<Graph>('GET', `graph?${p}`, undefined, user);
+}
+
 // ---- Vault (§7.6): значения не кэшируются и не логируются ----
 
 export interface VaultItem {

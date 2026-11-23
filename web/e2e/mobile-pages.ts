@@ -56,6 +56,8 @@ export const PAGES: MobilePage[] = [
     path: (c) => `#/u/${c.user}/s/knowledge/n/${c.env('E2E_NOTE_WIDE')}`,
     tabs: ['История', 'Связи'],
   },
+  // локальный граф связей (задача 11, §5.10): вид «Граф» вкладки «Связи» — холст во всю ширину
+  { name: 'документ-граф', path: (c) => `#/u/${c.user}/s/knowledge/n/${c.env('E2E_NOTE_MEDIA')}`, tabs: ['Связи', 'Граф'] },
   { name: 'вложения', path: (c) => `#/u/${c.user}/s/knowledge/n/${c.env('E2E_NOTE_DOCS')}`, tabs: ['Вложения'] },
   { name: 'вложение-xlsx', path: (c) => attachment(c, 'E2E_XLSX_SHA', 'таблица.xlsx') },
   { name: 'вложение-docx', path: (c) => attachment(c, 'E2E_DOCX_SHA', 'договор.docx') },

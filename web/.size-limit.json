@@ -19,5 +19,6 @@
   { "name": "Audit (страница «Аудит»)", "path": "dist/assets/Audit-*.js", "gzip": true, "limit": "2.9 KB" },
   { "name": "ImportDialog (окно импорта архива)", "path": "dist/assets/ImportDialog-*.js", "gzip": true, "limit": "5.6 KB" },
   { "name": "dialog-content (окна bits-ui, общий чанк — грузится при старте)", "path": "dist/assets/dialog-content-*.js", "gzip": true, "limit": "14.7 KB" },
+  { "name": "GraphView (локальный граф связей, вид «Граф»)", "path": "dist/assets/GraphView-*.js", "gzip": true, "limit": "6 KB" },
   { "name": "pdf.worker", "path": "dist/pdfjs/pdf.worker-*.min.js", "gzip": true, "limit": "400 KB" }
 ]
