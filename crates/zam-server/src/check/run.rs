@@ -183,23 +183,23 @@ fn hash16(v: &Value) -> String {
 }
 
 /// `fp_hash` отпечатка `fp` (первые 16 знаков blake3 его JSON; ключи объекта — по порядку).
-pub fn fp_hash(fp: &Value) -> String {
+pub(crate) fn fp_hash(fp: &Value) -> String {
     hash16(fp)
 }
 
 /// Что отпечаток прогона берёт у сервера.
 #[derive(Debug, Clone, PartialEq)]
-pub struct FpInputs<'a> {
+pub(crate) struct FpInputs<'a> {
     /// `model_id` загруженного эмбеддера (`<id>@<sha8>`); `None` — не загружен.
-    pub model: Option<&'a str>,
+    pub(crate) model: Option<&'a str>,
     /// Устройство загруженного эмбеддера (`cpu`, `cuda:0`); `None` — эмбеддер не загружен.
-    pub device: Option<String>,
+    pub(crate) device: Option<String>,
     /// Реранкер устройства эмбеддера (`RerankSlot::model_for`); `None` — устройство неизвестно.
-    pub reranker: Option<&'a str>,
+    pub(crate) reranker: Option<&'a str>,
     /// Реранкер без устройства (CPU) — когда нет ни устройства, ни прошлого прогона.
-    pub reranker_cpu: &'a str,
+    pub(crate) reranker_cpu: &'a str,
     /// Режим Qdrant (`[qdrant] mode`).
-    pub qdrant: Value,
+    pub(crate) qdrant: Value,
 }
 
 /// Отпечаток прогона (§6.5 п. 4): модель, устройство и реранкер его устройства, режим Qdrant,
@@ -207,7 +207,7 @@ pub struct FpInputs<'a> {
 /// **реранкер** берутся из прошлого прогона `prev` **[решение исполнителя]**: поиск без векторов —
 /// деградация (`degraded`, регрессия перехода), а не смена отпечатка (`changed`); на CUDA-сервере
 /// реранкер «без устройства» (CPU) иначе сменил бы `fp_hash` (ревью r1 задачи 5, Important 1).
-pub fn fingerprint_of(i: &FpInputs<'_>, prev: Option<&Value>) -> Value {
+pub(crate) fn fingerprint_of(i: &FpInputs<'_>, prev: Option<&Value>) -> Value {
     let was = |k: &str| prev.and_then(|p| p[k].as_str()).map(str::to_string);
     let model = i
         .model
@@ -246,9 +246,9 @@ fn fingerprint(st: &AppState, prev: Option<&Value>) -> Value {
     fingerprint_of(&inputs, prev)
 }
 
-/// Контекст прогона: версия сервера и хэши итоговых секций `[search]`, `[recall]` (открыт для
-/// тестов: прошлые прогоны с тем же контекстом — без пометки «после обновления»).
-pub fn context(st: &AppState) -> Value {
+/// Контекст прогона: версия сервера и хэши итоговых секций `[search]`, `[recall]` (тестам —
+/// через `check::test_hooks::context`).
+pub(crate) fn context(st: &AppState) -> Value {
     json!({
         "server": version(st),
         "search": hash16(&json!(st.cfg.search)),

@@ -411,6 +411,17 @@ pub mod test_hooks {
         *lock(&VERSION) = v.map(str::to_string);
     }
 
+    /// `fp_hash` отпечатка `fp` — тесты вставляют прошлые прогоны с хэшем, как у сервера.
+    pub fn fp_hash(fp: &serde_json::Value) -> String {
+        super::run::fp_hash(fp)
+    }
+
+    /// Контекст прогона сервера `st` — прошлые прогоны тестов с тем же контекстом (эпизод не
+    /// «после обновления»).
+    pub fn context(st: &crate::app::AppState) -> serde_json::Value {
+        super::run::context(st)
+    }
+
     /// Снимает все переопределения.
     pub fn reset() {
         *lock(&PAUSE) = None;

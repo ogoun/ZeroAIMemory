@@ -684,7 +684,7 @@ async fn check_degraded_on_cuda_keeps_fingerprint() {
         "qdrant": a.st.cfg.qdrant.mode,
         "check_version": check::CHECK_VERSION,
     });
-    let hash = check::run::fp_hash(&fp);
+    let hash = check::test_hooks::fp_hash(&fp);
     let db = a.st.users.get(a.st.admin_id).await.unwrap();
     for n in 1..=5 {
         let id = Id::new();
@@ -702,7 +702,7 @@ async fn check_degraded_on_cuda_keeps_fingerprint() {
             fingerprint: Some(fp.clone()),
             fp_hash: Some(hash.clone()),
             // контекст — как у текущего сервера: эпизод не «после обновления», строка с флагом
-            context: Some(check::run::context(&a.st)),
+            context: Some(check::test_hooks::context(&a.st)),
             metrics: Some(json!({"search_p95_ms": 10.0, "prompt_on": true, "degraded": false})),
             verdict: Some(json!({"kind": if n < 5 { "baseline" } else { "ok" }, "flags": []})),
             flags: Vec::new(),

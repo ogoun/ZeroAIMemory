@@ -381,8 +381,11 @@ pub fn night_check_known(p: &Paths, server: &Path) -> Result<bool> {
     if let Some(k) = lock().get(server) {
         return Ok(*k);
     }
+    // каталог пробы — свой у процесса и удаляется после неё: два xtask в одном `target/eval`
+    // (например, `eval --hints` и `bench`) не делят каталог сервера (ревью r2 задачи 5, N1)
+    let name = format!("caps-probe-{}", std::process::id());
     let spec = RunSpec {
-        name: "caps-probe".into(),
+        name: name.clone(),
         model: None,
         device: Device::Cpu,
         reranker: None,
@@ -390,10 +393,18 @@ pub fn night_check_known(p: &Paths, server: &Path) -> Result<bool> {
         keep_cuda_path: false,
         ctrl_break: false,
     };
-    let s = Session::start_raw(p, &spec, server, true, &[])?;
-    let caps = super::caps::probe(&s.base);
-    s.stop()?;
-    let known = match caps {
+    let caps = Session::start_raw(p, &spec, server, true, &[]).and_then(|s| {
+        let caps = super::caps::probe(&s.base);
+        s.stop()?;
+        Ok(caps)
+    });
+    let dir = p.work.join(&name);
+    if let Err(e) = fs::remove_dir_all(&dir)
+        && dir.exists()
+    {
+        println!("каталог пробы {} не удалён: {e}", dir.display());
+    }
+    let known = match caps? {
         Ok(c) => super::caps::night_check_off(&c).is_some(),
         Err(e) => {
             println!("возможности сервера не узнаны ({e:#}): works.check не передаётся");
