@@ -152,7 +152,12 @@ test('import_dialog_dry_run_then_import', async ({ page }) => {
   const dlg = page.getByRole('dialog', { name: 'Импорт архива' });
   await expect(dlg).toContainText(`«Knowledge» пользователя ${name}`);
   await expect(dlg).toContainText('Отчёты переносятся только импортом из WebUI.');
-  await expect(dlg).toContainText('Закрытие окна не отменяет импорт');
+  // предупреждение о закрытии — по фазе; живая область хода и итога есть заранее (пустая)
+  const warning = dlg.getByTestId('import-warning');
+  await expect(warning).toContainText('после начала задания закрытие импорт не отменяет');
+  const live = dlg.getByRole('status');
+  await expect(live).toHaveCount(1);
+  await expect(live).toHaveText('');
   await dlg.getByLabel('Архив (.zip)').setInputFiles(zip);
 
   // «Проверить без записи»: ход этапов — первые два опроса подставлены (архив проверяется быстрее
@@ -191,6 +196,9 @@ test('import_dialog_dry_run_then_import', async ({ page }) => {
   expect(Object.fromEntries(q)).toEqual({ own: 'false', on_conflict: 'skip', dry_run: 'true' });
   const stage = dlg.getByTestId('import-stage');
   await expect(stage).toHaveText('Этап: в очереди: перед вами 1 задание');
+  await expect(warning).toHaveText(
+    'Закрытие окна не отменяет импорт: он идёт на сервере, итог после закрытия не показывается.',
+  );
   seen1();
   await expect(stage).toHaveText('Этап: запись — 2 из 5');
   seen2();
@@ -203,6 +211,10 @@ test('import_dialog_dry_run_then_import', async ({ page }) => {
   expect(dry?.dry_run).toBe(true);
   expect(dry!.report!.created).toBeGreaterThan(0);
   await expect(report).toContainText(`будет создано: ${fmt(dry!.report!.created)}`);
+  // итог объявляется живой областью коротко
+  await expect(live).toHaveText(
+    `Проверка без записи готова: будет создано ${fmt(dry!.report!.created)}, конфликтов ${fmt(dry!.report!.conflicts_total)}.`,
+  );
   // отчёты решения Knowledge не принимает — конфликт с причиной
   expect(dry!.report!.conflicts.some((c) => c.reason === 'report-space')).toBe(true);
   await expect(report).toContainText('отчёты — только в пространство решения');
@@ -225,6 +237,7 @@ test('import_dialog_dry_run_then_import', async ({ page }) => {
   await expect(report.getByRole('heading', { level: 3 })).toHaveText('Импорт завершён');
   await expect(report).toContainText(`создано: ${fmt(fin.report!.created)}`);
   await expect(report).not.toContainText('будет создано');
+  await expect(live).toHaveText(new RegExp(`^Импорт завершён: создано ${fmt(fin.report!.created)},`));
   await expect(journals.locator('[data-count="insights"]')).toHaveText(fmt(src.journals.insights));
   await expect(journals.locator('[data-count="glossary"]')).toHaveText(fmt(src.journals.glossary));
   const row = item.locator('.tree-row.space').filter({ has: page.getByRole('button', { name: 'Knowledge', exact: true }) });
@@ -426,4 +439,91 @@ test.describe('телефон, сенсорный ввод', () => {
     await expect(dlg).toHaveCount(0);
     expect(problems, problems.join('\n')).toEqual([]);
   });
+});
+
+test('import_close_while_sending_asks_abort', async ({ page }) => {
+  // отправка «висит» (ответ на POST подставляет сценарий, когда отпустит): закрытие окна до 202 —
+  // вопрос «Прервать отправку?»; «Продолжить» — отправка идёт и кончается заданием; «Прервать» —
+  // XHR прерван, окно закрыто, задания нет, итог — строкой под пространством
+  const problems = watch(page);
+  mkdirSync(TMP, { recursive: true });
+  const zip = `${TMP}import-abort.zip`;
+  writeFileSync(zip, Buffer.from('PK\u0005\u0006'.padEnd(22, '\u0000'), 'latin1'));
+  const job = '01M7ABRT000000000000000000';
+  const gates: (() => void)[] = [];
+  let posts = 0;
+  await page.route(isImport, async (route) => {
+    posts++;
+    await new Promise<void>((r) => gates.push(r));
+    try {
+      await route.fulfill({ status: 202, json: { job, status: `/spaces/knowledge/imports/${job}` } });
+    } catch {
+      // запрос прерван страницей — ответить уже некому
+    }
+  });
+  let polls = 0;
+  await page.route(isPoll, (route) => {
+    polls++;
+    return route.fulfill({
+      json: {
+        job,
+        state: 'done',
+        stage: 'done',
+        queue: null,
+        dry_run: true,
+        progress: { done: 0, total: 0 },
+        report: {
+          created: 0, revised: 0, skipped: 0, conflicts: [], demoted_axioms: 0, id_remapped: 0, remapped: [],
+          unresolved: [], links_skipped: 0, warnings: [], dry_run: true, archive_fingerprint: 'x', own: false,
+          conflicts_total: 0, unresolved_total: 0, warnings_total: 0, remapped_total: 0,
+        },
+        error: null,
+      },
+    });
+  });
+  const failed: string[] = [];
+  page.on('requestfailed', (r) => {
+    if (isImport(new URL(r.url()))) failed.push(r.failure()?.errorText ?? '?');
+  });
+  await open(page);
+  const t = tree(page);
+  await (await menuOf(page, t, 'Knowledge')).filter({ hasText: IMPORT_ITEM }).click();
+  const dlg = page.getByRole('dialog', { name: 'Импорт архива' });
+  await dlg.getByLabel('Архив (.zip)').setInputFiles(zip);
+  const ask = dlg.getByRole('group', { name: /^Прервать отправку\?/ });
+
+  // «Продолжить отправку»: окно остаётся, отправка доходит до задания
+  await dlg.getByRole('button', { name: 'Проверить без записи' }).click();
+  await expect(dlg.getByRole('status')).toHaveText(/^Отправка архива/);
+  await expect(dlg.getByTestId('import-warning')).toHaveText(
+    'Закрытие окна прервёт отправку: архив не дойдёт до сервера, задание не будет создано.',
+  );
+  await expect.poll(() => gates.length).toBe(1);
+  await dlg.getByRole('button', { name: 'Закрыть' }).click();
+  await expect(ask).toBeVisible();
+  await expect(ask.getByRole('button', { name: 'Продолжить отправку' })).toBeFocused();
+  await ask.getByRole('button', { name: 'Продолжить отправку' }).click();
+  await expect(ask).toHaveCount(0);
+  // Esc — тоже закрытие: снова вопрос, окно на месте
+  await page.keyboard.press('Escape');
+  await expect(ask).toBeVisible();
+  await ask.getByRole('button', { name: 'Продолжить отправку' }).click();
+  gates[0]();
+  await expect(dlg.getByRole('region', { name: 'Итог импорта' })).toBeVisible();
+  expect(polls).toBe(1);
+  expect(failed).toEqual([]);
+
+  // «Прервать отправку»: XHR прерван, окно закрыто, опроса нет, итог — под строкой пространства
+  await dlg.getByRole('button', { name: 'Импортировать' }).click();
+  await expect.poll(() => gates.length).toBe(2);
+  await dlg.getByRole('button', { name: 'Закрыть' }).click();
+  await ask.getByRole('button', { name: 'Прервать отправку' }).click();
+  await expect(dlg).toHaveCount(0);
+  await expect.poll(() => failed.length).toBe(1);
+  await expect(t.getByRole('status')).toHaveText('Импорт: отправка прервана, задание не создано.');
+  gates[1]();
+  await page.waitForTimeout(1500);
+  expect(posts).toBe(2);
+  expect(polls).toBe(1);
+  expect(problems, problems.join('\n')).toEqual([]);
 });

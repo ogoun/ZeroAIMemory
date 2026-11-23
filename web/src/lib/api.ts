@@ -1,4 +1,5 @@
 // Клиент REST API. Пути относительные: разрешаются от <base href>, который подставляет сервер.
+import { ApiError, apiError } from './apiError';
 import { changesCounts } from './counts';
 
 export interface User {
@@ -33,44 +34,8 @@ export interface IssuedToken {
   plaintext: string;
 }
 
-export class ApiError extends Error {
-  constructor(
-    public status: number,
-    message: string,
-    /** Тело problem+json (RFC 9457) с дополнительными полями, если пришло. */
-    public problem: Record<string, unknown> | null = null,
-    /** `Retry-After` ответа в секундах (503 занятого сервера, 429), если пришёл. */
-    public retryAfter: number | null = null,
-  ) {
-    super(message);
-  }
-}
-
-/** `Retry-After` (RFC 9110 §10.2.3): секунды или HTTP-дата → секунды от сейчас; нет — `null`. */
-function retryAfterSecs(v: string | null): number | null {
-  if (!v) return null;
-  const s = v.trim();
-  if (/^\d+$/.test(s)) return Number(s);
-  const at = Date.parse(s);
-  return Number.isNaN(at) ? null : Math.max(0, Math.ceil((at - Date.now()) / 1000));
-}
-
-/** Отказ API → `ApiError`: текст — `detail` problem+json (иначе `statusText`), само тело problem и
- * `Retry-After`. Один разбор у `request` (fetch) и `importArchive` (XMLHttpRequest). */
-function apiError(status: number, statusText: string, body: string, retryAfter: string | null): ApiError {
-  let detail = statusText;
-  let problem: Record<string, unknown> | null = null;
-  try {
-    const p: unknown = JSON.parse(body);
-    if (p && typeof p === 'object') {
-      problem = p as Record<string, unknown>;
-      if (typeof problem.detail === 'string') detail = problem.detail;
-    }
-  } catch {
-    /* тело не JSON */
-  }
-  return new ApiError(status, detail, problem, retryAfterSecs(retryAfter));
-}
+// Отказ API — `apiError.ts` (без runtime-импортов: модульный тест разбора `Retry-After`).
+export { ApiError };
 
 /**
  * Стили подсветки кода сервера. Кэш — проверкой (`render.rs`, M7.2): `ETag` по хэшу содержимого
@@ -551,7 +516,9 @@ export interface ImportJob {
  * `Retry-After`. `axioms: 'demote'` — параметр не передаётся: сервер понижает аксиомы только у
  * чужого архива, у своего (по описи или `own`) оставляет как есть (ТЗ §16.4); явный
  * `axioms=demote` понизил бы и свои. Ответ 202 числа разделов не меняет — их помечает итог
- * задания (`importJob`, пре-флайт N33).
+ * задания (`importJob`, пре-флайт N33). `signal` прерывает отправку до ответа (`x.abort()`):
+ * промис отклоняется `DOMException` `AbortError` «отправка прервана» (`isImportAborted`), сервер
+ * снимает резерв задания и пишет аудит `space.import.done` с `reason: client` — задания нет.
  */
 export function importArchive(
   user: string,
@@ -559,12 +526,19 @@ export function importArchive(
   file: File,
   o: ImportOptions,
   onprogress: (sent: number, total: number) => void,
+  signal?: AbortSignal,
 ): Promise<ImportStarted> {
   const p = new URLSearchParams({ own: String(o.own), on_conflict: o.onConflict });
   if (o.axioms === 'keep') p.set('axioms', 'keep');
   p.set('dry_run', String(o.dryRun));
+  const aborted = () => new DOMException('отправка прервана', 'AbortError');
+  if (signal?.aborted) return Promise.reject(aborted());
   return new Promise((resolve, reject) => {
     const x = new XMLHttpRequest();
+    const stop = () => x.abort();
+    signal?.addEventListener('abort', stop, { once: true });
+    x.onloadend = () => signal?.removeEventListener('abort', stop);
+    x.onabort = () => reject(aborted());
     x.open('POST', `api/v1/spaces/${q(space)}/import?${p}`);
     x.setRequestHeader('Content-Type', 'application/zip');
     x.setRequestHeader('X-Zam-Expected-Bytes', String(file.size));
@@ -593,6 +567,9 @@ export function importArchive(
     x.send(file);
   });
 }
+
+/** Отправку прервали (`importArchive` с `signal`). */
+export const isImportAborted = (e: unknown): boolean => e instanceof DOMException && e.name === 'AbortError';
 
 /** Состояние задания импорта; итог без `dry_run` (готово или ошибка — запись могла начаться)
  * помечает числа разделов пользователя устаревшими — та же точка, что у `request` (пре-флайт N33). */

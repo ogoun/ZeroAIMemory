@@ -268,10 +268,13 @@
   let importing = $state.raw<Target | null>(null);
   /** Чанк диалога не загрузился: текст под строкой пространства (`LazyFail`, §5.1 п. 9). */
   let importFail = $state<{ key: string; error: unknown } | null>(null);
+  /** Итог закрытого окна (отправка прервана) — строкой под пространством до следующего импорта. */
+  let importNote = $state<{ key: string; text: string } | null>(null);
   const kImport = (u: string, ref: string) => `i|${u}|${ref}`;
 
   async function openImport(t: Target) {
     importFail = null;
+    importNote = null;
     try {
       importDialog ??= (await import('./ImportDialog.svelte')).default;
       importing = t;
@@ -575,6 +578,9 @@
       <button type="button" class="more" aria-label="Действия: {s.name}" onclick={(e) => menuBelow(e, target)}>⋯</button>
     </div>
     {@render status(kExport(uid, ref))}
+    {#if importNote?.key === kImport(uid, ref)}
+      <div class="tree-note muted" role="status" style:--depth={depth}>{importNote.text}</div>
+    {/if}
     {#if importFail?.key === kImport(uid, ref)}
       <div class="tree-note" style:--depth={depth}>
         <LazyFail error={importFail.error} label="Окно импорта не загрузилось">
@@ -740,7 +746,11 @@
     space={ref}
     spaceName={t.space.name}
     userName={t.uid === ownId ? '' : (users.find((u) => u.id === t.uid)?.name ?? t.uid)}
-    onclose={() => (importing = null)}
+    onclose={(note) => {
+      // до `importing = null`: `t` и `ref` — производные от него
+      if (note) importNote = { key: kImport(t.uid, ref), text: note };
+      importing = null;
+    }}
     ondone={() => void refreshSpace(t.uid, ref)}
     {onexpired}
   />

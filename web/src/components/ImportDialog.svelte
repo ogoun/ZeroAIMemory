@@ -4,12 +4,22 @@
   // уходит `importArchive` (XMLHttpRequest — ход отправки), после 202 задание опрашивается сразу и
   // дальше раз в секунду, пока открыт диалог: этап, счётчики записи, итог. Отказ приёма — текстом по
   // коду ответа. Итог без `dry_run` помечает числа разделов устаревшими в `importJob` (`api.ts`, одна
-  // точка), дерево перечитывает `ondone`. Закрытие окна задание не отменяет (оно на сервере, итог
-  // живёт там час), опрос останавливается, итог после закрытия не показывается **[решение
-  // координатора 26]** — окно предупреждает.
+  // точка), дерево перечитывает `ondone`. Закрытие окна во время отправки (до 202) — вопрос
+  // «Прервать отправку?»: «Прервать» — `abort()` XHR, задания нет, итог — строкой под пространством
+  // (`onclose(note)`); после 202 закрытие задание не отменяет (оно на сервере, итог живёт там час),
+  // опрос останавливается, итог после закрытия не показывается **[решение координатора 26]** —
+  // окно предупреждает по фазе. Ход и итог — живая область `role="status"` (есть в DOM заранее).
   import { Dialog } from 'bits-ui';
   import { onDestroy } from 'svelte';
-  import { ApiError, errorText, importArchive, importJob, type ImportJob, type ImportReport } from '../lib/api';
+  import {
+    ApiError,
+    errorText,
+    importArchive,
+    importJob,
+    isImportAborted,
+    type ImportJob,
+    type ImportReport,
+  } from '../lib/api';
   import { bytesText } from '../lib/backups';
   import { formatCount } from '../lib/counts';
   import { plural } from '../lib/plural';
@@ -22,7 +32,8 @@
     spaceName: string;
     /** Имя пользователя — у администратора в чужом пространстве; своё — пусто. */
     userName?: string;
-    onclose: () => void;
+    /** Окно закрыто; `note` — итог для строки пространства (отправка прервана). */
+    onclose: (note?: string) => void;
     /** Итог без `dry_run` (готово или ошибка после начала записи): перечитать дерево. */
     ondone: () => void;
     onexpired: () => void;
@@ -49,16 +60,56 @@
   let error = $state('');
   /** Сбой одного опроса (повтор через секунду). */
   let note = $state('');
+  /** Закрытие во время отправки: вопрос «Прервать отправку?». */
+  let askAbort = $state(false);
+  let keepBtn = $state<HTMLButtonElement | null>(null);
 
   let busy = $derived(phase !== 'idle');
 
-  // Диалог закрыт — опрос останавливается: таймер снят, ответ запроса в пути отбрасывается.
+  /** Отправка тела (до 202): прервать — `abort()`. */
+  let sending: AbortController | null = null;
+
+  // Диалог закрыт — опрос останавливается: таймер снят, ответ запроса в пути отбрасывается;
+  // окно убрано посреди отправки (выход, смена дерева) — отправка прерывается.
   let alive = true;
   let timer: ReturnType<typeof setTimeout> | undefined;
   onDestroy(() => {
     alive = false;
     clearTimeout(timer);
+    sending?.abort();
   });
+
+  /** Закрыть окно: во время отправки — сначала вопрос, после 202 — сразу (задание идёт дальше). */
+  function requestClose() {
+    if (phase !== 'sending') return onclose();
+    askAbort = true;
+  }
+
+  // вопрос показан — фокус на безопасный выбор «Продолжить отправку»
+  $effect(() => {
+    if (askAbort) keepBtn?.focus();
+  });
+
+  function abortSending() {
+    sending?.abort();
+    onclose('Импорт: отправка прервана, задание не создано.');
+  }
+
+  /** Предупреждение о закрытии окна — по фазе (§5.7 п. 4, решение координатора 26). */
+  const closeWarning = $derived(
+    phase === 'sending'
+      ? 'Закрытие окна прервёт отправку: архив не дойдёт до сервера, задание не будет создано.'
+      : phase === 'running'
+        ? 'Закрытие окна не отменяет импорт: он идёт на сервере, итог после закрытия не показывается.'
+        : 'Закрытие окна во время отправки прервёт её; после начала задания закрытие импорт не отменяет — он идёт на сервере, итог после закрытия не показывается.',
+  );
+
+  /** Итог — коротко для живой области (`role="status"`): что и сколько. */
+  function summary(r: ImportReport): string {
+    const head = r.dry_run ? 'Проверка без записи готова' : 'Импорт завершён';
+    const made = r.dry_run ? 'будет создано' : 'создано';
+    return `${head}: ${made} ${formatCount(r.created)}, конфликтов ${formatCount(r.conflicts_total)}.`;
+  }
   const pause = (ms: number) => new Promise<void>((r) => (timer = setTimeout(r, ms)));
 
   /** Отказ приёма — понятным текстом по коду (§5.7 п. 3), прочее — `errorText`. */
@@ -89,10 +140,10 @@
     return `Импорт не выполнен: ${detail}`;
   }
 
-  /** Этап задания (§5.7 п. 3) и счётчики записи. */
-  function stageText(j: ImportJob | null): string {
+  /** Этап задания (§5.7 п. 3). */
+  function stageName(j: ImportJob | null): string {
     const n = j?.queue ?? 0;
-    const name = !j
+    return !j
       ? 'в очереди'
       : j.stage === 'queued'
         ? n > 0
@@ -107,8 +158,12 @@
               : j.stage === 'receiving'
                 ? 'приём архива'
                 : j.stage;
+  }
+
+  /** Счётчики записи этапа: « — done из total» (сервер заполняет их только при записи). */
+  function stageCount(j: ImportJob | null): string {
     const p = j?.progress;
-    return p && p.total > 0 ? `${name} — ${formatCount(p.done)} из ${formatCount(p.total)}` : name;
+    return p && p.total > 0 ? ` — ${formatCount(p.done)} из ${formatCount(p.total)}` : '';
   }
 
   const REASON: Record<string, string> = {
@@ -147,22 +202,37 @@
     sent = 0;
     total = f.size;
     phase = 'sending';
+    askAbort = false;
+    sending = new AbortController();
     let id: string;
     try {
       // свой архив — аксиомы как есть: выбор «Аксиомы чужого архива» к нему не относится
       const o = { own, onConflict, axioms: own ? ('keep' as const) : axioms, dryRun };
       id = (
-        await importArchive(user, space, f, o, (s, t) => {
-          sent = s;
-          total = t;
-        })
+        await importArchive(
+          user,
+          space,
+          f,
+          o,
+          (s, t) => {
+            sent = s;
+            total = t;
+          },
+          sending.signal,
+        )
       ).job;
     } catch (e) {
       phase = 'idle';
+      askAbort = false;
+      sending = null;
+      if (!alive || isImportAborted(e)) return;
       if (e instanceof ApiError && e.status === 401) return onexpired();
       error = `Архив не принят: ${refusalText(e)}`;
       return;
     }
+    sending = null;
+    // 202 пришёл, пока висел вопрос: отправку уже не прервать — вопрос снимается, задание идёт
+    askAbort = false;
     if (!alive) return;
     phase = 'running';
     await poll(id);
@@ -206,11 +276,15 @@
   }
 </script>
 
+<!-- открыто, пока окно смонтировано: Esc, щелчок мимо и «Закрыть» идут в `requestClose` (во время
+     отправки — вопрос, окно остаётся) -->
 <Dialog.Root
-  open
-  onOpenChange={(o) => {
-    if (!o) onclose();
-  }}
+  bind:open={
+    () => true,
+    (v) => {
+      if (!v) requestClose();
+    }
+  }
 >
   <Dialog.Portal>
     <Dialog.Overlay class="overlay" />
@@ -248,22 +322,23 @@
           </fieldset>
         </fieldset>
       </form>
-      <p class="warn small">
-        Закрытие окна не отменяет импорт: он идёт на сервере, итог после закрытия не показывается.
-      </p>
+      <p class="warn small" data-testid="import-warning">{closeWarning}</p>
 
+      <!-- ход и итог — живая область, есть в DOM заранее: объявляются начало отправки, смена этапа
+           и итог; счётчики байт и записей — вне объявления (числа — у `progress`) -->
+      <div class="progress" role="status" data-testid="import-status">
+        {#if phase === 'sending'}
+          <p>Отправка архива<span aria-hidden="true">: {bytesText(sent)} из {bytesText(total)}</span></p>
+        {:else if phase === 'running'}
+          <p data-testid="import-stage">Этап: {stageName(job)}<span aria-hidden="true">{stageCount(job)}</span></p>
+        {:else if result}
+          <p class="sr">{summary(result)}</p>
+        {/if}
+      </div>
       {#if phase === 'sending'}
-        <div class="progress">
-          <p>Отправка архива: {bytesText(sent)} из {bytesText(total)}</p>
-          <progress max={total || 1} value={sent} aria-label="Отправка архива"></progress>
-        </div>
-      {:else if phase === 'running'}
-        <div class="progress">
-          <p data-testid="import-stage">Этап: {stageText(job)}</p>
-          {#if job && job.progress.total > 0}
-            <progress max={job.progress.total} value={job.progress.done} aria-label="Запись"></progress>
-          {/if}
-        </div>
+        <progress max={total || 1} value={sent} aria-label="Отправка архива"></progress>
+      {:else if phase === 'running' && job && job.progress.total > 0}
+        <progress max={job.progress.total} value={job.progress.done} aria-label="Запись"></progress>
       {/if}
       {#if note}<p class="muted small">{note}</p>{/if}
       {#if error}<p class="error" role="alert">{error}</p>{/if}
@@ -306,11 +381,21 @@
         </section>
       {/if}
 
-      <div class="row actions">
-        <button type="button" disabled={busy || !file} onclick={() => start(true)}>Проверить без записи</button>
-        <button type="button" class="primary" disabled={busy || !file} onclick={() => start(false)}>Импортировать</button>
-        <Dialog.Close type="button">Закрыть</Dialog.Close>
-      </div>
+      {#if askAbort && phase === 'sending'}
+        <div class="ask warn" role="group" aria-labelledby="import-ask">
+          <p id="import-ask"><b>Прервать отправку?</b> Архив ещё не дошёл до сервера: задание не будет создано.</p>
+          <div class="row actions">
+            <button type="button" class="danger-fill" onclick={abortSending}>Прервать отправку</button>
+            <button type="button" bind:this={keepBtn} onclick={() => (askAbort = false)}>Продолжить отправку</button>
+          </div>
+        </div>
+      {:else}
+        <div class="row actions">
+          <button type="button" disabled={busy || !file} onclick={() => start(true)}>Проверить без записи</button>
+          <button type="button" class="primary" disabled={busy || !file} onclick={() => start(false)}>Импортировать</button>
+          <button type="button" onclick={requestClose}>Закрыть</button>
+        </div>
+      {/if}
     </Dialog.Content>
   </Dialog.Portal>
 </Dialog.Root>
@@ -371,6 +456,24 @@
   }
   .progress p {
     margin: 12px 0 4px;
+  }
+  /* только для чтения с экрана: итог в живой области (видимый — в разделе «Итог импорта») */
+  .sr {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .ask {
+    margin-top: 16px;
+  }
+  .ask p {
+    margin: 0;
+  }
+  .ask .actions {
+    margin-top: 8px;
   }
   progress {
     width: 100%;
