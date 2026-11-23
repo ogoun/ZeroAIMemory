@@ -1176,14 +1176,19 @@ fn write_zip_to(stage: &Path, m: &Manifest, tmp: &Path, root: &Path) -> Result<(
 }
 
 /// Удаляет копии (каталоги) сверх `keep`: `Prune` расписания и ротация копии из WebUI при
-/// `schedule = "daily"` ([`runner`]).
-pub fn prune(paths: &[PathBuf]) {
+/// `schedule = "daily"` ([`runner`]); число удалённых.
+pub fn prune(paths: &[PathBuf]) -> usize {
+    let mut n = 0;
     for p in paths {
         match remove_copy(p) {
-            Ok(()) => tracing::info!(path = %p.display(), "копия удалена (сверх backup.keep)"),
-            // уже удалена (из WebUI между решением и удалением) — не сбой
+            Ok(()) => {
+                n += 1;
+                tracing::info!(path = %p.display(), "копия удалена (сверх backup.keep)");
+            }
+            // уже удалена (не сервером) между списком и удалением — не сбой
             Err(_) if !p.exists() => tracing::debug!(path = %p.display(), "копии уже нет"),
             Err(e) => tracing::warn!(path = %p.display(), error = %e, "копия не удалена"),
         }
     }
+    n
 }

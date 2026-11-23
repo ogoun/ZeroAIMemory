@@ -19,7 +19,7 @@ export async function postLimited(
   expect(wait, 'Retry-After').toBeGreaterThan(0);
   // ожидание не съедает таймаут сценария (по умолчанию 60 с — столько же, сколько окно лимита)
   const info = test.info();
-  info.setTimeout(info.timeout + wait * 1000 + 10_000);
+  if (info.timeout > 0) info.setTimeout(info.timeout + wait * 1000 + 10_000);
   await new Promise((res) => setTimeout(res, wait * 1000 + 500));
   const again = await rc.post(url, opts);
   expect(again.status(), `${url}: 429 и после Retry-After`).not.toBe(429);

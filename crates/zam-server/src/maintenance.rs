@@ -302,12 +302,12 @@ pub async fn backup_tick(
                 out.backup = Some(run.result.is_ok());
                 out.pruned += run.pruned;
             }
-            Action::Prune(list) => {
-                out.pruned += list.len();
-                let b = backups.clone();
-                tokio::task::spawn_blocking(move || b.prune(&list))
+            // список удаления — заново под замком удаления, удалённые — по факту (ТЗ §16.4)
+            Action::Prune(_) => {
+                let (b, d, keep) = (backups.clone(), dir.clone(), cfg.backup.keep);
+                out.pruned += tokio::task::spawn_blocking(move || b.rotate(&d, keep))
                     .await
-                    .ok();
+                    .unwrap_or(0);
             }
         }
     }

@@ -162,11 +162,10 @@ impl BackupRunner {
         super::delete_copy(dir, name)
     }
 
-    /// Удаляет копии сверх `keep` ([`super::prune`]) под замком удаления — `Prune` расписания.
-    /// Блокирующая: звать вне потоков runtime.
-    pub fn prune(&self, paths: &[PathBuf]) {
-        let _one = lock_removal(&self.removal);
-        super::prune(paths);
+    /// Удаляет копии каталога копий `dir` сверх `keep` — `Prune` расписания ([`rotate`]); число
+    /// удалённых. Блокирующая: звать вне потоков runtime.
+    pub fn rotate(&self, dir: &Path, keep: u32) -> usize {
+        rotate(&self.removal, dir, keep)
     }
 
     /// Идущая копия и последний итог (снимок под мьютексом, без ввода-вывода).
@@ -212,6 +211,14 @@ impl BackupRunner {
 /// Замок удаления копий (отравленный — тот же: удаление идемпотентно).
 fn lock_removal(m: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Ротация `keep` каталога копий `dir` под замком удаления: список копий читается уже под
+/// замком — копия, удалённая из WebUI, в него не попадёт, и лишней не удалится (ТЗ §16.4: «по
+/// фактическому списку»). Одна у ротации после копии и у `Prune` расписания; число удалённых.
+fn rotate(removal: &Mutex<()>, dir: &Path, keep: u32) -> usize {
+    let _one = lock_removal(removal);
+    super::prune(&super::schedule::prune_list(&super::list_copies(dir), keep))
 }
 
 /// Замок взят; снимается при итоге или уничтожении (без итога — «прервана»).
@@ -264,20 +271,16 @@ impl RunGuard {
     ) -> RunOutcome {
         let by = self.running.by;
         let c = cfg.clone();
-        let rotate = cfg.backup.schedule == BackupSchedule::Daily;
+        let rotate_keep = cfg.backup.schedule == BackupSchedule::Daily;
         // замок — в потоке копии: снятая задача не отпускает его раньше конца копии, паника
         // копии снимает его с итогом «прервана»
         let joined = tokio::task::spawn_blocking(move || {
             let r = super::backup(&c, &BackupOpts::default());
-            let mut pruned = Vec::new();
-            if rotate && r.is_ok() {
-                // список — под замком удаления: копия, удалённая из WebUI, в него уже не попадёт
-                let _one = lock_removal(&self.removal);
-                let dir = c.backup.dir(&c.data_dir);
-                pruned = super::schedule::prune_list(&super::list_copies(&dir), c.backup.keep);
-                super::prune(&pruned);
+            let mut pruned = 0;
+            if rotate_keep && r.is_ok() {
+                pruned = rotate(&self.removal, &c.backup.dir(&c.data_dir), c.backup.keep);
             }
-            (self, r, pruned.len())
+            (self, r, pruned)
         })
         .await;
         let (mut guard, result, pruned) = match joined {
