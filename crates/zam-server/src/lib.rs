@@ -7,6 +7,7 @@ pub mod auth;
 pub mod backup;
 pub mod bootstrap;
 pub mod certainty;
+pub mod check;
 pub mod config;
 pub mod cuda;
 pub mod docs;
@@ -21,9 +22,11 @@ pub mod models;
 pub mod qdrant;
 pub mod reindex;
 pub mod rerank;
+pub mod schedule;
 pub mod service;
 pub mod vault;
 pub mod web;
+pub mod works;
 
 #[cfg(test)]
 mod test_util;

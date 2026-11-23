@@ -7,9 +7,16 @@
 //! Учёт выданного без сессии (`tokens_unattributed`, спецификация M6 §7.1, миграция 0025) —
 //! здесь же, в базе пользователя запроса: сутки UTC × событие, [`add_unattributed`] и
 //! [`unattributed_tokens`].
+//!
+//! «Агент открыл подсказку» (`usage_opened`, спецификация M7 §6.6, миграция 0027) — отдельная
+//! таблица в базе цели: одно событие на сессию и цель держит первичный ключ ([`record_opened`] —
+//! `INSERT OR IGNORE`), счётчики — [`opened_counts_many`], начало учёта — строка
+//! `meta.usage_opened_since` ([`usage_opened_since`]). Внешнего ключа на `sessions` нет: уборка
+//! сессий строки не трогает.
 use std::collections::HashMap;
 
-use rusqlite::params;
+use jiff::Timestamp;
+use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 use zam_core::{Id, TargetKind, TargetRef};
 
@@ -225,6 +232,89 @@ pub async fn usage_counts_many(
         Ok(out)
     })
     .await
+}
+
+/// Ключ `meta` начала учёта открытий (миграция 0027, §6.6 п. 3).
+pub const USAGE_OPENED_SINCE: &str = "usage_opened_since";
+
+/// Открытие цели агентом после показа подсказкой (§6.6 п. 2): сессия `session_id` прочитала
+/// цель `target`, показанную ей событием `source`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedEvent {
+    pub ts: Timestamp,
+    /// Кто открыл (пользователь запроса).
+    pub user_id: Id,
+    pub session_id: String,
+    pub target: TargetRef,
+    /// Событие показа (`session_start`, `prompt`, …).
+    pub source: UsageSource,
+}
+
+/// Пишет открытие цели; повтор той же сессии и цели ничего не меняет (`INSERT OR IGNORE` по
+/// первичному ключу). `true` — новая строка.
+pub async fn record_opened(db: &Db, ev: &OpenedEvent) -> Result<bool, StoreError> {
+    crate::sessions::check_session_id(&ev.session_id)?;
+    let ev = ev.clone();
+    db.write(move |t| {
+        let n = t
+            .prepare_cached(
+                "INSERT OR IGNORE INTO usage_opened
+                   (ts, user_id, session_id, target_kind, target_id, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?
+            .execute(params![
+                fmt_ts(ev.ts),
+                ev.user_id,
+                ev.session_id,
+                kind_str(ev.target.kind),
+                ev.target.id,
+                ev.source.as_str()
+            ])?;
+        Ok(n == 1)
+    })
+    .await
+}
+
+/// Число открытий (сессий, открывших цель) многих целей одного вида одним запросом (по индексу
+/// `usage_opened_target`); цели без открытий в ответе нет.
+pub async fn opened_counts_many(
+    db: &Db,
+    kind: TargetKind,
+    ids: &[Id],
+) -> Result<HashMap<Id, i64>, StoreError> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let list =
+        serde_json::Value::from(ids.iter().map(Id::to_string).collect::<Vec<_>>()).to_string();
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT target_id, count(*) FROM usage_opened
+             WHERE target_kind = ?1 AND target_id IN (SELECT value FROM json_each(?2))
+             GROUP BY target_id",
+        )?;
+        let rows = st.query_map(params![kind_str(kind), list], |r| {
+            Ok((r.get::<_, Id>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })
+    .await
+}
+
+/// Начало учёта открытий — момент применения миграции 0027 (`meta.usage_opened_since`); строки
+/// нет — `None`.
+pub async fn usage_opened_since(db: &Db) -> Result<Option<Timestamp>, StoreError> {
+    let raw: Option<String> = db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [USAGE_OPENED_SINCE],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+        .await?;
+    raw.as_deref().map(crate::time::parse_ts).transpose()
 }
 
 /// Счётчики событий цели (по индексу `usage_target`).

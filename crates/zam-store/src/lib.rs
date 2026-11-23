@@ -8,7 +8,8 @@
 //! цель индексации (`attachment_docs`, кэш извлечения `blob_extract`; M5), отчёты (вид записи
 //! `report`, файлы `entry_attachments`; M5.5), карта кода решения (`code_*`, ссылки на символы;
 //! M5.6), журнал идей (вид записи `idea`; M5.7), эпохи выданного сессии, учёт без сессии и
-//! снимки сессий (`session_snapshots`; M6).
+//! снимки сессий (`session_snapshots`; M6), виды внутренних работ и открытия подсказок
+//! (`works`, `usage_opened`; M7.3).
 
 pub mod access;
 pub mod archive;
@@ -49,6 +50,7 @@ pub mod time;
 pub mod usage;
 pub mod user_db;
 pub mod vault;
+pub mod works;
 
 pub use access::{AccessDecision, AccessEntry, AccessState, SolutionInfo, SolutionRole};
 pub use attachments::{
@@ -194,6 +196,7 @@ pub use tasks::{
     TaskData, TaskError, TaskNode, TaskTree, check_task, check_task_transition, claim_task,
     claimed_tasks, open_tasks, release_task, task_tree,
 };
+pub use usage::{OpenedEvent, opened_counts_many, record_opened, usage_opened_since};
 pub use usage::{
     UnattributedRow, UsageCounts, UsageEvent, UsageKind, UsageSource, add_unattributed,
     record_usage, record_usages, unattributed_tokens, usage_counts, usage_counts_many,

@@ -22,13 +22,16 @@ pub fn tmp(name: &str) -> PathBuf {
 }
 
 /// Конфигурация теста в каталоге `dir`. Рабочий процесс разбора документов — бинарник пакета:
-/// текущий исполняемый файл теста подкоманды `doc-worker` не знает.
+/// текущий исполняемый файл теста подкоманды `doc-worker` не знает. Ночная проверка выключена
+/// (M7.3, решение 67): умолчание `check = "nightly"` в 04:30 UTC запускало бы её в любом тестовом
+/// сервере в окне, в том числе при часах, замороженных в окне; тесты ночи включают её сами.
 pub fn cfg_in(dir: PathBuf) -> ServerConfig {
     let mut c = ServerConfig {
         data_dir: dir,
         ..ServerConfig::default()
     };
     c.docs.worker_program = Some(PathBuf::from(env!("CARGO_BIN_EXE_zam-server")));
+    c.works.check = zam_server::config::CheckMode::Off;
     c
 }
 

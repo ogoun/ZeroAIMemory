@@ -1152,9 +1152,9 @@ fn add_columns(sql: &str, cols: &[&str]) -> String {
 /// идеями, вопросом-предложением, задачей «начать», отметками `session_seen`, учётом и картой
 /// кода) открывается последней схемой: копия `bak-v24`; строки на месте (`session_seen` — в
 /// эпохе 0, `recv_count = 0`, новые столбцы — по умолчанию, новые таблицы пусты); объекты
-/// `sqlite_master` совпадают, кроме таблиц 0025 и `entries` (её следом пересобирает 0026, M6.5);
-/// пять триггеров отчёта срабатывают; `foreign_key_check` пуст, `integrity_check` ok; идея
-/// «показана» в своей сессии.
+/// `sqlite_master` совпадают, кроме таблиц 0025 и `entries` (её следом пересобирает 0026, M6.5)
+/// и новых таблиц 0027 (M7.3) с их индексами; пять триггеров отчёта срабатывают;
+/// `foreign_key_check` пуст, `integrity_check` ok; идея «показана» в своей сессии.
 #[tokio::test]
 async fn migrate_0025_from_m57_db() {
     let dir = tmp_dir("m57-db");
@@ -1205,8 +1205,7 @@ async fn migrate_0025_from_m57_db() {
         .await
         .unwrap();
     let (version, violations, fk, integrity) = checks;
-    // 0025 и следом 0026 (M6.5) — последняя схема
-    assert_eq!(version, 26);
+    // 0025 и следом 0026 (M6.5), 0027 (M7.3) — последняя схема
     assert_eq!(version, USER_MIGRATIONS.len() as u32);
     assert_eq!(violations, 0, "foreign_key_check не пуст");
     assert!(fk, "foreign_keys выключены после миграции");
@@ -1290,6 +1289,11 @@ async fn migrate_0025_from_m57_db() {
         s("session_snapshots"),
         String::new(),
     ));
+    // следом 0027 (M7.3): семь новых таблиц (SQL миграции) и их индексы, строки — пусты
+    want.extend(objects_0027(&dir));
+    for t in TABLES_0027 {
+        assert_eq!(counts_after.get(t), Some(&0), "таблица {t}");
+    }
     let extra: Vec<_> = objects_after.difference(&want).collect();
     let missing: Vec<_> = want.difference(&objects_after).collect();
     assert!(
@@ -1398,13 +1402,18 @@ async fn reopen_v25_repairs_late_0025_schema() {
     }
     // копии перед миграцией нет: мигратор ничего не применял
     assert!(!dir.join("u.db.bak-v25").exists());
-    // текущие миграции: 0026 поверх дособранной схемы
+    // текущие миграции: 0026 и 0027 поверх дособранной схемы
     let fresh = fresh_schema(&dir, USER_MIGRATIONS);
     drop(Db::open(&path, USER_MIGRATIONS).unwrap());
     let c = conn(&path);
-    assert_eq!(user_version(&c), 26);
+    assert_eq!(user_version(&c), USER_MIGRATIONS.len() as u32);
     assert_eq!(master_objects(&c), fresh);
-    assert_eq!(table_counts(&c), counts);
+    // прежние таблицы — те же строки; 0027 (M7.3) добавила пустые таблицы и строку
+    // `meta.usage_opened_since`
+    let mut want = counts.clone();
+    *want.get_mut("meta").unwrap() += 1;
+    want.extend(TABLES_0027.map(|t| (t.to_string(), 0)));
+    assert_eq!(table_counts(&c), want);
     assert_eq!(fk_violations(&c), 0);
     assert!(dir.join("u.db.bak-v25").exists());
 }
@@ -1451,16 +1460,46 @@ fn historic_list(rev: &str) -> &'static [Migration] {
     Box::leak(v.into_boxed_slice())
 }
 
-/// Список итоговых миграций и фиктивной 0027 (только в тесте: досборка до следующих миграций).
-fn with_fake_0027() -> &'static [Migration] {
+/// Список итоговых миграций и фиктивной 0028 (только в тесте: досборка до следующих миграций).
+fn with_fake_0028() -> &'static [Migration] {
     let mut v = USER_MIGRATIONS.to_vec();
-    assert_eq!(v.len(), 26);
+    assert_eq!(v.len(), 27);
     v.push(Migration {
-        version: 27,
-        sql: "CREATE TABLE probe_0027 (x INTEGER);",
+        version: 28,
+        sql: "CREATE TABLE probe_0028 (x INTEGER);",
         rebuild: false,
     });
     Box::leak(v.into_boxed_slice())
+}
+
+/// Семь таблиц миграции 0027 (M7.3): только новые, прежние не меняются.
+const TABLES_0027: [&str; 7] = [
+    "check_results",
+    "check_runs",
+    "probes",
+    "proposals",
+    "usage_opened",
+    "work_calls",
+    "works",
+];
+
+/// Объекты 0027 — семь таблиц и их индексы — у чистой базы последней схемой; SQL таблиц — SQL
+/// миграции ([`create_in`]).
+fn objects_0027(dir: &Path) -> BTreeSet<MasterObject> {
+    let objs: BTreeSet<MasterObject> = fresh_schema(dir, USER_MIGRATIONS)
+        .into_iter()
+        .filter(|o| TABLES_0027.contains(&o.2.as_str()))
+        .collect();
+    assert_eq!(USER_MIGRATIONS[26].version, 27);
+    for t in TABLES_0027 {
+        let o = objs
+            .iter()
+            .find(|o| o.0 == "table" && o.1 == t)
+            .unwrap_or_else(|| panic!("нет таблицы {t}"));
+        assert_eq!(o.3, create_in(USER_MIGRATIONS[26].sql, t), "{t}");
+    }
+    assert!(objs.iter().any(|o| o.0 == "index" && o.1 == "works_open"));
+    objs
 }
 
 /// Схема чистой базы на списке `list`.
@@ -1505,7 +1544,7 @@ async fn reopen_historic_0025_versions_repaired() {
             drop(Db::open(&path, USER_MIGRATIONS).unwrap());
             let c = conn(&path);
             assert_eq!(master_objects(&c), want, "{rev}, открытие {round}");
-            assert_eq!(user_version(&c), 26);
+            assert_eq!(user_version(&c), USER_MIGRATIONS.len() as u32);
             let kind: String = c
                 .query_row(
                     "SELECT trigger_kind FROM session_snapshots WHERE session_id = 's'",
@@ -1520,18 +1559,18 @@ async fn reopen_historic_0025_versions_repaired() {
 
 /// N-1: база версии 25 промежуточной сборки, а у сервера уже есть следующие миграции —
 /// досборка идёт до них (версия читается до миграций): настоящая 0026 переносит
-/// `entries.imported_from`, который дособирает досборка, за ней фиктивная 0027; итог совпадает с
-/// чистой базой.
+/// `entries.imported_from`, который дособирает досборка, за ней настоящая 0027 и фиктивная 0028;
+/// итог совпадает с чистой базой.
 #[tokio::test]
 async fn repair_runs_before_next_migration() {
     let dir = tmp_dir("v25-then-next");
-    let list = with_fake_0027();
+    let list = with_fake_0028();
     let want = fresh_schema(&dir, list);
     let path = dir.join("u.db");
     drop(Db::open(&path, historic_list("61c5c14")).unwrap());
     drop(Db::open(&path, list).unwrap());
     let c = conn(&path);
-    assert_eq!(user_version(&c), 27);
+    assert_eq!(user_version(&c), 28);
     assert_eq!(master_objects(&c), want);
     assert!(dir.join("u.db.bak-v25").exists());
 }
@@ -1636,8 +1675,8 @@ const IMPORTED: &str = "SELECT 'node:' || id || '=' || imported_from FROM nodes
 /// у заметки и у записи открывается схемой 0026 (CHECK статусов идеи += `returned`, пересборка
 /// `entries` по рецепту 0024): копия `bak-v25`; строки, счётчики таблиц и `imported_from` на
 /// месте; объекты `sqlite_master` — как у чистой базы, а от прежних отличается только SQL
-/// `entries`; пять триггеров отчёта срабатывают; идея пишется в `returned`, неизвестный статус
-/// отсекает CHECK.
+/// `entries` (и следом — новые таблицы 0027 с их индексами, M7.3); пять триггеров отчёта
+/// срабатывают; идея пишется в `returned`, неизвестный статус отсекает CHECK.
 #[tokio::test]
 async fn migrate_0026_from_m6_db() {
     let dir = tmp_dir("m6-db");
@@ -1694,8 +1733,11 @@ async fn migrate_0026_from_m6_db() {
         })
         .await
         .unwrap();
-    assert_eq!(checks, (26, 0, true, "ok".to_string()));
-    assert_eq!(checks.0, USER_MIGRATIONS.len() as u32);
+    // 0026 и следом 0027 (M7.3) — последняя схема
+    assert_eq!(
+        checks,
+        (USER_MIGRATIONS.len() as u32, 0, true, "ok".to_string())
+    );
     // строки (в том числе Idempotency-Key и `imported_from`; все столбцы на своих местах) и
     // счётчики всех таблиц
     assert_eq!(rows_after, rows_before);
@@ -1708,11 +1750,17 @@ async fn migrate_0026_from_m6_db() {
         assert_eq!(counts_after.get(t), Some(n), "таблица {t}");
     }
     assert!(!counts_after.keys().any(|t| t.ends_with("_new")));
-    // схема — как у чистой базы; от прежней отличается только SQL таблицы `entries`
+    // схема — как у чистой базы; от прежней отличается только SQL таблицы `entries` и
+    // объектами 0027 (M7.3: семь новых таблиц и их индексы)
     assert_eq!(objects_after, fresh_schema(&dir, USER_MIGRATIONS));
+    let new_0027 = objects_0027(&dir);
+    assert!(new_0027.is_subset(&objects_after));
     let is_entries = |o: &&MasterObject| o.0 == "table" && o.1 == "entries";
     let before: Vec<&MasterObject> = objects_before.iter().filter(|o| !is_entries(o)).collect();
-    let after: Vec<&MasterObject> = objects_after.iter().filter(|o| !is_entries(o)).collect();
+    let after: Vec<&MasterObject> = objects_after
+        .iter()
+        .filter(|o| !is_entries(o) && !new_0027.contains(*o))
+        .collect();
     assert_eq!(after, before);
     let sql_of = |s: &BTreeSet<MasterObject>| s.iter().find(is_entries).unwrap().3.clone();
     let (sql_before, sql_after) = (sql_of(&objects_before), sql_of(&objects_after));
