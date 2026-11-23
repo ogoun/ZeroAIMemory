@@ -7,8 +7,9 @@
   // корзину, с подтверждением; «Корзина» — вместо списка удалённые термины с «Восстановить»
   // (`JournalTrash`, ленивый чанк; имя, занятое за это время, — 409 со ссылкой в тексте ошибки).
   import { untrack } from 'svelte';
-  import Lazy from './Lazy.svelte';
+  import Notice from './Notice.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
+  import TrashPanel from './TrashPanel.svelte';
   import { trashAsk } from '../lib/entryTrash';
   import {
     ApiError,
@@ -189,6 +190,7 @@
     ask = trashAsk(user, c, {
       deleted: async (msg) => {
         mode = 'none';
+        cur = null;
         go({ name: 'journal', user, space, journal: 'glossary', entry: null }, { replace: true });
         await load(user, space);
         listNotice = msg;
@@ -198,6 +200,7 @@
         actionError = msg;
       },
       expired: onexpired,
+      focus: () => listEl?.querySelector('[role="status"]'),
     });
   }
 
@@ -208,8 +211,8 @@
     if (!trash) load(user, space);
   }
 
-  /** Термин восстановлен из корзины: список перечитается при возврате к нему (`toggleTrash`). */
-  const onrestored = () => {};
+  /** Итог над списком (`Notice`): фокус после удаления — сюда, кнопки карточки уже нет. */
+  let listEl = $state<HTMLElement | null>(null);
 
   /** Карточка или форма показана (в узкой области — вместо списка). */
   let detailOpen = $derived(cur !== null || curError !== '' || mode === 'create' || mode === 'edit');
@@ -350,14 +353,14 @@
     <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
   </div>
   {#if trash}
-    <Lazy what="Корзина" load={() => import('./JournalTrash.svelte')} props={{ user, space, kind: 'term', onrestored, onexpired }} />
+    <TrashPanel {user} {space} kind="term" {onexpired} />
   {:else}
     {@render liveList()}
   {/if}
 {/snippet}
 
 {#snippet liveList()}
-  {#if listNotice}<p class="muted" role="status">{listNotice}</p>{/if}
+  <div bind:this={listEl}><Notice text={listNotice} /></div>
 
   {#if groups.length > 1}
     <!-- указатель букв — полоса (§5.2 п. 4): одна строка с прокруткой на телефоне и планшете -->
@@ -477,11 +480,6 @@
   .bar input {
     flex: 1;
     min-width: 220px;
-  }
-  .toggle[aria-pressed='true'] {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: var(--selected);
   }
   /* раскладка — `.strip` (app.css): при касании буквы — цели по 44 px с зазором `--touch-gap` */
   .alpha {

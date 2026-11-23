@@ -4,10 +4,14 @@
   // (M7.2, спецификация §5.9): у выбранного релиза — «Изменить» (`EntryEdit`: заголовок, текст,
   // теги, область; версия и коммиты — как есть) и «Удалить» (в корзину, с подтверждением);
   // «Корзина» — удалённые релизы с «Восстановить» (`JournalTrash`). Форма и корзина — ленивые чанки.
+  // Пока форма открыта, выбор другого релиза, «Сравнить с» и «Корзина» неактивны: набранное молча не
+  // теряется.
   import { untrack } from 'svelte';
   import DiffView from './DiffView.svelte';
-  import Lazy from './Lazy.svelte';
+  import EditPanel from './EditPanel.svelte';
+  import Notice from './Notice.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
+  import TrashPanel from './TrashPanel.svelte';
   import {
     ApiError,
     compareRelease,
@@ -17,6 +21,7 @@
     type ReleaseCompare,
   } from '../lib/api';
   import { trashAsk } from '../lib/entryTrash';
+  import { focusSoon } from '../lib/focus';
   import { CHANGELOG_KINDS, dataStr, fmtTime } from '../lib/journals';
   import { go } from '../lib/router';
 
@@ -56,13 +61,20 @@
     set(errorText(e));
   }
 
+  /** Пространство, для которого сброшены корзина, форма и итог: эффект ниже перезапускается на
+   * каждый переход (свойства — из объекта маршрута), а сброс нужен только при смене пространства —
+   * иначе переход (адрес без записи после удаления, запись из поиска) стёр бы итог и форму. */
+  let scopeOf = '';
   $effect(() => {
     const u = user;
     const s = space;
     untrack(() => {
-      trash = false;
-      editing = false;
-      notice = '';
+      if (scopeOf !== `${u}|${s}`) {
+        scopeOf = `${u}|${s}`;
+        trash = false;
+        editing = false;
+        notice = '';
+      }
       load(u, s, true);
     });
   });
@@ -118,12 +130,23 @@
     go({ name: 'journal', user, space, journal: 'releases', entry: id }, { replace: true });
   }
 
-  /** Релиз сохранён или перечитан (409): список и сравнение — с новой ревизией. */
+  let root = $state<HTMLElement | null>(null);
+  /** «Изменить» выбранного релиза — фокус после закрытия формы. */
+  const editButton = () => root?.querySelector('.compare .actions button');
+
+  /** Форма закрыта «Отменой»: фокус — на «Изменить». */
+  function closeEdit() {
+    editing = false;
+    focusSoon(editButton);
+  }
+
+  /** Релиз сохранён: список и сравнение — с новой ревизией, фокус — на «Изменить». */
   async function refresh(done: string) {
     editing = false;
     await load(user, space, true);
     await compare(user, selected, withId);
     notice = done;
+    focusSoon(editButton);
   }
 
   /** 409 правки или удаления: сравнение перечитано, ошибка — под заголовком. */
@@ -138,26 +161,24 @@
     ask = trashAsk(user, e, {
       deleted: async (msg) => {
         editing = false;
-        // выбранный ушёл в корзину: адрес без записи — последний релиз
-        go({ name: 'journal', user, space, journal: 'releases', entry: null }, { replace: true });
+        // сначала список без удалённого, потом адрес без записи — сравнение последнего релиза: иначе
+        // «последним» на миг оказался бы удалённый, и его сравнение ответило бы 404
         await load(user, space, true);
+        go({ name: 'journal', user, space, journal: 'releases', entry: null }, { replace: true });
         notice = msg;
       },
       stale,
       expired: onexpired,
+      focus: () => root?.querySelector(':scope > [role="status"]'),
     });
   }
 
   function toggleTrash() {
     trash = !trash;
-    editing = false;
     notice = '';
     // назад к списку: восстановленные из корзины — в нём
     if (!trash) load(user, space, true);
   }
-
-  /** Релиз восстановлен из корзины: список перечитается при возврате к нему (`toggleTrash`). */
-  const onrestored = () => {};
 
   /** 409 формы правки: релиз перечитан — заголовок и текст сравнения с новой ревизией, форма цела. */
   function reread(e: Entry) {
@@ -174,13 +195,13 @@
   });
 </script>
 
-<section class="journal releases">
+<section class="journal releases" bind:this={root}>
   <div class="row bar">
-    <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
+    <button type="button" class="toggle" aria-pressed={trash} disabled={editing} onclick={toggleTrash}>Корзина</button>
   </div>
-  {#if notice}<p class="muted" role="status">{notice}</p>{/if}
+  <Notice text={notice} />
   {#if trash}
-    <Lazy what="Корзина" load={() => import('./JournalTrash.svelte')} props={{ user, space, kind: 'release', onrestored, onexpired }} />
+    <TrashPanel {user} {space} kind="release" {onexpired} />
   {:else}
     {#if error}<p class="error" role="alert">{error}</p>{/if}
     <div class="layout">
@@ -191,6 +212,7 @@
               type="button"
               class="rel"
               aria-current={r.id === selected ? 'true' : undefined}
+              disabled={editing}
               onclick={() => pick(r.id)}
             >
               <span class="ver">{version(r)}</span>
@@ -221,7 +243,7 @@
             </div>
             <label class="row with">
               Сравнить с
-              <select bind:value={withId} aria-label="Сравнить с">
+              <select bind:value={withId} aria-label="Сравнить с" disabled={editing}>
                 <option value="">предыдущим релизом</option>
                 {#each releases.filter((r) => r.id !== cmp?.to.id) as r (r.id)}
                   <option value={r.id}>{version(r)}</option>
@@ -241,18 +263,13 @@
             {#if actionError}<p class="error" role="alert">{actionError}</p>{/if}
           </header>
           {#if editing}
-            <Lazy
-              what="Форма"
-              load={() => import('./EntryEdit.svelte')}
-              props={{
-                user,
-                entry: cmp.to,
-                onsaved: (e) => refresh(`Релиз «${e.title}» сохранён.`),
-                oncancel: () => (editing = false),
-                onreread: reread,
-                onexpired,
-              }}
-              oncancel={() => (editing = false)}
+            <EditPanel
+              {user}
+              entry={cmp.to}
+              onsaved={(e) => refresh(`Релиз «${e.title}» сохранён.`)}
+              oncancel={closeEdit}
+              onreread={reread}
+              {onexpired}
             />
           {/if}
           {#if cmp.to.body}<p class="body">{cmp.to.body}</p>{/if}
@@ -375,16 +392,7 @@
     font-weight: 600;
     overflow-wrap: anywhere;
   }
-  .toggle[aria-pressed='true'] {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: var(--selected);
-  }
   .actions {
     margin-top: 6px;
-  }
-  .small-btn {
-    padding: 2px 8px;
-    font-size: 12px;
   }
 </style>

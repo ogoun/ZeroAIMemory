@@ -10,11 +10,15 @@
   // Правка и корзина (M7.2, спецификация §5.9): у открытого вопроса — «Изменить» (`EntryEdit`:
   // текст вопроса, теги, область) и «Неактуален» (`status: obsolete` с причиной); у любого —
   // «Удалить» (в корзину, с подтверждением); «Корзина» — удалённые вопросы с «Восстановить»
-  // (`JournalTrash`). Форма и корзина — ленивые чанки.
+  // (`JournalTrash`). Форма и корзина — ленивые чанки. Пока форма открыта, «Изменить» другого
+  // вопроса и «Корзина» неактивны; вопрос, отвеченный в другом месте за время правки, закрывает
+  // форму с объяснением.
 
   import { tick, untrack } from 'svelte';
-  import Lazy from './Lazy.svelte';
+  import EditPanel from './EditPanel.svelte';
+  import Notice from './Notice.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
+  import TrashPanel from './TrashPanel.svelte';
   import {
     ApiError,
     answerQuestion,
@@ -27,6 +31,7 @@
     type Space,
   } from '../lib/api';
   import { trashAsk } from '../lib/entryTrash';
+  import { focusSoon } from '../lib/focus';
   import { DEFER_FORM, START_SUBMIT, deferDefault, deferError, deferMin, sharedWarning } from '../lib/ideaForms';
   import { AUTHOR_TEXT, STATUS_TEXT, entryRef, fmtTime } from '../lib/journals';
   import { href } from '../lib/router';
@@ -76,13 +81,20 @@
     set(errorText(e));
   }
 
+  /** Пространство, для которого сброшены корзина, форма и итог: эффект ниже перезапускается на
+   * каждый переход (свойства — из объекта маршрута), а сброс нужен только при смене пространства —
+   * иначе переход (адрес без записи после удаления, запись из поиска) стёр бы итог и форму. */
+  let scopeOf = '';
   $effect(() => {
     const u = user;
     const s = space;
     untrack(() => {
-      trash = false;
-      editing = '';
-      notice = '';
+      if (scopeOf !== `${u}|${s}`) {
+        scopeOf = `${u}|${s}`;
+        trash = false;
+        editing = '';
+        notice = '';
+      }
       load(u, s, true);
     });
   });
@@ -227,10 +239,32 @@
     notice = '';
   }
 
-  function saved(e: Entry) {
+  let root = $state<HTMLElement | null>(null);
+  /** Кнопка действия вопроса `id` с именем, начинающимся на `name` («Изменить», «Удалить»). */
+  const action = (id: string, name: string) =>
+    root?.querySelector(`[data-question="${CSS.escape(id)}"] .acts button[aria-label^="${name}"]`);
+
+  /** Форма закрыта (сохранено или «Отмена»): фокус — на «Изменить» вопроса. */
+  function closeEdit(id: string) {
     editing = '';
+    focusSoon(() => action(id, 'Изменить') ?? action(id, 'Удалить'));
+  }
+
+  function saved(e: Entry) {
     replace(e);
+    closeEdit(e.id);
     notice = `Вопрос «${e.title}» сохранён.`;
+  }
+
+  /** 409 формы правки: вопрос перечитан. Ответили или сняли его в другом месте — правки больше нет
+   * (правится только открытый): форма закрывается, причина — у карточки, «Удалить» снова видна. */
+  function reread(e: Entry) {
+    replace(e);
+    if (editing === e.id && e.status !== 'open') {
+      editing = '';
+      errors[e.id] = `Пока шла правка, вопрос стал «${e.status ? STATUS_TEXT[e.status] : ''}» в другом месте — форма закрыта, текст не сохранён.`;
+      focusSoon(() => action(e.id, 'Удалить'));
+    }
   }
 
   /** 409: список перечитан, ошибка — у карточки вопроса. */
@@ -260,6 +294,8 @@
         if (editing === q.id) editing = '';
         notice = `Вопрос «${q.title}» отмечен неактуальным.`;
       },
+      // «Неактуален» ушла вместе с вариантами ответа — фокус на «Удалить» вопроса
+      refocus: () => action(q.id, 'Удалить'),
     };
   }
 
@@ -274,30 +310,27 @@
       },
       stale: (msg) => stale(q.id, msg),
       expired: onexpired,
+      focus: () => root?.querySelector(':scope > [role="status"]'),
     });
   }
 
   function toggleTrash() {
     trash = !trash;
-    editing = '';
     notice = '';
     // назад к списку: восстановленные из корзины — в нём
     if (!trash) load(user, space, true);
   }
-
-  /** Вопрос восстановлен из корзины: список перечитается при возврате к нему (`toggleTrash`). */
-  const onrestored = () => {};
 </script>
 
 <Prompt bind:ask />
 
-<section class="journal questions">
+<section class="journal questions" bind:this={root}>
   <div class="row bar">
-    <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
+    <button type="button" class="toggle" aria-pressed={trash} disabled={!!editing} onclick={toggleTrash}>Корзина</button>
   </div>
-  {#if notice}<p class="muted" role="status">{notice}</p>{/if}
+  <Notice text={notice} />
   {#if trash}
-    <Lazy what="Корзина" load={() => import('./JournalTrash.svelte')} props={{ user, space, kind: 'question', onrestored, onexpired }} />
+    <TrashPanel {user} {space} kind="question" {onexpired} />
   {:else}
     {#if error}<p class="error" role="alert">{error}</p>{/if}
     {#if loading && items.length === 0}<p class="muted">Загрузка…</p>{/if}
@@ -319,12 +352,7 @@
           {/if}
 
           {#if q.status === 'open' && editing === q.id}
-            <Lazy
-              what="Форма"
-              load={() => import('./EntryEdit.svelte')}
-              props={{ user, entry: q, onsaved: saved, oncancel: () => (editing = ''), onreread: replace, onexpired }}
-              oncancel={() => (editing = '')}
-            />
+            <EditPanel {user} entry={q} onsaved={saved} oncancel={() => closeEdit(q.id)} onreread={reread} {onexpired} />
           {:else if q.status === 'open'}
             {#if opts.length}
               <div class="row opts" role="group" aria-label="Варианты ответа">
@@ -393,7 +421,7 @@
                  вопросы различимы -->
             <div class="row acts" role="group" aria-label="Действия с вопросом">
               {#if q.status === 'open'}
-                <button type="button" class="small-btn" aria-label="Изменить «{q.title}»" onclick={() => startEdit(q)}>Изменить</button>
+                <button type="button" class="small-btn" aria-label="Изменить «{q.title}»" disabled={!!editing} onclick={() => startEdit(q)}>Изменить</button>
                 <button type="button" class="small-btn" aria-label="Неактуален «{q.title}»" onclick={() => askObsolete(q)}>Неактуален</button>
               {/if}
               <button type="button" class="small-btn danger" aria-label="Удалить «{q.title}»" onclick={() => askDelete(q)}>Удалить</button>
@@ -450,16 +478,7 @@
   .bar {
     margin-bottom: 8px;
   }
-  .toggle[aria-pressed='true'] {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: var(--selected);
-  }
   .acts {
     margin-top: 8px;
-  }
-  .small-btn {
-    padding: 2px 8px;
-    font-size: 12px;
   }
 </style>

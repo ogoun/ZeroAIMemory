@@ -14,11 +14,15 @@
     danger?: boolean;
     /** Действие; исключение показывается в окне, окно остаётся открытым. */
     run: (value: string) => Promise<void> | void;
+    /** После удавшегося `run`: куда перевести фокус при закрытии окна (кнопка, открывшая окно,
+     * могла уйти вместе с записью); `null` — как обычно, на неё. */
+    refocus?: () => Element | null | undefined;
   }
 </script>
 
 <script lang="ts">
   import { Dialog } from 'bits-ui';
+  import { focusNow } from '../lib/focus';
 
   let { ask = $bindable() }: { ask: Ask | null } = $props();
 
@@ -26,6 +30,8 @@
   let error = $state('');
   let busy = $state(false);
   let field = $state<HTMLInputElement | null>(null);
+  /** Куда перевести фокус при закрытии окна после удавшегося действия (`Ask.refocus`). */
+  let refocus: Ask['refocus'] = undefined;
 
   // Новое окно — новое значение поля.
   $effect(() => {
@@ -45,6 +51,7 @@
     error = '';
     try {
       await ask.run(v);
+      refocus = ask?.refocus;
       ask = null;
     } catch (err) {
       error = err instanceof Error ? err.message : 'Ошибка';
@@ -65,11 +72,17 @@
     <Dialog.Content
       class="panel dialog"
       onOpenAutoFocus={(e) => {
+        refocus = undefined;
         if (field) {
           e.preventDefault();
           field.focus();
           field.select();
         }
+      }}
+      onCloseAutoFocus={(e) => {
+        const r = refocus;
+        refocus = undefined;
+        if (r && focusNow(r())) e.preventDefault();
       }}
     >
       {#if ask}

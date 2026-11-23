@@ -16,9 +16,10 @@
   import CertaintyBadge from './CertaintyBadge.svelte';
   import FileRefs from './FileRefs.svelte';
   import JournalSplit from './JournalSplit.svelte';
-  import Lazy from './Lazy.svelte';
   import Links from './Links.svelte';
+  import Notice from './Notice.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
+  import TrashPanel from './TrashPanel.svelte';
   import { trashAsk } from '../lib/entryTrash';
   import {
     ApiError,
@@ -521,6 +522,9 @@
     notice = '';
     ask = trashAsk(user, c, {
       deleted: async (msg) => {
+        // карточка закрывается сразу: иначе её «Связи» перечитались бы для удалённой записи (404),
+        // пока смена адреса и перечитывание оболочки ещё идут
+        cur = null;
         go({ name: 'journal', user, space, journal: 'insights', entry: null }, { replace: true });
         await reloadList();
         listNotice = msg;
@@ -530,6 +534,7 @@
         actionError = msg;
       },
       expired: onexpired,
+      focus: () => listEl?.querySelector('[role="status"]'),
     });
   }
 
@@ -540,8 +545,8 @@
     if (!trash) reloadList();
   }
 
-  /** Запись восстановлена из корзины: таблица перечитается при возврате к ней (`toggleTrash`). */
-  const onrestored = () => {};
+  /** Итог над таблицей (`Notice`): фокус после удаления — сюда, кнопки карточки уже нет. */
+  let listEl = $state<HTMLElement | null>(null);
 
   const live = (e: Entry) => e.status === 'active' || e.status === 'revisit';
   const evidenceOf = (e: Entry): Record<string, unknown> | null => {
@@ -576,7 +581,7 @@
     <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
   </form>
   {#if trash}
-    <Lazy what="Корзина" load={() => import('./JournalTrash.svelte')} props={{ user, space, kind: 'insight', onrestored, onexpired }} />
+    <TrashPanel {user} {space} kind="insight" {onexpired} />
   {:else}
     {@render liveTable()}
   {/if}
@@ -613,7 +618,7 @@
 {/snippet}
 
 {#snippet liveTable()}
-  {#if listNotice}<p class="muted" role="status">{listNotice}</p>{/if}
+  <div bind:this={listEl}><Notice text={listNotice} /></div>
   {#if error}<p class="error" role="alert">{error}</p>{/if}
 
   <div class="table-wrap">
@@ -1020,11 +1025,6 @@
   }
   .actions {
     margin-top: 12px;
-  }
-  .toggle[aria-pressed='true'] {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: var(--selected);
   }
   .form {
     display: grid;

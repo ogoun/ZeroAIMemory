@@ -1365,6 +1365,59 @@ async fn entries_trash_any_kind() {
     }
 }
 
+/// Корзина личного пространства (ревью задачи 10, круг 1, M5): Knowledge — другая ветка
+/// `space_scope` (личная база), право — то же право записи: токен `rw` и сессия владельца — 200,
+/// токен `ro` владельца — 403; у участника решения `knowledge` — его собственное, удалённых записей
+/// владельца там нет; восстановление возвращает задачу в ленту Knowledge.
+#[tokio::test]
+async fn entries_trash_knowledge() {
+    let w = common::reports::world("journals-trash-knowledge").await;
+    let a = &w.a;
+    let id = log_entry(a, &w.o.tok, "knowledge", "task", 0).await;
+    let r = a
+        .tok_rev(
+            &w.o.tok,
+            Method::DELETE,
+            &format!("/api/v1/entries/{id}"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    let trash = "/api/v1/spaces/knowledge/entries?kind=task&deleted=only";
+    for who in [Who::Tok(&w.o.tok), Who::Web(&w.o.web)] {
+        assert_eq!(feed_ids(&get_ok_as(a, who, trash).await), [id.as_str()]);
+    }
+    let ro = a.issue(&w.o.id, "ro").await;
+    let r = get_as(a, Who::Tok(&ro), trash).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    for who in [Who::Tok(&w.rw.tok), Who::Web(&w.rw.web)] {
+        assert_eq!(
+            feed_ids(&get_ok_as(a, who, trash).await),
+            Vec::<String>::new()
+        );
+    }
+    let r = a
+        .tok(
+            &w.o.tok,
+            Method::POST,
+            &format!("/api/v1/entries/{id}/restore"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let live = get_ok_as(
+        a,
+        Who::Tok(&w.o.tok),
+        "/api/v1/spaces/knowledge/entries?kind=task",
+    )
+    .await;
+    assert_eq!(feed_ids(&live), [id.as_str()]);
+    assert_eq!(
+        feed_ids(&get_ok_as(a, Who::Tok(&w.o.tok), trash).await),
+        Vec::<String>::new()
+    );
+}
+
 /// Права корзины (решение 30): у прочих видов — право записи пространства, как у `DELETE` и
 /// `restore`: владелец и участник `rw` (токен и сессия), администратор от имени владельца — 200;
 /// участник `ro` (сессия и токен) и токен `ro` владельца — 403, восстановить участник `ro` тоже не

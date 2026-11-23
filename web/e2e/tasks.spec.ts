@@ -960,6 +960,53 @@ test.describe('настольный', () => {
     await expect(col.locator(`[data-task="${t.id}"]`)).toHaveCount(0);
     expect(problems, problems.join('\n')).toEqual([]);
   });
+
+  test('task_edit_stale_keeps_next_step', async ({ page }) => {
+    // ревью задачи 10, круг 1 (I1, M1, M3): пока форма правки открыта, агент меняет следующий шаг →
+    // 409 → карточка перечитана, поле «Следующий шаг» (его не трогали) — шаг агента, «Сохранить шаг»
+    // не затрёт его старым; смена статуса и шаг на время правки неактивны; «Отмена» — фокус на
+    // «Изменить», Esc закрывает панель без вопроса о несохранённом
+    const problems = watch(page, (path, status) => status === 409 && /\/entries\/[0-9A-Za-z]+$/.test(path));
+    const guid = await newSolution('правка и шаг агента');
+    const t = await api<{ id: string; rev: number }>('POST', `spaces/${guid}/entries`, {
+      kind: 'task',
+      title: 'Задача под правкой',
+      body: '',
+      data: { next_step: 'шаг до правки' },
+    });
+    const c = await pageCtx(page);
+    await open(page, tasksUrl(c.user, guid, t.id));
+    const sheet = page.getByRole('dialog', { name: 'Задача', exact: true });
+    const card = sheet.getByRole('article', { name: 'Карточка задачи' });
+    const step = card.getByLabel('Следующий шаг');
+    await expect(step).toHaveValue('шаг до правки');
+    await card.getByRole('button', { name: 'Изменить', exact: true }).click();
+    const form = card.getByRole('form', { name: 'Правка задачи' });
+    await expect(form.getByLabel('Заголовок')).toBeFocused();
+    await expect(step).toBeDisabled();
+    await expect(card.getByRole('group', { name: 'Смена статуса' }).getByRole('button').first()).toBeDisabled();
+    await form.getByLabel('Заголовок').fill('Заголовок человека');
+    const other = await api<{ rev: number }>('PATCH', `entries/${t.id}`, { next_step: 'шаг агента' }, { 'If-Match': `"${t.rev}"` });
+    const stale = page.waitForResponse((r) => r.request().method() === 'PATCH' && r.url().endsWith(`/entries/${t.id}`));
+    await form.getByRole('button', { name: 'Сохранить' }).click();
+    expect((await stale).status()).toBe(409);
+    await expect(form.getByRole('alert')).toContainText(`(сейчас ревизия ${other.rev})`);
+    await expect(card).toContainText(`ревизия ${other.rev}`);
+    await expect(step).toHaveValue('шаг агента');
+    await expect(form.getByLabel('Заголовок')).toHaveValue('Заголовок человека');
+    await form.getByRole('button', { name: 'Отмена' }).click();
+    await expect(form).toHaveCount(0);
+    await expect(card.getByRole('button', { name: 'Изменить', exact: true })).toBeFocused();
+    await expect(step).toBeEnabled();
+    await expect(step).toHaveValue('шаг агента');
+    // несохранённого нет: Esc закрывает панель сразу, шаг агента цел
+    await page.keyboard.press('Escape');
+    await expect(sheet.getByRole('alertdialog')).toHaveCount(0);
+    await expect(sheet).toHaveCount(0);
+    const got = await api<{ title: string; data: Record<string, unknown> }>('GET', `entries/${t.id}`);
+    expect([got.title, got.data.next_step]).toEqual(['Задача под правкой', 'шаг агента']);
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
 });
 
 test.describe('телефон, сенсорный ввод', () => {

@@ -1,20 +1,23 @@
 <script lang="ts">
   // «Корзина» журнала (M7.2, спецификация §5.9 п. 3): удалённые записи вида `kind` пространства
   // (`GET …/entries?kind=<вид>&deleted=only` — новые удаления первыми, по 50 с «Показать ещё») и
-  // «Восстановить» (`POST /entries/{id}/restore`): запись уходит из корзины, журнал перечитывает
-  // живую ленту (`onrestored`). Права — как у восстановления вида: участнику `ro` сервер отвечает 403
-  // — текстом ошибки здесь. Своя корзина — у «Отчётов» (`ReportsView`), у Vault корзины в WebUI нет.
-  // Ленивый чанк: грузится при первом нажатии «Корзина» журнала.
+  // «Восстановить» (`POST /entries/{id}/restore`): запись уходит из корзины. Права — как у
+  // восстановления вида: участнику `ro` сервер отвечает 403 — текстом ошибки здесь. Своя корзина —
+  // у «Отчётов» (`ReportsView`), у Vault корзины в WebUI нет. Ленивый чанк (`TrashPanel`): грузится
+  // при первом нажатии «Корзина» журнала.
   import { tick, untrack } from 'svelte';
+  import Notice from './Notice.svelte';
   import { ApiError, errorText, listEntries, restoreEntry, type Entry, type EntryKind } from '../lib/api';
+  import { focusNow } from '../lib/focus';
   import { AUTHOR_TEXT, entryStatusText, fmtTime } from '../lib/journals';
 
   interface Props {
     user: string;
     space: string;
     kind: EntryKind;
-    /** Запись восстановлена: журнал перечитывает живую ленту. */
-    onrestored: () => void;
+    /** Запись восстановлена. Журналы WebUI не передают: корзина у них — вместо ленты, и живая лента
+     * перечитывается при возврате из корзины; нужно тому, кто покажет корзину рядом с лентой. */
+    onrestored?: () => void;
     /** 401: сессия кончилась. */
     onexpired?: () => void;
   }
@@ -82,12 +85,12 @@
       if (my !== seq) return;
       items = items.filter((x) => x.id !== e.id);
       notice = `Восстановлено: «${e.title}» — снова в журнале.`;
-      onrestored();
+      onrestored?.();
       // кнопка ушла вместе со строкой: фокус — на соседнюю строку, иначе на итог
       await tick();
       if (!btn.isConnected) {
         const row = root?.querySelectorAll<HTMLElement>('[data-trash] button')[Math.min(i, items.length - 1)];
-        (row ?? status)?.focus();
+        focusNow(row ?? root?.querySelector('[role="status"]'));
       }
     } catch (err) {
       if (my !== seq) return;
@@ -98,12 +101,11 @@
   }
 
   let root = $state<HTMLElement | null>(null);
-  let status = $state<HTMLElement | null>(null);
 </script>
 
 <section class="trash" aria-label="Корзина" bind:this={root}>
   <p class="muted small">Корзина: удалённые записи журнала, новые удаления первыми; «Восстановить» возвращает запись.</p>
-  <p class="muted" role="status" tabindex="-1" bind:this={status}>{notice}</p>
+  <Notice text={notice} />
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   <div class="feed" role="feed" aria-label="Удалённые записи" aria-busy={loading}>
     {#each items as e (e.id)}
@@ -171,9 +173,5 @@
   }
   .small {
     font-size: 12px;
-  }
-  /* живая область остаётся в документе (объявление итога), пустая — без отступа */
-  [role='status']:empty {
-    margin: 0;
   }
 </style>

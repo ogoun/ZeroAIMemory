@@ -2,7 +2,7 @@
 // замещение insight, повышение до theorem с доказательством, раскрытие секрета Vault,
 // вкладка «Связи» с обратной ссылкой, карточки записей в поиске Ctrl+K.
 // Данные — seedJournals (global-setup). Снимки — в .tmp/e2e/screens/ (под .gitignore).
-import { expect, test, type Locator, type Page } from '@playwright/test';
+import { expect, test, type Browser, type Locator, type Page } from '@playwright/test';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { pageCtx } from './mobile-pages';
@@ -686,4 +686,187 @@ test('entry_edit_stale_rev_rereads', async ({ page }) => {
   // 409 — ожидаемый ответ сценария
   const expected = `HTTP 409 PATCH /api/v1/entries/${e.id}`;
   expect(problems.filter((p) => p !== expected), problems.join('\n')).toEqual([]);
+});
+
+// ---- ревью задачи 10, круг 1 (M3, M5): релизы, корзины прочих журналов, участник `ro` ----
+
+/** Корзина журнала: переключатель на странице и область корзины. */
+const trashToggle = (page: Page) => page.locator('section.journal').getByRole('button', { name: 'Корзина', exact: true });
+const trashRegion = (page: Page) => page.getByRole('region', { name: 'Корзина' });
+
+/** Корзина журнала: удалённая запись `id` есть, «Восстановить» возвращает её; корзина пуста. */
+async function restoreFromTrash(page: Page, id: string, title: string) {
+  await trashToggle(page).click();
+  const trash = trashRegion(page);
+  await expect(trash.locator(`[data-trash="${id}"]`).getByRole('heading')).toHaveText(title);
+  await trash.getByRole('button', { name: `Восстановить «${title}»` }).click();
+  await expect(trash.getByRole('status')).toHaveText(`Восстановлено: «${title}» — снова в журнале.`);
+  await expect(trash).toContainText('Корзина пуста.');
+  // строки нет — фокус на итоге корзины
+  await expect(trash.getByRole('status')).toBeFocused();
+  await trashToggle(page).click();
+  await expect(trashToggle(page)).toHaveAttribute('aria-pressed', 'false');
+  expect((await agentApi<{ deleted_at: string | null }>('GET', `entries/${id}`)).deleted_at).toBeNull();
+}
+
+test('releases_edit_and_trash_restore', async ({ page }) => {
+  const problems = watch(page);
+  const guid = await newSolution('правка релиза');
+  const rel = (version: string, notes: string) =>
+    agentApi<Rec>('POST', `spaces/${guid}/entries`, {
+      kind: 'release',
+      title: `Релиз ${version}`,
+      body: notes,
+      data: { version, commits: [{ sha: 'abc1234', subject: 'feat: x' }] },
+    });
+  await rel('1.0.0', 'Первый.');
+  const r2 = await rel('1.1.0', 'Второй.');
+  const c = await pageCtx(page);
+  await page.goto(`${base()}#/u/${c.user}/s/${guid}/j/releases/${r2.id}`);
+  await expect(page.getByRole('heading', { name: 'Релиз 1.1.0' })).toBeVisible();
+  const compare = page.locator('.compare');
+  await compare.getByRole('button', { name: 'Изменить', exact: true }).click();
+  const form = compare.getByRole('form', { name: 'Правка релиза' });
+  await expect(form.getByLabel('Заголовок')).toBeFocused();
+  // форма открыта — выбор другого релиза, «Сравнить с» и «Корзина» неактивны (набранное цело)
+  const list = page.getByRole('list', { name: 'Релизы' });
+  await expect(list.getByRole('button', { name: /1\.0\.0/ })).toBeDisabled();
+  await expect(page.getByLabel('Сравнить с')).toBeDisabled();
+  await expect(trashToggle(page)).toBeDisabled();
+  await form.getByLabel('Заголовок').fill('Релиз 1.1.0 «Осень»');
+  await form.getByLabel('Текст').fill('Второй, с правкой.');
+  const saved = page.waitForResponse((r) => r.request().method() === 'PATCH' && r.url().endsWith(`/entries/${r2.id}`));
+  await form.getByRole('button', { name: 'Сохранить' }).click();
+  const resp = await saved;
+  expect(resp.status()).toBe(200);
+  // версия и коммиты — как есть: `data` в правке нет
+  expect(resp.request().postDataJSON()).toEqual({ title: 'Релиз 1.1.0 «Осень»', body: 'Второй, с правкой.' });
+  await expect(page.locator('section.journal > [role="status"]')).toHaveText('Релиз «Релиз 1.1.0 «Осень»» сохранён.');
+  await expect(compare.locator('.rel-title')).toHaveText('Релиз 1.1.0 «Осень»');
+  await expect(compare.getByRole('button', { name: 'Изменить', exact: true })).toBeFocused();
+  const after = await agentApi<Rec>('GET', `entries/${r2.id}`);
+  expect(after.data).toMatchObject({ version: '1.1.0', commits: [{ sha: 'abc1234', subject: 'feat: x' }] });
+
+  // «Удалить» — в корзину: в списке один релиз, фокус — на итоге; «Корзина» — «Восстановить»
+  await compare.getByRole('button', { name: 'Удалить', exact: true }).click();
+  await page.getByRole('dialog', { name: 'Удалить релиз?' }).getByRole('button', { name: 'Удалить', exact: true }).click();
+  const notice = page.locator('section.journal > [role="status"]');
+  await expect(notice).toHaveText('Релиз «Релиз 1.1.0 «Осень»» перемещён в корзину.');
+  await expect(notice).toBeFocused();
+  await expect(list.getByRole('button')).toHaveCount(1);
+  await restoreFromTrash(page, r2.id, 'Релиз 1.1.0 «Осень»');
+  await expect(list.getByRole('button')).toHaveCount(2);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('journals_trash_insights_glossary_ideas_questions', async ({ page }) => {
+  // «Удалить» у Insights и Словаря (итог над списком, фокус на нём), корзины Идей и Вопросов
+  const problems = watch(page);
+  const guid = await newSolution('корзины журналов');
+  const post = (body: Record<string, unknown>) => agentApi<Rec>('POST', `spaces/${guid}/entries`, body);
+  const ins = await post({ kind: 'insight', title: 'Insight в корзину', body: 'Суть.', data: { kind: 'gotcha' } });
+  const term = await post({ kind: 'term', title: 'Терминус', body: '', data: { definition: 'Термин для корзины', aliases: [] } });
+  const idea = await post({ kind: 'idea', title: 'Идея в корзину', body: 'Замысел.', data: { origin: 'agent' } });
+  const q = await post({ kind: 'question', title: 'Вопрос в корзину', body: 'Нужен ли?' });
+  const c = await pageCtx(page);
+  const url = (j: string, id = '') => `${base()}#/u/${c.user}/s/${guid}/j/${j}${id ? `/${id}` : ''}`;
+
+  // Insights: карточка → «Удалить» → строки нет, итог над таблицей в фокусе → корзина
+  await page.goto(url('insights', ins.id));
+  const icard = page.getByRole('article', { name: 'Карточка insight' });
+  await icard.getByRole('button', { name: 'Удалить', exact: true }).click();
+  await page.getByRole('dialog', { name: 'Удалить запись?' }).getByRole('button', { name: 'Удалить', exact: true }).click();
+  const inotice = page.locator('section.journal').getByRole('status').filter({ hasText: 'перемещена в корзину' });
+  await expect(inotice).toHaveText('Запись «Insight в корзину» перемещена в корзину.');
+  await expect(inotice).toBeFocused();
+  await expect(icard).toHaveCount(0);
+  await expect(page.getByRole('table', { name: 'Insights' }).locator(`[data-entry="${ins.id}"]`)).toHaveCount(0);
+  await restoreFromTrash(page, ins.id, 'Insight в корзину');
+  await expect(page.getByRole('table', { name: 'Insights' }).locator(`[data-entry="${ins.id}"]`)).toHaveCount(1);
+
+  // Словарь: то же
+  await page.goto(url('glossary', term.id));
+  const tcard = page.getByRole('article', { name: 'Карточка термина' });
+  await tcard.getByRole('button', { name: 'Удалить', exact: true }).click();
+  await page.getByRole('dialog', { name: 'Удалить термин?' }).getByRole('button', { name: 'Удалить', exact: true }).click();
+  const tnotice = page.locator('section.journal').getByRole('status').filter({ hasText: 'в корзину' });
+  await expect(tnotice).toHaveText('Термин «Терминус» перемещён в корзину.');
+  await expect(tnotice).toBeFocused();
+  await expect(page.getByRole('list', { name: 'Термины' })).not.toContainText('Терминус');
+  await restoreFromTrash(page, term.id, 'Терминус');
+  await expect(page.getByRole('list', { name: 'Термины' })).toContainText('Терминус');
+
+  // Идеи: удалена агентом — в корзине журнала, «Восстановить»
+  await agentApi('DELETE', `entries/${idea.id}`, undefined, { 'If-Match': `"${idea.rev}"` });
+  await page.goto(url('ideas'));
+  await expect(page.getByRole('button', { name: 'Новая идея' })).toBeVisible();
+  await restoreFromTrash(page, idea.id, 'Идея в корзину');
+
+  // Вопросы: «Удалить» в карточке → итог в фокусе → корзина
+  await page.goto(url('questions'));
+  const qcard = page.locator(`[data-question="${q.id}"]`);
+  await qcard.getByRole('button', { name: 'Удалить «Вопрос в корзину»' }).click();
+  await page.getByRole('dialog', { name: 'Удалить вопрос?' }).getByRole('button', { name: 'Удалить', exact: true }).click();
+  const qnotice = page.locator('section.journal > [role="status"]');
+  await expect(qnotice).toHaveText('Вопрос «Вопрос в корзину» перемещён в корзину.');
+  await expect(qnotice).toBeFocused();
+  await expect(qcard).toHaveCount(0);
+  await restoreFromTrash(page, q.id, 'Вопрос в корзину');
+  await expect(qcard).toContainText('Вопрос в корзину');
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+/** Участник решения `guid` с доступом `access`: вход в WebUI (пароль со сменой) — свой контекст. */
+async function member(browser: Browser, page: Page, guid: string, access: 'ro' | 'rw') {
+  const me = (await (await page.request.get(`${base()}api/v1/auth/me`)).json()) as { csrf: string };
+  const admin = async <T>(method: string, path: string, data?: unknown) => {
+    const r = await page.request.fetch(`${base()}api/v1/${path}`, { method, headers: { 'X-CSRF-Token': me.csrf }, data });
+    if (!r.ok()) throw new Error(`${method} ${path}: HTTP ${r.status()} ${await r.text()}`);
+    return (r.status() === 204 ? undefined : await r.json()) as T;
+  };
+  const name = `e2e-trash-${access}-${Date.now()}`;
+  const pass = ['e2e', 'trash', 'pass', '1'].join('-');
+  const pass2 = ['e2e', 'trash', 'pass', '2'].join('-');
+  const u = await admin<{ user: { id: string }; token: { plaintext: string } }>('POST', 'admin/users', { name });
+  const ctx = await browser.newContext({ storageState: { cookies: [], origins: [] } });
+  const req = await ctx.request.post(`${base()}api/v1/solutions`, {
+    headers: { Authorization: `Bearer ${u.token.plaintext}` },
+    data: { agent_solution_id: guid, name: 'Журналы E2E: доступ' },
+  });
+  expect(req.status()).toBe(202);
+  await admin('POST', `solutions/${guid}/access/${u.user.id}/approve`, { access });
+  await admin('POST', `admin/users/${u.user.id}/password`, { password: pass });
+  const login = await ctx.request.post(`${base()}api/v1/auth/login`, { data: { login: name, password: pass } });
+  expect(login.status()).toBe(200);
+  const mc = ((await login.json()) as { csrf: string }).csrf;
+  const pw = await ctx.request.post(`${base()}api/v1/auth/password`, { headers: { 'X-CSRF-Token': mc }, data: { old: pass, new: pass2 } });
+  expect(pw.status()).toBe(204);
+  return { ctx, id: u.user.id };
+}
+
+test('journal_trash_ro_member_403', async ({ page, browser }) => {
+  // участник `ro` общего решения: «Корзина» видна (кнопки не скрываются — как прочие действия
+  // журналов), сервер отвечает 403 — текст ошибки в корзине, записей нет
+  const guid = await newSolution('корзина участника ro');
+  const e = await agentApi<Rec>('POST', `spaces/${guid}/entries`, { kind: 'changelog', title: 'Удалённая владельцем', data: { kind: 'fix' } });
+  await agentApi('DELETE', `entries/${e.id}`, undefined, { 'If-Match': `"${e.rev}"` });
+  const m = await member(browser, page, guid, 'ro');
+  try {
+    const mp = await m.ctx.newPage();
+    const problems: string[] = [];
+    mp.on('pageerror', (err) => problems.push(err.message));
+    const trashed = mp.waitForResponse((r) => new URL(r.url()).searchParams.get('deleted') === 'only');
+    await mp.goto(`${base()}#/u/${m.id}/s/${guid}/j/changelog`);
+    // живых записей нет (единственная — в корзине): лента пуста
+    await expect(mp.locator('section.journal')).toContainText('Записей нет.');
+    await mp.locator('section.journal').getByRole('button', { name: 'Корзина', exact: true }).click();
+    expect((await trashed).status()).toBe(403);
+    const trash = mp.getByRole('region', { name: 'Корзина' });
+    await expect(trash.getByRole('alert')).toHaveText('Недостаточно прав: запись запрещена: доступ участника к решению — ro');
+    await expect(trash.locator('[data-trash]')).toHaveCount(0);
+    await expect(trash).not.toContainText('Удалённая владельцем');
+    expect(problems, problems.join('\n')).toEqual([]);
+  } finally {
+    await m.ctx.close();
+  }
 });

@@ -28,13 +28,17 @@
   // Правка и корзина (M7.2, спецификация §5.9): в карточке — «Изменить» (`EntryEdit`: заголовок,
   // текст, приоритет, кто ведёт, оценка, ссылки, теги, область; несохранённое в форме — вопрос перед
   // закрытием панели) и «Удалить» (в корзину, с подтверждением); «Корзина» доски — вместо доски
-  // удалённые задачи с «Восстановить» (`JournalTrash`). Форма и корзина — ленивые чанки.
+  // удалённые задачи с «Восстановить» (`JournalTrash`). Форма и корзина — ленивые чанки. Пока форма
+  // правки открыта, смена статуса, «Снять захват» и «Следующий шаг» неактивны (набранное молча не
+  // теряется); 409 формы переносит и черновик шага (`reread`).
   import { tick, untrack } from 'svelte';
   import FileRefs from './FileRefs.svelte';
   import JournalSplit from './JournalSplit.svelte';
-  import Lazy from './Lazy.svelte';
+  import EditPanel from './EditPanel.svelte';
+  import Notice from './Notice.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
   import StatusTabs from './StatusTabs.svelte';
+  import TrashPanel from './TrashPanel.svelte';
   import {
     ApiError,
     createEntry,
@@ -49,6 +53,7 @@
     type EntryStatus,
   } from '../lib/api';
   import { trashAsk } from '../lib/entryTrash';
+  import { focusSoon } from '../lib/focus';
   import { loadRefs, staleOf, type RefsByTarget } from '../lib/fileRefs';
   import {
     AUTHOR_TEXT,
@@ -580,7 +585,8 @@
     mode = 'edit';
   }
 
-  /** Правка сохранена (`EntryEdit`): доска и ссылки — заново, карточка перечитана. */
+  /** Правка сохранена (`EntryEdit`): доска и ссылки — заново, карточка перечитана, фокус — на её
+   * заголовке (кнопки формы ушли). */
   async function edited(e: Entry) {
     mode = 'none';
     cur = e;
@@ -588,7 +594,25 @@
     reloadRefs();
     await open(user, e.id);
     notice = 'Задача сохранена.';
+    focusSoon(() => detailEl()?.querySelector('h2'));
   }
+
+  /** «Отмена» формы правки: фокус — на «Изменить». */
+  function cancelEdit() {
+    mode = 'none';
+    focusSoon(() => detailEl()?.querySelector('[aria-label="Правка задачи"] button'));
+  }
+
+  /** 409 формы правки: запись перечитана. Черновик «Следующего шага» — по правилу `rebase` формы:
+   * нетронутый (равен шагу карточки) — из перечитанной записи, иначе «Сохранить шаг» затёр бы шаг
+   * агента новой ревизией, а закрытие панели спросило бы о несохранённом; набранный — остаётся. */
+  function reread(e: Entry) {
+    if (cur && stepDraft.trim() === str(cur.data, 'next_step')) stepDraft = str(e.data, 'next_step');
+    cur = e;
+  }
+
+  /** Карточка задачи (в панели или вместо доски). */
+  const detailEl = () => root?.querySelector<HTMLElement>('article[aria-label="Карточка задачи"]');
 
   /** «Удалить»: в корзину; панель закрывается, итог — над доской. */
   function askDelete(c: Entry) {
@@ -597,6 +621,7 @@
     ask = trashAsk(user, c, {
       deleted: async (msg) => {
         mode = 'none';
+        cur = null;
         go({ name: 'journal', user, space, journal: 'tasks', entry: null }, { replace: true });
         await reloadBoard();
         reloadRefs();
@@ -607,6 +632,8 @@
         actionError = msg;
       },
       expired: onexpired,
+      // панель закрыта, плитки нет — фокус на итог над доской
+      focus: () => root?.querySelector('.board-notice [role="status"]'),
     });
   }
 
@@ -617,8 +644,7 @@
     if (!trash) reloadBoard();
   }
 
-  /** Задача восстановлена из корзины: доска перечитается при возврате к ней (`toggleTrash`). */
-  const onrestored = () => {};
+  let root = $state<HTMLElement | null>(null);
 
   function startCreate() {
     nTitle = '';
@@ -650,7 +676,7 @@
   }
 </script>
 
-<section class="journal tasks" data-board={board ?? undefined} use:observeWidth={(w) => (width = w)}>
+<section class="journal tasks" data-board={board ?? undefined} use:observeWidth={(w) => (width = w)} bind:this={root}>
   <!-- широкая область — колонки и карточка-панель поверх доски, узкая — вкладки и карточка вместо
        доски (§5.2 п. 1) -->
   <JournalSplit
@@ -699,14 +725,14 @@
     <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
   </div>
   {#if trash}
-    <Lazy what="Корзина" load={() => import('./JournalTrash.svelte')} props={{ user, space, kind: 'task', onrestored, onexpired }} />
+    <TrashPanel {user} {space} kind="task" {onexpired} />
   {:else}
     {@render liveBoard()}
   {/if}
 {/snippet}
 
 {#snippet liveBoard()}
-  {#if boardNotice}<p class="muted" role="status">{boardNotice}</p>{/if}
+  <div class="board-notice"><Notice text={boardNotice} /></div>
   {#if boardError}<p class="error" role="alert">{boardError}</p>{/if}
   {#if total === 0 && !boardError}<p class="muted">{fromIdea ? 'Задач из идей нет.' : 'Задач нет.'}</p>{/if}
 
@@ -922,8 +948,8 @@
 
       {#if c.status !== 'done' && c.status !== 'dropped'}
         <form class="row" onsubmit={saveStep}>
-          <input bind:value={stepDraft} placeholder="следующий шаг" aria-label="Следующий шаг" maxlength="2000" />
-          <button type="submit" disabled={busy}>Сохранить шаг</button>
+          <input bind:value={stepDraft} placeholder="следующий шаг" aria-label="Следующий шаг" maxlength="2000" disabled={mode === 'edit'} />
+          <button type="submit" disabled={busy || mode === 'edit'}>Сохранить шаг</button>
         </form>
       {:else if str(c.data, 'next_step')}
         <p class="muted">Дальше было: {str(c.data, 'next_step')}</p>
@@ -931,28 +957,22 @@
 
       <div class="row actions" role="group" aria-label="Смена статуса">
         {#each targets(c) as s (s)}
-          <button type="button" onclick={() => startStatus(s)} disabled={busy}>
+          <button type="button" onclick={() => startStatus(s)} disabled={busy || mode === 'edit'}>
             {c.status === 'done' || c.status === 'dropped' ? 'Переоткрыть' : `→ ${STATUS_TEXT[s]}`}
           </button>
         {/each}
-        {#if claim}<button type="button" class="danger" onclick={release} disabled={busy}>Снять захват</button>{/if}
+        {#if claim}<button type="button" class="danger" onclick={release} disabled={busy || mode === 'edit'}>Снять захват</button>{/if}
       </div>
       {#if mode !== 'edit'}
         <div class="row actions" role="group" aria-label="Правка задачи">
-          <button type="button" onclick={startEdit} disabled={busy}>Изменить</button>
+          <button type="button" onclick={startEdit} disabled={busy || mode === 'status'}>Изменить</button>
           <button type="button" class="danger" onclick={() => askDelete(c)} disabled={busy}>Удалить</button>
         </div>
       {/if}
       {#if notice}<p class="muted" role="status">{notice}</p>{/if}
 
       {#if mode === 'edit'}
-        <Lazy
-          bind:this={editor}
-          what="Форма"
-          load={() => import('./EntryEdit.svelte')}
-          props={{ user, entry: c, onsaved: edited, oncancel: () => (mode = 'none'), onreread: (e) => (cur = e), onexpired }}
-          oncancel={() => (mode = 'none')}
-        />
+        <EditPanel bind:this={editor} {user} entry={c} onsaved={edited} oncancel={cancelEdit} onreread={reread} {onexpired} />
       {:else if mode === 'status'}
         <form class="form" onsubmit={submitStatus} aria-label="Смена статуса задачи">
           <h3>Статус: {STATUS_TEXT[toStatus]}</h3>
@@ -993,11 +1013,7 @@
   .bar {
     margin-bottom: 8px;
   }
-  .toggle[aria-pressed='true'] {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: var(--selected);
-  }
+  /* нажатый переключатель — `button.toggle[aria-pressed='true']` (app.css) */
   .toggle[aria-disabled='true'] {
     opacity: 0.6;
     cursor: default;

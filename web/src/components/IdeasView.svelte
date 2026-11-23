@@ -23,9 +23,9 @@
   // «Восстановить» (`JournalTrash`, ленивый чанк).
   import { tick, untrack, type Snippet } from 'svelte';
   import JournalSplit from './JournalSplit.svelte';
-  import Lazy from './Lazy.svelte';
   import LazyFail from './LazyFail.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
+  import TrashPanel from './TrashPanel.svelte';
   import {
     ApiError,
     adoptIdea,
@@ -169,9 +169,6 @@
     // назад к ленте: восстановленные из корзины — в ней (и в счётчиках чипов)
     if (!trash) load(user, space, true);
   }
-
-  /** Идея восстановлена из корзины: лента перечитается при возврате к ней (`toggleTrash`). */
-  const onrestored = () => {};
 
   function fail(e: unknown, set: (m: string) => void) {
     if (e instanceof ApiError && e.status === 401) return onexpired();
@@ -526,7 +523,7 @@
     <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
   </div>
   {#if trash}
-    <Lazy what="Корзина" load={() => import('./JournalTrash.svelte')} props={{ user, space, kind: 'idea', onrestored, onexpired }} />
+    <TrashPanel {user} {space} kind="idea" {onexpired} />
   {:else}
     {@render liveIdeas()}
   {/if}
@@ -842,11 +839,6 @@
   }
   .bar {
     margin-bottom: 8px;
-  }
-  .toggle[aria-pressed='true'] {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: var(--selected);
   }
   .tabs {
     display: flex;

@@ -23,16 +23,22 @@ export interface TrashHandlers {
   stale: (message: string) => void | Promise<void>;
   /** 401 — сессия кончилась. */
   expired: () => void;
+  /** Куда перевести фокус, когда запись ушла (кнопка «Удалить» ушла вместе с ней): обычно — итог
+   * журнала (`Notice.svelte`). */
+  focus?: () => Element | null | undefined;
 }
 
 /** Окно подтверждения «Удалить» записи `e` пользователя `user`: прочие ошибки — в окне. */
 export function trashAsk(user: string, e: Entry, h: TrashHandlers): Ask {
   const [noun, done] = NOUN[e.kind] ?? ['запись', 'Запись «%» перемещена'];
+  /** Запись удалена (а не 409): фокус — по `h.focus`, иначе — на кнопку, открывшую окно. */
+  let gone = false;
   return {
     title: `Удалить ${noun}?`,
     message: `«${e.title}» — в корзину журнала; вернуть можно из «Корзины».`,
     confirm: 'Удалить',
     danger: true,
+    refocus: () => (gone ? h.focus?.() : null),
     run: async () => {
       try {
         await deleteEntry(user, e.id, e.rev);
@@ -42,6 +48,7 @@ export function trashAsk(user: string, e: Entry, h: TrashHandlers): Ask {
         if (isStaleEntry(err)) return h.stale(errorText(err));
         throw new Error(errorText(err));
       }
+      gone = true;
       // функцией: `$&` и прочие шаблоны замены в заголовке — текст, а не подстановка
       await h.deleted(`${done.replace('%', () => e.title)} в корзину.`);
     },

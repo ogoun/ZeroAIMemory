@@ -4,11 +4,16 @@
   // спецификация §5.9): у записи — «Изменить» (`EntryEdit`: заголовок, текст, вид, теги, область;
   // 409 — запись перечитана) и «Удалить» (в корзину, с подтверждением); «Корзина» — удалённые
   // записи с «Восстановить» (`JournalTrash`). Форма и корзина — ленивые чанки.
+  // Пока форма открыта, действия, которые её закрыли бы (фильтры, «Корзина», «Изменить» другой
+  // записи), неактивны: набранное молча не теряется.
   import { untrack } from 'svelte';
-  import Lazy from './Lazy.svelte';
+  import EditPanel from './EditPanel.svelte';
+  import Notice from './Notice.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
+  import TrashPanel from './TrashPanel.svelte';
   import { ApiError, errorText, getEntry, listEntries, type Entry } from '../lib/api';
   import { trashAsk } from '../lib/entryTrash';
+  import { focusSoon } from '../lib/focus';
   import { AUTHOR_TEXT, CHANGELOG_KINDS, dataStr, fmtTime } from '../lib/journals';
 
   interface Props {
@@ -42,6 +47,10 @@
   let notice = $state('');
   let ask = $state<Ask | null>(null);
 
+  /** Пространство, для которого сброшены корзина, форма и итог: эффект ниже перезапускается на
+   * каждый переход (свойства — из объекта маршрута), а сброс нужен только при смене пространства —
+   * иначе переход (адрес без записи после удаления, запись из поиска) стёр бы итог и форму. */
+  let scopeOf = '';
   $effect(() => {
     const u = user;
     const s = space;
@@ -49,9 +58,12 @@
       kind = '';
       area = '';
       appliedArea = '';
-      trash = false;
-      editing = '';
-      notice = '';
+      if (scopeOf !== `${u}|${s}`) {
+        scopeOf = `${u}|${s}`;
+        trash = false;
+        editing = '';
+        notice = '';
+      }
       load(u, s, true);
     });
   });
@@ -120,9 +132,18 @@
     notice = '';
   }
 
-  function saved(e: Entry) {
+  let root = $state<HTMLElement | null>(null);
+
+  /** Форма закрыта (сохранено или «Отмена»): фокус — на «Изменить» той записи (у открытой сверху —
+   * она первая в документе). */
+  function closeEdit(id: string) {
     editing = '';
+    focusSoon(() => root?.querySelector(`[data-entry="${CSS.escape(id)}"] .actions button`));
+  }
+
+  function saved(e: Entry) {
     replace(e);
+    closeEdit(e.id);
     notice = `Запись «${e.title}» сохранена.`;
   }
 
@@ -148,19 +169,16 @@
       },
       stale: (msg) => stale(e.id, msg),
       expired: onexpired,
+      focus: () => root?.querySelector(':scope > [role="status"]'),
     });
   }
 
   function toggleTrash() {
     trash = !trash;
-    editing = '';
     notice = '';
     // назад к ленте: восстановленные из корзины — в ней
     if (!trash) load(user, space, true);
   }
-
-  /** Запись восстановлена из корзины: лента перечитается при возврате к ней (`toggleTrash`). */
-  const onrestored = () => {};
 
   const refsOf = (e: Entry): [string, string[]][] => {
     const r = e.data.refs;
@@ -197,15 +215,10 @@
       </div>
     {/each}
     {#if edit}
-      <Lazy
-        what="Форма"
-        load={() => import('./EntryEdit.svelte')}
-        props={{ user, entry: e, onsaved: saved, oncancel: () => (editing = ''), onreread: replace, onexpired }}
-        oncancel={() => (editing = '')}
-      />
+      <EditPanel {user} entry={e} onsaved={saved} oncancel={() => closeEdit(e.id)} onreread={replace} {onexpired} />
     {:else}
       <div class="row actions">
-        <button type="button" class="small-btn" aria-label="Изменить «{e.title}»" onclick={() => startEdit(e)}>Изменить</button>
+        <button type="button" class="small-btn" aria-label="Изменить «{e.title}»" disabled={!!editing} onclick={() => startEdit(e)}>Изменить</button>
         <button type="button" class="small-btn danger" aria-label="Удалить «{e.title}»" onclick={() => askDelete(e)}>Удалить</button>
       </div>
     {/if}
@@ -213,12 +226,12 @@
   </article>
 {/snippet}
 
-<section class="journal">
+<section class="journal" bind:this={root}>
   <form class="filters row" onsubmit={applyArea}>
     {#if !trash}
       <label class="row">
         Вид
-        <select bind:value={kind} aria-label="Вид записи" onchange={() => load(user, space, true)}>
+        <select bind:value={kind} aria-label="Вид записи" disabled={!!editing} onchange={() => load(user, space, true)}>
           <option value="">все</option>
           {#each CHANGELOG_KINDS as k (k)}<option value={k}>{k}</option>{/each}
         </select>
@@ -227,15 +240,15 @@
         Область
         <input bind:value={area} placeholder="например, web" aria-label="Область" />
       </label>
-      <button type="submit">Применить</button>
+      <button type="submit" disabled={!!editing}>Применить</button>
     {/if}
-    <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
+    <button type="button" class="toggle" aria-pressed={trash} disabled={!!editing} onclick={toggleTrash}>Корзина</button>
   </form>
 
-  {#if notice}<p class="muted" role="status">{notice}</p>{/if}
+  <Notice text={notice} />
 
   {#if trash}
-    <Lazy what="Корзина" load={() => import('./JournalTrash.svelte')} props={{ user, space, kind: 'changelog', onrestored, onexpired }} />
+    <TrashPanel {user} {space} kind="changelog" {onexpired} />
   {:else}
     {#if error}<p class="error" role="alert">{error}</p>{/if}
 
@@ -342,17 +355,8 @@
   .focused {
     margin-bottom: 16px;
   }
-  .toggle[aria-pressed='true'] {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: var(--selected);
-  }
   .actions {
     margin-top: 6px;
-  }
-  .small-btn {
-    padding: 2px 8px;
-    font-size: 12px;
   }
   .small {
     font-size: 12px;
