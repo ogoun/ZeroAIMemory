@@ -26,6 +26,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket}
 use std::time::Duration;
 
 use super::model::CallClass;
+pub use super::settings::BaseUrl;
+pub use crate::config::ModelAccess;
+use crate::config::WorksSection;
 
 /// Сколько адресов имени берётся для соединения (предел `ureq` 3 — `MAX_ADDRS`); класс
 /// считается по всем адресам.
@@ -34,32 +37,6 @@ const MAX_CONNECT_ADDRS: usize = 16;
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Предел длины базового адреса.
 const BASE_URL_MAX: usize = 2048;
-
-/// Базовый адрес подключения: схема (`http`/`https`, строчными), хост (строчными; IPv6 — без
-/// скобок), порт и путь без завершающего `/` (`""` или `/v1`).
-///
-/// **Этап 1 задачи 2:** временный тип до слияния с задачей 1 — там `works::settings::BaseUrl`
-/// (те же поля, serde) и `PinnedAddr = BaseUrl`; после перебазирования здесь остаётся `use`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct BaseUrl {
-    pub scheme: String,
-    pub host: String,
-    pub port: u16,
-    pub path: String,
-}
-
-/// Режим доступа к модели `[works] model_access`.
-///
-/// **Этап 1 задачи 2:** временный тип до слияния с задачей 1 (`crate::config::ModelAccess`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelAccess {
-    /// Любой адрес (вне LAN — с предупреждением).
-    Any,
-    /// Только LAN (и петля при `allow_loopback`).
-    Lan,
-    /// Режима `model` нет.
-    Off,
-}
 
 /// Класс адреса (§6.2 п. 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
@@ -160,6 +137,37 @@ impl BlockReason {
 pub struct Policy {
     pub allow_loopback: bool,
     pub access: ModelAccess,
+}
+
+impl Policy {
+    /// Политика сервера из `[works]`.
+    pub fn of(s: &WorksSection) -> Policy {
+        Policy {
+            allow_loopback: s.allow_loopback,
+            access: s.model_access,
+        }
+    }
+}
+
+/// Адрес подключения из открытых полей записи Vault (§6.2 п. 1): `data.url`, иначе
+/// `data.address`; нет строки — `None`.
+pub fn vault_address(data: &serde_json::Value) -> Option<&str> {
+    ["url", "address"]
+        .iter()
+        .find_map(|k| data.get(*k).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Хост адреса для показа человеку и аудита (без пути и порта схемы по умолчанию): `host` или
+/// `host:port`.
+pub fn host_label(base: &BaseUrl) -> String {
+    let default_port = if base.scheme == "https" { 443 } else { 80 };
+    if base.port == default_port {
+        url_host(&base.host)
+    } else {
+        format!("{}:{}", url_host(&base.host), base.port)
+    }
 }
 
 /// Почему маршрут к модели не построен.

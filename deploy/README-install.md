@@ -983,6 +983,85 @@ zam idea decline w:<id> [--reason R]
   умолчанию для всех — `[ideas] default_mode` (`review` или `propose`); в общем решении действует
   режим его владельца.
 
+## Подключённая модель (внутренние работы, с 0.0.16-m7.3)
+
+Внутренние работы памяти (пробы ночной проверки, кандидаты в Rules) делает агент в своей сессии
+или модель, которую подключил пользователь (`works.mode = "model"`). Модели в комплекте сервера
+нет. Протокол один — **OpenAI-совместимый Chat Completions** (`POST <адрес>/chat/completions`,
+без потока и инструментов); родной протокол Anthropic — в 0.0.19-m7.6.
+
+**Подключение.**
+1. Запись **личного Vault** (WebUI «Vault» или `POST /api/v1/spaces/knowledge/vault`): `data.url`
+   — базовый адрес поставщика с `/v1`, как он дан в его документации (без `user@`, `?…`, `#…`;
+   запасное поле — `data.address`), значение — ключ API. Локальному серверу без ключа — любое
+   значение и `auth: "none"` в подключении.
+2. `PATCH /api/v1/auth/settings` (сессия WebUI; по токену — 403):
+   `{"works": {"model": {"protocol": "openai", "vault": "<имя записи или v:<id>>", "model":
+   "<имя модели>", "max_tokens": 4000, "token_field": "auto", "body_extra": {…}}, "mode":
+   "model"}}`. `max_tokens` — 256..=32000; `token_field` — `auto` (у `api.openai.com` —
+   `max_completion_tokens`, иначе `max_tokens`), `max_tokens` или `max_completion_tokens`;
+   `body_extra` — JSON до 4 КиБ, сливается в тело запроса (ключи `model`, `messages`, `stream`,
+   `max_tokens`, `max_completion_tokens` — 422). `temperature` и прочие параметры выборки сервер не
+   шлёт.
+3. Сервер проверяет адрес записи и **закрепляет** его (схема, хост, порт, путь). Если `data.url`
+   записи потом изменится (например, токеном агента), обращения встают на паузу `vault_changed`
+   («был → стал»), пока человек не сохранит подключение заново; смена одного ключа паузы не даёт.
+4. Проверка: `POST /api/v1/works/model/test` → `{ok, ms, class?, hint?, thinking?}` —
+   фиксированный запрос без данных памяти; `thinking` и `hint` подсказывают выключить
+   размышления модели (рецепты — в таблице ниже).
+
+**Куда можно.** Проверяются **все** адреса имени, соединение идёт только по проверенным
+(подмена DNS после проверки запрос не уводит), редиректы не выполняются (3xx — `bad_response`):
+- вне LAN — только `https://`; сохранение отвечает `warnings: ["works_model_external: <хост>"]`
+  (аудит `works.model.external`), строки журнала отправок — с `external: true`;
+- LAN (`10/8`, `172.16/12`, `192.168/16`, `100.64/10`, `fc00::/7`) — можно и `http://`;
+- петля (`127.0.0.1`, `localhost`, `0.0.0.0`, `::1`), собственные адреса машины сервера (в том
+  числе её адрес LAN) и link-local (`169.254/16`, `fe80::/10`) — только при `[works]
+  allow_loopback = true` (администратор): так подключается модель на той же машине, что сервер;
+- `[works] model_access = "lan"` — вне LAN нельзя, `"off"` — режима `model` нет.
+
+**Прокси.** Как у загрузки зависимостей: `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` и `NO_PROXY`
+из окружения службы — только для адресов вне LAN; к LAN и петле — напрямую. Через прокси имя
+поставщика разрешает сам прокси. **SOCKS-прокси не поддерживается** (клиент собран без
+`socks-proxy`) — нужен HTTP CONNECT-прокси.
+
+**Пределы и паузы.** Потолки сервера `[works] max_daily_tokens`, `max_monthly_tokens` (сутки и
+месяц UTC; 0 — обращений нет), пределы пользователя `works.limits` — не выше потолков. Перед
+вызовом — оценка «вход + `max_tokens`»: не помещается в остаток — `limit`, стоп до следующей
+ночи. Одновременно — `max_parallel` обращений на сервер, у пользователя — одно; срок —
+`call_timeout_s`. Классы: `auth`, `not_found`, `blocked`, `vault`, `vault_changed` — пауза;
+`quota`, `limit`, `rate` (кроме одного повтора при `retry-after` ≤ 60 с) и три `unavailable` за
+ночь (повторы через 10 и 60 с) — стоп до следующей ночи, его помнит журнал отправок, перезапуск
+сервера его не снимает; `bad_request`, `thinking`, `max_tokens`, `refused`, `bad_response`,
+`bad_json` — работа не удалась. Паузу снимает сохранение подключения или успешная проверка (у
+`vault_changed` — только сохранение).
+
+**Журнал отправок** — `GET /api/v1/works/calls?days=` (1..=180, по умолчанию 7; администратор —
+`&user=<id>`; по токену — 403): время, работа, вид (`test` — проверка подключения), хост,
+модель, токены (`estimated` — оценка, когда поставщик не вернул `usage`), мс, исход, код HTTP,
+`external`, число элементов — **без текста** пакета и ответа; хранится 180 суток. Аудит:
+`works.model.key_use {vault, host}` (раз за ночь, ручной запуск и проверку), `works.model.paused
+{class}`, `works.model.vault_changed {from, to}`, `works.model.pause_cleared {class, by}`.
+
+**Данные наружу.** Модели уходит только пакет работы — маскированный вид агента без Human,
+Vault, вложений и записей участников общего решения; перед отправкой тело ещё раз проверяет
+сканер секретов: элемент с находкой выбрасывается, остальное уходит.
+
+**Поставщики** (сверено с документацией 2026-11-23; ссылки — в журнале этапа):
+
+| Поставщик | `data.url` | `auth` | `body_extra` и поля |
+|---|---|---|---|
+| OpenAI | `https://api.openai.com/v1` | `key` | `token_field: "auto"` → `max_completion_tokens` (`max_tokens` устарел); размышления — `{"reasoning_effort": "none"}` (или `"minimal"`, если модель не знает `none`); JSON — `{"response_format": {"type": "json_object"}}` |
+| Anthropic (вход совместимости) | `https://api.anthropic.com/v1` | `key` | `response_format` — только `json_schema` со `strict: true` (`json_object` — 400): JSON — по инструкции пакета; у Claude 5 размышления включены и в ответ не попадают — заложите их в `max_tokens`; у прочих — `{"thinking": {"type": "enabled", "budget_tokens": 1024}}`; `reasoning_effort` игнорируется. Вход — «для проверки и сравнения»; ключ — рабочей области (заголовок `anthropic-workspace-id` сервер не шлёт); родной протокол — 0.0.19-m7.6 |
+| DeepSeek | `https://api.deepseek.com` (без `/v1`) | `key` | выключить размышления — `{"thinking": {"type": "disabled"}}` (по умолчанию включены, текст — в `reasoning_content`); JSON — `{"response_format": {"type": "json_object"}}`: при неверном JSON поставщик отдаёт пустой ответ, сервер повторит один раз |
+| Kimi (Moonshot) | `https://api.moonshot.ai/v1` | `key` | `token_field: "max_completion_tokens"` (`max_tokens` устарел); K2.6 — `{"thinking": {"type": "disabled"}}`; у серии K3 размышления всегда — `{"reasoning_effort": "low"}`; JSON — `{"response_format": {"type": "json_object"}}` |
+| Qwen (DashScope) | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` (Сингапур), `https://dashscope.aliyuncs.com/compatible-mode/v1` (Пекин) или адрес рабочей области `https://<WorkspaceId>.<регион>.maas.aliyuncs.com/compatible-mode/v1` | `key` (того же региона) | `{"enable_thinking": false}` — у открытых гибридных Qwen3 размышления по умолчанию включены (без потока их нужно выключить); модели `*-thinking` думают всегда |
+| OpenRouter | `https://openrouter.ai/api/v1` | `key` | выключить — `{"reasoning": {"effort": "none"}}` (если модель позволяет); `{"reasoning": {"exclude": true}}` — скрыть, но токены оплачиваются; рассуждение (`reasoning`) сервер ответом не считает |
+| Ollama | `http://<хост>:11434/v1` (облако — `https://ollama.com/v1`) | `none` (облако — `key`) | выключить размышления — `{"reasoning_effort": "none"}`; JSON — `response_format` |
+| llama.cpp (`llama-server`) | `http://<хост>:<порт>/v1` — порт `--port`; слушает `127.0.0.1`, для LAN — `--host` | `none` (`key` — при `--api-key`) | Qwen3 — `{"chat_template_kwargs": {"enable_thinking": false}}` (так у модели на рабочем сервере памяти) или `--reasoning-budget 0` при запуске; рассуждение в `reasoning_content` — `--reasoning-format deepseek` |
+| vLLM | `http://<хост>:8000/v1` | `none` (`key` — при `--api-key`) | Qwen3 — `{"chat_template_kwargs": {"enable_thinking": false}}`; JSON — `{"response_format": {"type": "json_object"}}` |
+| LM Studio | `http://<хост>:1234/v1` | `none` (`key` — если включена аутентификация сервера) | — |
+
 ## Qdrant
 
 Векторный индекс — нативный Qdrant из комплекта (`qdrant/<версия>/`), без Docker. Его запускает

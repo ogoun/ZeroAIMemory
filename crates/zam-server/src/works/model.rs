@@ -24,6 +24,7 @@ use std::time::Duration;
 use serde_json::{Map, Value, json};
 
 use super::egress::{BaseUrl, PinnedResolver, Route, endpoint};
+pub use super::settings::{BODY_EXTRA_MAX_BYTES, ModelAuth, ModelConn, TokenField};
 
 /// Протокол подключения в M7.3 — один (§6.2 п. 1).
 pub const PROTOCOL_OPENAI: &str = "openai";
@@ -35,8 +36,6 @@ pub const RESERVED_BODY_KEYS: [&str; 5] = [
     "max_tokens",
     "max_completion_tokens",
 ];
-/// Предел `body_extra` (компактный JSON), байт.
-pub const BODY_EXTRA_MAX_BYTES: usize = 4096;
 /// Хост, у которого `token_field = "auto"` — `max_completion_tokens`.
 pub const OPENAI_HOST: &str = "api.openai.com";
 /// Срок соединения (§6.2 п. 7).
@@ -236,38 +235,6 @@ impl ModelReply {
     }
 }
 
-/// Заголовок авторизации подключения (`auth`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModelAuth {
-    /// `Authorization: Bearer <ключ>` — ключ из значения записи Vault.
-    Key,
-    /// Без заголовка (локальный сервер без ключа).
-    None,
-}
-
-/// Поле предела ответа (`token_field`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenField {
-    /// `max_completion_tokens` у `api.openai.com`, иначе `max_tokens`.
-    Auto,
-    MaxTokens,
-    MaxCompletionTokens,
-}
-
-/// Параметры запроса подключения.
-///
-/// **Этап 1 задачи 2:** временный тип до слияния с задачей 1 — там `works::settings::ModelConn`
-/// (`protocol`, `vault`, `model`, `auth`, `max_tokens`, `token_field`, `body_extra`, `pinned`);
-/// после перебазирования [`call_blocking`] берёт `&ModelConn`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ModelRequest {
-    pub model: String,
-    pub auth: ModelAuth,
-    pub max_tokens: u32,
-    pub token_field: TokenField,
-    pub body_extra: Map<String, Value>,
-}
-
 /// Роль сообщения беседы.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -360,7 +327,7 @@ pub fn limit_field(tf: TokenField, host: &str) -> &'static str {
 
 /// Тело запроса Chat Completions: `body_extra` верхним уровнем, поверх — поля сервера (`model`,
 /// `messages`, предел, `stream: false`): даже непроверенный `body_extra` их не перекрывает.
-pub fn request_body(req: &ModelRequest, base: &BaseUrl, messages: &[ChatMessage]) -> Value {
+pub fn request_body(req: &ModelConn, base: &BaseUrl, messages: &[ChatMessage]) -> Value {
     let mut body: Map<String, Value> = req
         .body_extra
         .iter()
@@ -544,7 +511,7 @@ fn transport_class(e: &ureq::Error) -> CallClass {
 
 /// Вызов с системным и пользовательским сообщением (§6.2 п. 2) — [`call_chat_blocking`].
 pub fn call_blocking(
-    req: &ModelRequest,
+    req: &ModelConn,
     route: &Route,
     key: Option<&str>,
     system: &str,
@@ -564,7 +531,7 @@ pub fn call_blocking(
 /// исправить, [`super::exec::json_step`]). Блокирующий: зовётся из `spawn_blocking`; срок вызова
 /// — `timeout`, соединения — не дольше [`CONNECT_TIMEOUT`]. `auth = "key"` без ключа — `vault`.
 pub fn call_chat_blocking(
-    req: &ModelRequest,
+    req: &ModelConn,
     route: &Route,
     key: Option<&str>,
     messages: &[ChatMessage],
@@ -643,13 +610,16 @@ mod tests {
         }
     }
 
-    fn req() -> ModelRequest {
-        ModelRequest {
+    fn req() -> ModelConn {
+        ModelConn {
+            protocol: PROTOCOL_OPENAI.into(),
+            vault: zam_core::Id::new(),
             model: "m".into(),
             auth: ModelAuth::Key,
             max_tokens: 4000,
             token_field: TokenField::Auto,
             body_extra: Map::new(),
+            pinned: None,
         }
     }
 

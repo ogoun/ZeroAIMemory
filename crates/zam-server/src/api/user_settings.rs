@@ -21,10 +21,15 @@
 //!   там, где снимать нечего) и пустая правка — 400; строка `ideas.mode` не из `review |
 //!   propose` и строка режима или `works.check` не из своих значений — 422; `works.pause` — 400
 //!   (паузу пишет сервер); режим `model` без подключения или при `[works] model_access = "off"`,
-//!   пределы выше потолков `[works]`, неизвестная запись Vault подключения — 422. Ответ — все
-//!   настройки `{hooks: {…}, ideas: {proactive, mode}, works: {…}}`. Аудит `user.settings.update
-//!   {key, from, to}` на каждое изменение (у `works.model` — без `body_extra`). `PATCH`, сменивший
-//!   действующий режим вида, зовёт снятие его открытых работ
+//!   пределы выше потолков `[works]`, неизвестная запись Vault подключения — 422. Подключение
+//!   (M7.3 §6.2 пп. 1, 6): протокол не `openai`, ключи сервера в `body_extra`, адрес записи Vault
+//!   с `userinfo`, `?` или `#`, `http` вне LAN, петля и свои адреса сервера без `[works]
+//!   allow_loopback`, вне LAN при `model_access = "lan"` — 422; адрес закрепляется (`pinned`),
+//!   вне LAN — `warnings: ["works_model_external: <хост>"]` и аудит `works.model.external`;
+//!   сохранение подключения (и без изменений) снимает паузу исполнителя любого класса. Ответ —
+//!   все настройки `{hooks: {…}, ideas: {proactive, mode}, works: {…}, warnings?}`. Аудит
+//!   `user.settings.update {key, from, to}` на каждое изменение (у `works.model` — без
+//!   `body_extra`). `PATCH`, сменивший действующий режим вида, зовёт снятие его открытых работ
 //!   ([`crate::works::queue::on_mode_change`]).
 //! - Выбор, совпавший с действующим умолчанием, не сохраняется: такой пользователь пойдёт за
 //!   новым `[ideas] default_mode`, если администратор его сменит (как `hooks` — за `true`).
@@ -61,10 +66,11 @@ use crate::app::AppState;
 use crate::auth::{AdminOnly, Client, Principal};
 use crate::config::{IdeasMode, ModelAccess, WorksMode, WorksSection};
 use crate::error::ApiError;
+use crate::works::egress;
 use crate::works::settings::{
-    self as works_settings, BODY_EXTRA_MAX_BYTES, Limits, MAX_TOKENS_RANGE, MODEL_NAME_MAX,
-    ModelAuth, ModelConn, TokenField, UserWorks, WORKS_CHECK, WORKS_KIND_PREFIX, WORKS_LIMITS,
-    WORKS_MODE, WORKS_MODEL,
+    self as works_settings, BODY_EXTRA_MAX_BYTES, BaseUrl, Limits, MAX_TOKENS_RANGE,
+    MODEL_NAME_MAX, ModelAuth, ModelConn, TokenField, UserWorks, WORKS_CHECK, WORKS_KIND_PREFIX,
+    WORKS_LIMITS, WORKS_MODE, WORKS_MODEL,
 };
 use zam_store::works::WorkKind;
 
@@ -537,12 +543,23 @@ fn max_tokens_default() -> u32 {
     works_settings::MAX_TOKENS_DEFAULT
 }
 
-/// Подключение `works.model` из входа: форма, пределы полей и запись личного Vault
-/// пользователя `user` по имени или `v:<id>` (хранится id). Проверку адреса записи, класс сети и
-/// закрепление адреса добавляет клиент модели (задача 2 плана).
-async fn resolve_model(st: &AppState, user: Id, raw: Value) -> Result<Value, ApiError> {
+/// Подключение `works.model` из входа: форма, протокол (только `openai`), пределы полей,
+/// `body_extra` без ключей сервера, запись личного Vault пользователя `user` по имени или
+/// `v:<id>` (хранится id) и её адрес (§6.2 пп. 1, 6): `data.url` (иначе `data.address`) без
+/// `userinfo`, `?` и `#`; `http` вне LAN, петля и свои адреса сервера без `[works]
+/// allow_loopback`, вне LAN при `model_access = "lan"`, имя без адресов — 422. Адрес
+/// закрепляется (`pinned`: схема, хост, порт, путь). Второе — хост, если адрес вне LAN
+/// (предупреждение `works_model_external`).
+async fn resolve_model(
+    st: &AppState,
+    user: Id,
+    raw: Value,
+) -> Result<(Value, Option<String>), ApiError> {
     let input: ModelInput = serde_json::from_value(raw)
         .map_err(|e| ApiError::BadRequest(format!("works.model: {e}")))?;
+    let protocol = input.protocol.trim().to_string();
+    crate::works::model::check_protocol(&protocol)
+        .map_err(|e| ApiError::Unprocessable(format!("works.model.protocol: {e}")))?;
     let model = input.model.trim().to_string();
     if model.is_empty() || model.chars().count() > MODEL_NAME_MAX {
         return Err(ApiError::Unprocessable(format!(
@@ -570,6 +587,8 @@ async fn resolve_model(st: &AppState, user: Id, raw: Value) -> Result<Value, Api
             "works.model.body_extra: не больше {BODY_EXTRA_MAX_BYTES} байт"
         )));
     }
+    crate::works::model::check_body_extra(&body_extra)
+        .map_err(|e| ApiError::Unprocessable(format!("works.model.body_extra: {e}")))?;
     let wanted = input.vault.trim();
     let by_id = wanted.strip_prefix("v:").and_then(|s| s.parse::<Id>().ok());
     let db = st.users.get(user).await?;
@@ -582,17 +601,56 @@ async fn resolve_model(st: &AppState, user: Id, raw: Value) -> Result<Value, Api
             "works.model.vault: в личном Vault нет записи «{wanted}» — имя записи или v:<id>"
         )));
     };
+    let (base, external) = check_model_address(st, item).await?;
     let conn = ModelConn {
-        protocol: input.protocol.trim().to_string(),
+        protocol,
         vault: item.id,
         model,
         auth: input.auth,
         max_tokens: input.max_tokens,
         token_field: input.token_field,
         body_extra,
-        pinned: None,
+        pinned: Some(base),
     };
-    Ok(json!(conn))
+    Ok((json!(conn), external))
+}
+
+/// Адрес записи Vault подключения (§6.2 пп. 1, 6): разбор и маршрут по политике `[works]` (при
+/// `model_access = "off"` подключение хранится — адрес проверяется как при `any`). Итог — адрес
+/// для закрепления и хост, если он вне LAN.
+async fn check_model_address(
+    st: &AppState,
+    item: &zam_store::VaultMeta,
+) -> Result<(BaseUrl, Option<String>), ApiError> {
+    let addr = egress::vault_address(&item.data).ok_or_else(|| {
+        ApiError::Unprocessable(format!(
+            "works.model.vault: у записи «{}» нет адреса — data.url (с /v1, как у поставщика) \
+             или data.address",
+            item.title
+        ))
+    })?;
+    let base = egress::parse_base_url(addr).map_err(|e| {
+        ApiError::Unprocessable(format!("works.model.vault: data.url записи — {e}"))
+    })?;
+    let mut policy = egress::Policy::of(&st.cfg.works);
+    if policy.access == ModelAccess::Off {
+        policy.access = ModelAccess::Any;
+    }
+    let b = base.clone();
+    let route = tokio::task::spawn_blocking(move || egress::route(&b, policy))
+        .await
+        .map_err(|e| ApiError::aborted("проверка адреса подключения", &e))?
+        .map_err(|e| match e {
+            egress::RouteError::Unresolved => ApiError::Unprocessable(format!(
+                "works.model.vault: имя {} не разрешается — проверьте data.url записи",
+                base.host
+            )),
+            egress::RouteError::Blocked(r) => {
+                ApiError::Unprocessable(format!("works.model.vault: {}", r.message()))
+            }
+        })?;
+    let external = route.external.then(|| egress::host_label(&base));
+    Ok((base, external))
 }
 
 /// `works.limits` правки — не больше потолков сервера (`[works] max_daily_tokens`,
@@ -689,9 +747,14 @@ async fn apply(
     let current = user_flags(&st.system, user, st.cfg.ideas.default_mode).await?;
     let works_cur = works_settings::load(&st.system, user).await?;
     let works_cfg = &st.cfg.works;
+    // сохранение подключения снимает паузу любого класса (§6.2 п. 5); вне LAN — предупреждение
+    let (mut saved_model, mut external) = (false, None);
     for (k, v) in edits.iter_mut() {
         if k == WORKS_MODEL && !v.is_null() {
-            *v = resolve_model(st, user, std::mem::take(v)).await?;
+            let (conn, ext) = resolve_model(st, user, std::mem::take(v)).await?;
+            *v = conn;
+            saved_model = true;
+            external = ext;
         }
     }
     check_limits(&edits, works_cfg)?;
@@ -748,6 +811,21 @@ async fn apply(
                     }),
                 )
                 .await?;
+            // подключение вне LAN (§6.2 п. 6): данные памяти уйдут за пределы локальной сети
+            if key == WORKS_MODEL
+                && let Some(host) = &external
+            {
+                st.system
+                    .audit(
+                        actor,
+                        Some(user),
+                        "works.model.external",
+                        Some(&user.to_string()),
+                        Some(ip),
+                        json!({ "host": host }),
+                    )
+                    .await?;
+            }
         }
         // режим уже записан: сбой снятия работ — WARN, а не ошибка `PATCH` (повтор того же
         // `PATCH` — «без изменений» и снятия не позовёт); исполнитель всё равно сверяет
@@ -766,7 +844,16 @@ async fn apply(
         // правка настроек — и способ самолечения кэша
         st.user_flags.invalidate(user);
     }
-    Ok(Json(settings_json(st, user).await?))
+    // и подключение без изменений: повторное сохранение — подтверждение человека (у
+    // `vault_changed` — единственное, §6.2 п. 1); после снятия работ — пауза не режим вида
+    if saved_model {
+        crate::works::exec::clear_pause(st, user, &works_cur, "save").await;
+    }
+    let mut out = settings_json(st, user).await?;
+    if let Some(host) = external {
+        out["warnings"] = json!([format!("works_model_external: {host}")]);
+    }
+    Ok(Json(out))
 }
 
 /// После записи `works.*`: виды, у которых сменился действующий режим ([`UserWorks::effective`]

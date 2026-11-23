@@ -5271,6 +5271,126 @@ token` FAILED (`DataDirLocked` при повторной сборке на то�
   `startup_panic_keeps_runner_working` FAILED («не дождались: учтённый запуск после упавшего шага
   старта»).
 
+### M7.3 · Задача 2 — Клиент модели: протокол, данные наружу, пределы, журнал отправок
+
+Спецификация §6.2; worktree `.tmp/m73/wt-t2`, ветка `m7.3-t2`. Этап 1 (`f47f5490`, от
+`072e3257`) — чистый клиент без настроек; этап 2 — проводка после слияния задачи 1 (`db884070`).
+
+**Адреса** (`works::egress`): `parse_base_url` (только `http`/`https`; без `userinfo`, `?`, `#`,
+пробелов; хост — IPv4, `[IPv6]` без зоны или ASCII-имя, путь без завершающего `/`),
+`classify_ip` (петля → сам узел по UDP `connect` → link-local → LAN → вне LAN; `::ffff:` — как
+IPv4), `resolve` (литерал — без резолвера, `localhost`/`*.localhost` — `127.0.0.1` и `::1` без
+резолвера, иначе подмена `test-hooks` или системный резолвер со сроком 10 с), `check`/`allowed`
+(причины `BlockReason`: `model_access_off`, `loopback_requires_admin`, `model_access_lan`,
+`http_external`), `route` (имя — один раз, проверка **каждого** адреса). Соединение `ureq` — только
+по проверенным адресам: `Agent::with_parts(cfg, DefaultConnector, PinnedResolver)`
+(`ureq::unversioned::resolver::Resolver` в 3.4.2 есть — решение 78 выполнено без запасного пути;
+прочие имена — прокси окружения — резолвер по умолчанию).
+
+**Протокол** (`works::model`): тело `{model, messages, <предел>, stream: false}` + `body_extra`
+верхним уровнем (поля сервера сильнее), `max_completion_tokens` у `api.openai.com` при `auto`;
+агент `ureq` — `max_redirects(0)`, `http_status_as_error(false)`, прокси только вне LAN, ответ —
+до 4 МиБ; 17 классов `CallClass`, `CallError {class, http_status, retry_after, usage}`,
+`ModelReply {text, input_tokens, output_tokens, estimated, reasoning}`.
+
+**Исполнение** (`works::exec`): второй скан собранного тела (элементы с находкой выброшены,
+скан — до чистого тела), JSON (`extract_json`, `json_step` — один повтор беседы),
+`run_payload(ctx, user, RunKey, Payload, WorkKind, work)` — режим вида, окно ночи, стоп по
+журналу, `prepare` (запись Vault, сверка с `pinned`, маршрут, ключ), пределы, слоты
+(`AppState.model_calls`: `max_parallel` на сервер, у пользователя — один), повторы, журнал,
+пауза, аудит; `test_connection` (`POST /works/model/test`). `zam_store::work_calls`
+(`record_call`, `tokens_since`, `list_calls`, `calls_between`, `gc`), срок 180 суток —
+`maintenance::gc_work_calls` тем же проходом обслуживания. `PATCH works.model`: протокол,
+ключи сервера в `body_extra`, адрес записи (разбор и маршрут по политике `[works]`; при
+`model_access = "off"` — как при `any`), `pinned`, `warnings`, аудит `works.model.external`,
+снятие паузы.
+
+- [решение исполнителя, задача 2] **`call_blocking` берёт проверенный `&Route`**, а не `&BaseUrl`:
+  в сигнатуре плана нет политики, а «имя разрешается один раз за вызов, соединение — по
+  проверенным адресам» требует передать в вызов итог проверки (`egress::route(base, Policy)`).
+- [решение исполнителя, задача 2] `CallError.usage` сверх полей плана: обрезанный (`thinking`,
+  `max_tokens`) и отклонённый ответ токены израсходовал — пределы считаются по журналу.
+  `ModelReply.reasoning` — для `thinking?` проверки подключения. `call_chat_blocking(messages)` —
+  повтор JSON «той же беседой»; `call_blocking` — обёртка.
+- [решение исполнителя, задача 2] **Строки запуска (`RunKey`) — по времени**, отдельного столбца
+  в `work_calls` нет (схема полна с задачи 1): ночь — `[slot(d), slot(d) + window_min)` (ночные
+  обращения идут только в окне; `run_payload` ночи вне окна — `aborted` без запроса), ручной
+  запуск — от момента его id (UUIDv7; задача 3 создаёт id в начале запуска; округление вверх до
+  миллисекунды). Проверки подключения (`kind = test`) в стоп не входят, в расход — входят.
+- [решение исполнителя, задача 2] **Стоп по журналу** (решение 77): строка `quota` или `limit` —
+  стоп; **последняя** строка запуска — `rate` (повтор не помог или `retry-after` > 60 с) — стоп;
+  три `unavailable` — стоп. Строка `limit` пишется без отправки (`ms = NULL`): иначе следующий,
+  меньший пакет той же ночи прошёл бы. Имя не разрешилось — строка `unavailable` без отправки.
+- [решение исполнителя, задача 2] `run_payload`: режим вида не `model` (в том числе `enabled =
+  false`, пауза) — `blocked` **без** паузы; сбой хранилища — `aborted` (класс только для
+  вызывающего, в журнал не пишется). Вид — `WorkKind`, а не `&str` плана.
+- [решение исполнителя, задача 2] Пауза ставится там, где запрос не уходит (`blocked`, `vault`,
+  `vault_changed`) и после ответа `auth`/`not_found` — и у проверки подключения (таблица п. 5).
+  Аудит паузы — `works.model.paused {class}`, снятия — `works.model.pause_cleared {class, by:
+  save|test}`. Снятие паузы не зовёт `on_mode_change`: пауза — не смена режима вида.
+- [решение исполнителя, задача 2] **Подтверждение адреса** после `vault_changed` — повторное
+  сохранение подключения (`PATCH works.model`, и без изменений): закрепляется адрес, который
+  человек видит в записи Vault; отдельной кнопки-эндпоинта в задаче 2 нет (WebUI — задача 8).
+- [решение исполнителя, задача 2] `POST /works/model/test`: `[works] enabled = false` и
+  `model_access = "off"` — 409 `code: works_disabled` (`/problems/conflict`; тип
+  `/problems/works-disabled` задачи 3 — для `POST /works/run`), идёт обращение пользователя —
+  409 `model_busy`, нет подключения — 422; срок — не дольше 120 с; ответ не JSON — `ok: false`,
+  `bad_json` с советом `response_format`. Администратор — `?user=<id>` у обоих маршрутов.
+- [решение исполнителя, задача 2] Классы вне строк таблицы п. 5: 408 — `unavailable`, прочие
+  1xx/4xx — `bad_response`; `insufficient_quota` в теле любого 4xx — `quota`; непонятный
+  `retry-after` — как без него; HTTP-дата `retry-after` — секунды до неё; TLS, DNS, прокси —
+  `unavailable`; поле `refusal` — `refused`; `tool_calls` — `bad_response`; пустой `content` при
+  рассуждении — `thinking` при любом `finish_reason`; рассуждение — и `reasoning` (OpenRouter);
+  `<think>…</think>` в начале ответа перед разбором JSON снимается.
+- [решение исполнителя, задача 2] `localhost` — без резолвера (`hosts` не уводит «петлю»); `::` —
+  петля; IPv4-в-IPv6 соединяется как IPv4; «худший» класс — петля > сам узел > link-local > вне
+  LAN > LAN, но политика — по каждому адресу.
+- [решение исполнителя, задача 2] Тестовые записи Vault задачи 1 (`works_settings.rs`) —
+  `https://192.0.2.10:8443/v1`: `http` вне LAN `PATCH` теперь отвергает.
+
+**Поставщики** (таблица «Подключённая модель» `deploy/README-install.md`, сверка 2026-11-23):
+OpenAI — https://developers.openai.com/api/reference/resources/chat (`max_tokens` устарел,
+`max_completion_tokens`, `reasoning_effort` с `none`, `json_object`); Anthropic —
+https://platform.claude.com/docs/en/api/openai-sdk (вход `https://api.anthropic.com/v1/`,
+`response_format` — только `json_schema` со `strict`, `json_object` — 400, у Claude 5 размышления
+включены и в ответе не видны, `thinking {type: enabled, budget_tokens}` у прочих,
+`reasoning_effort` игнорируется, «не для промышленной нагрузки»); DeepSeek —
+https://api-docs.deepseek.com/, …/guides/thinking_mode, …/guides/json_mode (база
+`https://api.deepseek.com`, `thinking {type: disabled}`, `reasoning_content`, `json_object` и слово
+«json»); Kimi — https://platform.kimi.ai/docs/api/chat (`https://api.moonshot.ai/v1`, `max_tokens`
+устарел, K2.6 — `thinking {type: disabled}`, K3 — только `reasoning_effort`); Qwen DashScope —
+https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope и
+https://www.alibabacloud.com/help/en/model-studio/deep-thinking (адреса регионов и рабочих областей,
+`enable_thinking`); OpenRouter — https://openrouter.ai/docs/use-cases/reasoning-tokens
+(`https://openrouter.ai/api/v1`, `reasoning.effort: none`, `reasoning.exclude`, поле `reasoning`);
+Ollama — https://docs.ollama.com/api/openai-compatibility (`http://localhost:11434/v1`, ключ не
+проверяется, `reasoning_effort: none`); llama.cpp — README `tools/server` (`--port`, на дату
+сверки по умолчанию 9931, `--host` 127.0.0.1, `--api-key`, `--reasoning-format deepseek`,
+`--reasoning-budget 0`) и issue/PR о `chat_template_kwargs` в теле запроса (официальной страницы
+нет); vLLM — https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server/
+(`:8000/v1`, `--api-key`, `chat_template_kwargs`, `json_object`); LM Studio —
+https://lmstudio.ai/docs/app/api/endpoints/openai и …/developer/core/authentication (`:1234/v1`,
+ключ по умолчанию не нужен).
+
+**TDD.** Этап 1: интеграционные тесты и подставная модель — до реализации `model`/`exec`; RED на
+заглушках `todo!()` всех публичных функций — `works_model` 0/18, `--lib works::` 0/14. Этап 2:
+реализация раньше тестов, поэтому RED — мутациями (откачены): стоп по журналу выключен, сверка с
+`pinned` выключена, пределы всегда «помещаются», `key_use` на каждый вызов, второй скан выключен,
+проверка адреса в `PATCH` без политики и предупреждения, снятие паузы сохранением и проверкой
+убрано, срок журнала не удаляет — `works_model` 17 passed / **14 FAILED** (`pause_cleared_by_patch_
+or_test`, `http_external_refused`, `model_test_409_on_vault_changed`, `loopback_requires_admin`,
+`work_calls_retention_180_days`, `lan_check_cases`, `off_mode_zero_requests`,
+`error_classes_reactions`, `vault_url_change_by_token_pauses`, `secret_in_payload_element_dropped`,
+`limits_daily_monthly_stop`, `key_use_audit_once_per_night`, `model_access_lan_blocks_external`,
+`own_address_is_self`).
+
+**Прогоны** (`CARGO_TARGET_DIR=.tmp/m73/wt-t2/target/m73-t2`): `zam-server --test works_model` —
+31 passed (часы не замораживаются: ночь теста — окно с началом за 10 минут до «сейчас»; сроки и
+ожидания повторов — `works::exec::test_hooks` в мс), `--test works_settings` — 7 passed; числа
+итогового прогона, clippy и `fmt` — в отчёте задачи. Тест хоста `api.openai.com` — без сети
+(подмена резолвера действует и на соединение). `git diff main -- Cargo.lock` — строка `"ureq"` в
+зависимостях `zam-server`, новых `[[package]]` нет.
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

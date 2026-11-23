@@ -56,6 +56,9 @@ pub struct AppState {
     /// [`crate::works::NightRunner`]): создаётся до сборки состояния, запускается после неё;
     /// останавливается первым в [`AppState::shutdown`].
     pub night: Arc<crate::works::NightRunner>,
+    /// Слоты обращений к подключённой модели (M7.3 §6.2 п. 7): `[works] max_parallel` на
+    /// сервер, у пользователя — одно ([`crate::works::exec::CallSlots`]).
+    pub model_calls: Arc<crate::works::exec::CallSlots>,
     /// Копия в процессе сервера (M7 §5.6): замок, общий у страницы «Копии»
     /// (`POST /admin/backups`) и автокопии воркера обслуживания (клон — в `Maintenance::start`),
     /// идущая копия, последний итог и кэш сводок описей.
@@ -414,6 +417,7 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     let state = AppState {
         maintenance,
         night,
+        model_calls: Arc::new(crate::works::exec::CallSlots::new(cfg.works.max_parallel)),
         backups,
         glossary: Arc::default(),
         user_flags: Arc::default(),
