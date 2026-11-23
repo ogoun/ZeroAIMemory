@@ -62,7 +62,7 @@ fn start_state(
         rt.block_on(async move {
             let mut cfg = ServerConfig {
                 data_dir: data,
-                ..ServerConfig::default()
+                ..common::server_defaults()
             };
             tweak(&mut cfg);
             // место на диске раннера не влияет: свободное место подменено (1 ТиБ)

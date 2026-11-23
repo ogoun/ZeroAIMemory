@@ -38,7 +38,7 @@ fn start(name: &str, mode: IdeasMode) -> (String, String) {
         rt.block_on(async move {
             let mut cfg = ServerConfig {
                 data_dir: data,
-                ..ServerConfig::default()
+                ..common::server_defaults()
             };
             cfg.ideas.default_mode = mode;
             let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();

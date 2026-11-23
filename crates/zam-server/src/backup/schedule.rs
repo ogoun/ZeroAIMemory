@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use jiff::{Timestamp, tz::TimeZone};
+use jiff::Timestamp;
 
 use crate::config::{BackupSchedule, BackupSection};
 
@@ -18,15 +18,12 @@ pub enum Action {
     Prune(Vec<PathBuf>),
 }
 
-/// Сегодняшний (UTC) момент `at` для `now`.
-fn slot(now: Timestamp, cfg: &BackupSection) -> Option<Timestamp> {
-    let (h, m) = cfg.at_hm();
-    now.to_zoned(TimeZone::UTC)
-        .date()
-        .at(h, m, 0, 0)
-        .to_zoned(TimeZone::UTC)
-        .ok()
-        .map(|z| z.timestamp())
+/// Сегодняшний момент `at` для `now`: «сегодня» и `at` — в поясе `[backup] tz` (M7.3 §6.1 п. 3;
+/// по умолчанию UTC — как до M7.3), общая функция слота [`crate::schedule::slot`].
+fn slot(now: Timestamp, cfg: &BackupSection) -> Timestamp {
+    let tz = cfg.time_zone();
+    let today = now.to_zoned(tz.clone()).date();
+    crate::schedule::slot(today, cfg.at_hm(), &tz)
 }
 
 /// Что делать в момент `now`: `last` — время последней копии **или попытки** (неудачная
@@ -34,10 +31,10 @@ fn slot(now: Timestamp, cfg: &BackupSection) -> Option<Timestamp> {
 /// готовые копии каталога копий от старых к новым ([`super::list_copies`]).
 ///
 /// - `schedule = "off"` — [`Action::Skip`];
-/// - копия — если `now` не раньше сегодняшнего `at` (UTC) и сегодня после `at` копии (попытки)
-///   ещё не было (пропущенный вчерашний срок не догоняется до сегодняшнего `at`); удаления в
-///   этом же шаге нет: лишние копии удаляются следующим шагом **после успешной** копии, по
-///   фактическому списку — неудачная копия не стоит хороших;
+/// - копия — если `now` не раньше сегодняшнего `at` (в поясе `tz`) и сегодня после `at` копии
+///   (попытки) ещё не было (пропущенный вчерашний срок не догоняется до сегодняшнего `at`);
+///   удаления в этом же шаге нет: лишние копии удаляются следующим шагом **после успешной**
+///   копии, по фактическому списку — неудачная копия не стоит хороших;
 /// - иначе удаление копий сверх `keep`, начиная с самых старых.
 pub fn tick(
     now: Timestamp,
@@ -48,7 +45,8 @@ pub fn tick(
     if cfg.schedule == BackupSchedule::Off {
         return vec![Action::Skip];
     }
-    if slot(now, cfg).is_some_and(|s| now >= s && last.is_none_or(|l| l < s)) {
+    let s = slot(now, cfg);
+    if now >= s && last.is_none_or(|l| l < s) {
         return vec![Action::Backup];
     }
     let extra = prune_list(existing, cfg.keep);
