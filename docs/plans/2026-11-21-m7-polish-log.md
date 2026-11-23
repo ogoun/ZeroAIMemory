@@ -5067,22 +5067,23 @@ Markdown-выдаче агенту (31). Решения по ходу задач
 
 #### Приёмка: числа
 
-Итоговая приёмка на голове ветки `…` (… (числа впишет координатор); Windows 11, HDD).
+Итоговая приёмка на голове ветки `90830595` (2026-11-23 13:44–16:06, Windows 11, HDD, машина
+без посторонней нагрузки; сценарий `.tmp/m72/accept/accept.ps1`, `CARGO_TARGET_DIR` — отдельный).
 
 | Проверка | Итог |
 |---|---|
-| Полный прогон workspace `ZAM_REQUIRE_ML=1` (Windows 11, HDD) | … (числа впишет координатор) |
-| `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` | … |
-| CI `ci.yml` — Windows и Linux; Edge; CUDA | … |
-| `package.yml` / `package-smoke` | … |
-| WebUI: `npm run check`, `npm run test:build` (17 файлов), `npm run build` | … |
-| e2e WebUI (release-сборка) | … passed (у 0.0.14-m7.1 — 122; последний полный прогон задачи 10 — 180 passed, волны правок финального ревью — 201 passed) |
-| `npx size-limit` — чанки до (`v0.0.14-m7.1`) и после | … (таблица — координатор; пределы новых чанков — CHANGELOG, «Для разработчиков») |
-| Тихое окно `m4` (`hook_budgets`) | … |
-| Тихое окно `m57` (`acceptance_recall_p95_with_50_ideas`) | … |
-| Тихое окно `m6` (`acceptance_hook_budgets`, медиана отношения p95 `/recall(prompt)` к v0.0.14-m7.1 ≤ 1,10) | … |
-| Блок v8 ru/en (500/497), MCP — 11 инструментов, описания ≤ 300 | … |
-| Финальное ревью ветки и волна правок | … |
+| Полный прогон workspace `ZAM_REQUIRE_ML=1` (Windows 11, HDD) | 207 наборов, 3564 passed, 0 failed, 60 ignored (debug, 1 ч 36 мин); тайминговых падений нет |
+| `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` | чисто (код 0 оба) |
+| CI `ci.yml` — Windows и Linux; Edge; CUDA | `90830595`: CI 45158736576 success (web, check windows-latest, check ubuntu-22.04); Edge 45148843716 и CUDA 45148843710 — success на `25929a9f` (после него их пути не менялись, на `90830595` они не запускались) |
+| `package.yml` / `package-smoke` | success в составе CI `90830595`: package и cli для windows-x64 и linux-x64; models — skipped (`inputs.extras` — только у выпуска и `release-dry-run`) |
+| WebUI: `npm run check`, `npm run test:build` (17 файлов), `npm run build` | чисто: check — код 0, test:build — 90 тестов, 90 pass, build — код 0 |
+| e2e WebUI (release-сборка) | 201 passed (5,2 мин; у 0.0.14-m7.1 — 122; последний полный прогон задачи 10 — 180 passed, волны правок финального ревью — 201 passed) |
+| `npx size-limit` — чанки до (`v0.0.14-m7.1`) и после | все 24 строки в пределах (КБ gzip, до → после, предел): `entry` 79,64 → 86,03 (103); `dialog-content` — новый общий чанк окон bits-ui, вынесен из `entry` и грузится при старте, 13,32 (14,7), старт вместе — 99,35; `SessionsView` 4,32 → 7,22 (7,9); `IdeasView` 10,54 → 11,54 (12); `ReportsView` 8,6 → 8,89 (9); `CodeView` 8,1 → 7,91 (9); `IdeaForm` 2,19 → 2,26 (2,5); новые — `EntryEdit` 3,17 (3,4), `JournalTrash` 1,81 (2), `Backups` 4,7 (5,3), `Audit` 2,51 (2,9), `ImportDialog` 5,09 (5,6), `GraphView` 5,67 (6); прочие (просмотрщики, `print`, `pdf.worker`) — в пределах ±0,07. «До» — `a2daa25d` (`v0.0.14-m7.1`), собрано из `git archive` в `.tmp` |
+| Тихое окно `m4` (`hook_budgets`) | ok (корпус 212 заметок, 165 insight, 3 правила; p95 процесса, мс, к бюджету): session-start 51,6/300, prompt 85,0/250 (тайм-аутов 0 из 59), post-tool 113,2/250, pre-tool 25,1/50, checkpoint 43,6/100, post-tool-ok 21,8/50, subagent-start 83,0/300, session-start-holdout 76,3/300, checkpoint-snap 65,6/100, session-start-catchup 95,1/300 |
+| Тихое окно `m57` (`acceptance_recall_p95_with_50_ideas`) | ok: p95 session-start с идеями / без — 43,5/38,8 мс, prompt — 33,7/23,8 мс |
+| Тихое окно `m6` (`acceptance_hook_budgets`, медиана отношения p95 `/recall(prompt)` к v0.0.14-m7.1 ≤ 1,10) | ok, release: медиана отношения 0,940 (раунды 0,296–1,133); p95 ветки 7,4–13,6 мс, у v0.0.14-m7.1 — 8,3–25,1 мс |
+| Блок v8 ru/en (500/497), MCP — 11 инструментов, описания ≤ 300 | зелёные в полном прогоне: `agent_setup_block_v8_under_500_tokens_ru_en`, `mcp_tools_still_eleven`, `all_schema_descriptions_under_300` |
+| Финальное ревью ветки и волна правок | `9db9aa57..b7348711`: With fixes — Critical нет, Important I1 (несохранённое в Insights, Идеях и Словаре терялось по «←» и переходу), Minor M1–M9; волна правок `743dda54`, `bc287635`, `3008a168`, `3905b63b` (I1, M1–M5 и из триажа — признак правки всех журналов, вкладки DocView, прозрачность, окно конфликта редактора); M6–M9 — в M7.4 (задачи памяти, «Известные ограничения»); повторное ревью — закрыто всё, новых Critical и Important нет, N1 (документы) — `6bb0b755`; итог — `90830595` |
 | Тег `v0.0.15-m7.2`, Release, развёртывание на рабочий сервер памяти (с копией данных) и тестовый стенд, клиент владельца | … |
 
 ## Уточнить у владельца
