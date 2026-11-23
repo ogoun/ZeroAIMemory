@@ -10,28 +10,35 @@
 //!   enabled`, **в фоне** задачи раннера: сборка состояния и роутера их не ждёт, базы
 //!   пользователей на старте синхронно не открываются. Учтённые запуски
 //!   ([`NightRunner::spawn_tracked`]) начинаются после них.
+//! - **Шаги** (старт, каждая ночь, учтённые запуски) идут отдельными задачами учёта раннера
+//!   (`JoinSet`): паника шага не роняет задачу раннера — шаг старта считается законченным с
+//!   ошибкой (ERROR в журнал), ручные запуски и ночной цикл продолжают работать.
 //! - **Контекст ночи** [`NightCtx`] — клон `AppState` (поиск и `/recall` тем же путём, что у
 //!   агента, Vault, базы, конфигурация, копии) и признак остановки.
 //! - **Ручные запуски** (`POST /works/run`, `POST /check/run`) идут через раннер:
-//!   `st.night.spawn_tracked(fut)` с `NightCtx::new(st.clone())` внутри; [`NightRunner::stop`]
-//!   ждёт их тем же сроком и снимает.
+//!   `st.night.spawn_tracked(|ctx| async move { … })` — контекст строит **сам раннер** из своего
+//!   клона состояния ночи; внешний клон `AppState` в замыкание не захватывается. [`NightRunner::stop`]
+//!   ждёт запуски тем же сроком и снимает.
 //! - **Кто держит клон состояния.** Создаётся раннер до сборки `AppState`
 //!   ([`NightRunner::idle`]), запускается после неё ([`NightRunner::start`]). Клон состояния ночи
-//!   держит **поле раннера**, задача — только `Weak` на него (между ночами) и сильную ссылку на
-//!   время шага (старт, ночь); поле `night` у этого клона — **отвязанный раннер**: та же остановка
-//!   и тот же учёт запусков, но без задачи — у него `start` и `stop` ничего не делают. Цикла `Arc`
-//!   нет: когда уходит последний внешний клон `AppState` без [`NightRunner::stop`] (тесты, сборки
-//!   в процессе), раннер уничтожается и отпускает клон сразу — лок каталога данных и соединения
-//!   баз освобождаются, как до M7.3. Шаг, идущий в этот момент (старт, ночь, учтённый запуск),
-//!   держит свой клон, пока рантайм его не снимет.
+//!   держит **поле раннера**, задача — только `Weak` на него; шаги (старт, ночь, учтённые
+//!   запуски) — свои копии этого клона в задачах учёта, которыми владеет раннер. Поле `night` у
+//!   клона — **отвязанный раннер**: та же остановка, но без задачи и учёта — у него `start`,
+//!   `stop` и `spawn_tracked` ничего не делают. Цикла `Arc` нет (шаги держат клон с отвязанным
+//!   раннером, а не сам раннер): когда уходит последний внешний клон `AppState` без
+//!   [`NightRunner::stop`] (тесты, сборки в процессе), раннер уничтожается — клон ночи
+//!   отпускается сразу, задачи учтённых шагов снимаются (`JoinSet` при уничтожении), их копии
+//!   уходят на ближайшем ожидании, — и лок каталога данных и соединения баз освобождаются, как
+//!   до M7.3.
 //! - **Останавливается первой** в `AppState::shutdown` ([`NightRunner::stop`]): признак
-//!   остановки, ожидание задачи и учтённых запусков не дольше [`STOP_WAIT`] (функции видят
-//!   признак — [`NightCtx::stopping`], [`NightCtx::stopped`] — и заканчивают шаг), затем снятие,
-//!   клон отпускается — до остановки обслуживания и закрытия баз.
+//!   остановки, ожидание задачи и шагов не дольше [`STOP_WAIT`] (функции видят признак —
+//!   [`NightCtx::stopping`], [`NightCtx::stopped`] — и заканчивают шаг), затем снятие, клон
+//!   отпускается — до остановки обслуживания и закрытия баз.
 //! - **Правила для функций ночи и ручных запусков** (задачи 2, 3, 5 плана): признак остановки —
 //!   только `ctx.stopping()` / `ctx.stopped()`; у `ctx.st().night` (отвязанный раннер) не звать
-//!   `start`/`stop`; клон `NightCtx`/`AppState` не уносить в `tokio::spawn`, переживающий будущее
-//!   шага (иначе снятие в `stop` его не отпустит) — фоновое — только `spawn_tracked`.
+//!   `start`/`stop`/`spawn_tracked`; клон `NightCtx`/`AppState` не уносить в `tokio::spawn`,
+//!   переживающий будущее шага (иначе снятие в `stop` его не отпустит) — фоновое — только
+//!   `spawn_tracked` у `st.night` обработчика.
 //! - **Узкая ручка**: блокирующее замыкание (`spawn_blocking`, вызов модели) получает только
 //!   данные запроса — ни `Db`, ни `AppState`: снятая задача бросает висящий вызов, и он не держит
 //!   соединений баз.
@@ -85,7 +92,8 @@ impl NightCtx {
     }
 }
 
-/// Учтённый запуск не принят: сервер останавливается.
+/// Учтённый запуск не принят: сервер останавливается, раннер не запущен или это отвязанный
+/// раннер клона ночи.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("сервер останавливается: новые внутренние работы не запускаются")]
 pub struct Stopping;
@@ -99,15 +107,21 @@ enum Startup {
     Running,
     /// Шаги старта закончены.
     Done,
+    /// Шаг старта аварийно завершился (паника) или снят: дальше — как после `Done`.
+    Failed,
 }
 
-/// Общее у раннера и его отвязанного двойника в клоне состояния ночи.
+/// Общее у раннера и его отвязанного двойника в клоне состояния ночи: признак остановки и
+/// состояние старта. Учёта шагов здесь нет: его держит только сам раннер ([`Tracked`]) — иначе
+/// шаг с клоном состояния (а у клона `night` — двойник) замкнул бы учёт сам на себя.
 struct Shared {
     stop: CancellationToken,
-    /// Учтённые запуски; `None` — после [`NightRunner::stop`]: новых нет.
-    tracked: Mutex<Option<JoinSet<()>>>,
     startup: watch::Sender<Startup>,
 }
+
+/// Учёт шагов раннера (старт, ночи, учтённые запуски); `None` — после [`NightRunner::stop`] и у
+/// отвязанного двойника: новых нет.
+type Tracked = Mutex<Option<JoinSet<()>>>;
 
 /// Номер раннера процесса (журнал тестовой точки остановки).
 static SERIAL: AtomicU64 = AtomicU64::new(1);
@@ -116,10 +130,12 @@ static SERIAL: AtomicU64 = AtomicU64::new(1);
 pub struct NightRunner {
     serial: u64,
     shared: Arc<Shared>,
-    /// Отвязанный двойник (поле `night` клона состояния ночи): `start` и `stop` — без действия.
+    /// Отвязанный двойник (поле `night` клона состояния ночи): `start`, `stop` и
+    /// `spawn_tracked` — без действия.
     detached: bool,
     /// Клон состояния ночи; задача держит на него `Weak`.
     ctx: Mutex<Option<Arc<NightCtx>>>,
+    tracked: Arc<Tracked>,
     task: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -142,18 +158,19 @@ impl NightRunner {
     pub fn idle() -> Arc<NightRunner> {
         let shared = Arc::new(Shared {
             stop: CancellationToken::new(),
-            tracked: Mutex::new(Some(JoinSet::new())),
             startup: watch::Sender::new(Startup::NotStarted),
         });
         Arc::new(NightRunner::with_shared(shared, false))
     }
 
     fn with_shared(shared: Arc<Shared>, detached: bool) -> NightRunner {
+        let tracked = if detached { None } else { Some(JoinSet::new()) };
         NightRunner {
             serial: SERIAL.fetch_add(1, Ordering::Relaxed),
             shared,
             detached,
             ctx: Mutex::new(None),
+            tracked: Arc::new(Mutex::new(tracked)),
             task: Mutex::new(None),
         }
     }
@@ -183,8 +200,8 @@ impl NightRunner {
             );
         }
         let NightCtx { mut st, .. } = ctx;
-        // у клона ночи — отвязанный двойник с той же остановкой и учётом запусков: клон в поле
-        // раннера не держит сам раннер (нет цикла `Arc`)
+        // у клона ночи — отвязанный двойник с той же остановкой, без задачи и учёта: клон в поле
+        // раннера и шаги в учёте не держат сам раннер (нет цикла `Arc`)
         st.night = Arc::new(NightRunner::with_shared(self.shared.clone(), true));
         let ctx = Arc::new(NightCtx {
             st,
@@ -200,22 +217,30 @@ impl NightRunner {
         *task = Some(tokio::spawn(run(
             weak,
             self.shared.clone(),
+            self.tracked.clone(),
             period,
             enabled,
         )));
     }
 
-    /// Учтённый запуск (ручные работы и прогоны проверки, задачи 3 и 5 плана): `fut` идёт в фоне
-    /// после шагов старта, [`Self::stop`] ждёт его тем же сроком [`STOP_WAIT`] и снимает. Сервер
-    /// останавливается — [`Stopping`]. Клон состояния — внутри `fut` (`NightCtx::new`).
-    pub fn spawn_tracked<F>(&self, fut: F) -> Result<(), Stopping>
+    /// Учтённый запуск (ручные работы и прогоны проверки, задачи 3 и 5 плана): `f` получает
+    /// контекст, который раннер строит из **своего** клона состояния ночи (внешний клон
+    /// `AppState` в замыкание не захватывается — иначе запуск замкнул бы его на раннер), и идёт в
+    /// фоне после шагов старта; [`Self::stop`] ждёт его тем же сроком [`STOP_WAIT`] и снимает.
+    /// Сервер останавливается, раннер не запущен или это отвязанный раннер клона ночи —
+    /// [`Stopping`].
+    pub fn spawn_tracked<F, Fut>(&self, f: F) -> Result<(), Stopping>
     where
-        F: Future<Output = ()> + Send + 'static,
+        F: FnOnce(NightCtx) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
-        if self.shared.stop.is_cancelled() {
+        if self.detached || self.shared.stop.is_cancelled() {
             return Err(Stopping);
         }
-        let mut tracked = lock(&self.shared.tracked);
+        let Some(ctx) = lock(&self.ctx).as_deref().cloned() else {
+            return Err(Stopping);
+        };
+        let mut tracked = lock(&self.tracked);
         let Some(set) = tracked.as_mut() else {
             return Err(Stopping);
         };
@@ -232,15 +257,16 @@ impl NightRunner {
                     let _ = startup.wait_for(|s| *s != Startup::Running).await;
                 } => {}
             }
-            fut.await;
+            f(ctx).await;
         });
         Ok(())
     }
 
-    /// Учтённых запусков в полёте (тестовые точки и диагностика).
+    /// Шагов в учёте (старт, ночь, учтённые запуски), ещё не законченных — тестовые точки и
+    /// диагностика.
     #[doc(hidden)]
     pub fn tracked_running(&self) -> usize {
-        lock(&self.shared.tracked).as_mut().map_or(0, |set| {
+        lock(&self.tracked).as_mut().map_or(0, |set| {
             while set.try_join_next().is_some() {}
             set.len()
         })
@@ -256,7 +282,7 @@ impl NightRunner {
         }
         self.shared.stop.cancel();
         let mut handle = lock(&self.task).take();
-        let mut set = lock(&self.shared.tracked).take().unwrap_or_default();
+        let mut set = lock(&self.tracked).take().unwrap_or_default();
         let mut main_done = handle.is_none();
         let waited = tokio::time::timeout(STOP_WAIT, async {
             if let Some(h) = handle.as_mut() {
@@ -300,15 +326,67 @@ impl Drop for NightRunner {
             self.shared.stop.cancel();
             h.abort();
         }
+        // шаги учёта снимаются сразу (`JoinSet` при уничтожении), а не когда рантайм уберёт задачу
+        drop(lock(&self.tracked).take());
+    }
+}
+
+/// Как закончился шаг в учёте раннера.
+enum StepEnd {
+    Done,
+    /// Паника или снятие шага.
+    Failed,
+    /// Учёт закрыт (`stop`): шаг не начат.
+    Stopped,
+}
+
+/// Шаг (старт, ночь) — отдельной задачей учёта раннера: паника шага не роняет задачу раннера, а
+/// `stop` ждёт и снимает шаг вместе с учтёнными запусками.
+async fn step(tracked: &Tracked, fut: impl Future<Output = ()> + Send + 'static) -> StepEnd {
+    let (done, finished) = tokio::sync::oneshot::channel::<()>();
+    {
+        let mut g = lock(tracked);
+        let Some(set) = g.as_mut() else {
+            return StepEnd::Stopped;
+        };
+        while set.try_join_next().is_some() {}
+        set.spawn(async move {
+            fut.await;
+            let _ = done.send(());
+        });
+    }
+    match finished.await {
+        Ok(()) => StepEnd::Done,
+        // отправитель уничтожен без отправки: шаг запаниковал или снят
+        Err(_) => StepEnd::Failed,
     }
 }
 
 /// Задача раннера: шаги старта, затем (при `enabled`) тик, «пора ли», ночь.
-async fn run(weak: Weak<NightCtx>, shared: Arc<Shared>, period: Duration, enabled: bool) {
-    if let Some(ctx) = weak.upgrade() {
-        startup(&ctx).await;
-    }
-    shared.startup.send_replace(Startup::Done);
+async fn run(
+    weak: Weak<NightCtx>,
+    shared: Arc<Shared>,
+    tracked: Arc<Tracked>,
+    period: Duration,
+    enabled: bool,
+) {
+    let started = match weak.upgrade() {
+        Some(ctx) => match step(&tracked, async move { startup(&ctx).await }).await {
+            StepEnd::Done => Startup::Done,
+            StepEnd::Failed => {
+                if !shared.stop.is_cancelled() {
+                    tracing::error!(
+                        "шаги старта внутренних работ аварийно завершились: ночная часть и ручные \
+                         запуски продолжают работу без них"
+                    );
+                }
+                Startup::Failed
+            }
+            StepEnd::Stopped => return,
+        },
+        None => Startup::Done,
+    };
+    shared.startup.send_replace(started);
     if !enabled {
         return;
     }
@@ -330,7 +408,15 @@ async fn run(weak: Weak<NightCtx>, shared: Arc<Shared>, period: Duration, enable
             continue;
         };
         last = Some(night);
-        run_night(&ctx, night, until).await;
+        // ночь — шагом учёта: паника функции ночи не обрывает ночной цикл (следующая ночь — по
+        // расписанию), `stop` ждёт и снимает её
+        match step(&tracked, async move { run_night(&ctx, night, until).await }).await {
+            StepEnd::Done => {}
+            StepEnd::Failed if !shared.stop.is_cancelled() => {
+                tracing::error!(%night, "ночь внутренних работ аварийно завершилась");
+            }
+            StepEnd::Failed | StepEnd::Stopped => {}
+        }
     }
 }
 

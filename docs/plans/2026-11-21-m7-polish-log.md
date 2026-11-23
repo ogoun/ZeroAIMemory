@@ -5252,6 +5252,25 @@ token` FAILED (`DataDirLocked` при повторной сборке на то�
   `backup` 53, `m65_acceptance` 7, `mcp` 79 (процессы `ServerProc` с `ZAM_WORKS__CHECK=off`);
   `zam-cli --test agent_dates --test idea --test cache` — 1 + 20 + 2; 0 failed.
 
+**Круг правок 2** (повторное ревью r2: Approved, пункты r1 закрыты; новые Minor N1–N3):
+- N1 — шаги старта и каждая ночь идут **задачами учёта раннера** (`step`: `JoinSet` раннера +
+  `oneshot` о конце): паника шага — `StepEnd::Failed`, у старта — состояние `Startup::Failed` и
+  ERROR в журнал; учтённые запуски ждут «не `Running`» и идут, ночной цикл продолжает; `stop` ждёт
+  и снимает шаги вместе с запусками. Тест `startup_panic_keeps_runner_working`.
+- N2 — `spawn_tracked(|ctx: NightCtx| fut)`: контекст строит раннер из своего клона состояния
+  ночи (у клона `night` — двойник), внешний клон в запуск не попадает. Учёт шагов перенесён из
+  общего с двойником состояния в сам раннер (`Arc<Tracked>`): иначе шаг с клоном (через `night` →
+  двойник → общее состояние → учёт) замкнул бы учёт на себя. У двойника `spawn_tracked` —
+  `Err(Stopping)`; при уничтожении раннера учёт снимается сразу. Описание модуля, план (задачи 1,
+  3, 5 — новая сигнатура), спецификация §6.1 п. 5 — поправлены.
+- N3 — `startup_steps_run_in_background`: `api(...)` под `tokio::time::timeout(30 с)` — регрессия
+  падает, а не висит.
+- Прогоны (`ZAM_REQUIRE_ML=1`): `fmt --check` и `clippy -p zam-store -p zam-server -p zam-cli
+  --all-targets -D warnings` — чисто; `zam-server --test works_night` 7, `works_settings` 7,
+  `boot` 15 — 0 failed. Мутация (откачена): шаг старта без задачи учёта —
+  `startup_panic_keeps_runner_working` FAILED («не дождались: учтённый запуск после упавшего шага
+  старта»).
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

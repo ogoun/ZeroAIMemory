@@ -277,22 +277,24 @@ async fn manual_runs_tracked_by_stop() {
         Arc::new(AtomicUsize::new(0)),
         Arc::new(AtomicBool::new(false)),
     );
-    // смотрит на остановку: заканчивает шаг сам
-    let ctx = zam_server::works::NightCtx::new(a.st.clone());
-    let (e, f) = (entered.clone(), finished.clone());
+    // смотрит на остановку: заканчивает шаг сам; контекст даёт раннер (ревью r2, N2), у его
+    // клона `night` — отвязанный раннер: учтённого запуска у него нет
+    let twin_refused = Arc::new(AtomicBool::new(false));
+    let (e, f, t) = (entered.clone(), finished.clone(), twin_refused.clone());
     a.st.night
-        .spawn_tracked(async move {
+        .spawn_tracked(move |ctx| async move {
             ctx.st().users.get(ctx.st().admin_id).await.unwrap();
+            let refused = ctx.st().night.spawn_tracked(|_| async {}).is_err();
+            t.store(refused, Ordering::SeqCst);
             e.fetch_add(1, Ordering::SeqCst);
             ctx.stopped().await;
             f.store(true, Ordering::SeqCst);
         })
         .unwrap();
     // не смотрит на остановку: висит с клоном состояния
-    let ctx = zam_server::works::NightCtx::new(a.st.clone());
     let e = entered.clone();
     a.st.night
-        .spawn_tracked(async move {
+        .spawn_tracked(move |ctx| async move {
             let _hold = ctx;
             e.fetch_add(1, Ordering::SeqCst);
             std::future::pending::<()>().await;
@@ -305,6 +307,10 @@ async fn manual_runs_tracked_by_stop() {
     )
     .await;
     assert_eq!(a.st.night.tracked_running(), 2);
+    assert!(
+        twin_refused.load(Ordering::SeqCst),
+        "spawn_tracked у отвязанного раннера — Stopping"
+    );
     let t0 = Instant::now();
     a.st.shutdown().await;
     let took = t0.elapsed();
@@ -315,7 +321,7 @@ async fn manual_runs_tracked_by_stop() {
     );
     assert_eq!(a.st.night.tracked_running(), 0);
     assert_eq!(
-        a.st.night.spawn_tracked(async {}),
+        a.st.night.spawn_tracked(|_| async {}),
         Err(zam_server::works::Stopping)
     );
     drop(a);
@@ -347,10 +353,11 @@ async fn startup_steps_run_in_background() {
             Ok(())
         })
     }));
-    // `api` — сборка и вход администратора через роутер: шаги старта висят, сборка не ждёт
-    let t0 = Instant::now();
-    let a = api("night-startup", night_later).await;
-    assert!(t0.elapsed() < Duration::from_secs(30), "{:?}", t0.elapsed());
+    // `api` — сборка и вход администратора через роутер: шаги старта висят, сборка не ждёт;
+    // регрессия «сборка ждёт шагов старта» — падение по сроку, а не зависание (ревью r2, N3)
+    let a = tokio::time::timeout(Duration::from_secs(30), api("night-startup", night_later))
+        .await
+        .expect("сборка и вход не ждут шагов старта");
     until(
         "шаги старта начаты",
         Duration::from_secs(20),
@@ -361,7 +368,7 @@ async fn startup_steps_run_in_background() {
     let ran = Arc::new(AtomicBool::new(false));
     let r2 = ran.clone();
     a.st.night
-        .spawn_tracked(async move { r2.store(true, Ordering::SeqCst) })
+        .spawn_tracked(move |_| async move { r2.store(true, Ordering::SeqCst) })
         .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
@@ -417,4 +424,57 @@ async fn drop_without_shutdown_releases_data_dir() {
         .expect("повторная сборка на том же каталоге — без DataDirLocked");
     assert!(rep.initial_token.is_none(), "тот же каталог данных");
     st.shutdown().await;
+}
+
+/// Тело подменённого шага старта: паника.
+fn startup_panics() -> Result<(), StoreError> {
+    panic!("шаг старта: тестовая паника")
+}
+
+/// Ревью r2, N1: паника шага старта не оставляет состояние старта в `Running` — шаг идёт задачей
+/// учёта раннера, паника — «закончен с ошибкой» (ERROR в журнал): учтённый запуск выполняется,
+/// ночной цикл идёт (ночь с подменённой проверкой вызвана), остановка — штатная.
+#[tokio::test]
+async fn startup_panic_keeps_runner_working() {
+    let _serial = SERIAL.lock().await;
+    let _reset = Reset;
+    let nights = Arc::new(AtomicUsize::new(0));
+    let n = nights.clone();
+    test_hooks::set_on_start(Arc::new(|_ctx| -> JobFuture {
+        Box::pin(async { startup_panics() })
+    }));
+    test_hooks::set_tick(Duration::from_millis(50));
+    test_hooks::set_jobs(Jobs {
+        check: Some(job(move |_, _, _| {
+            let n = n.clone();
+            async move {
+                n.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })),
+        queue: None,
+    });
+    let a = tokio::time::timeout(Duration::from_secs(30), api("night-start-panic", night_now))
+        .await
+        .expect("сборка не ждёт шагов старта");
+    let ran = Arc::new(AtomicBool::new(false));
+    let r = ran.clone();
+    a.st.night
+        .spawn_tracked(move |_| async move { r.store(true, Ordering::SeqCst) })
+        .unwrap();
+    until(
+        "учтённый запуск после упавшего шага старта",
+        Duration::from_secs(20),
+        || ran.load(Ordering::SeqCst),
+    )
+    .await;
+    until(
+        "ночной цикл идёт",
+        Duration::from_secs(20),
+        || nights.load(Ordering::SeqCst) >= 1,
+    )
+    .await;
+    let t0 = Instant::now();
+    a.st.shutdown().await;
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
 }
