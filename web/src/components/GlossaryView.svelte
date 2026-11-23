@@ -6,7 +6,10 @@
   // на занявшие термины. Корзина (M7.2, спецификация §5.9 пп. 2–3): «Удалить» карточки — в
   // корзину, с подтверждением; «Корзина» — вместо списка удалённые термины с «Восстановить»
   // (`JournalTrash`, ленивый чанк; имя, занятое за это время, — 409 со ссылкой в тексте ошибки).
-  import { untrack } from 'svelte';
+  // Несохранённое (финальное ревью M7.2, I1): поля открытой формы (создание, правка, отзыв) против
+  // их значений при открытии — `unsaved()`; «← Словарь» сначала спрашивает «Закрыть без
+  // сохранения?» (`JournalSplit`), уход по адресу и другая форма — `LEAVE_EDIT` (`lib/leaveEdit.ts`).
+  import { onMount, untrack } from 'svelte';
   import Notice from './Notice.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
   import TrashPanel from './TrashPanel.svelte';
@@ -25,6 +28,7 @@
     type GlossaryItem,
   } from '../lib/api';
   import { AUTHOR_TEXT, JOURNAL_TITLE, fmtTime } from '../lib/journals';
+  import { LEAVE_EDIT, guardLeave } from '../lib/leaveEdit';
   import { go, href } from '../lib/router';
   import JournalSplit from './JournalSplit.svelte';
 
@@ -68,6 +72,30 @@
   let fCode = $state('');
   let fBody = $state('');
   let rReason = $state('');
+
+  /** Поля открытой формы. */
+  const formState = (): string =>
+    mode === 'create' || mode === 'edit'
+      ? JSON.stringify([fName, fDefinition, fAliases, fNot, fCode, fBody])
+      : mode === 'retract'
+        ? rReason
+        : '';
+  /** Поля формы при её открытии (пустые или из термина карточки). */
+  let pristine = '';
+
+  /** Открыть форму `m`: поля уже заданы — их снимок для `unsaved()`. */
+  function openForm(m: Mode) {
+    mode = m;
+    pristine = formState();
+  }
+
+  /** В открытой форме есть несохранённое. */
+  const unsaved = (): boolean => mode !== 'none' && formState() !== pristine;
+
+  /** Действие закроет открытую форму: при несохранённом — сначала вопрос; `false` — остаться. */
+  const leaveForm = (): boolean => !unsaved() || window.confirm(LEAVE_EDIT);
+
+  onMount(() => guardLeave(unsaved));
 
   const lines = (s: string) =>
     s
@@ -225,6 +253,7 @@
   }
 
   function startCreate() {
+    if (!leaveForm()) return;
     fName = '';
     fDefinition = '';
     fAliases = '';
@@ -233,12 +262,12 @@
     fBody = '';
     actionError = '';
     conflicts = [];
-    mode = 'create';
+    openForm('create');
   }
 
   function startEdit() {
     const c = cur;
-    if (!c) return;
+    if (!c || !leaveForm()) return;
     fName = c.title;
     fDefinition = typeof c.data.definition === 'string' ? c.data.definition : '';
     fAliases = strs(c.data.aliases).join('\n');
@@ -247,7 +276,14 @@
     fBody = c.body;
     actionError = '';
     conflicts = [];
-    mode = 'edit';
+    openForm('edit');
+  }
+
+  function startRetract() {
+    if (!leaveForm()) return;
+    rReason = '';
+    actionError = '';
+    openForm('retract');
   }
 
   const formData = () => ({
@@ -330,6 +366,7 @@
     open={detailOpen}
     back={{ href: href({ name: 'journal', user, space, journal: 'glossary', entry: null }), label: JOURNAL_TITLE.glossary }}
     onclose={closeDetail}
+    dirty={unsaved}
     {entry}
   >
     {#snippet list()}
@@ -421,7 +458,7 @@
       <div class="row actions">
         {#if c.status === 'active'}
           <button type="button" onclick={startEdit}>Править</button>
-          <button type="button" class="danger" onclick={() => ((rReason = ''), (actionError = ''), (mode = 'retract'))}>Отозвать</button>
+          <button type="button" class="danger" onclick={startRetract}>Отозвать</button>
         {/if}
         <button type="button" class="danger" onclick={() => askDelete(c)} disabled={busy}>Удалить</button>
       </div>

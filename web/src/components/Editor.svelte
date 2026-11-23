@@ -443,11 +443,16 @@
   </div>
 </section>
 
+<!-- окно открыто, пока есть конфликт: Esc и щелчок мимо закрывают его, только когда выбор не
+     выполняется (`conflictBusy`), — иначе после неудачи ошибка и выбор были бы скрыты (привязка
+     функцией, как у `ImportDialog`; финальное ревью M7.2, M4) -->
 <Dialog.Root
-  open={conflict !== null}
-  onOpenChange={(o) => {
-    if (!o && !conflictBusy) conflict = null;
-  }}
+  bind:open={
+    () => conflict !== null,
+    (o) => {
+      if (!o && !conflictBusy) conflict = null;
+    }
+  }
 >
   <Dialog.Portal>
     <Dialog.Overlay class="overlay" />

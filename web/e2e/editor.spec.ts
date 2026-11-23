@@ -207,6 +207,50 @@ test('конфликт: правка через API между открытие�
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
+test('conflict_dialog_stays_open_while_busy', async ({ page }) => {
+  // финальное ревью M7.2, M4: пока идёт «Скопировать мой текст и открыть текущую», Esc окно
+  // конфликта не закрывает — иначе после неудачи ошибка и выбор скрыты; после неудачи — ошибка в
+  // окне, Esc закрывает его, правка в редакторе цела
+  const problems = watch(page, ['409 PUT', '500 GET']);
+  const uid = await login(page);
+  const a = await api();
+  const n = await createNote(a, `E2E/Конфликт и Esc ${Date.now()}`, '# Конфликт и Esc\n\nисходный текст\n');
+  await page.goto(`${base()}#/u/${uid}/s/knowledge/n/${n.id}`);
+  await expect(page.locator('.doc').getByRole('heading', { level: 1, name: /^Конфликт и Esc/ })).toBeVisible();
+  await openEditor(page, 1);
+  await putNote(a, n.id, 1, '# Конфликт и Esc\n\nисходный текст\nчужая строка\n');
+  await typeAtEnd(page, 'моя строка');
+  await page.keyboard.press('Control+s');
+  const dlg = page.getByRole('dialog', { name: 'Заметка изменена в другом месте' });
+  await expect(dlg).toBeVisible();
+  // перечитывание заметки ждёт, пока не нажат Esc, и не удаётся
+  let release = () => {};
+  const held = new Promise<void>((r) => (release = () => r()));
+  let reads = 0;
+  const reread = (u: URL) => u.pathname.endsWith(`/api/v1/nodes/${n.id}`) && u.searchParams.get('format') === 'json';
+  await page.route(reread, async (route) => {
+    if (route.request().method() !== 'GET') return route.continue();
+    reads += 1;
+    await held;
+    await route.fulfill({ status: 500, contentType: 'text/plain', body: 'сбой для теста' });
+  });
+  const copy = dlg.getByRole('button', { name: 'Скопировать мой текст и открыть текущую' });
+  await copy.click();
+  await expect.poll(() => reads).toBe(1);
+  await expect(copy).toBeDisabled();
+  await page.keyboard.press('Escape');
+  release();
+  await expect(dlg.getByRole('alert')).toBeVisible();
+  await expect(copy).toBeEnabled();
+  await page.keyboard.press('Escape');
+  await expect(dlg).toBeHidden();
+  await expect(editorContent(page)).toContainText('моя строка');
+  await expect(page.locator('.editor .state')).toHaveText('Есть несохранённые изменения');
+  await page.unroute(reread);
+  await a.dispose();
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
 test('CRLF: сохранение не меняет переводы строк', async ({ page }) => {
   const problems = watch(page);
   const uid = await login(page);

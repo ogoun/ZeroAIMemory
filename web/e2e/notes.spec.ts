@@ -208,3 +208,51 @@ test('узкий экран: дерево — выдвижная панель', 
 
   expect(problems, problems.join('\n')).toEqual([]);
 });
+
+test('doc_tabs_keyboard', async ({ page }) => {
+  // финальное ревью M7.2, M3: вкладки документа — клавиатура tablist (`web/src/lib/tabs.ts`, как у
+  // прочих шести): ←/→ по кругу, Home, End, выбор следует за фокусом, `tabindex="0"` — у одной
+  // (выбранной); у каждой вкладки — своя панель (`aria-controls`, `tabpanel` с её именем);
+  // «Править» — кнопка рядом, а не в tablist
+  const problems = watch(page);
+  await login(page);
+  const uid = /#\/u\/([0-9A-Za-z]+)$/.exec(page.url())![1];
+  await page.goto(`${base()}#/u/${uid}/s/knowledge/n/${env('E2E_NOTE_DOCS')}`);
+  const list = page.getByRole('tablist', { name: 'Разделы заметки' });
+  const tabs = list.getByRole('tab');
+  await expect(tabs).toHaveText(['Документ', 'История', 'Связи', /^Вложения/]);
+  await expect(list.getByRole('button')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Править', exact: true })).toBeVisible();
+  const [doc, hist, links, att] = [0, 1, 2, 3].map((i) => tabs.nth(i));
+  const roving = list.locator('[tabindex="0"]');
+  await expect(roving).toHaveCount(1);
+  await expect(doc).toHaveAttribute('tabindex', '0');
+  for (const t of [doc, hist, links, att]) {
+    const id = await t.getAttribute('aria-controls');
+    expect(id, 'aria-controls').toBeTruthy();
+    await expect(page.locator(`[id="${id}"]`)).toHaveAttribute('role', 'tabpanel');
+  }
+  const press = async (key: string, to: typeof doc) => {
+    await page.keyboard.press(key);
+    await expect(to).toBeFocused();
+    await expect(to).toHaveAttribute('aria-selected', 'true');
+    await expect(to).toHaveAttribute('tabindex', '0');
+    await expect(roving).toHaveCount(1);
+  };
+  await doc.focus();
+  await press('ArrowRight', hist);
+  await expect(page.getByRole('tabpanel', { name: 'История' })).toBeVisible();
+  await expect(page.locator('.doc')).toBeHidden();
+  await press('ArrowRight', links);
+  await expect(page.getByRole('tabpanel', { name: 'Связи' })).toBeVisible();
+  await press('End', att);
+  await press('ArrowRight', doc);
+  await expect(page.locator('.doc')).toBeVisible();
+  await press('ArrowLeft', att);
+  await press('Home', doc);
+  // Tab из вкладок — дальше по странице (на «Править»), а не по остальным вкладкам
+  await page.keyboard.press('Tab');
+  await expect(page.getByRole('button', { name: 'Править', exact: true })).toBeFocused();
+
+  expect(problems, problems.join('\n')).toEqual([]);
+});

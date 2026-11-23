@@ -352,8 +352,8 @@ function emit() {
 }
 
 /** `hashchange`: проверка ухода, откат или событие маршрута. Отменённый переход и возврат после
- * отката до прочих слушателей окна (панель журнала, они подписаны позже) не доходят — для них
- * адрес не менялся. */
+ * отката до прочих слушателей окна (панель журнала) не доходят — для них адрес не менялся: роутер
+ * подписан при загрузке модуля, раньше любого компонента (см. ниже). */
 function onHashChange(e: HashChangeEvent) {
   const k = navKey();
   // возврат на показанную запись (по ключу — и запоздавший; без Navigation API — по ожидаемому
@@ -413,15 +413,16 @@ function onPopState() {
   shownKey = navKey() ?? shownKey;
 }
 
-let attached = false;
+// Подписка на окно — при загрузке модуля (финальное ревью M7.2, M2), а не в `listen`: оболочка
+// зовёт `listen` в своём `onMount`, а он идёт после монтирования детей. Первым роутер оказывался
+// лишь потому, что журналы монтируются после загрузки пространств (`journalLoaded` в
+// `Shell.svelte`); компонент со слушателем окна, смонтированный сразу с оболочкой, подписался бы
+// раньше, и `stopImmediatePropagation` отменённого перехода его не остановил бы.
+window.addEventListener('hashchange', onHashChange);
+window.addEventListener('popstate', onPopState);
 
 /** Подписка на смену маршрута; возвращает отписку. */
 export function listen(cb: (r: Route) => void): () => void {
-  if (!attached) {
-    window.addEventListener('hashchange', onHashChange);
-    window.addEventListener('popstate', onPopState);
-    attached = true;
-  }
   listeners.add(cb);
   return () => listeners.delete(cb);
 }

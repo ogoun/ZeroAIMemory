@@ -34,6 +34,7 @@
   import { codeOf, flashButton } from '../lib/hydrate/dom';
   import { hydrateRendered } from '../lib/hydrate/render';
   import { anchorId, go, href, parse } from '../lib/router';
+  import { onTabKey } from '../lib/tabs';
   import { revealSelected } from '../lib/viewport.svelte';
 
   interface Props {
@@ -53,6 +54,9 @@
 
   type Tab = 'doc' | 'history' | 'links' | 'attachments';
   let tab = $state<Tab>('doc');
+  const TAB_TITLE: Record<Tab, string> = { doc: 'Документ', history: 'История', links: 'Связи', attachments: 'Вложения' };
+  const uid = $props.id();
+  let tabEls = $state<HTMLButtonElement[]>([]);
   let info = $state<NodeInfo | null>(null);
   let rendered = $state<RenderedNode | null>(null);
   let spaceName = $state('');
@@ -221,6 +225,12 @@
 
   const fmtTime = (ts: string) => localTime(ts, { dateStyle: 'medium', timeStyle: 'short' });
 
+  /** Вкладки документа: «Вложения» — только у заметки. */
+  let tabs = $derived<Tab[]>(info?.kind === 'note' ? ['doc', 'history', 'links', 'attachments'] : ['doc', 'history', 'links']);
+  /** Клавиатура tablist (`lib/tabs.ts`, финальное ревью M7.2, M3): ←/→ по кругу, Home, End; выбор
+   * следует за фокусом. */
+  const ontabkey = (e: KeyboardEvent, i: number) => onTabKey(e, i, tabs.length, tabEls, (j) => (tab = tabs[j]));
+
   let crumbs = $derived(info ? info.path.split('/') : []);
   let tags = $derived.by(() => {
     const t = info?.frontmatter?.tags;
@@ -299,16 +309,25 @@
     {#if info && info.kind === 'note' && (fileRefs.length || verifiedAt)}
       <FileRefs refs={fileRefs} {verifiedAt} />
     {/if}
-    <!-- вкладки — полоса (§5.1 п. 4): одна строка с прокруткой на телефоне и планшете -->
-    <div class="tabs strip" role="tablist" aria-label="Разделы заметки" use:revealSelected={tab}>
-      <button type="button" role="tab" aria-selected={tab === 'doc'} onclick={() => (tab = 'doc')}>Документ</button>
-      <button type="button" role="tab" aria-selected={tab === 'history'} onclick={() => (tab = 'history')}>История</button>
-      <button type="button" role="tab" aria-selected={tab === 'links'} onclick={() => (tab = 'links')}>Связи</button>
-      {#if info?.kind === 'note'}
-        <button type="button" role="tab" aria-selected={tab === 'attachments'} onclick={() => (tab = 'attachments')}
-          >Вложения{#if attachments?.length}<span class="count">{attachments.length}</span>{/if}</button
-        >
-      {/if}
+    <!-- вкладки — полоса (§5.1 п. 4): одна строка с прокруткой на телефоне и планшете; ARIA tabs
+         (бегающий `tabindex`, ←/→, Home, End — `lib/tabs.ts`); «Править» — рядом, не в tablist -->
+    <div class="tabs-row">
+      <div class="tabs strip" role="tablist" aria-label="Разделы заметки" use:revealSelected={tab}>
+        {#each tabs as t, i (t)}
+          <button
+            type="button"
+            role="tab"
+            id={`${uid}-tab-${t}`}
+            bind:this={tabEls[i]}
+            aria-selected={tab === t}
+            aria-controls={`${uid}-${t}`}
+            tabindex={tab === t ? 0 : -1}
+            onclick={() => (tab = t)}
+            onkeydown={(e) => ontabkey(e, i)}
+            >{TAB_TITLE[t]}{#if t === 'attachments' && attachments?.length}<span class="count">{attachments.length}</span>{/if}</button
+          >
+        {/each}
+      </div>
       {#if info?.kind === 'note' && !editing}
         <button
           type="button"
@@ -329,7 +348,7 @@
     <p class="warn" role="status">{notice}</p>
   {/if}
 
-  <div role="tabpanel" hidden={tab !== 'doc'}>
+  <div role="tabpanel" id={`${uid}-doc`} aria-labelledby={`${uid}-tab-doc`} hidden={tab !== 'doc'}>
     {#if editing}
       <!-- редактор живёт до своего onclose: ошибка перечитывания документа не теряет правки -->
       <Editor
@@ -375,17 +394,17 @@
       {/if}
     {/if}
   </div>
-  <div role="tabpanel" hidden={tab !== 'history'}>
+  <div role="tabpanel" id={`${uid}-history`} aria-labelledby={`${uid}-tab-history`} hidden={tab !== 'history'}>
     {#if tab === 'history' && info?.kind === 'note'}
       <History {user} {node} rev={info.current_rev} onreverted={() => reload()} {onexpired} />
     {/if}
   </div>
-  <div role="tabpanel" hidden={tab !== 'links'}>
+  <div role="tabpanel" id={`${uid}-links`} aria-labelledby={`${uid}-tab-links`} hidden={tab !== 'links'}>
     {#if tab === 'links' && info}
       <Links {user} kind="node" id={info.id} {onexpired} />
     {/if}
   </div>
-  <div role="tabpanel" hidden={tab !== 'attachments'}>
+  <div role="tabpanel" id={`${uid}-attachments`} aria-labelledby={`${uid}-tab-attachments`} hidden={tab !== 'attachments'}>
     {#if tab === 'attachments' && info}
       {#if attachments === null}
         <p class="error" role="alert">Список вложений не загрузился.</p>
@@ -416,7 +435,9 @@
   .docview.editing {
     max-width: 1600px;
   }
-  .tabs .edit {
+  /* «Править» — справа в ряду вкладок, вне tablist (в нём — только вкладки) */
+  .tabs-row .edit {
+    flex: none;
     margin: 0 0 4px auto;
     padding: 3px 12px;
     border: 1px solid var(--border);
@@ -467,11 +488,18 @@
     background: var(--chip);
     color: var(--muted);
   }
-  .tabs {
+  .tabs-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
     margin-top: 12px;
-    /* раскладка — `.strip` (app.css); линия под вкладками — тенью: на узком экране вкладки
-       прокручиваются сами (страница — нет), а подчёркивание активной ложится на линию без выхода
-       за контейнер прокрутки */
+    box-shadow: inset 0 -1px var(--border);
+  }
+  .tabs {
+    /* раскладка — `.strip` (app.css), в ряду — сжимается (прокрутка внутри полосы); линия под
+       вкладками — тенью: на узком экране вкладки прокручиваются сами (страница — нет), а
+       подчёркивание активной ложится на линию без выхода за контейнер прокрутки */
+    min-width: 0;
     box-shadow: inset 0 -1px var(--border);
   }
   .tabs button {
