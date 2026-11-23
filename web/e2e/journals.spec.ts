@@ -877,8 +877,8 @@ test('changelog_edit_follows_entry', async ({ page }) => {
   await go(at(x.id));
   await expect(page).toHaveURL(new RegExp(`/j/changelog/${y.id}$`));
   await expect(form.getByLabel('Заголовок')).toHaveValue('Y с правкой');
-  // отменённый переход историю не меняет (круг 3, N6): прежняя запись, а не её копия; отменённое
-  // «назад» — тоже, а «назад» потом ведёт на X (запись до Y), а не на копию Y
+  // отменённый переход историю не меняет (круг 3, N6): прежняя запись (тот же номер), а не её копия;
+  // отменённое «назад» — тоже
   await expect.poll(place).toBe(yIdx);
   page.once('dialog', (d) => void d.dismiss());
   await page.goBack();

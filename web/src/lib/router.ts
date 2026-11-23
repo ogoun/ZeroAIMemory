@@ -187,20 +187,43 @@ let guard: Guard | null = null;
 /** Адрес, на котором стоит приложение (для отката запрещённого перехода). */
 let shown = location.hash;
 
-// ---- место в истории (M7.2, ревью задачи 10, круг 3) ----
+// ---- место в истории (M7.2, ревью задачи 10, круги 3–4) ----
 //
 // Отменённый переход не должен менять историю. `hashchange` не говорит, чем он вызван, поэтому
-// каждая запись истории приложения несёт свой номер (`history.state.zamIdx`): запись без номера —
-// новая (ссылка `<a href>`, `location.hash =`), с номером — переход по истории («назад», «вперёд»).
-// Откат: новая запись — «назад» на прежнюю (дубля прежнего адреса нет, отменённая остаётся
-// «впереди»); «назад»/«вперёд» — обратный шаг на ту же разницу номеров (прежняя запись цела).
-// Событие отката (`hashchange` возврата) роутер поглощает; подписчики `onCancel` узнают об отмене
-// (панель журнала снимает «идёт закрытие»).
+// роутер знает место каждой записи: индекс Navigation API (`navigation.currentEntry.index`, Baseline
+// с 2026-01: Chromium 102+, Firefox 147+, Safari 26.2+) — точный для любой записи документа, в том
+// числе созданной прежней версией до перезагрузки вкладки (ревью r4, N9). Без него — номер записи в
+// `history.state.zamIdx`: запись без номера — новая (ссылка `<a href>`, `location.hash =`), с
+// номером — переход по истории; номер дублируется в `history.state` и при Navigation API.
+// Откат — обратный шаг на разницу мест: новая запись — «назад» на прежнюю (дубля прежнего адреса
+// нет, отменённая остаётся «впереди» со своим номером); «назад»/«вперёд» — та же разница назад
+// (прежняя запись цела). Событие отката (`hashchange` возврата) роутер поглощает; подписчики
+// `onCancel` узнают об отмене (панель журнала снимает «идёт закрытие»). Шаг между соседними
+// записями с одинаковым адресом (удаление из карточки — `go(список, {replace})`) даёт только
+// `popstate` — место берётся из него (ревью r4, N8).
+// Ограничение запасного пути (браузер без Navigation API, вкладка открыта до выпуска): записи прежней
+// версии номера не имеют и при проходе по ним считаются новыми (номера идут в обратную сторону);
+// откат, пришедший не на ожидаемый адрес, второй раз не спрашивает и ставит прежний адрес
+// `replaceState` на место той записи; откат за пределы истории не приходит — ожидание возврата
+// устаревает за `RESTORE_MS`.
 
-/** Номер текущей записи истории. */
+type NavEntry = { index: number };
+const nav = (globalThis as { navigation?: { currentEntry?: NavEntry | null } }).navigation;
+
+/** Место текущей записи истории. */
 let idx = 0;
-/** Ждём `hashchange` возврата после отката (адрес, на который вернёмся). */
+/** Ждём `hashchange` возврата после отката (адрес, на который вернёмся) — недолго: откат за пределы
+ * истории (номера разошлись с местом записей) не приходит вовсе, и устаревшее ожидание не должно
+ * поглотить или вернуть следующий переход человека. */
 let restoring: string | null = null;
+let restoringUntil = 0;
+const RESTORE_MS = 1000;
+
+/** Ожидаемый адрес возврата, если ожидание не устарело. */
+const awaited = (): string | null => {
+  if (restoring !== null && performance.now() > restoringUntil) restoring = null;
+  return restoring;
+};
 
 const numbered = (): number | null => {
   const s = history.state as { zamIdx?: unknown } | null;
@@ -210,11 +233,22 @@ const numbered = (): number | null => {
 /** Номер записи — в её `history.state` (адрес прежний). */
 const stamp = (n: number) => history.replaceState({ ...(history.state ?? {}), zamIdx: n }, '', location.href);
 
-{
-  const n = numbered();
-  if (n === null) stamp(idx);
-  else idx = n;
-}
+/** Место текущей записи: индекс Navigation API, иначе номер записи; `null` — запись без номера
+ * (запасной путь: новая). */
+const place = (): number | null => {
+  const i = nav?.currentEntry?.index;
+  return typeof i === 'number' && i >= 0 ? i : numbered();
+};
+
+/** Место записи, на которую пришли (без номера — следующая за текущей), с номером в `history.state`. */
+const arrived = (): number => {
+  const at = place() ?? idx + 1;
+  if (numbered() !== at) stamp(at);
+  return at;
+};
+
+idx = place() ?? 0;
+if (numbered() !== idx) stamp(idx);
 
 const cancelled = new Set<() => void>();
 
@@ -271,38 +305,52 @@ function emit() {
  * адрес не менялся. */
 function onHashChange(e: HashChangeEvent) {
   // возврат после отката: прежний адрес, событие маршрута не нужно
-  if (restoring !== null && location.hash === restoring) {
+  const back = awaited();
+  if (back !== null && location.hash === back) {
     restoring = null;
     e.stopImmediatePropagation();
     return;
   }
-  restoring = null;
+  if (back !== null) {
+    // откат пришёл не туда (запасной путь: номера записей разошлись с их местом — история до
+    // номеров): второй раз не спрашивать — прежний адрес на месте этой записи; вопрос был один
+    history.replaceState(history.state, '', back);
+    restoring = null;
+    idx = place() ?? idx;
+    e.stopImmediatePropagation();
+    return;
+  }
   const skip = skipGuard;
   skipGuard = false;
-  const n = numbered();
+  // отменённая новая запись тоже получает номер: шаг «вперёд» к ней потом распознаётся как шаг по
+  // истории, а не как новая запись (иначе номер совпал бы с текущей)
+  const at = arrived();
   if (!skip && !allowed(current())) {
-    // остаться, не меняя историю: новая запись — «назад» на прежнюю (дубля нет); шаг по истории —
-    // обратный шаг (прежняя запись цела)
-    const delta = n === null ? -1 : idx - n;
+    // остаться, не меняя историю: обратный шаг на разницу мест — новая запись — «назад» на прежнюю
+    // (дубля нет); шаг по истории — назад на ту же разницу (прежняя запись цела)
+    const delta = idx - at;
     if (delta === 0) {
-      // номер не различает записи (история до номеров): прежний адрес на месте этой записи
+      // место не различает записи (история до номеров): прежний адрес на месте этой записи
       history.replaceState(history.state, '', shown || location.pathname + location.search);
     } else {
       restoring = shown;
+      restoringUntil = performance.now() + RESTORE_MS;
       history.go(delta);
     }
     e.stopImmediatePropagation();
     for (const cb of cancelled) cb();
     return;
   }
-  if (n === null) {
-    idx += 1;
-    stamp(idx);
-  } else {
-    idx = n;
-  }
+  idx = at;
   shown = location.hash;
   emit();
+}
+
+/** `popstate` без смены адреса — шаг по истории между соседними записями с одинаковым адресом
+ * (удаление из карточки: `go(список, {replace})` после перехода со списка): `hashchange` нет, но
+ * место текущей записи — другое; без этого следующий откат шагал бы на неверную разницу. */
+function onPopState() {
+  if (awaited() === null && location.hash === shown) idx = place() ?? idx;
 }
 
 let attached = false;
@@ -311,6 +359,7 @@ let attached = false;
 export function listen(cb: (r: Route) => void): () => void {
   if (!attached) {
     window.addEventListener('hashchange', onHashChange);
+    window.addEventListener('popstate', onPopState);
     attached = true;
   }
   listeners.add(cb);

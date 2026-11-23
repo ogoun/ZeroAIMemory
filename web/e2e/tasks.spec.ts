@@ -1015,64 +1015,193 @@ test.describe('настольный', () => {
     expect(problems, problems.join('\n')).toEqual([]);
   });
 
-  test('task_edit_cancelled_leave_keeps_history', async ({ page }) => {
-    // ревью задачи 10, круг 3 (N5): отменённый переход историю не меняет — панель потом закрывается
-    // и возвращает на доску. (а) ссылка в карточке («Подзадачи») при набранном → «Отмена» вопроса →
-    // форма цела → «Отмена» формы → Esc — панели нет, адрес — доска; (б) «назад» браузера при
-    // набранном → «Отмена» → «Закрыть» → «Закрыть без сохранения» — доска, а не страница до неё
-    const problems = watch(page);
-    const guid = await newSolution('отменённый уход');
-    const umbrella = await addTask(guid, 'Общая под правкой');
-    const step = await addTask(guid, 'Шаг общей');
-    await partOf(step, umbrella);
-    const c = await pageCtx(page);
-    await open(page, tasksUrl(c.user, guid));
-    const place = () => page.evaluate(() => (history.state as { zamIdx?: number } | null)?.zamIdx);
-    const boardIdx = await place();
-    const tile = columnOf(page, 'открыт').getByRole('button', { name: 'Общая под правкой', exact: true });
-    const sheet = page.getByRole('dialog', { name: 'Задача', exact: true });
-    const card = sheet.getByRole('article', { name: 'Карточка задачи' });
-    const form = card.getByRole('form', { name: 'Правка задачи' });
-    const leave = (accept: boolean) =>
-      page.once('dialog', (d) => {
-        expect([d.type(), d.message()]).toEqual(['confirm', 'В форме есть несохранённый текст. Закрыть её без сохранения?']);
-        void (accept ? d.accept() : d.dismiss());
+  // ревью задачи 10, круг 4: место записи истории — индекс Navigation API, без него — номер записи в
+  // `history.state` (запасной путь); оба пути — каждым из тестов ниже
+  const hideNavApi = (page: Page) =>
+    page.addInitScript(() => Object.defineProperty(window, 'navigation', { value: undefined, configurable: true }));
+  const navApiIs = async (page: Page, hidden: boolean) =>
+    expect(await page.evaluate(() => typeof (window as { navigation?: unknown }).navigation)).toBe(hidden ? 'undefined' : 'object');
+  const placeOf = (page: Page) => () => page.evaluate(() => (history.state as { zamIdx?: number } | null)?.zamIdx);
+
+  for (const [suffix, noNavApi] of [['', false], ['_no_nav_api', true]] as const) {
+    test(`task_edit_cancelled_leave_keeps_history${suffix}`, async ({ page }) => {
+      // ревью задачи 10, круг 3 (N5): отменённый переход историю не меняет — панель потом закрывается
+      // и возвращает на доску. (а) ссылка в карточке («Подзадачи») при набранном → «Отмена» вопроса →
+      // форма цела → «Отмена» формы → Esc — панели нет, адрес — доска; (б) «назад» браузера при
+      // набранном → «Отмена» → «Закрыть» → «Закрыть без сохранения» — доска, а не страница до неё
+      if (noNavApi) await hideNavApi(page);
+      const problems = watch(page);
+      const guid = await newSolution('отменённый уход');
+      const umbrella = await addTask(guid, 'Общая под правкой');
+      const step = await addTask(guid, 'Шаг общей');
+      await partOf(step, umbrella);
+      const c = await pageCtx(page);
+      await open(page, tasksUrl(c.user, guid));
+      await navApiIs(page, noNavApi);
+      const place = placeOf(page);
+      const boardIdx = await place();
+      const tile = columnOf(page, 'открыт').getByRole('button', { name: 'Общая под правкой', exact: true });
+      const sheet = page.getByRole('dialog', { name: 'Задача', exact: true });
+      const card = sheet.getByRole('article', { name: 'Карточка задачи' });
+      const form = card.getByRole('form', { name: 'Правка задачи' });
+      const leave = (accept: boolean) =>
+        page.once('dialog', (d) => {
+          expect([d.type(), d.message()]).toEqual(['confirm', 'В форме есть несохранённый текст. Закрыть её без сохранения?']);
+          void (accept ? d.accept() : d.dismiss());
+        });
+
+      // (а) ссылка карточки
+      await tile.click();
+      await expect(page).toHaveURL(new RegExp(`/j/tasks/${umbrella}$`));
+      const taskIdx = await place();
+      await card.getByRole('button', { name: 'Изменить', exact: true }).click();
+      await form.getByLabel('Заголовок').fill('Черновик заголовка');
+      leave(false);
+      await card.getByTestId('task-subtasks').getByRole('link', { name: 'Шаг общей' }).click();
+      await expect(page).toHaveURL(new RegExp(`/j/tasks/${umbrella}$`));
+      await expect(form.getByLabel('Заголовок')).toHaveValue('Черновик заголовка');
+      await expect.poll(place).toBe(taskIdx);
+      await form.getByRole('button', { name: 'Отмена' }).click();
+      await page.keyboard.press('Escape');
+      await expect(sheet).toHaveCount(0);
+      await expect(page).toHaveURL(/\/j\/tasks$/);
+      await expect.poll(place).toBe(boardIdx);
+
+      // (б) «назад» браузера
+      await tile.click();
+      await card.getByRole('button', { name: 'Изменить', exact: true }).click();
+      await form.getByLabel('Заголовок').fill('Другой черновик');
+      leave(false);
+      await page.goBack();
+      await expect(page).toHaveURL(new RegExp(`/j/tasks/${umbrella}$`));
+      await expect(form.getByLabel('Заголовок')).toHaveValue('Другой черновик');
+      await expect.poll(place).toBe(taskIdx);
+      await sheet.getByRole('button', { name: 'Закрыть', exact: true }).click();
+      await sheet.getByRole('alertdialog', { name: 'Несохранённый текст' }).getByRole('button', { name: 'Закрыть без сохранения' }).click();
+      await expect(sheet).toHaveCount(0);
+      await expect(page).toHaveURL(/\/j\/tasks$/);
+      await expect.poll(place).toBe(boardIdx);
+      expect((await api<{ title: string }>('GET', `entries/${umbrella}`)).title).toBe('Общая под правкой');
+      expect(problems, problems.join('\n')).toEqual([]);
+    });
+
+    test(`task_delete_empty_back_then_cancelled_back${suffix}`, async ({ page }) => {
+      // ревью задачи 10, круг 4 (N8): удаление из карточки оставляет соседние записи с адресом доски —
+      // «назад» между ними даёт только `popstate`; место роутера следует за ним, и следующее
+      // отменённое «назад» возвращает на карточку, а панель потом закрывается на доску
+      if (noNavApi) await hideNavApi(page);
+      const problems = watch(page);
+      const guid = await newSolution('пустое назад');
+      const gone = await addTask(guid, 'Задача в корзину');
+      await addTask(guid, 'Задача под правкой');
+      const c = await pageCtx(page);
+      await open(page, tasksUrl(c.user, guid));
+      await navApiIs(page, noNavApi);
+      const place = placeOf(page);
+      const col = columnOf(page, 'открыт');
+      const sheet = page.getByRole('dialog', { name: 'Задача', exact: true });
+      const card = sheet.getByRole('article', { name: 'Карточка задачи' });
+      await col.getByRole('button', { name: 'Задача в корзину', exact: true }).click();
+      await card.getByRole('button', { name: 'Удалить', exact: true }).click();
+      await page.getByRole('dialog', { name: 'Удалить задачу?' }).getByRole('button', { name: 'Удалить', exact: true }).click();
+      await expect(sheet).toHaveCount(0);
+      await expect(col.locator(`[data-task="${gone}"]`)).toHaveCount(0);
+      // «пустое назад»: адрес прежний (соседняя запись с адресом доски, только `popstate`)
+      const replacedIdx = (await place()) ?? 0;
+      await page.evaluate(() => history.back());
+      await expect.poll(place).toBe(replacedIdx - 1);
+      await expect(page).toHaveURL(/\/j\/tasks$/);
+      await col.getByRole('button', { name: 'Задача под правкой', exact: true }).click();
+      await expect(sheet).toBeVisible();
+      // место роутера последовало за «назад»: новая запись — на месте заменённой, без разрыва
+      const taskIdx = await place();
+      expect(taskIdx).toBe(replacedIdx);
+      await card.getByRole('button', { name: 'Изменить', exact: true }).click();
+      const form = card.getByRole('form', { name: 'Правка задачи' });
+      await form.getByLabel('Заголовок').fill('Черновик');
+      page.once('dialog', (d) => void d.dismiss());
+      await page.goBack();
+      await expect(page).toHaveURL(/\/j\/tasks\/[0-9A-Z]+$/);
+      await expect.poll(place).toBe(taskIdx);
+      await expect(form.getByLabel('Заголовок')).toHaveValue('Черновик');
+      await form.getByRole('button', { name: 'Отмена' }).click();
+      await page.keyboard.press('Escape');
+      await expect(sheet).toHaveCount(0);
+      await expect(page).toHaveURL(/\/j\/tasks$/);
+      await expect.poll(place).toBe(replacedIdx - 1);
+      expect(problems, problems.join('\n')).toEqual([]);
+    });
+
+    test(`task_edit_cancelled_back_old_entries${suffix}`, async ({ page }) => {
+      // ревью задачи 10, круг 4 (N9): записи истории без номера (прежняя версия в той же вкладке до
+      // перезагрузки) — отменённое «назад» спрашивает один раз и оставляет карточку с текстом. С
+      // Navigation API место записи точное: история цела, «назад» потом ведёт на прежнюю запись. Без
+      // него (ограничение запасного пути) откат приходит не туда — роутер второй раз не спрашивает и
+      // ставит прежний адрес на место той записи
+      if (noNavApi) await hideNavApi(page);
+      const problems = watch(page);
+      const guid = await newSolution('записи до номеров');
+      const first = await addTask(guid, 'Задача раньше');
+      const second = await addTask(guid, 'Задача под правкой');
+      const c = await pageCtx(page);
+      await open(page, tasksUrl(c.user, guid));
+      await navApiIs(page, noNavApi);
+      const at = (id: string) => new RegExp(`/j/tasks/${id}$`);
+      // переход и его `hashchange`: слушатель подписан позже роутера — роутер переход уже обработал
+      const hop = (how: string) =>
+        page.evaluate(
+          (how) =>
+            new Promise<void>((done) => {
+              addEventListener('hashchange', () => done(), { once: true });
+              if (how === 'back') history.back();
+              else if (how === 'forward') history.forward();
+              else location.hash = how;
+            }),
+          how,
+        );
+      const strip = () => page.evaluate(() => history.replaceState(null, '', location.href));
+      // доска → первая → вторая; номера сняты с каждой записи (как у записей прежней версии)
+      await hop(tasksUrl(c.user, guid, first));
+      await hop(tasksUrl(c.user, guid, second));
+      for (const how of ['', 'back', 'back', 'forward', 'forward']) {
+        if (how) await hop(how);
+        await strip();
+      }
+      await expect(page).toHaveURL(at(second));
+      // выпуск: перезагрузка вкладки на второй
+      await page.reload();
+      const sheet = page.getByRole('dialog', { name: 'Задача', exact: true });
+      const card = sheet.getByRole('article', { name: 'Карточка задачи' });
+      await card.getByRole('button', { name: 'Изменить', exact: true }).click();
+      const form = card.getByRole('form', { name: 'Правка задачи' });
+      await form.getByLabel('Заголовок').fill('Черновик');
+      let asked = 0;
+      page.on('dialog', (d) => {
+        if (d.type() === 'confirm') asked += 1;
+        void d.dismiss();
       });
-
-    // (а) ссылка карточки
-    await tile.click();
-    await expect(page).toHaveURL(new RegExp(`/j/tasks/${umbrella}$`));
-    const taskIdx = await place();
-    await card.getByRole('button', { name: 'Изменить', exact: true }).click();
-    await form.getByLabel('Заголовок').fill('Черновик заголовка');
-    leave(false);
-    await card.getByTestId('task-subtasks').getByRole('link', { name: 'Шаг общей' }).click();
-    await expect(page).toHaveURL(new RegExp(`/j/tasks/${umbrella}$`));
-    await expect(form.getByLabel('Заголовок')).toHaveValue('Черновик заголовка');
-    await expect.poll(place).toBe(taskIdx);
-    await form.getByRole('button', { name: 'Отмена' }).click();
-    await page.keyboard.press('Escape');
-    await expect(sheet).toHaveCount(0);
-    await expect(page).toHaveURL(/\/j\/tasks$/);
-    await expect.poll(place).toBe(boardIdx);
-
-    // (б) «назад» браузера
-    await tile.click();
-    await card.getByRole('button', { name: 'Изменить', exact: true }).click();
-    await form.getByLabel('Заголовок').fill('Другой черновик');
-    leave(false);
-    await page.goBack();
-    await expect(page).toHaveURL(new RegExp(`/j/tasks/${umbrella}$`));
-    await expect(form.getByLabel('Заголовок')).toHaveValue('Другой черновик');
-    await expect.poll(place).toBe(taskIdx);
-    await sheet.getByRole('button', { name: 'Закрыть', exact: true }).click();
-    await sheet.getByRole('alertdialog', { name: 'Несохранённый текст' }).getByRole('button', { name: 'Закрыть без сохранения' }).click();
-    await expect(sheet).toHaveCount(0);
-    await expect(page).toHaveURL(/\/j\/tasks$/);
-    await expect.poll(place).toBe(boardIdx);
-    expect((await api<{ title: string }>('GET', `entries/${umbrella}`)).title).toBe('Общая под правкой');
-    expect(problems, problems.join('\n')).toEqual([]);
-  });
+      await page.evaluate(() => history.back());
+      await expect.poll(() => asked).toBe(1);
+      await expect(page).toHaveURL(at(second));
+      // цепочки вопросов нет: следующий пришёл бы сразу за первым
+      await page.waitForTimeout(500);
+      expect(asked).toBe(1);
+      await expect(page).toHaveURL(at(second));
+      await expect(form.getByLabel('Заголовок')).toHaveValue('Черновик');
+      await form.getByRole('button', { name: 'Отмена' }).click();
+      await page.keyboard.press('Escape');
+      await expect(sheet).toHaveCount(0);
+      await expect(page).toHaveURL(/\/j\/tasks$/);
+      if (!noNavApi) {
+        // история цела: на месте второй — доска (панель, открытая без перехода, закрывается заменой),
+        // перед ней — первая
+        await page.goBack();
+        await expect(page).toHaveURL(at(first));
+      }
+      expect(asked).toBe(1);
+      expect(problems, problems.join('\n')).toEqual([]);
+    });
+  }
 });
 
 test.describe('телефон, сенсорный ввод', () => {
