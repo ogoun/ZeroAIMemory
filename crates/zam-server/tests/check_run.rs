@@ -27,23 +27,7 @@ use zam_store::probes::{NewProbe, ProbeAuthor, ProbeKind, ProbeTarget, Split};
 use zam_store::{SpaceKind, time::freeze_now};
 
 use common::api::{Api, api, api_with, id, ok, problem};
-
-/// Тестовые точки проверки, ночи и часы общие для процесса: тесты файла идут по одному.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Снимает переопределения проверки и ночи при выходе из теста (и при панике).
-struct Reset;
-
-impl Drop for Reset {
-    fn drop(&mut self) {
-        check::test_hooks::reset();
-        night_hooks::reset();
-    }
-}
-
-fn ts(s: &str) -> Timestamp {
-    s.parse().unwrap()
-}
+use common::check::{Reset, SERIAL, space_of, ts};
 
 /// Ночь `n` ноября 2026 (часы — в окне 04:30 UTC + 1 мин).
 fn day(n: u32) -> String {
@@ -62,17 +46,6 @@ fn note_text(i: usize) -> String {
 
 fn question(i: usize) -> String {
     format!("z{i}alpha z{i}bravo")
-}
-
-async fn space_of(a: &Api, user: Id, kind: SpaceKind) -> Id {
-    let db = a.st.users.get(user).await.unwrap();
-    zam_store::list_spaces(&db)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|s| s.kind == kind)
-        .unwrap()
-        .id
 }
 
 /// Проба вида `probe` части `test` о цели `target`.
@@ -657,8 +630,10 @@ async fn check_accept_only_latest_episode_run() {
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 }
 
-/// §6.5 п. 4: смена отпечатка (реранкер в конфигурации) — `changed` с тем, что сменилось, без
-/// флагов и строки; дальше база копится по новому отпечатку. Смена модели — тест с моделью ниже.
+/// §6.5 п. 4: смена отпечатка (режим Qdrant в конфигурации) — `changed` с тем, что сменилось, без
+/// флагов и строки; дальше база копится по новому отпечатку. Смена модели — тест с моделью ниже;
+/// реранкер у сервера без эмбеддера берётся из прошлого прогона (ревью r1, Important 1), его смена
+/// — модульный тест `check::run::tests`.
 #[tokio::test]
 async fn check_changed_on_fingerprint() {
     let _serial = SERIAL.lock().await;
@@ -671,12 +646,13 @@ async fn check_changed_on_fingerprint() {
     }
     assert_eq!(kind(&night(&a, &day(6)).await), "regression");
     let mut cfg = (*a.st.cfg).clone();
-    cfg.ml.rerank_model_cpu = "other-reranker".into();
+    // сервер теста — без модели: Qdrant не запускается, режим — только часть отпечатка
+    cfg.qdrant.mode = zam_server::config::QdrantMode::Edge;
     let a = restart(a, cfg).await;
     let r = night(&a, &day(7)).await;
     assert_eq!(kind(&r), "changed", "{r}");
-    assert_eq!(r["verdict"]["changed"]["what"], "reranker");
-    assert_eq!(r["verdict"]["changed"]["to"], "other-reranker");
+    assert_eq!(r["verdict"]["changed"]["what"], "qdrant");
+    assert_eq!(r["verdict"]["changed"]["to"], "edge");
     assert_eq!(r["verdict"]["flags"], json!([]));
     assert!(r["verdict"]["episode"].is_null());
     assert!(
@@ -688,6 +664,116 @@ async fn check_changed_on_fingerprint() {
     assert_eq!(
         (kind(&next), next["verdict"]["base_n"].as_u64()),
         ("baseline", Some(1))
+    );
+}
+
+/// §6.5 пп. 4–5 (ревью r1, Important 1): прошлые ночные прогоны — на CUDA (устройство `cuda:0`,
+/// реранкер GPU), текущий сервер без загруженного эмбеддера: отпечаток (модель, устройство,
+/// **реранкер**) — из прошлого прогона, `fp_hash` прежний, вердикт — регрессия перехода в
+/// `degraded` со строкой дайджеста, а не `changed`.
+#[tokio::test]
+async fn check_degraded_on_cuda_keeps_fingerprint() {
+    let _serial = SERIAL.lock().await;
+    let _reset = Reset;
+    check::test_hooks::set_pause(Duration::ZERO);
+    let (a, _) = fixture("check-cuda-degraded", 3, |_| {}).await;
+    let fp = json!({
+        "model": "bge-m3-fp16@1a2b3c4d",
+        "device": "cuda:0",
+        "reranker": a.st.cfg.ml.rerank_model_gpu,
+        "qdrant": a.st.cfg.qdrant.mode,
+        "check_version": check::CHECK_VERSION,
+    });
+    let hash = check::run::fp_hash(&fp);
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    for n in 1..=5 {
+        let id = Id::new();
+        zam_store::check::start_run(
+            &db,
+            id,
+            Trigger::Nightly,
+            Some(day(n).parse().unwrap()),
+            ts(&format!("{}T04:31:00Z", day(n))),
+        )
+        .await
+        .unwrap();
+        let f = zam_store::check::RunFinish {
+            status: zam_store::check::RunStatus::Done,
+            fingerprint: Some(fp.clone()),
+            fp_hash: Some(hash.clone()),
+            // контекст — как у текущего сервера: эпизод не «после обновления», строка с флагом
+            context: Some(check::run::context(&a.st)),
+            metrics: Some(json!({"search_p95_ms": 10.0, "prompt_on": true, "degraded": false})),
+            verdict: Some(json!({"kind": if n < 5 { "baseline" } else { "ok" }, "flags": []})),
+            flags: Vec::new(),
+            episode: None,
+            error: None,
+        };
+        zam_store::check::finish_run(&db, id, f, Vec::new())
+            .await
+            .unwrap();
+    }
+    // сервер теста — без модели: поиск без векторов, эмбеддера и устройства нет
+    assert!(a.st.index.model_id().is_none() && a.st.index.device.is_none());
+    let r = night(&a, &day(6)).await;
+    assert_eq!(r["fp_hash"], hash.as_str(), "{r}");
+    assert_eq!(r["fingerprint"]["device"], "cuda:0");
+    assert_eq!(
+        r["fingerprint"]["reranker"],
+        a.st.cfg.ml.rerank_model_gpu.as_str()
+    );
+    assert_eq!(kind(&r), "regression", "{r}");
+    assert_eq!(r["verdict"]["after_update"], false, "{r}");
+    assert_eq!(r["verdict"]["flags"][0]["name"], "degraded");
+    assert!(
+        digest(&a, "startup")
+            .await
+            .contains("(degraded: поиск без векторов)")
+    );
+}
+
+/// Review Focus 5: прогон, оборванный остановкой (`running` в базе), не мешает ручному
+/// `POST /check/run` после перезапуска — 202 и законченный прогон.
+#[tokio::test]
+async fn check_interrupted_run_not_blocking_manual() {
+    let _serial = SERIAL.lock().await;
+    let _reset = Reset;
+    quick();
+    let (a, _) = fixture("check-interrupted-manual", 2, |_| {}).await;
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    zam_store::check::start_run(
+        &db,
+        Id::new(),
+        Trigger::Manual,
+        None,
+        zam_store::time::now(),
+    )
+    .await
+    .unwrap();
+    drop(db);
+    let cfg = (*a.st.cfg).clone();
+    let a = restart(a, cfg).await;
+    let r = a.t(Method::POST, "/api/v1/check/run", None).await;
+    ok(&r, StatusCode::ACCEPTED);
+    let run: Id = r.json()["run"].as_str().unwrap().parse().unwrap();
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let t0 = Instant::now();
+    loop {
+        let r = zam_store::check::get_run(&db, run).await.unwrap();
+        if r.as_ref().is_some_and(|r| r.status.as_str() == "done") {
+            break;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "ручной прогон не закончился: {r:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let runs = zam_store::check::runs(&db, 10).await.unwrap();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert!(
+        runs.iter()
+            .any(|x| x.error.as_deref() == Some("interrupted"))
     );
 }
 
@@ -989,6 +1075,43 @@ async fn digest_regression_line_only_when_regressed() {
     }
     assert_eq!(kind(&night(&a, &day(7)).await), "ok");
     assert!(!digest(&a, "startup").await.contains(LINE));
+}
+
+/// §6.5 п. 7 (ревью r1, Minor 6): строка дайджеста — не длиннее 30 токенов точным счётчиком
+/// bge-m3 (им сервер считает бюджеты) во всех вариантах, в том числе самом длинном — «после
+/// обновления до <версия>» с флагом без `hit`; ru и en.
+#[tokio::test]
+async fn digest_line_fits_30_tokens() {
+    use zam_markdown::TokenCounter;
+    let Some(counter) = common::ml::bge_counter() else {
+        return;
+    };
+    assert!(counter.is_exact());
+    let mut long = Vec::new();
+    for after in [false, true] {
+        for flag in [
+            // крайние числа: самые длинные записи
+            json!({"name": "hit_search", "value": 0.0, "median": 1.0, "delta_pp": -100.0}),
+            json!({"name": "lost_steady", "lost": 4000, "steady": 40000}),
+            json!({"name": "p95", "value": 180000.0, "median": 90000.0}),
+            json!({"name": "negatives_shown", "value": 1.0, "median": 0.0, "delta_pp": 100.0}),
+            json!({"name": "degraded"}),
+        ] {
+            let mut v = json!({"kind": "regression", "flags": [flag], "after_update": after});
+            if after {
+                v["after_update_version"] = json!("0.0.17-m7.10");
+            }
+            let v = check::verdict::from_json(&v).unwrap();
+            for lang in [check::verdict::LineLang::Ru, check::verdict::LineLang::En] {
+                let line = check::verdict::digest_line(&v, lang).unwrap();
+                let n = counter.count(&line);
+                if n > 30 {
+                    long.push(format!("{n}: {line}"));
+                }
+            }
+        }
+    }
+    assert!(long.is_empty(), "длиннее 30 токенов:\n{}", long.join("\n"));
 }
 
 /// §6.5 п. 1: ручной прогон — 202 (человек или токен `rw`; `ro` — 403); второй, пока идёт

@@ -3185,8 +3185,6 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
         let (k, v) = hints::ideas::M57_MODE;
         base_sets.push((k.into(), v.into()));
     }
-    // без ночной проверки памяти (M7.3, решение 67): ключ — только серверу с `memory_check`
-    base_sets.extend(caps::night_check_off(&caps));
     for (k, v) in run::parse_sets(&a.sets)? {
         base_sets.push((k, v));
     }

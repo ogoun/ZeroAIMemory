@@ -361,16 +361,79 @@ pub const NO_CERTAINTY_BOOSTS: [(&str, &str); 3] = [
     ("search.boost_hypothesis", "1.0"),
 ];
 
+/// Сервер прогонов знает `works.check` (признак `memory_check`, M7.3): по каталогу бинарника,
+/// один раз на процесс xtask ([`night_check_known`]).
+static NIGHT_CHECK: std::sync::Mutex<BTreeMap<PathBuf, bool>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Переменная окружения «без ночной проверки» (`ZAM_WORKS__CHECK=off`) для сервера, который знает
+/// ключ (`known`), если прогон сам не задал `works.check` в `sets`.
+pub fn night_check_env(sets: &[(String, String)], known: bool) -> Option<(String, String)> {
+    let (k, v) = super::caps::NIGHT_CHECK_OFF;
+    (known && !sets.iter().any(|(s, _)| s == k)).then(|| (env_key(k), v.to_string()))
+}
+
+/// Знает ли сервер каталога `server` ключ `works.check` (M7.3, решение 67): короткая проба
+/// сервера без моделей (`/health.features` — `memory_check`), итог — на весь процесс xtask.
+/// Замеры времени старта (`bench`) зовут её до первого замера.
+pub fn night_check_known(p: &Paths, server: &Path) -> Result<bool> {
+    let lock = || NIGHT_CHECK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(k) = lock().get(server) {
+        return Ok(*k);
+    }
+    let spec = RunSpec {
+        name: "caps-probe".into(),
+        model: None,
+        device: Device::Cpu,
+        reranker: None,
+        sets: Vec::new(),
+        keep_cuda_path: false,
+        ctrl_break: false,
+    };
+    let s = Session::start_raw(p, &spec, server, true, &[])?;
+    let caps = super::caps::probe(&s.base);
+    s.stop()?;
+    let known = match caps {
+        Ok(c) => super::caps::night_check_off(&c).is_some(),
+        Err(e) => {
+            println!("возможности сервера не узнаны ({e:#}): works.check не передаётся");
+            false
+        }
+    };
+    lock().insert(server.to_path_buf(), known);
+    Ok(known)
+}
+
 impl Session {
-    /// Запускает сервер на `target/eval/<name>/data`; `fresh` — каталог очищается.
+    /// Запускает сервер на `target/eval/<name>/data`; `fresh` — каталог очищается. Серверу,
+    /// который знает `works.check` (M7.3), — без ночной проверки памяти (`ZAM_WORKS__CHECK=off`,
+    /// решение 67: ночь не нагружает CPU посреди замера); ключ — в окружение сервера, а не в
+    /// `sets` прогона: отчёты и сравнения прежние.
     pub fn start(p: &Paths, spec: &RunSpec, server: &Path, fresh: bool) -> Result<Session> {
+        let known = night_check_known(p, server)?;
+        let extra: Vec<(String, String)> = night_check_env(&spec.sets, known).into_iter().collect();
+        Self::start_raw(p, spec, server, fresh, &extra)
+    }
+
+    /// [`Session::start`] с дополнительными переменными окружения сервера `extra`.
+    fn start_raw(
+        p: &Paths,
+        spec: &RunSpec,
+        server: &Path,
+        fresh: bool,
+        extra: &[(String, String)],
+    ) -> Result<Session> {
         let dir = p.work.join(&spec.name);
         if fresh && dir.exists() {
             fs::remove_dir_all(&dir).with_context(|| format!("очистка {}", dir.display()))?;
         }
         fs::create_dir_all(&dir)?;
         let data = dir.join("data");
-        let env = server_env(p, spec, &dir)?;
+        let mut env = server_env(p, spec, &dir)?;
+        for (k, v) in extra {
+            env.vars.retain(|(ek, _)| ek != k);
+            env.vars.push((k.clone(), v.clone()));
+        }
         let base = format!("http://{}", env.addr);
         let log = dir.join("zam-server.stderr.log");
         let mut srv = Server::start(server, &data, &env, &log, spec.ctrl_break)?;
@@ -1300,7 +1363,7 @@ pub fn run_modes(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) ->
             None => r.clone(),
         });
     }
-    let mut spec = RunSpec {
+    let spec = RunSpec {
         name: run_name(model.as_deref(), label.as_deref()),
         model,
         device: a.device,
@@ -1314,19 +1377,6 @@ pub fn run_modes(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) ->
     } else {
         Session::start(p, &spec, &server, !a.reuse)?
     };
-    // без ночной проверки памяти (M7.3, решение 67): возможности сервера известны только после
-    // старта, а ключ `works.check` старому серверу слать нельзя — перезапуск на том же каталоге
-    // (до загрузки корпуса; токен — из файла прогона)
-    if let Some(q) = super::caps::probe(&s.base)
-        .ok()
-        .as_ref()
-        .and_then(super::caps::night_check_off)
-        && !spec.sets.iter().any(|(k, _)| *k == q.0)
-    {
-        s.stop()?;
-        spec.sets.push(q);
-        s = Session::start(p, &spec, &server, false)?;
-    }
     s.check_model()?;
     println!(
         "сервер {}: модель {}, устройство {}",
@@ -1481,6 +1531,23 @@ pub fn copy_dir(from: &Path, to: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// Ревью r1 задачи 5 M7.3 (Important 2, Minor 8): `works.check = off` уходит в окружение
+    /// сервера, который знает ключ, при любом старте сессии (и обеим сессиям `--preload` — без
+    /// перезапуска после загрузки корпуса), не попадает в `sets` прогона и не перекрывает свой
+    /// `works.check` прогона; старому серверу — ничего.
+    #[test]
+    fn night_check_env_cases() {
+        assert_eq!(
+            super::night_check_env(&[], true),
+            Some(("ZAM_WORKS__CHECK".to_string(), "off".to_string()))
+        );
+        assert_eq!(super::night_check_env(&[], false), None);
+        let own = vec![("works.check".to_string(), "on".to_string())];
+        assert_eq!(super::night_check_env(&own, true), None);
+        let other = vec![("search.w_fts".to_string(), "1.0".to_string())];
+        assert!(super::night_check_env(&other, true).is_some());
+    }
+
     use super::*;
 
     /// Равные баллы — по пути, разные — в порядке сервера (в том числе не по убыванию: реранк).

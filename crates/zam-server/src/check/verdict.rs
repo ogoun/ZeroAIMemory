@@ -544,16 +544,18 @@ pub fn decide(cur: &RunMetrics, prev: &[RunSummary], ctx: &VerdictCtx) -> Verdic
     v
 }
 
-/// Строки дайджеста при регрессии (M7.3 §6.5 п. 7, ≤ 30 токенов): `{delta}` — разница `hit` в
-/// п. п. со знаком.
+/// Строки дайджеста при регрессии (M7.3 §6.5 п. 7, ≤ 30 токенов точным счётчиком bge-m3):
+/// `{delta}` — разница `hit` в п. п. со знаком. У эпизода после обновления — версия вместо флага
+/// (с версией и флагом строка выходила за 30 токенов; флаги — в `zam check report`) **[решение
+/// исполнителя задачи 5, ревью r1]**.
 pub const CHECK_DIGEST_LINE_RU: &str =
     "Ночная проверка памяти: ухудшение поиска (hit {delta} п. п.) — zam check report";
-pub const CHECK_DIGEST_LINE_AFTER_UPDATE_RU: &str = "Ночная проверка памяти: ухудшение поиска после \
-     обновления до {version} (hit {delta} п. п.) — zam check report";
+pub const CHECK_DIGEST_LINE_AFTER_UPDATE_RU: &str =
+    "Ночная проверка памяти: ухудшение поиска после обновления до {version} — zam check report";
 pub const CHECK_DIGEST_LINE_EN: &str =
     "Nightly memory check: search got worse (hit {delta} pp) — zam check report";
-pub const CHECK_DIGEST_LINE_AFTER_UPDATE_EN: &str = "Nightly memory check: search got worse after \
-     the update to {version} (hit {delta} pp) — zam check report";
+pub const CHECK_DIGEST_LINE_AFTER_UPDATE_EN: &str =
+    "Nightly memory check: search got worse after the update to {version} — zam check report";
 
 /// Язык строки дайджеста.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -589,17 +591,17 @@ fn flag_detail(f: &Flag, lang: LineLang) -> String {
         FlagName::P95 => {
             let (v, m) = (f.value.unwrap_or(0.0), f.median.unwrap_or(0.0));
             if ru {
-                format!("p95: {v:.0} мс при медиане {m:.0} мс")
+                format!("p95: {v:.0} мс, медиана {m:.0} мс")
             } else {
-                format!("p95: {v:.0} ms vs median {m:.0} ms")
+                format!("p95: {v:.0} ms, median {m:.0} ms")
             }
         }
         FlagName::NegativesShown => {
             let d = signed_pp(f.delta_pp.unwrap_or(0.0));
             if ru {
-                format!("подсказки к посторонним: {d} п. п.")
+                format!("посторонние: {d} п. п.")
             } else {
-                format!("hints for unrelated questions: {d} pp")
+                format!("unrelated questions: {d} pp")
             }
         }
         FlagName::Degraded => {
@@ -626,18 +628,24 @@ pub fn digest_line(v: &Verdict, lang: LineLang) -> Option<String> {
     if v.kind != Kind::Regression {
         return None;
     }
+    if v.after_update {
+        let tpl = match lang {
+            LineLang::Ru => CHECK_DIGEST_LINE_AFTER_UPDATE_RU,
+            LineLang::En => CHECK_DIGEST_LINE_AFTER_UPDATE_EN,
+        };
+        let version = v.after_update_version.as_deref().unwrap_or("?");
+        return Some(tpl.replace("{version}", version));
+    }
+    let (tpl, hit_part) = match lang {
+        LineLang::Ru => (CHECK_DIGEST_LINE_RU, "(hit {delta} п. п.)"),
+        LineLang::En => (CHECK_DIGEST_LINE_EN, "(hit {delta} pp)"),
+    };
     let hit = v
         .flags
         .iter()
         .find(|f| f.name == FlagName::HitSearch)
         .or_else(|| v.flags.iter().find(|f| f.name == FlagName::HitPrompt));
-    let version = v.after_update_version.as_deref().unwrap_or("?");
-    let (plain, after) = match lang {
-        LineLang::Ru => (CHECK_DIGEST_LINE_RU, CHECK_DIGEST_LINE_AFTER_UPDATE_RU),
-        LineLang::En => (CHECK_DIGEST_LINE_EN, CHECK_DIGEST_LINE_AFTER_UPDATE_EN),
-    };
-    let tpl = if v.after_update { after } else { plain };
-    let line = match hit {
+    Some(match hit {
         Some(f) => tpl.replace("{delta}", &signed_pp(f.delta_pp.unwrap_or(0.0))),
         None => {
             let detail = v
@@ -645,14 +653,9 @@ pub fn digest_line(v: &Verdict, lang: LineLang) -> Option<String> {
                 .first()
                 .map(|f| flag_detail(f, lang))
                 .unwrap_or_default();
-            let hit_part = match lang {
-                LineLang::Ru => "(hit {delta} п. п.)",
-                LineLang::En => "(hit {delta} pp)",
-            };
             tpl.replace(hit_part, &format!("({detail})"))
         }
-    };
-    Some(line.replace("{version}", version))
+    })
 }
 
 /// Пояснения всех флагов вердикта (отчёт `zam check report`, WebUI).
@@ -845,7 +848,14 @@ mod tests {
         assert_eq!(v.episode, Some(h.prev[0].id));
         let line = digest_line(&v, LineLang::Ru).unwrap();
         assert!(line.contains("после обновления до 2.0"), "{line}");
-        assert!(line.contains("hit \u{2212}17 п. п."), "{line}");
+        // с версией — без флага (≤ 30 токенов), флаг — в отчёте
+        assert!(!line.contains("hit"), "{line}");
+        assert!(
+            flag_texts(&v, LineLang::Ru)
+                .iter()
+                .any(|t| t == "hit \u{2212}17 п. п."),
+            "{v:?}"
+        );
         let j = v.to_json();
         assert_eq!(j["after_update_version"], "2.0");
         assert_eq!(j["flags"][0]["name"], "lost_steady");
@@ -1023,9 +1033,10 @@ mod tests {
         assert!(
             digest_line(&v, LineLang::En)
                 .unwrap()
-                .contains("p95: 700 ms vs median 100 ms")
+                .contains("p95: 700 ms, median 100 ms")
         );
-        // ×7 при +450 мс — нет; с копией посреди прогона — задержки не сравниваются
+        // ×5,5 при +450 мс — нет (нужно и ×1,5, и +500 мс); с копией посреди прогона — задержки
+        // не сравниваются
         assert_eq!(
             h.night_with(ALL, |c| c.p95 = Some(150.0 + 400.0)).kind,
             Kind::Ok
@@ -1038,6 +1049,64 @@ mod tests {
             .kind,
             Kind::Ok
         );
+    }
+
+    /// Ручной прогон (ревью r1, Minor 6): в базу не входит и эпизода не начинает, но идущий
+    /// эпизод показывает; ночной прогон после ручного начинает эпизод сам.
+    #[test]
+    fn check_manual_run_episode_rules() {
+        let mut h = Hist::new(30);
+        for _ in 0..5 {
+            h.night(ALL);
+        }
+        let manual = |h: &Hist| {
+            let ctx = VerdictCtx {
+                nightly: false,
+                version: h.version.clone(),
+            };
+            decide(&h.cur(DAMAGED), &h.prev, &ctx)
+        };
+        let v = manual(&h);
+        assert_eq!(v.kind, Kind::Regression);
+        assert_eq!(v.episode, None, "ручной прогон эпизода не начинает");
+        let first = h.night(DAMAGED);
+        let ep = first.episode.expect("ночной — начинает");
+        assert_eq!(ep, h.prev[0].id);
+        assert_eq!(
+            manual(&h).episode,
+            Some(ep),
+            "ручной показывает идущий эпизод"
+        );
+    }
+
+    /// Принятая норма внутри истории (ревью r1, Minor 6): база начинается с принятого прогона —
+    /// следующая ночь `baseline` 1/5, через пять ночей — `ok` от новой базы.
+    #[test]
+    fn check_accepted_run_starts_base() {
+        let mut h = Hist::new(30);
+        for _ in 0..5 {
+            h.night(ALL);
+        }
+        assert_eq!(h.night(DAMAGED).kind, Kind::Regression);
+        h.prev[0].accepted = true;
+        assert_eq!(base_of(&h.prev, &h.prev[0].fp_hash), vec![0]);
+        let mut kinds = Vec::new();
+        for _ in 0..4 {
+            let v = h.night(DAMAGED);
+            kinds.push((v.kind, v.base_n));
+        }
+        assert_eq!(
+            kinds,
+            vec![
+                (Kind::Baseline, 1),
+                (Kind::Baseline, 2),
+                (Kind::Baseline, 3),
+                (Kind::Baseline, 4)
+            ]
+        );
+        // база — принятый и четыре после него: прежние ночи «все найдены» не участвуют
+        let v = h.night(DAMAGED);
+        assert_eq!((v.kind, v.base_n), (Kind::Ok, 5));
     }
 
     #[test]

@@ -195,20 +195,10 @@ pub async fn status(
             .map_or(Value::Null, |v| v["compared_with"].clone());
         o
     });
-    let version = last
-        .and_then(|r| r.verdict.as_ref())
-        .and_then(|v| v["after_update_version"].as_str());
+    // советы с текстом (у `after_update` — с версией эпизода, `run_advice`)
     let advice: Vec<Value> = last
         .map(|r| check_run::run_advice(r.verdict.as_ref(), r.metrics.as_ref()))
-        .unwrap_or_default()
-        .into_iter()
-        .map(|mut a| {
-            if a["code"] == "after_update" {
-                a["text"] = json!(check_run::advice_text("after_update", version));
-            }
-            a
-        })
-        .collect();
+        .unwrap_or_default();
     Ok(Json(json!({
         "last": last_json,
         "running": running.map(|r| json!({"run": r.to_string()})),
@@ -272,19 +262,17 @@ pub async fn run(
     let r = zam_store::check::get_run(&db, id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let probes: std::collections::HashMap<Id, Probe> = zam_store::probes::list_probes(
-        &db,
-        &ProbeFilter {
-            limit: usize::MAX >> 1,
-            ..ProbeFilter::default()
-        },
-    )
-    .await?
-    .into_iter()
-    .map(|p| (p.id, p))
-    .collect();
-    let results: Vec<Value> = zam_store::check::results(&db, id)
+    let rows = zam_store::check::results(&db, id).await?;
+    // пробы этого прогона по id (снятые — тоже), а не весь набор базы
+    let mut ids: Vec<Id> = rows.iter().map(|x| x.probe_id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let probes: std::collections::HashMap<Id, Probe> = zam_store::probes::probes_by_ids(&db, ids)
         .await?
+        .into_iter()
+        .map(|p| (p.id, p))
+        .collect();
+    let results: Vec<Value> = rows
         .into_iter()
         .map(|x| {
             let pr = probes.get(&x.probe_id);

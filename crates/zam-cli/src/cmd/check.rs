@@ -19,6 +19,9 @@ pub const OLD_SERVER: &str = "сервер не поддерживает про�
 const RUN_WAIT: Duration = Duration::from_secs(4 * 60 * 60 + 60);
 /// Опрос прогона.
 const POLL: Duration = Duration::from_secs(2);
+/// Сколько ждать, пока прогон появится на сервере (строку пишет запуск после шагов старта
+/// раннера): дольше — запуск упал до записи.
+const RECORD_WAIT: Duration = Duration::from_secs(120);
 
 fn status_json(ctx: &Ctx) -> Result<Value, CliError> {
     ctx.client
@@ -44,6 +47,21 @@ fn when(v: &Value) -> String {
         || "—".into(),
         |s| zam_core::time::agent_ts(s).unwrap_or_else(|| s.into()),
     )
+}
+
+/// Счётчики `{вид: N}` строкой «probe 12, cache 3» (пусто — «—»).
+fn counts(v: &Value) -> String {
+    let parts: Vec<String> = v
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(k, n)| format!("{k} {n}"))
+        .collect();
+    if parts.is_empty() {
+        "—".into()
+    } else {
+        parts.join(", ")
+    }
 }
 
 /// Вердикт одной строкой.
@@ -114,8 +132,10 @@ pub fn status(ctx: &Ctx) -> Result<(), CliError> {
     }
     let p = &v["probes"];
     s.push_str(&format!(
-        "пробы: активных {} (виды {}, части {})\n",
-        p["active"], p["by_kind"], p["by_split"]
+        "пробы: активных {} (виды: {}; части: {})\n",
+        p["active"],
+        counts(&p["by_kind"]),
+        counts(&p["by_split"])
     ));
     s.push_str(&format!(
         "ночная проверка: сервер {}, пользователь {}\n",
@@ -232,8 +252,16 @@ pub fn run(ctx: &Ctx, wait: bool) -> Result<(), CliError> {
         match ctx.client.get(&path, &[]).and_then(read_json) {
             Ok(r) if r["status"] != "running" => break r,
             Ok(_) => {}
-            // прогон ещё не записан (ждёт шагов старта сервера)
-            Err(e) if e.http_status() == Some(404) => {}
+            // прогон ещё не записан (ждёт шагов старта сервера); так долго — запуск упал
+            Err(e) if e.http_status() == Some(404) => {
+                if t0.elapsed() > RECORD_WAIT {
+                    return Err(CliError::config(format!(
+                        "прогон {run} не появился на сервере за {} мин: запуск не удался — \
+                         zam check status, журнал сервера",
+                        RECORD_WAIT.as_secs() / 60
+                    )));
+                }
+            }
             Err(e) => return Err(e),
         }
         if t0.elapsed() > RUN_WAIT {

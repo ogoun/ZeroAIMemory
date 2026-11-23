@@ -7,7 +7,6 @@ use std::io::Read;
 use std::time::Duration;
 
 use axum::http::{Method, StatusCode};
-use jiff::Timestamp;
 use serde_json::{Value, json};
 use zam_core::Id;
 use zam_server::check;
@@ -18,32 +17,11 @@ use zam_store::probes::{
 use zam_store::{SpaceKind, time::freeze_now};
 
 use common::api::{Api, api, id, ok};
+use common::check::{Reset, SERIAL, space_of, ts};
 
-/// Тестовые точки проверки и часы общие для процесса: тесты файла идут по одному.
-static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// Снимает переопределения проверки при выходе из теста (и при панике).
-struct Reset;
-
-impl Drop for Reset {
-    fn drop(&mut self) {
-        check::test_hooks::reset();
-    }
-}
-
-fn ts(s: &str) -> Timestamp {
-    s.parse().unwrap()
-}
-
+/// Пространство вида `kind` базы администратора.
 async fn space_id(a: &Api, kind: SpaceKind) -> Id {
-    let db = a.st.users.get(a.st.admin_id).await.unwrap();
-    zam_store::list_spaces(&db)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|s| s.kind == kind)
-        .unwrap()
-        .id
+    space_of(a, a.st.admin_id, kind).await
 }
 
 /// Проба вида `probe` о цели `target` в пространстве `space` (часть — по цели).
@@ -187,6 +165,40 @@ async fn probes_from_cache_valid_only() {
     // следующая ночь: проба уже есть — повтора нет
     assert!(night(&a, "2026-11-11").await.is_some());
     assert_eq!(probes(&a, "?kind=cache").await.len(), 1);
+}
+
+/// §6.4 п. 3 (ревью r1, Minor 1): кандидаты из кэша — действующие выжимки **без пробы**: у новой
+/// выжимки проба уже есть — кандидатом становится более старая, а не никто.
+#[tokio::test]
+async fn probes_from_cache_skips_probed() {
+    let _serial = SERIAL.lock().await;
+    let a = api("probes-cache-skip", |_| {}).await;
+    let kn = space_id(&a, SpaceKind::Knowledge).await;
+    let n = id(&a
+        .note("knowledge", "kb/c.md", "# C\n\nоскарпапа и дельтаэхо.\n")
+        .await);
+    for q in ["первый вопрос оскарпапа", "второй вопрос дельтаэхо"]
+    {
+        let r = a
+            .t(
+                Method::POST,
+                "/api/v1/cache",
+                Some(
+                    json!({"query": q, "summary": "кратко", "sources": [{"id": format!("n:{n}")}]}),
+                ),
+            )
+            .await;
+        ok(&r, StatusCode::CREATED);
+    }
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let all = zam_store::probes::cache_candidates(&db, 10).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].query, "второй вопрос дельтаэхо", "новые первыми");
+    // у новой выжимки проба есть (тот же вопрос в регистре и пробелах иначе)
+    probe(&a, kn, "Второй  вопрос дельтаэхо", &format!("n:{n}")).await;
+    let one = zam_store::probes::cache_candidates(&db, 1).await.unwrap();
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].query, "первый вопрос оскарпапа");
 }
 
 /// §6.4 п. 4: набор посторонних вопросов сервера — 30 активных проб вида `negative` без

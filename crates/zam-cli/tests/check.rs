@@ -139,6 +139,8 @@ fn check_report_json() {
         st.contains("последний прогон") && st.contains("ночная проверка: сервер off"),
         "{st}"
     );
+    // счётчики проб — словами, а не JSON
+    assert!(st.contains("виды: negative 30, probe 1; части: "), "{st}");
     let no_wait: Value = serde_json::from_str(&ok(&zam(
         &url,
         &tok,

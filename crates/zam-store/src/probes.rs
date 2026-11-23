@@ -327,6 +327,21 @@ pub async fn list_probes(db: &Db, f: &ProbeFilter) -> Result<Vec<Probe>, StoreEr
     .await
 }
 
+/// Пробы по id (в том числе снятые; нет такой — пропуск) — вопросы результатов прогона.
+pub async fn probes_by_ids(db: &Db, ids: Vec<Id>) -> Result<Vec<Probe>, StoreError> {
+    db.read(move |c| {
+        let mut st = c.prepare_cached(&format!("SELECT {COLS} FROM probes WHERE id = ?1"))?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(p) = st.query_row([id], row).optional()? {
+                out.push(p);
+            }
+        }
+        Ok(out)
+    })
+    .await
+}
+
 /// Сводка проб базы: активных всего, активных по видам и частям.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProbeCounts {
@@ -524,21 +539,38 @@ pub struct CacheCandidate {
 /// Целей у пробы из кэша — не больше.
 pub const CACHE_PROBE_TARGETS: usize = 5;
 
-/// Действующие выжимки кэша (`state = 'valid'`, не удалённые), новые первыми, не больше `limit`:
-/// запрос и источники (`cache_deps`, до [`CACHE_PROBE_TARGETS`]). Выжимка без источников-целей
-/// пропускается.
+/// Действующие выжимки кэша **без пробы** (`state = 'valid'`, не удалённые; та же нормализованная
+/// строка вопроса у активной пробы пространства выжимки — уже опробована), новые первыми, не
+/// больше `limit`: запрос и источники (`cache_deps`, до [`CACHE_PROBE_TARGETS`]). Выжимка без
+/// источников-целей пропускается. Обходятся все действующие выжимки базы (их число держит
+/// `cache.max_entries`): у старых выжимок пробы появляются и тогда, когда у новых они уже есть.
 pub async fn cache_candidates(db: &Db, limit: usize) -> Result<Vec<CacheCandidate>, StoreError> {
     db.read(move |c| {
+        let probed: HashSet<(String, String)> = {
+            let mut st =
+                c.prepare_cached("SELECT space_id, question FROM probes WHERE status = 'active'")?;
+            let rows =
+                st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let mut out = HashSet::new();
+            for row in rows {
+                let (space, q) = row?;
+                out.insert((space, normalize_query(&q)));
+            }
+            out
+        };
         let entries: Vec<(Id, Id, String)> = {
             let mut st = c.prepare_cached(
                 "SELECT id, space_id, query FROM answer_cache
                  WHERE state = 'valid' AND deleted_at IS NULL
-                 ORDER BY created_at DESC, id DESC LIMIT ?1",
+                 ORDER BY created_at DESC, id DESC",
             )?;
-            let rows = st.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })?;
-            rows.collect::<Result<Vec<_>, _>>()?
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<Result<Vec<(Id, Id, String)>, _>>()?
+                .into_iter()
+                .filter(|(_, space, query)| {
+                    !probed.contains(&(space.to_string(), normalize_query(query)))
+                })
+                .collect()
         };
         let mut deps = c.prepare_cached(
             "SELECT d.target_kind, d.target_id, d.rev, e.kind FROM cache_deps d
@@ -547,6 +579,9 @@ pub async fn cache_candidates(db: &Db, limit: usize) -> Result<Vec<CacheCandidat
         )?;
         let mut out = Vec::new();
         for (id, space, query) in entries {
+            if out.len() == limit {
+                break;
+            }
             let rows = deps.query_map([id], |r| {
                 Ok((
                     r.get::<_, String>(0)?,

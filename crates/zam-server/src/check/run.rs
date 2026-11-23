@@ -102,17 +102,7 @@ pub(crate) async fn execute(
         Ok(End::Stopped) => zam_store::check::ERROR_INTERRUPTED.to_string(),
         Err(e) => e.to_string(),
     };
-    let f = RunFinish {
-        status: RunStatus::Failed,
-        fingerprint: None,
-        fp_hash: None,
-        context: None,
-        metrics: None,
-        verdict: None,
-        flags: Vec::new(),
-        episode: None,
-        error: Some(error),
-    };
+    let f = finish_plain(RunStatus::Failed, Some(error));
     if let Err(e) = zam_store::check::finish_run(&db, id, f, Vec::new()).await {
         tracing::warn!(run = %id, error = %e, "проверка памяти: итог прогона не записан");
     }
@@ -192,32 +182,73 @@ fn hash16(v: &Value) -> String {
     blake3::hash(v.to_string().as_bytes()).to_hex()[..16].to_string()
 }
 
-/// Отпечаток прогона: модель и устройство (без загруженной модели — как у прошлого прогона
-/// `prev`), реранкер, режим Qdrant, версия правил проверки.
-fn fingerprint(st: &AppState, prev: Option<&Value>) -> Value {
+/// `fp_hash` отпечатка `fp` (первые 16 знаков blake3 его JSON; ключи объекта — по порядку).
+pub fn fp_hash(fp: &Value) -> String {
+    hash16(fp)
+}
+
+/// Что отпечаток прогона берёт у сервера.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FpInputs<'a> {
+    /// `model_id` загруженного эмбеддера (`<id>@<sha8>`); `None` — не загружен.
+    pub model: Option<&'a str>,
+    /// Устройство загруженного эмбеддера (`cpu`, `cuda:0`); `None` — эмбеддер не загружен.
+    pub device: Option<String>,
+    /// Реранкер устройства эмбеддера (`RerankSlot::model_for`); `None` — устройство неизвестно.
+    pub reranker: Option<&'a str>,
+    /// Реранкер без устройства (CPU) — когда нет ни устройства, ни прошлого прогона.
+    pub reranker_cpu: &'a str,
+    /// Режим Qdrant (`[qdrant] mode`).
+    pub qdrant: Value,
+}
+
+/// Отпечаток прогона (§6.5 п. 4): модель, устройство и реранкер его устройства, режим Qdrant,
+/// версия правил проверки. Эмбеддер не загружен — устройство неизвестно, и модель, устройство и
+/// **реранкер** берутся из прошлого прогона `prev` **[решение исполнителя]**: поиск без векторов —
+/// деградация (`degraded`, регрессия перехода), а не смена отпечатка (`changed`); на CUDA-сервере
+/// реранкер «без устройства» (CPU) иначе сменил бы `fp_hash` (ревью r1 задачи 5, Important 1).
+pub fn fingerprint_of(i: &FpInputs<'_>, prev: Option<&Value>) -> Value {
     let was = |k: &str| prev.and_then(|p| p[k].as_str()).map(str::to_string);
-    let model = st
-        .index
-        .model_id()
+    let model = i
+        .model
         .map(str::to_string)
         .or_else(|| was("model"))
         .unwrap_or_else(|| "none".into());
-    let device = st.index.device.as_ref().map(|d| d.device);
-    let device_s = device
-        .map(|d| d.to_string())
+    let device = i
+        .device
+        .clone()
         .or_else(|| was("device"))
         .unwrap_or_else(|| "none".into());
+    let reranker = i
+        .reranker
+        .map(str::to_string)
+        .or_else(|| was("reranker"))
+        .unwrap_or_else(|| i.reranker_cpu.to_string());
     json!({
         "model": model,
-        "device": device_s,
-        "reranker": st.rerank.model_for(device),
-        "qdrant": st.cfg.qdrant.mode,
+        "device": device,
+        "reranker": reranker,
+        "qdrant": i.qdrant,
         "check_version": CHECK_VERSION,
     })
 }
 
-/// Контекст прогона: версия сервера и хэши итоговых секций `[search]`, `[recall]`.
-fn context(st: &AppState) -> Value {
+/// Отпечаток прогона на сервере `st` ([`fingerprint_of`]).
+fn fingerprint(st: &AppState, prev: Option<&Value>) -> Value {
+    let device = st.index.device.as_ref().map(|d| d.device);
+    let inputs = FpInputs {
+        model: st.index.model_id(),
+        device: device.map(|d| d.to_string()),
+        reranker: device.map(|d| st.rerank.model_for(Some(d))),
+        reranker_cpu: st.rerank.model_for(None),
+        qdrant: json!(st.cfg.qdrant.mode),
+    };
+    fingerprint_of(&inputs, prev)
+}
+
+/// Контекст прогона: версия сервера и хэши итоговых секций `[search]`, `[recall]` (открыт для
+/// тестов: прошлые прогоны с тем же контекстом — без пометки «после обновления»).
+pub fn context(st: &AppState) -> Value {
     json!({
         "server": version(st),
         "search": hash16(&json!(st.cfg.search)),
@@ -622,7 +653,7 @@ async fn body(
     }
     let history = zam_store::check::nightly_done(db, HISTORY_RUNS).await?;
     let fp = fingerprint(st, history.first().and_then(|r| r.fingerprint.as_ref()));
-    let fp_hash = hash16(&fp);
+    let fp_hash = fp_hash(&fp);
     let ctx_v = context(st);
     let mut f = RunFinish {
         status: if timeout {
@@ -791,4 +822,78 @@ pub fn run_advice(verdict: Option<&Value>, metrics: Option<&Value>) -> Vec<Value
         .into_iter()
         .map(|c| json!({"code": c, "text": advice_text(c, version)}))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inputs<'a>(
+        model: Option<&'a str>,
+        device: Option<&str>,
+        reranker: Option<&'a str>,
+    ) -> FpInputs<'a> {
+        FpInputs {
+            model,
+            device: device.map(str::to_string),
+            reranker,
+            reranker_cpu: "jina-reranker-v2",
+            qdrant: json!("managed"),
+        }
+    }
+
+    /// Ревью r1, Important 1: прошлый прогон — на CUDA (реранкер GPU), текущий — без
+    /// загруженного эмбеддера: модель, устройство и реранкер — из прошлого, `fp_hash` прежний
+    /// (переход в `degraded` — регрессия, а не `changed`).
+    #[test]
+    fn fingerprint_keeps_previous_without_embedder() {
+        let cuda = fingerprint_of(
+            &inputs(
+                Some("bge-m3-fp16@1a2b3c4d"),
+                Some("cuda:0"),
+                Some("bge-reranker-v2-m3"),
+            ),
+            None,
+        );
+        assert_eq!(cuda["reranker"], "bge-reranker-v2-m3");
+        let lost = fingerprint_of(&inputs(None, None, None), Some(&cuda));
+        assert_eq!(lost, cuda);
+        assert_eq!(fp_hash(&lost), fp_hash(&cuda));
+        // эмбеддер загружен на CPU — реранкер устройства, отпечаток другой (смена устройства)
+        let cpu = fingerprint_of(
+            &inputs(
+                Some("bge-m3-int8@99887766"),
+                Some("cpu"),
+                Some("jina-reranker-v2"),
+            ),
+            Some(&cuda),
+        );
+        assert_eq!(
+            (cpu["device"].as_str(), cpu["reranker"].as_str()),
+            (Some("cpu"), Some("jina-reranker-v2"))
+        );
+        assert_ne!(fp_hash(&cpu), fp_hash(&cuda));
+        // эмбеддер загружен, сменился только реранкер — отпечаток другой
+        let other = fingerprint_of(
+            &inputs(
+                Some("bge-m3-fp16@1a2b3c4d"),
+                Some("cuda:0"),
+                Some("other-reranker"),
+            ),
+            Some(&cuda),
+        );
+        assert_eq!(other["reranker"], "other-reranker");
+        assert_ne!(fp_hash(&other), fp_hash(&cuda));
+        // ни эмбеддера, ни прошлого прогона — `none` и реранкер без устройства
+        let none = fingerprint_of(&inputs(None, None, None), None);
+        assert_eq!(
+            (
+                none["model"].as_str(),
+                none["device"].as_str(),
+                none["reranker"].as_str()
+            ),
+            (Some("none"), Some("none"), Some("jina-reranker-v2"))
+        );
+        assert_eq!(none["check_version"], CHECK_VERSION);
+    }
 }

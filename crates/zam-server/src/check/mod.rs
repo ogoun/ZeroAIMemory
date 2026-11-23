@@ -131,9 +131,11 @@ pub async fn night(ctx: &NightCtx, night: civil::Date, until: Timestamp) -> Resu
     Ok(())
 }
 
-/// Ночной прогон пользователя `user` за ночь `night` без тика (тестовая точка): окно — по
-/// `[works] at`/`tz`/`window_min`. `None` — прогона не было (выключен у пользователя, уже был,
-/// копия или другой прогон не кончились до конца окна, нет проб).
+/// Ночной прогон пользователя `user` за ночь `night` без тика (тестовая точка, фича
+/// `test-hooks`): окно — по `[works] at`/`tz`/`window_min`. `None` — прогона не было (выключен у
+/// пользователя, уже был, копия или другой прогон не кончились до конца окна, нет проб).
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
 pub async fn run_night(
     ctx: &NightCtx,
     user: Id,
@@ -161,32 +163,20 @@ async fn nightly_for(
         return Ok(None);
     }
     // копия идёт — ждать до конца окна (§6.5 п. 1)
-    let poll = backup_poll();
-    while st.backups.state().running.is_some() {
-        if ctx.stopping() || zam_store::time::now() >= until {
-            return Ok(None);
-        }
-        tokio::select! {
-            () = ctx.stopped() => return Ok(None),
-            () = tokio::time::sleep(poll) => {}
-        }
+    if !wait_for(ctx, until, || st.backups.state().running.is_none()).await {
+        return Ok(None);
     }
     let id = Id::new();
     // ручной прогон пользователя идёт — ждать его конца
-    let busy = loop {
-        match claim(user, id) {
-            Ok(b) => break b,
-            Err(_) => {
-                if ctx.stopping() || zam_store::time::now() >= until {
-                    return Ok(None);
-                }
-                tokio::select! {
-                    () = ctx.stopped() => return Ok(None),
-                    () = tokio::time::sleep(poll) => {}
-                }
-            }
-        }
-    };
+    let mut busy = None;
+    if !wait_for(ctx, until, || {
+        busy = claim(user, id).ok();
+        busy.is_some()
+    })
+    .await
+    {
+        return Ok(None);
+    }
     let window = SignedDuration::from_mins(i64::from(st.cfg.works.window_min));
     harvest_cache(&db, until - window).await?;
     let probes = zam_store::probes::probe_counts(&db).await?;
@@ -204,6 +194,24 @@ async fn nightly_for(
     r.map(Some)
 }
 
+/// Ждёт `ready()` с опросом [`BACKUP_POLL`] до конца окна `until`; `false` — окно кончилось или
+/// сервер останавливается.
+async fn wait_for(ctx: &NightCtx, until: Timestamp, mut ready: impl FnMut() -> bool) -> bool {
+    let poll = backup_poll();
+    loop {
+        if ready() {
+            return true;
+        }
+        if ctx.stopping() || zam_store::time::now() >= until {
+            return false;
+        }
+        tokio::select! {
+            () = ctx.stopped() => return false,
+            () = tokio::time::sleep(poll) => {}
+        }
+    }
+}
+
 /// Пробы из кэша выжимок (§6.4 п. 3): действующие выжимки без пробы — вопрос `query`, цели —
 /// источники (до 5), вид `cache`, автор `system`; до [`CACHE_PROBES_PER_NIGHT`] за ночь (с
 /// `since` — начала окна ночи). Повтор вопроса пропускается; предел активных проб — конец.
@@ -214,7 +222,7 @@ async fn harvest_cache(db: &zam_store::Db, since: Timestamp) -> Result<u32, Stor
         return Ok(0);
     }
     let mut added = 0;
-    for c in cache_candidates(db, 4 * CACHE_PROBES_PER_NIGHT as usize).await? {
+    for c in cache_candidates(db, room as usize).await? {
         if added == room {
             break;
         }
