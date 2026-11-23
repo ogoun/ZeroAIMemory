@@ -301,9 +301,20 @@ test('вложение: «Прикрепить файл», уход с несо�
   const t = tree(page);
   const other = t.getByRole('link', { name: 'Вторая заметка' });
   const here = page.url();
+  // отменённый переход историю не меняет (ревью задачи 10 M7.2, круг 3): после «остаться» —
+  // прежняя запись истории (тот же номер роутера), а не её копия; отменённое «назад» — тоже
+  const place = () => page.evaluate(() => (history.state as { zamIdx?: number } | null)?.zamIdx);
+  const idx0 = await place();
+  expect(typeof idx0).toBe('number');
   page.once('dialog', (d) => void d.dismiss());
   await other.click();
   await expect(page).toHaveURL(here);
+  await expect(editorContent(page)).toBeVisible();
+  await expect.poll(place).toBe(idx0);
+  page.once('dialog', (d) => void d.dismiss());
+  await page.goBack();
+  await expect(page).toHaveURL(here);
+  await expect.poll(place).toBe(idx0);
   await expect(editorContent(page)).toBeVisible();
   page.once('dialog', (d) => void d.accept());
   await other.click();

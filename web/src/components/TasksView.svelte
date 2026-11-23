@@ -24,10 +24,22 @@
   // «Подзадачи 8/13» (`subtasks.items`), подзадачи — «Часть: k:<id> «…» (8/13)»; «давно без
   // обновлений» (`stale` сервера) — плашка на плитке и в карточке (не `staleOf`: та — о ссылках на
   // файлы).
+  //
+  // Правка и корзина (M7.2, спецификация §5.9): в карточке — «Изменить» (`EntryEdit`: заголовок,
+  // текст, приоритет, кто ведёт, оценка, ссылки, теги, область; несохранённое в форме — вопрос перед
+  // закрытием панели) и «Удалить» (в корзину, с подтверждением); «Корзина» доски — вместо доски
+  // удалённые задачи с «Восстановить» (`JournalTrash`). Форма и корзина — ленивые чанки. Смена статуса,
+  // «Снять захват», «Сохранить шаг» и переход к другой задаче закрывают открытую форму правки, при
+  // несохранённом — сначала вопрос (`leaveEdit`, проверка ухода `EntryEdit`); 409 формы переносит и
+  // черновик шага (`reread`).
   import { tick, untrack } from 'svelte';
   import FileRefs from './FileRefs.svelte';
   import JournalSplit from './JournalSplit.svelte';
+  import EditPanel from './EditPanel.svelte';
+  import Notice from './Notice.svelte';
+  import Prompt, { type Ask } from './Prompt.svelte';
   import StatusTabs from './StatusTabs.svelte';
+  import TrashPanel from './TrashPanel.svelte';
   import {
     ApiError,
     createEntry,
@@ -41,6 +53,9 @@
     type Entry,
     type EntryStatus,
   } from '../lib/api';
+  import { LEAVE_EDIT } from '../lib/leaveEdit';
+  import { trashAsk } from '../lib/entryTrash';
+  import { focusSoon } from '../lib/focus';
   import { loadRefs, staleOf, type RefsByTarget } from '../lib/fileRefs';
   import {
     AUTHOR_TEXT,
@@ -125,11 +140,18 @@
   let cur = $state<Entry | null>(null);
   let curError = $state('');
   let eseq = 0;
-  type Mode = 'none' | 'create' | 'status';
+  type Mode = 'none' | 'create' | 'status' | 'edit';
   let mode = $state<Mode>('none');
   let busy = $state(false);
   let actionError = $state('');
   let notice = $state('');
+  /** «Корзина»: вместо доски — удалённые задачи. */
+  let trash = $state(false);
+  /** Итог действия, закрывшего карточку (удаление), — над доской. */
+  let boardNotice = $state('');
+  let ask = $state<Ask | null>(null);
+  /** Форма правки (`EditPanel`): её несохранённое — в `unsaved()` и `leaveEdit()`. */
+  let editor = $state<{ dirty: () => boolean; leave: () => boolean; release: () => void } | null>(null);
 
   let nStep = $state('');
   let nTitle = $state('');
@@ -157,6 +179,8 @@
         listOf = `${u}|${s}`;
         fromIdea = false;
         withSubtasks = false;
+        trash = false;
+        boardNotice = '';
         tab = null;
         tabFor = '';
         resetBoard();
@@ -453,6 +477,7 @@
   /** Открыть задачу: новая запись истории — «назад» браузера возвращает к доске (§5.1 п. 5). */
   function select(id: string) {
     notice = '';
+    boardNotice = '';
     go({ name: 'journal', user, space, journal: 'tasks', entry: id });
   }
 
@@ -461,8 +486,20 @@
 
   /** Закрыли карточку («← Задачи», фон, Esc): форма новой задачи закрывается здесь. */
   function closeDetail() {
+    // несохранённое панель уже спросила («Закрыть без сохранения?») — переход не спрашивает снова
+    editor?.release();
     mode = 'none';
     actionError = '';
+  }
+
+  /** Действие закроет открытую форму правки (смена статуса, шаг, захват): при несохранённом —
+   * сначала вопрос; `false` — остаться. */
+  function leaveEdit(): boolean {
+    if (mode !== 'edit') return true;
+    if (editor && !editor.leave()) return false;
+    editor?.release();
+    mode = 'none';
+    return true;
   }
 
   /** Несохранённое в панели (вопрос перед закрытием): поля — так, как уйдут при отправке
@@ -472,6 +509,8 @@
     if (mode === 'create') return !!(nTitle.trim() || nBody.trim() || nStep.trim());
     const c = cur;
     if (!c) return false;
+    // форма правки сравнивает черновик с перечитанной записью сама (`EntryEdit.dirty`)
+    if (mode === 'edit' && editor?.dirty()) return true;
     if (mode === 'status') {
       if (sReason.trim()) return true;
       if (toStatus === 'blocked' && sBlocked.trim() !== str(c.data, 'blocked_by')) return true;
@@ -512,6 +551,7 @@
       : TASK_COLUMNS.filter((s) => s !== e.status);
 
   function startStatus(s: EntryStatus) {
+    if (!leaveEdit()) return;
     toStatus = s;
     sReason = '';
     sBlocked = cur ? str(cur.data, 'blocked_by') : '';
@@ -540,7 +580,7 @@
   function saveStep(e: SubmitEvent) {
     e.preventDefault();
     const c = cur;
-    if (!c) return;
+    if (!c || !leaveEdit()) return;
     act(async () => {
       await patchEntry(user, c.id, c.rev, { next_step: stepDraft.trim() });
     }, 'Следующий шаг сохранён.');
@@ -548,11 +588,81 @@
 
   function release() {
     const c = cur;
-    if (!c) return;
+    if (!c || !leaveEdit()) return;
     act(async () => {
       await releaseTask(user, c.id);
     }, 'Захват снят.');
   }
+
+  function startEdit() {
+    // открыта форма статуса с набранной причиной или блокером — сначала вопрос
+    const typed = mode === 'status' && (!!sReason.trim() || (toStatus === 'blocked' && sBlocked.trim() !== str(cur?.data ?? {}, 'blocked_by')));
+    if (typed && !window.confirm(LEAVE_EDIT)) return;
+    actionError = '';
+    notice = '';
+    mode = 'edit';
+  }
+
+  /** Правка сохранена (`EntryEdit`): доска и ссылки — заново, карточка перечитана, фокус — на её
+   * заголовке (кнопки формы ушли). */
+  async function edited(e: Entry) {
+    mode = 'none';
+    cur = e;
+    await reloadBoard();
+    reloadRefs();
+    await open(user, e.id);
+    notice = 'Задача сохранена.';
+    focusSoon(() => detailEl()?.querySelector('h2'));
+  }
+
+  /** «Отмена» формы правки: фокус — на «Изменить». */
+  function cancelEdit() {
+    mode = 'none';
+    focusSoon(() => detailEl()?.querySelector('[aria-label="Правка задачи"] button'));
+  }
+
+  /** 409 формы правки: запись перечитана. Черновик «Следующего шага» — по правилу `rebase` формы:
+   * нетронутый (равен шагу карточки) — из перечитанной записи, иначе «Сохранить шаг» затёр бы шаг
+   * агента новой ревизией, а закрытие панели спросило бы о несохранённом; набранный — остаётся. */
+  function reread(e: Entry) {
+    if (cur && stepDraft.trim() === str(cur.data, 'next_step')) stepDraft = str(e.data, 'next_step');
+    cur = e;
+  }
+
+  /** Карточка задачи (в панели или вместо доски). */
+  const detailEl = () => root?.querySelector<HTMLElement>('article[aria-label="Карточка задачи"]');
+
+  /** «Удалить»: в корзину; панель закрывается, итог — над доской. */
+  function askDelete(c: Entry) {
+    actionError = '';
+    notice = '';
+    ask = trashAsk(user, c, {
+      deleted: async (msg) => {
+        mode = 'none';
+        cur = null;
+        go({ name: 'journal', user, space, journal: 'tasks', entry: null }, { replace: true });
+        await reloadBoard();
+        reloadRefs();
+        boardNotice = msg;
+      },
+      stale: async (msg) => {
+        await open(user, c.id);
+        actionError = msg;
+      },
+      expired: onexpired,
+      // панель закрыта, плитки нет — фокус на итог над доской
+      focus: () => root?.querySelector('.board-notice [role="status"]'),
+    });
+  }
+
+  function toggleTrash() {
+    trash = !trash;
+    boardNotice = '';
+    // назад к доске: восстановленные из корзины — на ней (числа и видимые статусы — заново)
+    if (!trash) reloadBoard();
+  }
+
+  let root = $state<HTMLElement | null>(null);
 
   function startCreate() {
     nTitle = '';
@@ -584,7 +694,7 @@
   }
 </script>
 
-<section class="journal tasks" data-board={board ?? undefined} use:observeWidth={(w) => (width = w)}>
+<section class="journal tasks" data-board={board ?? undefined} use:observeWidth={(w) => (width = w)} bind:this={root}>
   <!-- широкая область — колонки и карточка-панель поверх доски, узкая — вкладки и карточка вместо
        доски (§5.2 п. 1) -->
   <JournalSplit
@@ -605,28 +715,42 @@
   </JournalSplit>
 </section>
 
-{#snippet boardView()}
-  <div class="row bar">
-    <button type="button" class="primary" onclick={startCreate}>Новая задача</button>
-    <button type="button" class="toggle" aria-pressed={fromIdea} onclick={toggleFromIdea} title="Только задачи из идей — пункты плана работ">Из идей</button>
-    <!-- с «Из идей» шаги из идей и так на доске (пункты плана): переключатель нажат и неактивен
-         (`aria-disabled` — остаётся в порядке Tab), причина — видимой строкой и его описанием -->
-    <button
-      type="button"
-      class="toggle"
-      aria-pressed={flat}
-      aria-disabled={fromIdea}
-      aria-describedby={fromIdea ? `${uid}-flat-why` : undefined}
-      onclick={() => {
-        if (!fromIdea) toggleSubtasks();
-      }}
-      title={fromIdea ? undefined : 'Шаги планов — в колонках по статусам, с пометкой «часть …»; выключено — под общей задачей'}
-    >
-      Подзадачи на доске
-    </button>
-    {#if fromIdea}<span class="muted small" id="{uid}-flat-why">с «Из идей» — все задачи из идей, и шаги тоже</span>{/if}
-  </div>
+<Prompt bind:ask />
 
+{#snippet boardView()}
+  <!-- «Корзина» — одна кнопка в обоих видах: фокус на ней переживает переключение -->
+  <div class="row bar">
+    {#if !trash}
+      <button type="button" class="primary" onclick={startCreate}>Новая задача</button>
+      <button type="button" class="toggle" aria-pressed={fromIdea} onclick={toggleFromIdea} title="Только задачи из идей — пункты плана работ">Из идей</button>
+      <!-- с «Из идей» шаги из идей и так на доске (пункты плана): переключатель нажат и неактивен
+           (`aria-disabled` — остаётся в порядке Tab), причина — видимой строкой и его описанием -->
+      <button
+        type="button"
+        class="toggle"
+        aria-pressed={flat}
+        aria-disabled={fromIdea}
+        aria-describedby={fromIdea ? `${uid}-flat-why` : undefined}
+        onclick={() => {
+          if (!fromIdea) toggleSubtasks();
+        }}
+        title={fromIdea ? undefined : 'Шаги планов — в колонках по статусам, с пометкой «часть …»; выключено — под общей задачей'}
+      >
+        Подзадачи на доске
+      </button>
+      {#if fromIdea}<span class="muted small" id="{uid}-flat-why">с «Из идей» — все задачи из идей, и шаги тоже</span>{/if}
+    {/if}
+    <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
+  </div>
+  {#if trash}
+    <TrashPanel {user} {space} kind="task" {onexpired} />
+  {:else}
+    {@render liveBoard()}
+  {/if}
+{/snippet}
+
+{#snippet liveBoard()}
+  <div class="board-notice"><Notice text={boardNotice} /></div>
   {#if boardError}<p class="error" role="alert">{boardError}</p>{/if}
   {#if total === 0 && !boardError}<p class="muted">{fromIdea ? 'Задач из идей нет.' : 'Задач нет.'}</p>{/if}
 
@@ -857,9 +981,17 @@
         {/each}
         {#if claim}<button type="button" class="danger" onclick={release} disabled={busy}>Снять захват</button>{/if}
       </div>
-      {#if notice}<p class="muted" role="status">{notice}</p>{/if}
+      {#if mode !== 'edit'}
+        <div class="row actions" role="group" aria-label="Правка задачи">
+          <button type="button" onclick={startEdit} disabled={busy}>Изменить</button>
+          <button type="button" class="danger" onclick={() => askDelete(c)} disabled={busy}>Удалить</button>
+        </div>
+      {/if}
+      <Notice text={notice} />
 
-      {#if mode === 'status'}
+      {#if mode === 'edit'}
+        <EditPanel bind:this={editor} {user} entry={c} onsaved={edited} oncancel={cancelEdit} onreread={reread} {onexpired} />
+      {:else if mode === 'status'}
         <form class="form" onsubmit={submitStatus} aria-label="Смена статуса задачи">
           <h3>Статус: {STATUS_TEXT[toStatus]}</h3>
           {#if c.status === 'done' || c.status === 'dropped'}
@@ -899,11 +1031,7 @@
   .bar {
     margin-bottom: 8px;
   }
-  .toggle[aria-pressed='true'] {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: var(--selected);
-  }
+  /* нажатый переключатель — `button.toggle[aria-pressed='true']` (app.css) */
   .toggle[aria-disabled='true'] {
     opacity: 0.6;
     cursor: default;

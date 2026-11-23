@@ -9,11 +9,18 @@
   // карточка вместо таблицы); в области журнала уже 720 px таблица остаётся таблицей (те же строки
   // и ячейки), столбцы «Вид», «Область», «Показы», «Изменено» скрыты, их значения — строкой под
   // заголовком. Условие — ширина области журнала, а не колонки списка рядом с карточкой.
+  // Корзина (M7.2, спецификация §5.9 пп. 2–3): «Удалить» карточки — в корзину, с подтверждением
+  // (отзыв оставляет запись в истории, удаление убирает её из журнала и поиска); «Корзина» — вместо
+  // таблицы удалённые записи с «Восстановить» (`JournalTrash`, ленивый чанк).
   import { tick, untrack } from 'svelte';
   import CertaintyBadge from './CertaintyBadge.svelte';
   import FileRefs from './FileRefs.svelte';
   import JournalSplit from './JournalSplit.svelte';
   import Links from './Links.svelte';
+  import Notice from './Notice.svelte';
+  import Prompt, { type Ask } from './Prompt.svelte';
+  import TrashPanel from './TrashPanel.svelte';
+  import { trashAsk } from '../lib/entryTrash';
   import {
     ApiError,
     entryFeedback,
@@ -101,6 +108,11 @@
   let actionError = $state('');
   let notice = $state('');
   let eseq = 0;
+  /** «Корзина»: вместо таблицы — удалённые записи. */
+  let trash = $state(false);
+  /** Итог действия, закрывшего карточку (удаление), — над таблицей. */
+  let listNotice = $state('');
+  let ask = $state<Ask | null>(null);
 
   // формы
   let sTitle = $state('');
@@ -166,6 +178,8 @@
       fArea = '';
       fTag = '';
       fHuman = false;
+      trash = false;
+      listNotice = '';
       load(u, s, true);
       reloadRefs();
     });
@@ -324,6 +338,7 @@
   /** Открыть запись: новая запись истории — «назад» браузера возвращает к таблице (§5.1 п. 5). */
   function select(id: string) {
     notice = '';
+    listNotice = '';
     go({ name: 'journal', user, space, journal: 'insights', entry: id });
   }
 
@@ -501,6 +516,38 @@
     }, 'Триггеры сохранены.');
   }
 
+  /** «Удалить» карточки: в корзину; карточка закрывается, итог — над таблицей. */
+  function askDelete(c: Entry) {
+    actionError = '';
+    notice = '';
+    ask = trashAsk(user, c, {
+      deleted: async (msg) => {
+        // карточка закрывается сразу: иначе её «Связи» перечитались бы для удалённой записи (404),
+        // пока смена адреса и перечитывание оболочки ещё идут
+        cur = null;
+        go({ name: 'journal', user, space, journal: 'insights', entry: null }, { replace: true });
+        await reloadList();
+        listNotice = msg;
+      },
+      stale: async (msg) => {
+        await open(user, c.id);
+        actionError = msg;
+      },
+      expired: onexpired,
+      focus: () => listEl?.querySelector('[role="status"]'),
+    });
+  }
+
+  function toggleTrash() {
+    trash = !trash;
+    listNotice = '';
+    // назад к таблице: восстановленные из корзины — в ней
+    if (!trash) reloadList();
+  }
+
+  /** Итог над таблицей (`Notice`): фокус после удаления — сюда, кнопки карточки уже нет. */
+  let listEl = $state<HTMLElement | null>(null);
+
   const live = (e: Entry) => e.status === 'active' || e.status === 'revisit';
   const evidenceOf = (e: Entry): Record<string, unknown> | null => {
     const ev = e.data.evidence;
@@ -524,37 +571,54 @@
   </JournalSplit>
 </section>
 
-{#snippet table()}
-  <form class="filters row" onsubmit={applyText}>
-    <label class="row">
-      Вид
-      <select bind:value={fKind} aria-label="Вид insight" onchange={reloadList}>
-        <option value="">все</option>
-        {#each INSIGHT_KINDS as k (k)}<option value={k}>{k}</option>{/each}
-      </select>
-    </label>
-    <label class="row">
-      Статус
-      <select bind:value={fStatus} aria-label="Статус" onchange={reloadList}>
-        <option value="">все</option>
-        {#each STATUSES as s (s)}<option value={s}>{STATUS_TEXT[s]}</option>{/each}
-      </select>
-    </label>
-    <label class="row">
-      Надёжность
-      <select bind:value={fCertainty} aria-label="Надёжность" onchange={reloadList}>
-        <option value="">любая</option>
-        {#each CERTAINTIES as c (c)}<option value={c}>{c}</option>{/each}
-      </select>
-    </label>
-    <input bind:value={fArea} placeholder="область" aria-label="Область" />
-    <input bind:value={fTag} placeholder="тег" aria-label="Тег" />
-    <label class="row">
-      <input type="checkbox" bind:checked={fHuman} onchange={reloadList} aria-label="Решения человека" /> Решения человека
-    </label>
-    <button type="submit">Применить</button>
-  </form>
+<Prompt bind:ask />
 
+{#snippet table()}
+  <!-- фильтры — у живой таблицы; «Корзина» — одна кнопка в обоих видах (фокус переживает
+       переключение) -->
+  <form class="filters row" onsubmit={applyText}>
+    {#if !trash}{@render filters()}{/if}
+    <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
+  </form>
+  {#if trash}
+    <TrashPanel {user} {space} kind="insight" {onexpired} />
+  {:else}
+    {@render liveTable()}
+  {/if}
+{/snippet}
+
+{#snippet filters()}
+  <label class="row">
+    Вид
+    <select bind:value={fKind} aria-label="Вид insight" onchange={reloadList}>
+      <option value="">все</option>
+      {#each INSIGHT_KINDS as k (k)}<option value={k}>{k}</option>{/each}
+    </select>
+  </label>
+  <label class="row">
+    Статус
+    <select bind:value={fStatus} aria-label="Статус" onchange={reloadList}>
+      <option value="">все</option>
+      {#each STATUSES as s (s)}<option value={s}>{STATUS_TEXT[s]}</option>{/each}
+    </select>
+  </label>
+  <label class="row">
+    Надёжность
+    <select bind:value={fCertainty} aria-label="Надёжность" onchange={reloadList}>
+      <option value="">любая</option>
+      {#each CERTAINTIES as c (c)}<option value={c}>{c}</option>{/each}
+    </select>
+  </label>
+  <input bind:value={fArea} placeholder="область" aria-label="Область" />
+  <input bind:value={fTag} placeholder="тег" aria-label="Тег" />
+  <label class="row">
+    <input type="checkbox" bind:checked={fHuman} onchange={reloadList} aria-label="Решения человека" /> Решения человека
+  </label>
+  <button type="submit">Применить</button>
+{/snippet}
+
+{#snippet liveTable()}
+  <div bind:this={listEl}><Notice text={listNotice} /></div>
   {#if error}<p class="error" role="alert">{error}</p>{/if}
 
   <div class="table-wrap">
@@ -695,8 +759,9 @@
         {#if c.status !== 'retracted'}
           <button type="button" class="danger" onclick={() => ((rReason = ''), (mode = 'retract'))}>Отозвать</button>
         {/if}
+        <button type="button" class="danger" onclick={() => askDelete(c)} disabled={busy}>Удалить</button>
       </div>
-      {#if notice}<p class="muted" role="status">{notice}</p>{/if}
+      <Notice text={notice} />
 
       {#if mode === 'supersede'}
         <form class="form" onsubmit={submitSupersede} aria-label="Замена insight">
@@ -1012,7 +1077,9 @@
   .small {
     font-size: 12px;
   }
+  /* «×» триггера — прежний кегль: общее `button.small-btn` (app.css) задаёт 12 px */
   .small-btn {
     padding: 0 6px;
+    font-size: inherit;
   }
 </style>

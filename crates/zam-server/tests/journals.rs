@@ -1272,3 +1272,260 @@ async fn space_counts_code_disabled_zero() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert_eq!(r.json()["journals"]["code"], 0, "{}", r.text());
 }
+
+// ---- корзина любого журнала (M7 §5.9 п. 3, задача 10 M7.2) ----
+
+/// Лента вида `kind` решения `G`: живая или корзина (`deleted=only`).
+fn feed_uri(kind: &str, trash: bool) -> String {
+    let extra = if trash { "&deleted=only" } else { "" };
+    format!("/api/v1/spaces/{G}/entries?kind={kind}{extra}")
+}
+
+/// id элементов ленты в её порядке.
+fn feed_ids(v: &Value) -> Vec<String> {
+    v["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{v}"))
+        .iter()
+        .map(id_of)
+        .collect()
+}
+
+/// «Ключ» собирается из частей: в исходниках нет строки, похожей на настоящий.
+fn secret() -> String {
+    format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5")
+}
+
+/// Корзина любого вида (решение 30): удалённые changelog, задача и вопрос — в `deleted=only` своего
+/// вида (и только своего, с `deleted_at`), в живой ленте их нет — у токена и у сессии владельца;
+/// восстановление возвращает запись в ленту (новые первыми) и убирает из корзины. Без `kind` —
+/// 400, как раньше; `top_level` и `parent` — у живой ленты задач, с корзиной — 422.
+#[tokio::test]
+async fn entries_trash_any_kind() {
+    let w = common::reports::world("journals-trash-any").await;
+    let (a, tok) = (&w.a, w.o.tok.as_str());
+    let mut gone = Vec::new();
+    for kind in ["changelog", "task", "question"] {
+        let keep = log_entry(a, tok, G, kind, 0).await;
+        let id = log_entry(a, tok, G, kind, 1).await;
+        let r = a
+            .tok_rev(tok, Method::DELETE, &format!("/api/v1/entries/{id}"), None)
+            .await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT, "{kind}: {}", r.text());
+        gone.push((kind, keep, id));
+    }
+    for (kind, keep, id) in &gone {
+        for who in [Who::Tok(tok), Who::Web(&w.o.web)] {
+            let trash = get_ok_as(a, who, &feed_uri(kind, true)).await;
+            assert_eq!(feed_ids(&trash), [id.as_str()], "{kind}: {trash}");
+            assert_eq!(trash["items"][0]["kind"], *kind, "{trash}");
+            assert!(!trash["items"][0]["deleted_at"].is_null(), "{trash}");
+            let live = get_ok_as(a, who, &feed_uri(kind, false)).await;
+            assert_eq!(feed_ids(&live), [keep.as_str()], "{kind}: {live}");
+        }
+    }
+    for (kind, keep, id) in &gone {
+        let r = a
+            .tok(
+                tok,
+                Method::POST,
+                &format!("/api/v1/entries/{id}/restore"),
+                None,
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{kind}: {}", r.text());
+        let live = get_ok_as(a, Who::Tok(tok), &feed_uri(kind, false)).await;
+        assert_eq!(
+            feed_ids(&live),
+            [id.as_str(), keep.as_str()],
+            "{kind}: {live}"
+        );
+        let trash = get_ok_as(a, Who::Tok(tok), &feed_uri(kind, true)).await;
+        assert_eq!(feed_ids(&trash), Vec::<String>::new(), "{kind}: {trash}");
+    }
+    // корзина — одного вида: без `kind` — 400, как раньше
+    for who in [Who::Tok(tok), Who::Web(&w.o.web)] {
+        let r = get_as(a, who, &format!("/api/v1/spaces/{G}/entries?deleted=only")).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    }
+    let parent = format!("&parent={}", gone[1].1);
+    for extra in ["&top_level=1", parent.as_str()] {
+        let r = get_as(
+            a,
+            Who::Tok(tok),
+            &format!("{}{extra}", feed_uri("task", true)),
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{extra}: {}",
+            r.text()
+        );
+    }
+}
+
+/// Корзина личного пространства (ревью задачи 10, круг 1, M5): Knowledge — другая ветка
+/// `space_scope` (личная база), право — то же право записи: токен `rw` и сессия владельца — 200,
+/// токен `ro` владельца — 403; у участника решения `knowledge` — его собственное, удалённых записей
+/// владельца там нет; восстановление возвращает задачу в ленту Knowledge.
+#[tokio::test]
+async fn entries_trash_knowledge() {
+    let w = common::reports::world("journals-trash-knowledge").await;
+    let a = &w.a;
+    let id = log_entry(a, &w.o.tok, "knowledge", "task", 0).await;
+    let r = a
+        .tok_rev(
+            &w.o.tok,
+            Method::DELETE,
+            &format!("/api/v1/entries/{id}"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    let trash = "/api/v1/spaces/knowledge/entries?kind=task&deleted=only";
+    for who in [Who::Tok(&w.o.tok), Who::Web(&w.o.web)] {
+        assert_eq!(feed_ids(&get_ok_as(a, who, trash).await), [id.as_str()]);
+    }
+    let ro = a.issue(&w.o.id, "ro").await;
+    let r = get_as(a, Who::Tok(&ro), trash).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    for who in [Who::Tok(&w.rw.tok), Who::Web(&w.rw.web)] {
+        assert_eq!(
+            feed_ids(&get_ok_as(a, who, trash).await),
+            Vec::<String>::new()
+        );
+    }
+    let r = a
+        .tok(
+            &w.o.tok,
+            Method::POST,
+            &format!("/api/v1/entries/{id}/restore"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let live = get_ok_as(
+        a,
+        Who::Tok(&w.o.tok),
+        "/api/v1/spaces/knowledge/entries?kind=task",
+    )
+    .await;
+    assert_eq!(feed_ids(&live), [id.as_str()]);
+    assert_eq!(
+        feed_ids(&get_ok_as(a, Who::Tok(&w.o.tok), trash).await),
+        Vec::<String>::new()
+    );
+}
+
+/// Права корзины (решение 30): у прочих видов — право записи пространства, как у `DELETE` и
+/// `restore`: владелец и участник `rw` (токен и сессия), администратор от имени владельца — 200;
+/// участник `ro` (сессия и токен) и токен `ro` владельца — 403, восстановить участник `ro` тоже не
+/// может. Агенту по токену заголовки корзины — с маской `‹secret›`, сессии — исходник. Корзина
+/// отчётов — прежние права: только владелец в своей сессии (участникам и администратору от имени —
+/// 403, токену отчёт не виден — 400).
+#[tokio::test]
+async fn entries_trash_rights() {
+    let w = common::reports::world("journals-trash-rights").await;
+    let a = &w.a;
+    let s = secret();
+    let r = a
+        .tok(
+            &w.o.tok,
+            Method::POST,
+            &format!("/api/v1/spaces/{G}/entries"),
+            Some(
+                json!({"kind": "changelog", "title": format!("Ключ {s} в логе"),
+                        "body": "Подробности.", "data": {"kind": "fix"}}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let cl = id_of(&r.json());
+    // удаляет участник `rw` — по праву записи
+    let r = a
+        .tok_rev(
+            &w.rw.tok,
+            Method::DELETE,
+            &format!("/api/v1/entries/{cl}"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    let trash = feed_uri("changelog", true);
+    for (who, ctx) in [
+        (Who::Web(&w.o.web), "сессия владельца"),
+        (Who::Tok(&w.o.tok), "токен владельца"),
+        (Who::Web(&w.rw.web), "сессия участника rw"),
+        (Who::Tok(&w.rw.tok), "токен участника rw"),
+    ] {
+        let r = get_as(a, who, &trash).await;
+        assert_eq!(r.status, StatusCode::OK, "{ctx}: {}", r.text());
+        assert_eq!(feed_ids(&r.json()), [cl.as_str()], "{ctx}");
+        // заголовок: токену — с маской, сессии — исходник
+        match who {
+            Who::Tok(_) => assert!(
+                !r.text().contains(&s) && r.text().contains("‹secret"),
+                "{ctx}: {}",
+                r.text()
+            ),
+            Who::Web(_) => assert!(r.text().contains(&s), "{ctx}: {}", r.text()),
+        }
+    }
+    let r = a.adm(Method::GET, &trash, None, Some(&w.o.id)).await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "администратор от имени: {}",
+        r.text()
+    );
+    assert_eq!(feed_ids(&r.json()), [cl.as_str()]);
+    let ro_owner = a.issue(&w.o.id, "ro").await;
+    for (who, ctx) in [
+        (Who::Web(&w.ro.web), "сессия участника ro"),
+        (Who::Tok(&w.ro.tok), "токен участника ro"),
+        (Who::Tok(&ro_owner), "токен ro владельца"),
+    ] {
+        let r = get_as(a, who, &trash).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{ctx}: {}", r.text());
+        assert!(!r.text().contains(&s), "{ctx}: {}", r.text());
+    }
+    // читать живую ленту участник `ro` может, восстановить — нет (то же право)
+    get_ok_as(a, Who::Tok(&w.ro.tok), &feed_uri("changelog", false)).await;
+    let restore = format!("/api/v1/entries/{cl}/restore");
+    let r = a.tok(&w.ro.tok, Method::POST, &restore, None).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.text());
+    let r = a.tok(&w.rw.tok, Method::POST, &restore, None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let live = get_ok_as(a, Who::Tok(&w.rw.tok), &feed_uri("changelog", false)).await;
+    assert_eq!(feed_ids(&live), [cl.as_str()]);
+
+    // корзина отчётов — прежние права
+    let r = w
+        .report_as(&w.o.tok, G, "Отчёт в корзину", "# Итог\n\nТекст.", &[])
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let rep = id_of(&r.json());
+    trash_entry(a, &w.o.web, &rep).await;
+    let reports = feed_uri("report", true);
+    let owner = get_ok_as(a, Who::Web(&w.o.web), &reports).await;
+    assert_eq!(feed_ids(&owner), [rep.as_str()]);
+    for (who, ctx) in [
+        (Who::Web(&w.rw.web), "сессия участника rw"),
+        (Who::Web(&w.ro.web), "сессия участника ro"),
+    ] {
+        let r = get_as(a, who, &reports).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{ctx}: {}", r.text());
+    }
+    let r = a.adm(Method::GET, &reports, None, Some(&w.o.id)).await;
+    assert_eq!(
+        r.status,
+        StatusCode::FORBIDDEN,
+        "администратор от имени: {}",
+        r.text()
+    );
+    for tok in [&w.o.tok, &w.rw.tok] {
+        let r = get_as(a, Who::Tok(tok), &reports).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+    }
+}

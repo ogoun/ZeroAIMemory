@@ -46,6 +46,7 @@ pub const FEATURES: &[&str] = &[
     "sessions_parent",
     "space_counts",
     "backup_api",
+    "entries_trash",
     "agent_text_masked",
 ];
 

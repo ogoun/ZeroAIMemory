@@ -7,17 +7,32 @@
   // вариантом (у вопроса «вернуть» идею со снятой задачей, §16, — «вернуть»/«отказаться», без
   // даты), у «отложить» — дата «не раньше» (UTC, не раньше завтрашней); «начать» идеи
   // Knowledge с задачей в общем решении (`data.task_space`) — после предупреждения (§5.2, п. 1).
+  // Правка и корзина (M7.2, спецификация §5.9): у открытого вопроса — «Изменить» (`EntryEdit`:
+  // текст вопроса, теги, область) и «Неактуален» (`status: obsolete` с причиной); у любого —
+  // «Удалить» (в корзину, с подтверждением); «Корзина» — удалённые вопросы с «Восстановить»
+  // (`JournalTrash`). Форма и корзина — ленивые чанки. Форма привязана к вопросу: переход по адресу,
+  // «Изменить» другого вопроса и «Корзина» её закрывают, при несохранённом — сначала вопрос
+  // (`EntryEdit`: проверка ухода и `leave()`); вопрос, отвеченный в другом месте за время правки,
+  // закрывает форму с объяснением. Переход к записи выключает «Корзину».
 
   import { tick, untrack } from 'svelte';
+  import EditPanel from './EditPanel.svelte';
+  import Notice from './Notice.svelte';
+  import Prompt, { type Ask } from './Prompt.svelte';
+  import TrashPanel from './TrashPanel.svelte';
   import {
     ApiError,
     answerQuestion,
     answeredDecision,
     errorText,
+    isStaleEntry,
     listEntries,
+    patchEntry,
     type Entry,
     type Space,
   } from '../lib/api';
+  import { trashAsk } from '../lib/entryTrash';
+  import { focusSoon } from '../lib/focus';
   import { DEFER_FORM, START_SUBMIT, deferDefault, deferError, deferMin, sharedWarning } from '../lib/ideaForms';
   import { AUTHOR_TEXT, STATUS_TEXT, entryRef, fmtTime } from '../lib/journals';
   import { href } from '../lib/router';
@@ -55,16 +70,41 @@
   /** Вопрос-предложение, у которого открыт выбор даты «отложить», и сама дата. */
   let deferFor = $state('');
   let deferDate = $state('');
+  /** «Корзина»: вместо списка — удалённые вопросы. */
+  let trash = $state(false);
+  /** Вопрос с открытой формой правки. */
+  let editing = $state('');
+  let notice = $state('');
+  let ask = $state<Ask | null>(null);
 
   function fail(e: unknown, set: (m: string) => void) {
     if (e instanceof ApiError && e.status === 401) return onexpired();
     set(errorText(e));
   }
 
+  /** Пространство, для которого сброшены корзина, форма и итог: эффект ниже перезапускается на
+   * каждый переход (свойства — из объекта маршрута), а сброс нужен только при смене пространства —
+   * иначе переход (адрес без записи после удаления, запись из поиска) стёр бы итог и форму. */
+  let scopeOf = '';
   $effect(() => {
     const u = user;
     const s = space;
-    untrack(() => load(u, s, true));
+    const id = entry;
+    untrack(() => {
+      if (scopeOf !== `${u}|${s}`) {
+        scopeOf = `${u}|${s}`;
+        trash = false;
+        notice = '';
+      }
+      // переход: форма закрывается (уход с несохранённым спросил `EntryEdit`), к записи — корзина
+      // выключается, прежний итог убирается
+      editing = '';
+      if (id) {
+        trash = false;
+        notice = '';
+      }
+      load(u, s, true);
+    });
   });
 
   async function load(u: string, s: string, reset: boolean) {
@@ -197,96 +237,224 @@
 
   const decisionHref = (id: string) =>
     href({ name: 'journal', user, space, journal: 'insights', entry: id });
+
+  /** Вопрос `e` в списке — новой ревизией (после правки или перечитывания). */
+  const replace = (e: Entry) => (items = items.map((x) => (x.id === e.id ? e : x)));
+
+  /** Открытая форма правки (`EditPanel`): её несохранённое — в `leaveEdit`. */
+  let editor = $state<{ leave: () => boolean; release: () => void } | null>(null);
+
+  /** Действие закроет открытую форму: при несохранённом — сначала вопрос; `false` — остаться. */
+  function leaveEdit(): boolean {
+    if (!editing) return true;
+    if (editor && !editor.leave()) return false;
+    editor?.release();
+    editing = '';
+    return true;
+  }
+
+  function startEdit(q: Entry) {
+    if (editing !== q.id && !leaveEdit()) return;
+    editing = q.id;
+    errors[q.id] = '';
+    notice = '';
+  }
+
+  let root = $state<HTMLElement | null>(null);
+  /** Кнопка действия вопроса `id` с именем, начинающимся на `name` («Изменить», «Удалить»). */
+  const action = (id: string, name: string) =>
+    root?.querySelector(`[data-question="${CSS.escape(id)}"] .acts button[aria-label^="${name}"]`);
+
+  /** Форма закрыта (сохранено или «Отмена»): фокус — на «Изменить» вопроса. */
+  function closeEdit(id: string) {
+    editing = '';
+    focusSoon(() => action(id, 'Изменить') ?? action(id, 'Удалить'));
+  }
+
+  function saved(e: Entry) {
+    replace(e);
+    closeEdit(e.id);
+    notice = `Вопрос «${e.title}» сохранён.`;
+  }
+
+  /** 409 формы правки: вопрос перечитан. Ответили или сняли его в другом месте — правки больше нет
+   * (правится только открытый): форма закрывается, причина — у карточки, «Удалить» снова видна. */
+  function reread(e: Entry) {
+    replace(e);
+    if (editing === e.id && e.status !== 'open') {
+      editing = '';
+      errors[e.id] = `Пока шла правка, вопрос стал «${e.status ? STATUS_TEXT[e.status] : ''}» в другом месте — форма закрыта, текст не сохранён.`;
+      focusSoon(() => action(e.id, 'Удалить'));
+    }
+  }
+
+  /** 409: список перечитан, ошибка — у карточки вопроса. */
+  async function stale(id: string, message: string) {
+    await load(user, space, true);
+    errors[id] = message;
+  }
+
+  /** «Неактуален»: `status: obsolete` с причиной (сервер требует её, M4.5 §4). */
+  function askObsolete(q: Entry) {
+    errors[q.id] = '';
+    notice = '';
+    ask = {
+      title: 'Вопрос неактуален?',
+      message: `«${q.title}» уйдёт из открытых: ответить на него будет нельзя.`,
+      label: 'Причина',
+      placeholder: 'например, решили без вопроса',
+      confirm: 'Неактуален',
+      run: async (reason) => {
+        try {
+          replace(await patchEntry(user, q.id, q.rev, { status: 'obsolete', reason }));
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 401) return onexpired();
+          if (isStaleEntry(e)) return stale(q.id, errorText(e));
+          throw new Error(errorText(e));
+        }
+        if (editing === q.id) editing = '';
+        notice = `Вопрос «${q.title}» отмечен неактуальным.`;
+      },
+      // «Неактуален» ушла вместе с вариантами ответа — фокус на «Удалить» вопроса
+      refocus: () => action(q.id, 'Удалить'),
+    };
+  }
+
+  function askDelete(q: Entry) {
+    errors[q.id] = '';
+    notice = '';
+    ask = trashAsk(user, q, {
+      deleted: (msg) => {
+        if (editing === q.id) editing = '';
+        items = items.filter((x) => x.id !== q.id);
+        notice = msg;
+      },
+      stale: (msg) => stale(q.id, msg),
+      expired: onexpired,
+      focus: () => root?.querySelector(':scope > [role="status"]'),
+    });
+  }
+
+  function toggleTrash() {
+    if (!leaveEdit()) return;
+    trash = !trash;
+    notice = '';
+    // назад к списку: восстановленные из корзины — в нём
+    if (!trash) load(user, space, true);
+  }
 </script>
 
-<section class="journal questions">
-  {#if error}<p class="error" role="alert">{error}</p>{/if}
-  {#if loading && items.length === 0}<p class="muted">Загрузка…</p>{/if}
-  {#if !loading && items.length === 0 && !error}<p class="muted">Вопросов нет.</p>{/if}
+<Prompt bind:ask />
 
-  <div class="list" role="feed" aria-label="Вопросы">
-    {#each ordered as q (q.id)}
-      {@const a = answerOf(q)}
-      {@const opts = optionsOf(q)}
-      <article class="q panel" class:selected={q.id === entry} class:done={q.status !== 'open'} data-question={q.id}>
-        <header class="row">
-          <h2>{q.title}</h2>
-          <span class="chip status">{q.status ? STATUS_TEXT[q.status] : ''}</span>
-          <span class="muted small">{AUTHOR_TEXT[q.author.kind] ?? q.author.kind} · {fmtTime(q.created_at)}</span>
-        </header>
-        {#if q.body}<p class="body">{q.body}</p>{/if}
-        {#if ideaOf(q)}
-          <p><a href={ideaHref(ideaOf(q))} data-testid="idea-link">Идея {entryRef('idea', ideaOf(q))}</a></p>
-        {/if}
+<section class="journal questions" bind:this={root}>
+  <div class="row bar">
+    <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
+  </div>
+  <Notice text={notice} />
+  {#if trash}
+    <TrashPanel {user} {space} kind="question" {onexpired} />
+  {:else}
+    {#if error}<p class="error" role="alert">{error}</p>{/if}
+    {#if loading && items.length === 0}<p class="muted">Загрузка…</p>{/if}
+    {#if !loading && items.length === 0 && !error}<p class="muted">Вопросов нет.</p>{/if}
 
-        {#if q.status === 'open'}
-          {#if opts.length}
-            <div class="row opts" role="group" aria-label="Варианты ответа">
-              {#each opts as o (o.key)}
-                <button
-                  type="button"
-                  class:primary={o.key === recommended(q)}
-                  disabled={busy !== '' || (confirmFor === q.id && o.key === 'accept')}
-                  title={o.key === recommended(q) ? 'Рекомендация агента' : ''}
-                  onclick={() => pick(q, o.key)}
-                >
-                  {o.text}{#if o.key === recommended(q)}<span class="rec"> · рекомендуется</span>{/if}
-                </button>
-              {/each}
-            </div>
+    <div class="list" role="feed" aria-label="Вопросы">
+      {#each ordered as q (q.id)}
+        {@const a = answerOf(q)}
+        {@const opts = optionsOf(q)}
+        <article class="q panel" class:selected={q.id === entry} class:done={q.status !== 'open'} data-question={q.id}>
+          <header class="row">
+            <h2>{q.title}</h2>
+            <span class="chip status">{q.status ? STATUS_TEXT[q.status] : ''}</span>
+            <span class="muted small">{AUTHOR_TEXT[q.author.kind] ?? q.author.kind} · {fmtTime(q.created_at)}</span>
+          </header>
+          {#if q.body}<p class="body">{q.body}</p>{/if}
+          {#if ideaOf(q)}
+            <p><a href={ideaHref(ideaOf(q))} data-testid="idea-link">Идея {entryRef('idea', ideaOf(q))}</a></p>
           {/if}
-          {#if confirmFor === q.id}
-            {@const sp = sharedTarget(q)}
-            <div class="row" role="group" aria-label="Подтверждение «начать»">
-              <p class="warn" data-testid="shared-warning">{sharedWarning(sp?.name ?? '')}</p>
-              <button type="button" class="primary" disabled={busy !== ''} onclick={() => pick(q, 'accept')}>{START_SUBMIT}</button>
-              <button type="button" onclick={() => (confirmFor = '')}>Отмена</button>
-            </div>
+
+          {#if q.status === 'open' && editing === q.id}
+            <EditPanel bind:this={editor} {user} entry={q} onsaved={saved} oncancel={() => closeEdit(q.id)} onreread={reread} {onexpired} />
+          {:else if q.status === 'open'}
+            {#if opts.length}
+              <div class="row opts" role="group" aria-label="Варианты ответа">
+                {#each opts as o (o.key)}
+                  <button
+                    type="button"
+                    class:primary={o.key === recommended(q)}
+                    disabled={busy !== '' || (confirmFor === q.id && o.key === 'accept')}
+                    title={o.key === recommended(q) ? 'Рекомендация агента' : ''}
+                    onclick={() => pick(q, o.key)}
+                  >
+                    {o.text}{#if o.key === recommended(q)}<span class="rec"> · рекомендуется</span>{/if}
+                  </button>
+                {/each}
+              </div>
+            {/if}
+            {#if confirmFor === q.id}
+              {@const sp = sharedTarget(q)}
+              <div class="row" role="group" aria-label="Подтверждение «начать»">
+                <p class="warn" data-testid="shared-warning">{sharedWarning(sp?.name ?? '')}</p>
+                <button type="button" class="primary" disabled={busy !== ''} onclick={() => pick(q, 'accept')}>{START_SUBMIT}</button>
+                <button type="button" onclick={() => (confirmFor = '')}>Отмена</button>
+              </div>
+            {/if}
+            {#if deferFor === q.id}
+              <form class="row" onsubmit={(e) => submitDefer(e, q)} aria-label={DEFER_FORM.aria}>
+                <label class="row">
+                  Не раньше
+                  <input type="date" bind:value={deferDate} min={deferMin()} required aria-label="Отложить до" />
+                  <span class="muted small" title="Даты хранятся в UTC">UTC</span>
+                </label>
+                <button type="submit" disabled={busy !== ''}>{DEFER_FORM.submit}</button>
+                <button type="button" onclick={() => (deferFor = '')}>Отмена</button>
+              </form>
+            {/if}
+            {#if !ideaOf(q)}
+              <form class="row" onsubmit={(e) => submitText(e, q)} aria-label="Ответ текстом">
+                <input
+                  bind:value={texts[q.id]}
+                  placeholder={opts.length ? 'или свой ответ' : 'ответ'}
+                  aria-label="Ответ на вопрос «{q.title}»"
+                  maxlength="4000"
+                />
+                <button type="submit" disabled={busy !== ''}>Ответить</button>
+              </form>
+            {/if}
+          {:else if a}
+            <p class="answer">
+              Ответ: <strong>{answerText(q, a)}</strong>
+              <span class="muted small">
+                · {a.by === 'human' ? 'человек' : 'агент'} · {CHANNEL_TEXT[a.channel] ?? a.channel} · {fmtTime(a.answered_at)}
+              </span>
+            </p>
+            {#if a.decision_id}
+              <p><a href={decisionHref(a.decision_id)} data-testid="decision-link">Созданное решение</a></p>
+            {/if}
+          {:else if q.status === 'obsolete'}
+            <p class="muted">Вопрос неактуален.</p>
           {/if}
-          {#if deferFor === q.id}
-            <form class="row" onsubmit={(e) => submitDefer(e, q)} aria-label={DEFER_FORM.aria}>
-              <label class="row">
-                Не раньше
-                <input type="date" bind:value={deferDate} min={deferMin()} required aria-label="Отложить до" />
-                <span class="muted small" title="Даты хранятся в UTC">UTC</span>
-              </label>
-              <button type="submit" disabled={busy !== ''}>{DEFER_FORM.submit}</button>
-              <button type="button" onclick={() => (deferFor = '')}>Отмена</button>
-            </form>
-          {/if}
-          {#if !ideaOf(q)}
-            <form class="row" onsubmit={(e) => submitText(e, q)} aria-label="Ответ текстом">
-              <input
-                bind:value={texts[q.id]}
-                placeholder={opts.length ? 'или свой ответ' : 'ответ'}
-                aria-label="Ответ на вопрос «{q.title}»"
-                maxlength="4000"
-              />
-              <button type="submit" disabled={busy !== ''}>Ответить</button>
-            </form>
+          {#if created[q.id] && !a}
+            <p><a href={decisionHref(created[q.id])} data-testid="decision-link">Созданное решение</a></p>
           {/if}
           {#if errors[q.id]}<p class="error" role="alert">{errors[q.id]}</p>{/if}
-        {:else if a}
-          <p class="answer">
-            Ответ: <strong>{answerText(q, a)}</strong>
-            <span class="muted small">
-              · {a.by === 'human' ? 'человек' : 'агент'} · {CHANNEL_TEXT[a.channel] ?? a.channel} · {fmtTime(a.answered_at)}
-            </span>
-          </p>
-          {#if a.decision_id}
-            <p><a href={decisionHref(a.decision_id)} data-testid="decision-link">Созданное решение</a></p>
+          {#if editing !== q.id}
+            <!-- правка, «Неактуален» и корзина (§5.9 пп. 1–2); имена — с вопросом: в списке кнопок диктора
+                 вопросы различимы -->
+            <div class="row acts" role="group" aria-label="Действия с вопросом">
+              {#if q.status === 'open'}
+                <button type="button" class="small-btn" aria-label="Изменить «{q.title}»" onclick={() => startEdit(q)}>Изменить</button>
+                <button type="button" class="small-btn" aria-label="Неактуален «{q.title}»" onclick={() => askObsolete(q)}>Неактуален</button>
+              {/if}
+              <button type="button" class="small-btn danger" aria-label="Удалить «{q.title}»" onclick={() => askDelete(q)}>Удалить</button>
+            </div>
           {/if}
-        {:else if q.status === 'obsolete'}
-          <p class="muted">Вопрос неактуален.</p>
-        {/if}
-        {#if created[q.id] && !a}
-          <p><a href={decisionHref(created[q.id])} data-testid="decision-link">Созданное решение</a></p>
-        {/if}
-      </article>
-    {/each}
-  </div>
-  {#if next && !loading}
-    <button type="button" onclick={() => load(user, space, false)}>Показать ещё</button>
+        </article>
+      {/each}
+    </div>
+    {#if next && !loading}
+      <button type="button" onclick={() => load(user, space, false)}>Показать ещё</button>
+    {/if}
   {/if}
 </section>
 
@@ -328,5 +496,11 @@
   form input {
     flex: 1;
     min-width: min(220px, 100%);
+  }
+  .bar {
+    margin-bottom: 8px;
+  }
+  .acts {
+    margin-top: 8px;
   }
 </style>

@@ -207,6 +207,46 @@ test('question_answer_one_click_creates_decision', async ({ page }) => {
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
+test('question_obsolete_with_reason', async ({ page }) => {
+  // M7.2, спецификация §5.9 п. 2: «Неактуален» открытого вопроса — `status: obsolete` с причиной
+  // (окно с полем «Причина»; без причины сервер не примет); ответить на неактуальный нельзя
+  const problems = watch(page);
+  const q = await entry({
+    kind: 'question',
+    title: 'Вопрос WM: нужен ли экспорт в CSV?',
+    body: 'Агент спрашивает про формат выгрузки.',
+    data: { options: [{ key: 'yes', text: 'Да' }, { key: 'no', text: 'Нет' }] },
+  });
+  await openJournal(page, 'questions');
+  const card = page.locator(`[data-question="${q.id}"]`);
+  await expect(card.getByRole('button', { name: 'Да', exact: true })).toBeVisible();
+  await card.getByRole('button', { name: 'Неактуален «Вопрос WM: нужен ли экспорт в CSV?»' }).click();
+  const ask = page.getByRole('dialog', { name: 'Вопрос неактуален?' });
+  await expect(ask).toContainText('уйдёт из открытых');
+  // без причины окно не отправляется (поле обязательно)
+  await ask.getByRole('button', { name: 'Неактуален', exact: true }).click();
+  await expect(ask).toBeVisible();
+  await ask.getByLabel('Причина').fill('решили без вопроса');
+  const sent = page.waitForRequest((r) => r.method() === 'PATCH' && r.url().endsWith(`/entries/${q.id}`));
+  await ask.getByRole('button', { name: 'Неактуален', exact: true }).click();
+  const req = await sent;
+  expect(req.postDataJSON()).toEqual({ status: 'obsolete', reason: 'решили без вопроса' });
+  expect(req.headers()['if-match']).toBe(`"${q.rev}"`);
+  await expect(ask).toHaveCount(0);
+  await expect(page.locator('section.journal').getByRole('status')).toHaveText('Вопрос «Вопрос WM: нужен ли экспорт в CSV?» отмечен неактуальным.');
+  await expect(card.locator('.status')).toHaveText('неактуален');
+  await expect(card).toContainText('Вопрос неактуален.');
+  // вариантов ответа и «Неактуален» больше нет, «Удалить» — есть
+  await expect(card.getByRole('button', { name: 'Да', exact: true })).toHaveCount(0);
+  await expect(card.getByRole('button', { name: /^Неактуален/ })).toHaveCount(0);
+  await expect(card.getByRole('button', { name: /^Удалить/ })).toBeVisible();
+  const got = await api<{ status: string }>('GET', `entries/${q.id}`);
+  expect(got.status).toBe('obsolete');
+  const revs = await api<{ items: { status: string | null; reason: string | null }[] }>('GET', `entries/${q.id}/revisions`);
+  expect(revs.items.at(-1)).toMatchObject({ status: 'obsolete', reason: 'решили без вопроса' });
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
 test('decision_adr_fields', async ({ page }) => {
   const problems = watch(page);
   const adr = {

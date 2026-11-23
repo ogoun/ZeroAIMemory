@@ -2,7 +2,8 @@
 //!
 //! - `GET/POST /spaces/{space}/entries` — лента (фильтры `kind`, `status`, `certainty`,
 //!   `area`, `tag`, `data_kind` — вид changelog или insight из `data.kind`, `since`, `until`;
-//!   курсор `cursor`, `limit`) и создание (`Idempotency-Key`: 201, повтор —
+//!   курсор `cursor`, `limit`; `deleted=only` — корзина вида с правами его восстановления, M7
+//!   §5.9 п. 3) и создание (`Idempotency-Key`: 201, повтор —
 //!   200; ключ действует в границах автора, расхождение запроса → 422
 //!   `/problems/idempotency-mismatch`, ключ удалённой записи → 409);
 //! - `GET/PATCH/DELETE /entries/{id}` — `PATCH` и `DELETE` требуют `If-Match: <rev>` (§11.3,
@@ -80,7 +81,7 @@ use super::render::Viewer;
 use super::reports::ReportInput;
 use super::scope::{
     Mode, deny_report_mutation, entry_scope, live_entry, report_trash_allowed, space_scope,
-    trash_allowed,
+    trash_allowed, trash_feed_allowed,
 };
 use super::secret_restore;
 use super::{json_body, query};
@@ -524,7 +525,7 @@ pub struct ListQuery {
     until: Option<String>,
     cursor: Option<String>,
     limit: Option<usize>,
-    /// `only` — корзина (только `kind=report`, только владельцу решения в WebUI).
+    /// `only` — корзина вида `kind` (права — как у восстановления, M7 §5.9 п. 3).
     deleted: Option<String>,
     /// Только `kind=idea`: `human` | `agent` (M5.7 §7.1).
     origin: Option<String>,
@@ -692,8 +693,10 @@ fn parse_time(raw: &str, what: &str) -> Result<Timestamp, ApiError> {
 
 /// `GET /spaces/{space}/entries` → `{items, next_cursor}`. Без `kind` отчётов в ленте нет;
 /// `kind=report` — только сессиям WebUI (токену — 400, как неизвестный вид: отчёт агенту не
-/// виден, §7), у элементов — `first_image` и нет `body`; `deleted=only` — корзина отчётов
-/// ([`trash_allowed`], иначе 403).
+/// виден, §7), у элементов — `first_image` и нет `body`. `deleted=only` — корзина вида `kind`
+/// (без вида — 400; новые удаления первыми): у отчётов — [`trash_allowed`], у прочих — право
+/// записи пространства, как у `DELETE` и `restore` ([`trash_feed_allowed`]); иначе 403 (M7 §5.9
+/// п. 3, решение 30). `top_level` и `parent` с корзиной — 422.
 pub async fn list(
     State(st): State<AppState>,
     p: Principal,
@@ -713,12 +716,16 @@ pub async fn list(
     };
     let deleted_only = parse_deleted(q.deleted.as_deref())?;
     if deleted_only {
-        if kind != Some(EntryKind::Report) {
-            return Err(ApiError::BadRequest(
-                "deleted=only — только у ленты отчётов (kind=report)".into(),
-            ));
+        // корзина — одного вида с правами его восстановления (M7 §5.9 п. 3, решение 30)
+        match kind {
+            None => {
+                return Err(ApiError::BadRequest(
+                    "deleted=only — корзина одного вида: нужен kind".into(),
+                ));
+            }
+            Some(EntryKind::Report) => trash_allowed(&st, &p, sc.owner, sc.role)?,
+            Some(_) => trash_feed_allowed(&st, &p, &sc).await?,
         }
-        trash_allowed(&st, &p, sc.owner, sc.role)?;
     }
     // фильтры по `data` идеи — только у ленты идей (M5.7 §7.1)
     let idea_filter = [&q.origin, &q.priority]
@@ -734,6 +741,12 @@ pub async fn list(
         return Err(unprocessable("from_idea — фильтр ленты задач (kind=task)"));
     }
     let sub = SubtaskFilter::parse(kind, q.top_level.as_deref(), q.parent.as_deref())?;
+    // дерево подзадач — у живых задач: корзина — плоский список удалённых
+    if deleted_only && sub.active() {
+        return Err(unprocessable(
+            "top_level и parent — фильтры живой ленты задач, у корзины (deleted=only) их нет",
+        ));
+    }
     let mut f = EntryFilter {
         space_id: sc.space.id,
         kind,

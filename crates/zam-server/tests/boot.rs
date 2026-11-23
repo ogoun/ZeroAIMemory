@@ -116,6 +116,8 @@ fn health_features_documented() {
         "backup_api",
         // число записей разделов `GET /spaces/{space}/counts` (задача 4 M7.2)
         "space_counts",
+        // корзина любого журнала `deleted=only` (задача 10 M7.2)
+        "entries_trash",
     ] {
         assert!(built.contains(f), "{f}");
     }

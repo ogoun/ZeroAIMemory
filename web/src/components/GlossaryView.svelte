@@ -3,8 +3,14 @@
   // псевдониму и определению, карточка (псевдонимы, «не путать с», код) и правка. Сессия WebUI —
   // человек. Правка идёт с ревизией карточки (If-Match): запись изменилась — 409, карточка
   // перечитывается. Имя или псевдоним занят другим термином — 409 term-conflict со ссылками
-  // на занявшие термины.
+  // на занявшие термины. Корзина (M7.2, спецификация §5.9 пп. 2–3): «Удалить» карточки — в
+  // корзину, с подтверждением; «Корзина» — вместо списка удалённые термины с «Восстановить»
+  // (`JournalTrash`, ленивый чанк; имя, занятое за это время, — 409 со ссылкой в тексте ошибки).
   import { untrack } from 'svelte';
+  import Notice from './Notice.svelte';
+  import Prompt, { type Ask } from './Prompt.svelte';
+  import TrashPanel from './TrashPanel.svelte';
+  import { trashAsk } from '../lib/entryTrash';
   import {
     ApiError,
     createEntry,
@@ -48,6 +54,11 @@
   let actionError = $state('');
   let conflicts = $state<{ id: string; title: string; matched: string }[]>([]);
   let notice = $state('');
+  /** «Корзина»: вместо списка — удалённые термины. */
+  let trash = $state(false);
+  /** Итог действия, закрывшего карточку (удаление), — над списком. */
+  let listNotice = $state('');
+  let ask = $state<Ask | null>(null);
 
   // форма
   let fName = $state('');
@@ -81,6 +92,8 @@
       if (listOf === `${u}|${s}`) return;
       listOf = `${u}|${s}`;
       search = '';
+      trash = false;
+      listNotice = '';
       load(u, s);
     });
   });
@@ -166,8 +179,40 @@
   /** Открыть термин: новая запись истории — «назад» браузера возвращает к списку (§5.1 п. 5). */
   function select(id: string) {
     notice = '';
+    listNotice = '';
     go({ name: 'journal', user, space, journal: 'glossary', entry: id });
   }
+
+  /** «Удалить» карточки: в корзину; карточка закрывается, итог — над списком. */
+  function askDelete(c: Entry) {
+    actionError = '';
+    notice = '';
+    ask = trashAsk(user, c, {
+      deleted: async (msg) => {
+        mode = 'none';
+        cur = null;
+        go({ name: 'journal', user, space, journal: 'glossary', entry: null }, { replace: true });
+        await load(user, space);
+        listNotice = msg;
+      },
+      stale: async (msg) => {
+        await open(user, c.id);
+        actionError = msg;
+      },
+      expired: onexpired,
+      focus: () => listEl?.querySelector('[role="status"]'),
+    });
+  }
+
+  function toggleTrash() {
+    trash = !trash;
+    listNotice = '';
+    // назад к списку: восстановленные из корзины — в нём
+    if (!trash) load(user, space);
+  }
+
+  /** Итог над списком (`Notice`): фокус после удаления — сюда, кнопки карточки уже нет. */
+  let listEl = $state<HTMLElement | null>(null);
 
   /** Карточка или форма показана (в узкой области — вместо списка). */
   let detailOpen = $derived(cur !== null || curError !== '' || mode === 'create' || mode === 'edit');
@@ -296,11 +341,26 @@
   </JournalSplit>
 </section>
 
+<Prompt bind:ask />
+
 {#snippet termList()}
+  <!-- «Корзина» — одна кнопка в обоих видах: фокус на ней переживает переключение -->
   <div class="row bar">
-    <input type="search" bind:value={search} placeholder="Поиск по имени, псевдониму, определению" aria-label="Поиск по словарю" />
-    <button type="button" class="primary" onclick={startCreate}>Новый термин</button>
+    {#if !trash}
+      <input type="search" bind:value={search} placeholder="Поиск по имени, псевдониму, определению" aria-label="Поиск по словарю" />
+      <button type="button" class="primary" onclick={startCreate}>Новый термин</button>
+    {/if}
+    <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
   </div>
+  {#if trash}
+    <TrashPanel {user} {space} kind="term" {onexpired} />
+  {:else}
+    {@render liveList()}
+  {/if}
+{/snippet}
+
+{#snippet liveList()}
+  <div bind:this={listEl}><Notice text={listNotice} /></div>
 
   {#if groups.length > 1}
     <!-- указатель букв — полоса (§5.2 п. 4): одна строка с прокруткой на телефоне и планшете -->
@@ -363,8 +423,9 @@
           <button type="button" onclick={startEdit}>Править</button>
           <button type="button" class="danger" onclick={() => ((rReason = ''), (actionError = ''), (mode = 'retract'))}>Отозвать</button>
         {/if}
+        <button type="button" class="danger" onclick={() => askDelete(c)} disabled={busy}>Удалить</button>
       </div>
-      {#if notice}<p class="muted" role="status">{notice}</p>{/if}
+      <Notice text={notice} />
       {#if mode === 'none' && actionError}<p class="error" role="alert">{actionError}</p>{/if}
       {#if mode === 'retract'}
         <form class="form" onsubmit={submitRetract} aria-label="Отзыв термина">
