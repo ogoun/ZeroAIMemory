@@ -52,6 +52,10 @@ interface Fixture {
   center: string;
   alpha: string;
   insight: string;
+  /** Заметка «Термины»: `[[Квазиграф]]` — термин словаря, обратная ссылка — от задачи. */
+  terms: string;
+  term: string;
+  task: string;
 }
 
 let made: Promise<Fixture> | null = null;
@@ -60,7 +64,8 @@ let made: Promise<Fixture> | null = null;
  * Решение сценариев (одно на файл): «Центр» ссылается на «Альфа», «Бета», «Гамма» (вики-ссылки,
  * `links_to`), «Дельта» — на «Центр» (явная `relates_to`, обратная ссылка), «Альфа» — на «Эпсилон»
  * (второй шаг от центра); insight со связью `relates_to` к «Альфа». Цели создаются раньше
- * ссылок: порядок рёбер — порядок ссылок в тексте.
+ * ссылок: порядок рёбер — порядок ссылок в тексте. Отдельно от «Центра»: «Термины» ссылаются на
+ * термин «Квазиграф» (`[[…]]` без заметки — термин словаря), задача — на «Термины» (`relates_to`).
  */
 function fixture(): Promise<Fixture> {
   made ??= (async () => {
@@ -84,7 +89,20 @@ function fixture(): Promise<Fixture> {
         links: [{ type: 'relates_to', target: `node:${alpha}` }],
       })
     ).id;
-    return { guid, center, alpha, insight };
+    const term = (
+      await api<{ id: string }>('POST', `spaces/${guid}/entries`, {
+        kind: 'term',
+        title: 'Квазиграф',
+        body: '',
+        data: { definition: 'Термин для проверки перехода по связи', aliases: [], code: [] },
+      })
+    ).id;
+    const terms = await note('Термины', 'Определение — [[Квазиграф]].');
+    const task = (
+      await api<{ id: string }>('POST', `spaces/${guid}/entries`, { kind: 'task', title: 'Граф: задача о связях', body: '' })
+    ).id;
+    await api('POST', 'edges', { src: `e:${task}`, type: 'relates_to', dst: `n:${terms}` });
+    return { guid, center, alpha, insight, terms, term, task };
   })();
   return made;
 }
@@ -106,6 +124,16 @@ const labels = (g: Locator) => g.getByRole('link').evaluateAll((els) => els.map(
 /** `viewBox` холста: x, y, ширина, высота. */
 async function viewBox(g: Locator): Promise<number[]> {
   return ((await g.getAttribute('viewBox')) ?? '').split(' ').map(Number);
+}
+
+/** Узел в фокусе — внутри видимой части холста (по `viewBox`). */
+async function focusedInView(g: Locator): Promise<boolean> {
+  const [x, y, w, h] = await viewBox(g);
+  const t = await g.locator('a:focus').evaluate((a) => (a.parentElement as Element).getAttribute('transform') ?? '');
+  const m = /translate\(([-\d.e+]+)[ ,]+([-\d.e+]+)\)/.exec(t);
+  if (!m) throw new Error(`transform узла: «${t}»`);
+  const [px, py] = [Number(m[1]), Number(m[2])];
+  return px >= x && px <= x + w && py >= y && py <= y + h;
 }
 
 test('links_graph_depth_and_navigate', async ({ page }) => {
@@ -150,6 +178,20 @@ test('links_graph_depth_and_navigate', async ({ page }) => {
   await expect(g.getByRole('link')).toHaveCount(4);
   expect(await labels(g)).toEqual(['links_to: Альфа', 'links_to: Бета', 'links_to: Гамма', 'links_to: Эпсилон']);
   await expect(page.getByRole('status').filter({ hasText: 'Показано' })).toHaveCount(0);
+  // живая область «Показано …» — в дереве доступности и пустой (ревью r1, m5)
+  const status = g.locator('xpath=preceding-sibling::*[@role="status"][1]');
+  await expect(status).toHaveText('');
+  await expect(status).toHaveCSS('display', 'block');
+
+  // Ctrl+Enter на узле-заметке — новая вкладка, как у ссылки (ревью r1, m6); страница — на месте
+  const here = page.url();
+  const popup = page.context().waitForEvent('page');
+  await g.getByRole('link', { name: 'links_to: Бета' }).focus();
+  await page.keyboard.press('Control+Enter');
+  const tab = await popup;
+  await expect(tab).toHaveURL(new RegExp(`/s/${fx.guid}/n/[0-9A-Za-z]+$`));
+  await tab.close();
+  expect(page.url()).toBe(here);
 
   // нажатие узла открывает заметку
   await g.getByRole('link', { name: 'links_to: Альфа' }).click();
@@ -201,6 +243,21 @@ test('links_graph_entry_card_zoom_pan_print', async ({ page }) => {
   await card.getByRole('button', { name: 'По размеру' }).click();
   expect(await viewBox(g)).toEqual(fit);
 
+  // после увеличения Tab по узлам — каждый узел в фокусе виден: вид сдвигается к нему (ревью r1, m2)
+  for (let i = 0; i < 6; i++) await card.getByRole('button', { name: 'Увеличить' }).click();
+  const zoomed = await viewBox(g);
+  await card.getByRole('button', { name: 'По размеру' }).focus();
+  await page.keyboard.press('Tab');
+  for (let i = 0; i < 3; i++) {
+    await expect(g.locator('a:focus')).toHaveCount(1);
+    expect(await focusedInView(g), `узел ${i + 1} в фокусе — в видимой части`).toBe(true);
+    await page.keyboard.press('Tab');
+  }
+  const after = await viewBox(g);
+  expect(after[2], 'масштаб тот же').toBeCloseTo(zoomed[2], 6);
+  expect(after.slice(0, 2), 'вид сдвигался к узлам').not.toEqual(zoomed.slice(0, 2));
+  await card.getByRole('button', { name: 'По размеру' }).click();
+
   // сдвиг мышью: содержимое — за указателем (вид — в обратную сторону); отпускание — не переход
   await g.scrollIntoViewIfNeeded();
   const box = (await g.boundingBox())!;
@@ -213,6 +270,29 @@ test('links_graph_entry_card_zoom_pan_print', async ({ page }) => {
   expect(moved[1]).toBeLessThan(fit[1]);
   expect(moved[2]).toBe(fit[2]);
   await expect(page).toHaveURL(new RegExp(`/j/insights/${fx.insight}$`));
+
+  // кнопку отпустили за холстом до захвата — наведение без кнопки вид не тянет (ревью r1, m1)
+  await page.mouse.move(box.x + 3, box.y + 3);
+  await page.mouse.down();
+  await page.mouse.move(box.x - 40, box.y - 40);
+  await page.mouse.up();
+  await page.mouse.move(box.x + 120, box.y + 90, { steps: 5 });
+  await page.mouse.move(box.x + 220, box.y + 160, { steps: 5 });
+  expect(await viewBox(g)).toEqual(moved);
+
+  // «Список» и обратно «Граф»: глубина, вид — прежние, повторного запроса нет (ревью r1, m3)
+  let asked = 0;
+  page.on('request', (r) => {
+    if (r.url().includes('/api/v1/graph?')) asked++;
+  });
+  const tabs = card.getByRole('tablist', { name: 'Вид связей' });
+  await tabs.getByRole('tab', { name: 'Список' }).click();
+  await expect(g).toBeHidden();
+  await tabs.getByRole('tab', { name: 'Граф' }).click();
+  await expect(g.getByRole('link')).toHaveCount(3);
+  await expect(card.getByLabel('Глубина')).toHaveValue('2');
+  expect(await viewBox(g)).toEqual(moved);
+  expect(asked, 'запросы графа при возврате').toBe(0);
 
   // печать — список, без графа и переключателя
   await page.emulateMedia({ media: 'print' });
@@ -255,6 +335,35 @@ test('links_graph_cap_60', async ({ page }) => {
   expect(shown.slice(0, 50)).toEqual(near.map((n) => `links_to: ${n.title}`));
   expect(shown.slice(50)).toEqual(far.slice(0, 9).map((n) => `links_to: ${n.title}`));
   await page.screenshot({ path: `${screens}graph-60.png`, fullPage: true });
+
+  // узел без пути к центру (сервер обрезал рёбра) — имя без пустого типа (ревью r1, m4)
+  const small = { nodes: [node(me, 'Центр'), node('n:a', 'Сосед'), node('n:lone', 'Одинокий')], edges: [edge(1, me, 'n:a')], truncated: true };
+  await page.unroute('**/api/v1/graph?*');
+  await page.route('**/api/v1/graph?*', (route) => route.fulfill({ json: small }));
+  await page.getByLabel('Глубина').selectOption('2');
+  await expect(g.getByRole('link')).toHaveCount(2);
+  expect(await labels(g)).toEqual(['links_to: Сосед', 'связь не показана: Одинокий']);
+  await expect(page.getByRole('status').filter({ hasText: 'Показано' })).toHaveText('Показано 3 из 3+');
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('links_open_entry_by_kind_term_task', async ({ page }) => {
+  // переход по связи к записи — в журнал её вида (задача 11, ревью r1, m8): термин словаря (у
+  // него тоже есть статус) — в «Словарь», а не в Insights; задача — в «Задачи», а не в Changelog;
+  // список и граф — одна функция перехода
+  const problems = watch(page);
+  const fx = await fixture();
+  await openLinks(page, fx.terms);
+  await page.getByRole('region', { name: 'Исходящие связи' }).getByRole('button', { name: 'Квазиграф' }).click();
+  await expect(page).toHaveURL(new RegExp(`/s/${fx.guid}/j/glossary/${fx.term}$`));
+
+  await openLinks(page, fx.terms);
+  await views(page).getByRole('tab', { name: 'Граф' }).click();
+  const g = graphOf(page);
+  await expect(g.getByRole('link')).toHaveCount(2);
+  expect(await labels(g)).toEqual(['links_to: Квазиграф', 'relates_to: Граф: задача о связях']);
+  await g.getByRole('link', { name: 'relates_to: Граф: задача о связях' }).click();
+  await expect(page).toHaveURL(new RegExp(`/s/${fx.guid}/j/tasks/${fx.task}$`));
   expect(problems, problems.join('\n')).toEqual([]);
 });
 

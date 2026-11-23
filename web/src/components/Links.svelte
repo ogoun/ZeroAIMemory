@@ -42,6 +42,9 @@
   ];
   const uid = $props.id();
   let view = $state<View>('list');
+  /** «Граф» уже открывали: он остаётся смонтированным (глубина, тип, масштаб целы, повторного
+   * запроса нет — ревью r1, m3), пока виден список — скрыт и не запрашивается. */
+  let graphSeen = $state(false);
   let viewTabs = $state<HTMLButtonElement[]>([]);
 
   let outgoing = $state<Item[]>([]);
@@ -133,7 +136,11 @@
     }
   }
 
-  const select = (j: number) => (view = VIEWS[j][0]);
+  function choose(v: View) {
+    view = v;
+    if (v === 'graph') graphSeen = true;
+  }
+  const select = (j: number) => choose(VIEWS[j][0]);
 </script>
 
 {#snippet list(title: string, rows: Item[], empty: string)}
@@ -173,7 +180,7 @@
         aria-selected={view === v}
         aria-controls={`${uid}-${v}`}
         tabindex={view === v ? 0 : -1}
-        onclick={() => (view = v)}
+        onclick={() => choose(v)}
         onkeydown={(e) => onTabKey(e, i, VIEWS.length, viewTabs, select)}>{label}</button
       >
     {/each}
@@ -190,11 +197,11 @@
     </section>
   </div>
   <div role="tabpanel" id={`${uid}-graph`} aria-labelledby={`${uid}-tab-graph`} class="graph-view" hidden={view !== 'graph'}>
-    {#if view === 'graph'}
+    {#if graphSeen}
       {#await import('./GraphView.svelte')}
         <p class="muted">Загрузка графа…</p>
       {:then { default: GraphView }}
-        <GraphView {user} {kind} {id} {hrefOf} onopen={open} {onexpired} />
+        <GraphView {user} {kind} {id} {hrefOf} onopen={open} {onexpired} active={view === 'graph'} />
       {:catch e}
         <!-- чанк графа не пришёл: сервер обновился (у чанков новые имена) или нет сети (§5.1 п. 9) -->
         <LazyFail error={e} label="Граф не загрузился" />

@@ -22,9 +22,11 @@
     hrefOf: (n: GraphNode) => string | null;
     onopen: (n: GraphNode) => void;
     onexpired: () => void;
+    /** Вид «Граф» выбран: скрытый граф (список на экране) не запрашивается. */
+    active: boolean;
   }
 
-  let { user, kind, id, hrefOf, onopen, onexpired }: Props = $props();
+  let { user, kind, id, hrefOf, onopen, onexpired, active }: Props = $props();
 
   /** Узлов на графе — не больше (спецификация §5.10 п. 1). */
   const MAX = 60;
@@ -72,9 +74,19 @@
 
   const center = $derived(`${kind === 'node' ? 'n' : 'e'}:${id}`);
 
+  /** Для чего загружен граф (пользователь, узел, глубина, тип): возврат к «Графу» без перемен —
+   * без запроса (ревью r1, m3). */
+  let loadedFor = '';
+
   $effect(() => {
     const a = [user, kind, id, depth, type] as const;
-    untrack(() => load(...a));
+    const on = active;
+    untrack(() => {
+      const key = a.join(' ');
+      if (!on || key === loadedFor) return;
+      loadedFor = key;
+      load(...a);
+    });
   });
 
   /** Чей граф загружен: другой узел или запись — прежний граф не показывается до ответа. */
@@ -94,6 +106,8 @@
       if (my === seq) data = g;
     } catch (e) {
       if (my !== seq) return;
+      // отказ — повтор при следующем показе «Графа»
+      loadedFor = '';
       if (e instanceof ApiError && e.status === 401) return onexpired();
       error = errorText(e);
     } finally {
@@ -211,6 +225,12 @@
   function move(e: PointerEvent) {
     const p = pts.get(e.pointerId);
     if (!p || !svg) return;
+    // кнопку отпустили за холстом до захвата (или окно потеряло фокус): указатель не тянет вид
+    // (ревью r1, m1); у касания `buttons` — 1, пока палец на экране
+    if (!(e.buttons & 1)) {
+      pts.delete(e.pointerId);
+      return;
+    }
     const r = svg.getBoundingClientRect();
     // пикселей на единицу вида (`preserveAspectRatio` по умолчанию — вписать)
     const s = Math.min(r.width / view.w, r.height / view.h);
@@ -243,6 +263,21 @@
   }
 
   const up = (e: PointerEvent) => pts.delete(e.pointerId);
+  /** Холст потерял захват (отпускание, отмена) — указатель забыт; захват, переданный холсту от
+   * узла (касание), сюда не относится: событие узла всплывает с другой целью. */
+  const lost = (e: PointerEvent) => e.target === svg && pts.delete(e.pointerId);
+
+  /** Узел в фокусе с клавиатуры вне видимой части (после «+» или щипка) — вид сдвигается к нему
+   * без смены масштаба (ревью r1, m2): SVG сам к фокусу не прокручивает. Фокус указателем (нажатие
+   * у края, начало сдвига) вид не трогает. */
+  function reveal(nid: string) {
+    const p = pos.get(nid);
+    if (!p) return;
+    const m = R + 24;
+    const v = view;
+    if (p.x - m >= v.x && p.x + m <= v.x + v.w && p.y - m >= v.y && p.y + m <= v.y + v.h) return;
+    view = { ...v, x: p.x - v.w / 2, y: p.y - v.h / 2 };
+  }
 
   function swallow(e: MouseEvent) {
     if (!dragged) return;
@@ -251,9 +286,10 @@
     dragged = false;
   }
 
-  /** Переход по узлу; ссылка с адресом и модификатором (новая вкладка, окно) — браузеру. */
+  /** Переход по узлу; ссылка с адресом и модификатором (Ctrl, ⌘, Shift — новая вкладка, окно) —
+   * браузеру: и щелчком, и Enter (ревью r1, m6). */
   function activate(e: MouseEvent | KeyboardEvent, n: GraphNode, h: string | null) {
-    if (h && e instanceof MouseEvent && (e.ctrlKey || e.metaKey || e.shiftKey)) return;
+    if (h && (e.ctrlKey || e.metaKey || e.shiftKey)) return;
     e.preventDefault();
     onopen(n);
   }
@@ -320,6 +356,7 @@
       onpointermove={move}
       onpointerup={up}
       onpointercancel={up}
+      onlostpointercapture={lost}
       onclickcapture={swallow}
     >
       <defs>
@@ -362,10 +399,10 @@
                 href={h ?? undefined}
                 role={h ? undefined : 'link'}
                 tabindex="0"
-                aria-label={`${o.type}: ${o.n.title}`}
+                aria-label={`${o.type || 'связь не показана'}: ${o.n.title}`}
                 onclick={(e) => activate(e, o.n, h)}
-                onkeydown={(e) => e.key === 'Enter' && activate(e, o.n, null)}
-                onfocus={() => (hot = o.id)}
+                onkeydown={(e) => e.key === 'Enter' && activate(e, o.n, h)}
+                onfocus={(e) => ((hot = o.id), e.currentTarget.matches(':focus-visible') && reveal(o.id))}
                 onblur={() => (hot = '')}
                 onpointerenter={() => (hot = o.id)}
                 onpointerleave={() => (hot = '')}
@@ -395,12 +432,13 @@
   .zoom {
     gap: 4px;
   }
-  .cap:empty {
-    display: none;
-  }
+  /* живая область — всегда в дереве доступности (ревью r1, m5): пустая — нулевой высоты */
   .cap {
     margin: 6px 0 0;
     font-size: 13px;
+  }
+  .cap:empty {
+    margin: 0;
   }
   .canvas {
     display: block;
