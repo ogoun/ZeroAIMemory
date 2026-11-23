@@ -591,6 +591,14 @@ async fn work_result_idempotent() {
     assert_eq!(echo_rows(&a).await, 1);
     let w = echo_works(&a).await.remove(0);
     assert_eq!(w.result_key.as_deref(), Some("k-1"));
+    // служебные поля приёма в ленту не выходят (ревью r2, N4)
+    let r = a.adm(Method::GET, WORKS, None, None).await;
+    let res = &r.json()["works"][0]["result"];
+    assert!(res["accepted"].is_array(), "{res}");
+    assert!(
+        res.get("request_hash").is_none() && res.get("response").is_none(),
+        "{res}"
+    );
 }
 
 /// Ревью r1, Important 2: два одновременных итога с одним ключом — оба 200 с одним ответом,
@@ -1353,6 +1361,77 @@ async fn masked_before_send() {
     assert!(!body.contains(&s), "{body}");
     assert!(body.contains("‹secret›"), "{body}");
     assert!(body.contains(&target), "{body}");
+}
+
+/// Ревью r2, N1 (решение 72): второй скан выбросил элемент с секретом, а модель отказалась от всей
+/// работы (`skip`) — работа `cancelled`, но отсев `secret_in_payload` остаётся: следующие
+/// постановки этот элемент не предлагают (до новой ревизии записи).
+#[tokio::test]
+async fn secret_dropped_stays_excluded_after_skip() {
+    let _g = SERIAL.lock().await;
+    let m = MockModel::start();
+    m.push(MockReply::chat("{\"skip\": \"нечего делать\"}"));
+    m.set_default(MockReply::chat("{\"items\": []}"));
+    let a = server("secret-skip", night_now).await;
+    let clean = insight(&a, "knowledge", "Чистая", "текст").await;
+    let leaky = insight(&a, "knowledge", "С ключом", "текст").await;
+    connect(&a, &m).await;
+    let space = zam_store::list_spaces(&db(&a).await)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == zam_store::SpaceKind::Knowledge)
+        .unwrap()
+        .id;
+    // снимок с ключом в тексте — мимо маски сборщика: его выбросит второй скан тела
+    let item = |n: usize, target: &str, text: String| WorkItem {
+        n,
+        target: target.to_string(),
+        rev: 1,
+        kind: "insight".into(),
+        title: "т".into(),
+        text,
+        signals: Vec::new(),
+    };
+    let s = secret();
+    store::enqueue(
+        &db(&a).await,
+        NewWork {
+            kind: WorkKind::Echo,
+            space,
+            mode: WorkMode::Model,
+            origin: Origin::Nightly,
+            night: Some(zam_store::time::utc_today()),
+            items: vec![
+                item(1, &clean, "текст".into()),
+                item(2, &leaky, format!("токен деплоя {s} в CI")),
+            ],
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    night_in_window(&a).await;
+    let body = m.requests()[0].body.clone();
+    assert!(!body.contains(&s), "{body}");
+    assert!(body.contains(&clean), "{body}");
+    let ws = echo_works(&a).await;
+    let first = ws.last().unwrap();
+    assert_eq!(first.state, WorkState::Cancelled, "{first:?}");
+    let rejected = first.result.as_ref().unwrap()["rejected"].clone();
+    assert_eq!(rejected[0]["n"], 2, "{rejected}");
+    assert_eq!(rejected[0]["reason"], store::SECRET_IN_PAYLOAD);
+    let excluded = store::excluded_refs(&db(&a).await, WorkKind::Echo)
+        .await
+        .unwrap();
+    assert!(excluded.contains(&(leaky.clone(), 1)), "{excluded:?}");
+    // следующая постановка — без записи с ключом
+    night_in_window(&a).await;
+    let ws = echo_works(&a).await;
+    assert!(ws.len() > 1, "{ws:?}");
+    for w in &ws[..ws.len() - 1] {
+        assert!(w.items.iter().all(|i| i.target != leaky), "{w:?}");
+    }
 }
 
 /// §6.3 п. 2: ручной запуск — только человек: токену 403 и ни одного запроса к модели.

@@ -113,8 +113,9 @@ pub const STALE: &str = "stale";
 /// повод остался, отсеивается заново.
 pub const REFS_HORIZON_DAYS: i64 = 365;
 /// `part` отметки показа строки внутренних работ дайджеста в `session_seen` (§6.3 п. 5): цель —
-/// первая работа строки (`target_kind = entry`, id работы), ревизия — число работ; строка — раз
-/// за сессию (любая эпоха). Подсказки записей ([`crate::RECALL_PART`]) такая отметка не задевает.
+/// первая работа строки (`target_kind = entry`, id работы), ревизия не используется (1) — важен
+/// сам факт показа: строка — раз за сессию (любая эпоха). Подсказки записей
+/// ([`crate::RECALL_PART`]) такая отметка не задевает.
 pub const WORKS_LINE_PART: &str = "works_line";
 
 /// Кто выполняет работу (`works.mode`).
@@ -887,14 +888,14 @@ pub async fn queued_agent_counts(
     .await
 }
 
-/// Пары «ссылка, ревизия», которые сборщик вида не берёт до новой ревизии записи (решение 72):
-/// отклонённые с причиной [`SECRET_IN_PAYLOAD`] (`result.rejected`) и, у вида `probes`, явные
-/// `skip` исполнителя (`result.skip`) — из итогов работ `done` за последние
-/// [`REFS_HORIZON_DAYS`] суток.
+/// Пары «ссылка, ревизия», которые сборщик вида не берёт до новой ревизии записи (решение 72),
+/// из итогов за последние [`REFS_HORIZON_DAYS`] суток: отклонённые с причиной
+/// [`SECRET_IN_PAYLOAD`] (`result.rejected`) — у работ `done` **и** `cancelled` (модель отказалась
+/// от всей работы `skip`, а второй скан элемент уже выбросил — отсев остаётся; ревью r2 задачи 3,
+/// N1) и, у вида `probes`, явные `skip` исполнителя (`result.skip`) — только у `done`.
 pub async fn excluded_refs(db: &Db, kind: WorkKind) -> Result<HashSet<(String, i64)>, StoreError> {
-    let results = item_results(db, kind).await?;
     let mut out = HashSet::new();
-    for r in &results {
+    for (state, r) in item_results(db, kind, &[WorkState::Done, WorkState::Cancelled]).await? {
         for x in r["rejected"].as_array().into_iter().flatten() {
             if x["reason"] == SECRET_IN_PAYLOAD
                 && let (Some(t), Some(rev)) = (x["target"].as_str(), x["rev"].as_i64())
@@ -902,7 +903,7 @@ pub async fn excluded_refs(db: &Db, kind: WorkKind) -> Result<HashSet<(String, i
                 out.insert((t.to_string(), rev));
             }
         }
-        if kind == WorkKind::Probes {
+        if kind == WorkKind::Probes && state == WorkState::Done {
             for x in r["skip"].as_array().into_iter().flatten() {
                 if let (Some(t), Some(rev)) = (x["target"].as_str(), x["rev"].as_i64()) {
                     out.insert((t.to_string(), rev));
@@ -916,9 +917,8 @@ pub async fn excluded_refs(db: &Db, kind: WorkKind) -> Result<HashSet<(String, i
 /// Пары «ссылка, ревизия» принятых элементов закрытых итогом (`done`) работ вида за последние
 /// [`REFS_HORIZON_DAYS`] суток: элемент с итогом в той же ревизии сборщик не предлагает снова.
 pub async fn accepted_refs(db: &Db, kind: WorkKind) -> Result<HashSet<(String, i64)>, StoreError> {
-    let results = item_results(db, kind).await?;
     let mut out = HashSet::new();
-    for r in &results {
+    for (_, r) in item_results(db, kind, &[WorkState::Done]).await? {
         for x in r["accepted"].as_array().into_iter().flatten() {
             if let (Some(t), Some(rev)) = (x["target"].as_str(), x["rev"].as_i64()) {
                 out.insert((t.to_string(), rev));
@@ -928,24 +928,35 @@ pub async fn accepted_refs(db: &Db, kind: WorkKind) -> Result<HashSet<(String, i
     Ok(out)
 }
 
-/// Итоги (`result`) работ вида, закрытых итогом (`done`) за последние [`REFS_HORIZON_DAYS`]
-/// суток.
-async fn item_results(db: &Db, kind: WorkKind) -> Result<Vec<Value>, StoreError> {
+/// Итоги (`result`) работ вида в состояниях `states`, закрытых за последние
+/// [`REFS_HORIZON_DAYS`] суток, с состоянием работы.
+async fn item_results(
+    db: &Db,
+    kind: WorkKind,
+    states: &[WorkState],
+) -> Result<Vec<(WorkState, Value)>, StoreError> {
     let at = now();
     let since = fmt_ts(
         at.checked_sub(SignedDuration::from_hours(24 * REFS_HORIZON_DAYS))
             .unwrap_or(at),
     );
+    let states = states.to_vec();
     db.read(move |c| {
         let mut st = c.prepare_cached(
-            "SELECT result FROM works
-             WHERE kind = ?1 AND state = 'done' AND result IS NOT NULL AND finished_at >= ?2",
+            "SELECT state, result FROM works
+             WHERE kind = ?1 AND result IS NOT NULL AND finished_at >= ?2",
         )?;
-        let rows = st.query_map(params![kind.as_str(), since], |r| r.get::<_, String>(0))?;
+        let rows = st.query_map(params![kind.as_str(), since], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
         let mut out = Vec::new();
-        for s in rows {
-            if let Ok(v) = serde_json::from_str::<Value>(&s?) {
-                out.push(v);
+        for row in rows {
+            let (state, s) = row?;
+            let Some(state) = WorkState::parse(&state).filter(|x| states.contains(x)) else {
+                continue;
+            };
+            if let Ok(v) = serde_json::from_str::<Value>(&s) {
+                out.push((state, v));
             }
         }
         Ok(out)

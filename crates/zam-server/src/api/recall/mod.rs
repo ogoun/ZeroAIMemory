@@ -4082,6 +4082,7 @@ pub async fn recall(
                     }),
                     part: zam_store::works::WORKS_LINE_PART.to_string(),
                 },
+                // ревизия не используется — важен факт показа
                 rev: 1,
             });
         }

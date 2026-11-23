@@ -122,8 +122,9 @@ pub fn work_json(w: &Work, mask: bool) -> Value {
         .collect();
     let mut result = w.result.clone().unwrap_or(Value::Null);
     if let Value::Object(o) = &mut result {
-        // ответ исполнителю — копия итога: в ленте не повторяется
+        // служебные поля приёма: ответ исполнителю — копия итога, отпечаток тела — сверка повтора
         o.remove("response");
+        o.remove("request_hash");
     }
     if mask {
         agent_view::mask_value(&mut result);

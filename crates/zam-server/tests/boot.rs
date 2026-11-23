@@ -32,23 +32,13 @@ async fn first_run_creates_admin_and_token_once() {
     let t = rep.initial_token.unwrap();
     assert!(t.starts_with("zam_"));
     assert!(st.system.verify_token(&t, None).await.unwrap().is_some());
-    // роутер держит клон состояния (и лок каталога данных)
+    // штатная остановка, как у прочих пересборок на том же каталоге: шаги старта ночного
+    // исполнителя (M7.3: возврат работ модели в очередь открывает базы в фоне) `shutdown`
+    // дожидается; затем роутер и состояние отпускают лок каталога данных
+    st.shutdown().await;
     drop(app);
     drop(st);
-    // шаги старта ночного исполнителя (M7.3: возврат работ модели в очередь открывает базы
-    // пользователей) идут в фоне с клоном состояния: снятые при уходе раннера, они отпускают его
-    // на ближайшем ожидании (`works/night.rs`), — повторная сборка ждёт ограниченно
-    let t0 = std::time::Instant::now();
-    let rep2 = loop {
-        match build(cfg_in(d.clone()), Some("pw".into())).await {
-            Ok((_, _, rep)) => break rep,
-            Err(e) if t0.elapsed() < std::time::Duration::from_secs(5) => {
-                assert!(e.to_string().contains("уже используется"), "{e}");
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            Err(e) => panic!("каталог данных не освобождён: {e}"),
-        }
-    };
+    let (_, _, rep2) = build(cfg_in(d), Some("pw".into())).await.unwrap();
     assert!(rep2.initial_token.is_none());
 }
 
