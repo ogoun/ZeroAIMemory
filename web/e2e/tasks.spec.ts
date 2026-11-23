@@ -807,6 +807,14 @@ test.describe('настольный', () => {
     await expect(columnOf(page, 'в работе').getByRole('heading')).toHaveText('в работе 0');
     await expect(toggle).toHaveAttribute('aria-pressed', 'true');
     await expect(toggle).toBeDisabled();
+    // причина — видимой строкой и описанием кнопки; кнопка в порядке Tab, нажатие ничего не меняет
+    await expect(toggle).toHaveAccessibleDescription('с «Из идей» — все задачи из идей, и шаги тоже');
+    await expect(page.getByText('с «Из идей» — все задачи из идей, и шаги тоже')).toBeVisible();
+    await toggle.focus();
+    await expect(toggle).toBeFocused();
+    await page.keyboard.press('Enter');
+    await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+    await expect(stepTile).toBeVisible();
     const after = lists.slice(before);
     expect(after).toHaveLength(5);
     expect(after.every((u) => u.searchParams.get('from_idea') === '1' && !u.searchParams.has('top_level')), after.join('\n')).toBe(true);
@@ -818,6 +826,7 @@ test.describe('настольный', () => {
     await expect(board.locator(`[data-task="${step}"]`)).toHaveCount(0);
     await expect(toggle).toHaveAttribute('aria-pressed', 'false');
     await expect(toggle).toBeEnabled();
+    await expect(page.getByText('с «Из идей» — все задачи из идей, и шаги тоже')).toHaveCount(0);
     expect(problems, problems.join('\n')).toEqual([]);
   });
 
@@ -1012,6 +1021,47 @@ test.describe('телефон, сенсорный ввод', () => {
     await page.getByRole('button', { name: 'Подзадачи на доске' }).tap();
     await expect(tabs).toHaveText(['Открыт 2', 'В работе 3', 'Заблокирован 1', 'Выполнен 3', 'Снят 0']);
     expect(counted.slice(before).map((u) => u.searchParams.has('top_level'))).toEqual([false]);
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+
+  test('tasks_from_idea_step_keeps_tab', async ({ page }) => {
+    // «Из идей» на телефоне: общая из идеи, её шаг (выполнен) — не из идеи, своей плитки на этой доске
+    // у шага нет. Касание шага в раскрытии вкладку не меняет; «← Задачи» — та же вкладка, раскрытие
+    // общей и фокус на нажатой ссылке (а не вкладка «Выполнен» без шага)
+    const problems = watch(page);
+    const guid = await newSolution('из идей на телефоне');
+    const idea = await api<{ id: string }>('POST', `spaces/${guid}/entries`, {
+      kind: 'idea',
+      title: 'Идея плана',
+      body: 'Идея плана: замысел.',
+      data: { origin: 'human' },
+    });
+    await api('POST', `entries/${idea.id}/decide`, { decision: 'accept', by: 'human' });
+    const planned = await api<{ items: { id: string }[] }>('GET', `spaces/${guid}/entries?kind=task&from_idea=1`);
+    expect(planned.items).toHaveLength(1);
+    const umbrella = planned.items[0].id;
+    const step = await addTask(guid, 'Шаг не из идеи', 'done');
+    await partOf(step, umbrella);
+    const c = await pageCtx(page);
+    await open(page, tasksUrl(c.user, guid));
+    await expect(tabOf(page, 'Открыт')).toHaveAttribute('aria-selected', 'true');
+    await page.getByRole('button', { name: 'Из идей' }).tap();
+    await expect(tabOf(page, 'Открыт')).toHaveAccessibleName('Открыт, 1 задача');
+    await expect(tabOf(page, 'Выполнен')).toHaveAccessibleName('Выполнен, 0 задач');
+    const panel = page.getByRole('tabpanel');
+    const tile = panel.locator(`[data-task="${umbrella}"]`);
+    await expect(tile.getByTestId('task-progress')).toHaveText('1/1');
+    await tile.getByRole('button', { name: 'Подзадачи: Идея плана', exact: true }).tap();
+    const link = tile.getByRole('list', { name: 'Подзадачи «Идея плана»' }).getByRole('link', { name: 'Шаг не из идеи' });
+    await link.tap();
+    const card = page.getByRole('article', { name: 'Карточка задачи' });
+    await expect(card.getByRole('heading', { name: 'Шаг не из идеи' })).toBeFocused();
+    await page.getByRole('link', { name: '← Задачи' }).tap();
+    await expect(card).toHaveCount(0);
+    await expect(tabOf(page, 'Открыт')).toHaveAttribute('aria-selected', 'true');
+    await expect(tabOf(page, 'Выполнен')).toHaveAttribute('aria-selected', 'false');
+    await expect(link).toBeFocused();
+    await expect(page.getByRole('button', { name: 'Из идей' })).toHaveAttribute('aria-pressed', 'true');
     expect(problems, problems.join('\n')).toEqual([]);
   });
 });

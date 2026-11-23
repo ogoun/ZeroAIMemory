@@ -396,12 +396,17 @@
     }
   }
 
-  /** Вкладка открытой задачи `e` — её статус (решение 18). У подзадачи на доске верхнего уровня
-   * своей плитки нет: открытая с доски (из раскрытия под общей) вкладку не меняет, из адреса — вкладка
-   * родителя. `null` — вкладку не менять. */
+  /** Своя плитка задачи `e` на текущей доске: «Из идей» — только у задач из идей (шаг не из идеи —
+   * лишь в раскрытии общей, общая не из идеи — лишь по ссылке «часть …»); иначе с переключателем —
+   * у всех, без него — у верхнего уровня. */
+  const hasTile = (e: Entry): boolean => (fromIdea ? !!e.idea : withSubtasks || !e.parent);
+
+  /** Вкладка открытой задачи `e` — её статус (решение 18). Своей плитки на доске нет (шаг в
+   * раскрытии, общая по ссылке «часть …»): открытая с доски вкладку не меняет, из адреса — вкладка
+   * родителя, а без него — своя. `null` — вкладку не менять. */
   function tabStatusOf(e: Entry): EntryStatus | null {
-    if (e.parent && !flat) return tab === null ? e.parent.status : null;
-    return e.status;
+    if (hasTile(e)) return e.status;
+    return tab === null ? (e.parent?.status ?? e.status) : null;
   }
 
   const str = (d: Record<string, unknown>, k: string) => (typeof d[k] === 'string' ? (d[k] as string) : '');
@@ -604,19 +609,22 @@
   <div class="row bar">
     <button type="button" class="primary" onclick={startCreate}>Новая задача</button>
     <button type="button" class="toggle" aria-pressed={fromIdea} onclick={toggleFromIdea} title="Только задачи из идей — пункты плана работ">Из идей</button>
-    <!-- с «Из идей» шаги из идей и так на доске (пункты плана): переключатель нажат и неактивен -->
+    <!-- с «Из идей» шаги из идей и так на доске (пункты плана): переключатель нажат и неактивен
+         (`aria-disabled` — остаётся в порядке Tab), причина — видимой строкой и его описанием -->
     <button
       type="button"
       class="toggle"
       aria-pressed={flat}
-      disabled={fromIdea}
-      onclick={toggleSubtasks}
-      title={fromIdea
-        ? 'С «Из идей» на доске все задачи из идей, и шаги планов тоже'
-        : 'Шаги планов — в колонках по статусам, с пометкой «часть …»; выключено — под общей задачей'}
+      aria-disabled={fromIdea}
+      aria-describedby={fromIdea ? `${uid}-flat-why` : undefined}
+      onclick={() => {
+        if (!fromIdea) toggleSubtasks();
+      }}
+      title={fromIdea ? undefined : 'Шаги планов — в колонках по статусам, с пометкой «часть …»; выключено — под общей задачей'}
     >
       Подзадачи на доске
     </button>
+    {#if fromIdea}<span class="muted small" id="{uid}-flat-why">с «Из идей» — все задачи из идей, и шаги тоже</span>{/if}
   </div>
 
   {#if boardError}<p class="error" role="alert">{boardError}</p>{/if}
@@ -895,6 +903,10 @@
     border-color: var(--accent);
     color: var(--accent);
     background: var(--selected);
+  }
+  .toggle[aria-disabled='true'] {
+    opacity: 0.6;
+    cursor: default;
   }
   .from-idea,
   .part-of {
