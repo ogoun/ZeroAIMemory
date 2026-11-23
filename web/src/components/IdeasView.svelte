@@ -15,7 +15,14 @@
   // перечитать); формы — отдельный ленивый чанк `IdeaForm.svelte`, грузится при первом открытии.
   // Предлагает и разбирает идею агент (propose, review): у WebUI этих действий нет; у идеи со снятой
   // задачей открытый вопрос агента «вернуть» — пометка «Предложено вернуть» (§16, п. 6). Ленивый чанк.
-  import { untrack } from 'svelte';
+  // Узкие экраны (M7.2, спецификация §5.2 п. 2): лента и карточка — `JournalSplit` (рядом или
+  // карточка вместо ленты); «Группировать по статусу» в узкой области (< SPLIT_MIN) — аккордеон
+  // `<details>` (открыт первый непустой раздел, число — в заголовке); чипы статусов — полоса;
+  // фильтры (приоритет, тег, поиск) на телефоне — под кнопкой «Фильтры»; сбой загрузки чанка формы
+  // — `LazyFail`.
+  import { tick, untrack, type Snippet } from 'svelte';
+  import JournalSplit from './JournalSplit.svelte';
+  import LazyFail from './LazyFail.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
   import {
     ApiError,
@@ -67,6 +74,7 @@
     AUTHOR_TEXT,
     IDEA_STATUSES,
     IDEA_STATUS_TEXT,
+    JOURNAL_TITLE,
     PRIORITIES,
     PRIORITY_TEXT,
     dataStr as str,
@@ -74,8 +82,10 @@
     fmtTime,
     type IdeaPriority,
   } from '../lib/journals';
+  import { SPLIT_MIN } from '../lib/layout';
   import { snippetParts } from '../lib/snippet';
   import { go, href } from '../lib/router';
+  import { observeWidth, revealSelected, viewport } from '../lib/viewport.svelte';
 
   interface Props {
     user: string;
@@ -116,6 +126,17 @@
   let loading = $state(false);
   let error = $state('');
   let seq = 0;
+  /** Первая страница ленты не загрузилась: следующий переход повторит загрузку. */
+  let failed = false;
+
+  /** Ширина области журнала (CSS px): узкая (< SPLIT_MIN) — разделы аккордеоном. */
+  let width = $state(0);
+  let narrow = $derived(width > 0 && width < SPLIT_MIN);
+  /** Телефон: фильтры — под кнопкой «Фильтры». */
+  let phone = $derived(viewport.current === 'phone');
+  let filtersOpen = $state(false);
+  /** Заданных фильтров (приоритет, тег, поиск) — число на кнопке «Фильтры». */
+  let activeFilters = $derived([priority, applied.tag, applied.query].filter(Boolean).length);
   /** Число идей по статусам (`entries/counts`) с фильтрами ленты; `null` — ещё не пришло. */
   let counts = $state<Partial<Record<EntryStatus, number>> | null>(null);
   let cseq = 0;
@@ -142,11 +163,16 @@
     set(errorText(e));
   }
 
-  /** Пространство, для которого заданы фильтры: другое — фильтры и выдача сбрасываются. */
+  /** Пространство, для которого заданы фильтры: другое — фильтры и выдача сбрасываются. Эффект
+   * перезапускается на каждый переход (свойства — из объекта маршрута): открытие идеи ленту не
+   * перечитывает, а неудавшуюся загрузку — повторяет с прежними фильтрами. */
   let filtersFor = '';
   $effect(() => {
     const key = JSON.stringify([user, space]);
-    if (key === filtersFor) return;
+    if (key === filtersFor) {
+      if (failed) untrack(() => load(user, space, true));
+      return;
+    }
     filtersFor = key;
     untrack(() => {
       seq++;
@@ -194,7 +220,10 @@
     const my = ++seq;
     loading = true;
     error = '';
-    if (reset) loadCounts(u, s);
+    if (reset) {
+      failed = false;
+      loadCounts(u, s);
+    }
     const statuses = chipStatuses(chip);
     try {
       if (applied.query) {
@@ -224,6 +253,7 @@
       if (reset) {
         items = [];
         hits = null;
+        failed = true;
       }
       fail(e, (m) => (error = m));
     } finally {
@@ -273,10 +303,28 @@
     }
   }
 
+  /** «Показать ещё»: на время загрузки кнопка остаётся (`aria-disabled`), фокус на ней цел;
+   * страниц больше нет и кнопка ушла — фокус на первую догруженную запись. */
+  async function more(e: MouseEvent) {
+    if (loading) return;
+    const btn = e.currentTarget as HTMLElement;
+    const n = items.length;
+    await load(user, space, false);
+    await tick();
+    const a = document.activeElement;
+    const first = items[n]?.id;
+    if (btn.isConnected || (a && a !== document.body) || !first) return;
+    document.querySelector<HTMLElement>(`[data-idea="${CSS.escape(first)}"] button`)?.focus();
+  }
+
+  /** Открыть идею: новая запись истории — «назад» браузера возвращает к ленте (§5.1 п. 5). */
   function select(id: string) {
     notice = '';
-    go({ name: 'journal', user, space, journal: 'ideas', entry: id }, { replace: true });
+    go({ name: 'journal', user, space, journal: 'ideas', entry: id });
   }
+
+  /** Карточка или форма создания показана (рядом с лентой или вместо неё). */
+  let detailOpen = $derived(cur !== null || curError !== '' || mode === 'create');
 
   function selectTab(t: Tab) {
     if (tab === t) return;
@@ -442,14 +490,34 @@
   const taskHref = (id: string, sp = taskSpace ?? space) => href({ name: 'journal', user, space: sp, journal: 'tasks', entry: id });
   const questionHref = (id: string) => href({ name: 'journal', user, space, journal: 'questions', entry: id });
   let filtered = $derived(!!(applied.tag || applied.query || chip !== 'active'));
+  /** Число раздела: «показано из» счётчика сервера, если загружены не все. */
+  const shownOf = (shown: number, total: number | undefined) =>
+    total !== undefined && total !== shown ? `${shown} из ${total}` : String(shown);
 </script>
 
-<section class="journal ideas">
+<section class="journal ideas" use:observeWidth={(w) => (width = w)}>
+  <!-- лента и карточка — рядом в широкой области, карточка вместо ленты в узкой (§5.2 п. 2) -->
+  <JournalSplit
+    open={detailOpen}
+    back={{ href: href({ name: 'journal', user, space, journal: 'ideas', entry: null }), label: JOURNAL_TITLE.ideas }}
+    onclose={closeForm}
+    {entry}
+  >
+    {#snippet list()}
+      {@render ideasList()}
+    {/snippet}
+    {#snippet detail()}
+      {@render ideaDetail()}
+    {/snippet}
+  </JournalSplit>
+</section>
+
+<Prompt bind:ask />
+
+{#snippet ideasList()}
   <div class="row bar">
     <button type="button" class="primary" onclick={() => show('create')}>Новая идея</button>
   </div>
-
-  {#if mode === 'create'}{@render form('create')}{/if}
 
   <div class="tabs" role="tablist" aria-label="Происхождение идей">
     {#each TABS as t, i (t.id)}
@@ -468,17 +536,31 @@
   </div>
 
   <div role="tabpanel" id={`${uid}-panel`} aria-labelledby={`${uid}-tab-${tab}`}>
-    <div class="row chips">
-      <div class="row" role="group" aria-label="Статус идей">
+    <div class="chips">
+      <!-- чипы — полоса: одна строка с прокруткой на телефоне и планшете (§5.1 п. 4) -->
+      <div class="strip status-chips" role="group" aria-label="Статус идей" use:revealSelected={chip}>
         {#each IDEA_CHIPS as ch (ch.id)}
           <button type="button" class="schip" aria-pressed={chip === ch.id} data-chip={ch.id} onclick={() => pickChip(ch.id)}>
             {chipTitle(ch.id)}{#if counts && !applied.query}{' '}<span class="count">{chipCount(ch.id, counts)}</span>{/if}
           </button>
         {/each}
       </div>
-      <label class="row small"><input type="checkbox" bind:checked={grouped} /> Группировать по статусу</label>
+      <div class="row">
+        <label class="row small"><input type="checkbox" bind:checked={grouped} /> Группировать по статусу</label>
+        {#if phone}
+          <button
+            type="button"
+            class="filters-toggle"
+            aria-expanded={filtersOpen}
+            aria-controls={`${uid}-filters`}
+            onclick={() => (filtersOpen = !filtersOpen)}
+            >Фильтры{#if activeFilters}{' '}<span class="count">{activeFilters}</span>{/if}</button
+          >
+        {/if}
+      </div>
     </div>
-    <form class="filters row" onsubmit={apply} aria-label="Фильтры идей">
+    <!-- на телефоне — под кнопкой «Фильтры» (§5.2 п. 2) -->
+    <form id={`${uid}-filters`} class="filters row" hidden={phone && !filtersOpen} onsubmit={apply} aria-label="Фильтры идей">
       <label class="row">
         Приоритет
         <select bind:value={priority} onchange={() => load(user, space, true)} aria-label="Приоритет идей">
@@ -504,23 +586,24 @@
 
     {#if grouped}
       <!-- разделы в порядке чипов, у каждого — своя лента (в role=feed — только статьи); поиск и
-           лента не бывают вместе; число в заголовке — «показано из» счётчика сервера -->
+           лента не бывают вместе; число в заголовке — «показано из» счётчика сервера; в узкой
+           области — аккордеон, открыт первый (непустой) раздел -->
       <div class="groups">
-        {#each groupByStatus(hits ?? []) as g (g.status)}
-          <section class="group" aria-label={`Раздел «${statusText(g.status)}»`} data-group={g.status}>
-            {@render head(g.status, g.items.length, undefined)}
+        {#each groupByStatus(hits ?? []) as g, i (g.status)}
+          {#snippet feed()}
             <div class="feed" role="feed" aria-label={`Идеи раздела «${statusText(g.status)}»`} aria-busy={loading}>
               {#each g.items as h (h.entry_id)}{@render hit(h)}{/each}
             </div>
-          </section>
+          {/snippet}
+          {@render group(g.status, i === 0, g.items.length, undefined, feed)}
         {/each}
-        {#each groupByStatus(items) as g (g.status)}
-          <section class="group" aria-label={`Раздел «${statusText(g.status)}»`} data-group={g.status}>
-            {@render head(g.status, g.items.length, counts?.[g.status as EntryStatus])}
+        {#each groupByStatus(items) as g, i (g.status)}
+          {#snippet feed()}
             <div class="feed" role="feed" aria-label={`Идеи раздела «${statusText(g.status)}»`} aria-busy={loading}>
               {#each g.items as it (it.id)}{@render row(it)}{/each}
             </div>
-          </section>
+          {/snippet}
+          {@render group(g.status, i === 0, g.items.length, counts?.[g.status as EntryStatus], feed)}
         {/each}
       </div>
     {:else}
@@ -532,12 +615,15 @@
     {#if !loading && !error && !(hits ?? items).length}
       <p class="muted">{hits ? 'Ничего не найдено.' : filtered ? 'Идей по выбранным фильтрам нет.' : 'Идей нет.'}</p>
     {/if}
-    {#if next && !loading}
-      <button type="button" onclick={() => load(user, space, false)}>Показать ещё</button>
+    {#if next}
+      <button type="button" class="more" aria-disabled={loading} aria-busy={loading} onclick={more}>Показать ещё</button>
     {/if}
     {#if loading}<p class="muted">Загрузка…</p>{/if}
   </div>
+{/snippet}
 
+{#snippet ideaDetail()}
+  {#if mode === 'create'}{@render form('create')}{/if}
   {#if curError}<p class="error" role="alert">{curError}</p>{/if}
   {#if cur}
     {@const c = cur}
@@ -632,12 +718,25 @@
       {/if}
     </article>
   {/if}
-</section>
-
-<Prompt bind:ask />
+{/snippet}
 
 {#snippet head(status: string, shown: number, total: number | undefined)}
-  <h3>{statusText(status)} <span class="muted small">{total !== undefined && total !== shown ? `${shown} из ${total}` : shown}</span></h3>
+  <h3>{statusText(status)} <span class="muted small">{shownOf(shown, total)}</span></h3>
+{/snippet}
+
+<!-- раздел «Группировать по статусу»: в узкой области — `<details>` (число — в заголовке) -->
+{#snippet group(status: string, first: boolean, shown: number, total: number | undefined, feed: Snippet)}
+  {#if narrow}
+    <details class="group acc" data-group={status} open={first}>
+      <summary>{statusText(status)} <span class="muted small">{shownOf(shown, total)}</span></summary>
+      {@render feed()}
+    </details>
+  {:else}
+    <section class="group" aria-label={`Раздел «${statusText(status)}»`} data-group={status}>
+      {@render head(status, shown, total)}
+      {@render feed()}
+    </section>
+  {/if}
 {/snippet}
 
 {#snippet hit(h: SearchItem)}
@@ -709,9 +808,10 @@
       />
     {/key}
   {:catch e}
-    <!-- чанк формы не пришёл: сервер обновился (у чанков новые имена) или нет сети -->
-    <p class="error" role="alert">Форма не загрузилась: {errorText(e)} — обновите страницу</p>
-    <button type="button" onclick={closeForm}>Отмена</button>
+    <!-- чанк формы не пришёл: сервер обновился (у чанков новые имена) или нет сети (§5.1 п. 9) -->
+    <LazyFail error={e} label="Форма не загрузилась" hint="обновите страницу">
+      <button type="button" onclick={closeForm}>Отмена</button>
+    </LazyFail>
   {/await}
 {/snippet}
 
@@ -721,6 +821,10 @@
 {/snippet}
 
 <style>
+  .more[aria-disabled='true'] {
+    opacity: 0.5;
+    cursor: default;
+  }
   .bar {
     margin-bottom: 8px;
   }
@@ -741,8 +845,59 @@
     color: var(--accent);
   }
   .chips {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
     justify-content: space-between;
+    gap: 8px;
     margin-bottom: 8px;
+  }
+  .status-chips {
+    min-width: 0;
+    max-width: 100%;
+    gap: 6px;
+  }
+  /* при касании — зазор между чипами полосы (`--touch-gap`, app.css) */
+  @media (pointer: coarse) {
+    .status-chips {
+      gap: var(--touch-gap);
+    }
+  }
+  .filters[hidden] {
+    display: none;
+  }
+  .acc {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0 8px;
+  }
+  .acc[open] {
+    padding-bottom: 8px;
+  }
+  .acc summary {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 36px;
+    font-weight: 600;
+    font-size: 14px;
+    cursor: pointer;
+    list-style: none;
+  }
+  .acc summary::-webkit-details-marker {
+    display: none;
+  }
+  .acc summary::before {
+    content: '▸';
+    color: var(--muted);
+  }
+  .acc[open] > summary::before {
+    content: '▾';
+  }
+  @media (pointer: coarse) {
+    .acc summary {
+      min-height: 44px;
+    }
   }
   .schip {
     padding: 2px 10px;
@@ -822,7 +977,7 @@
     font-size: 12px;
   }
   .card {
-    margin-top: 16px;
+    margin-top: 4px;
   }
   .card h2 {
     margin: 0 0 4px;

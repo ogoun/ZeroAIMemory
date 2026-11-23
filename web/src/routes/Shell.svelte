@@ -222,7 +222,11 @@
     // Esc окна и меню (`role="dialog"`, `role="menu"`; меню аккаунта отмечает свой Esc
     // обработанным) закрывает их, а не панель
     if (e.target instanceof Element && e.target.closest('[role="dialog"], [role="menu"]')) return;
-    if (drawer) drawer = false;
+    // Esc закрыл панель — обработан: слой ниже (панель карточки доски, JournalSplit) его не берёт
+    if (drawer) {
+      drawer = false;
+      e.preventDefault();
+    }
   }
 
   /** Заголовок текущего раздела — в шапке телефона (разделы там — в панели). */

@@ -1,13 +1,15 @@
 // Узкие экраны и сенсорный ввод (M7.2, спецификация §5.1): классы ширины (шапка, выдвижная
 // панель, дерево), цели касания 44 px, полоса журналов, «список — карточка» (`JournalSplit`) в
-// «Словаре», сбой ленивого чанка, отсутствие горизонтальной прокрутки. Сессия — общая
+// «Словаре», «Идеи» (аккордеон разделов, фильтры под кнопкой) и «Insights» (компактная таблица) на
+// телефоне (§5.2 пп. 2–3; доска задач — tasks.spec.ts), сбой ленивого чанка, отсутствие
+// горизонтальной прокрутки. Сессия — общая
 // администратора; на телефоне «Выйти» — в меню аккаунта, поэтому сценарии ждут оболочку по кнопке
 // «Поиск» (есть на всех классах ширины). Размеры и помощники — viewports.ts, адреса — mobile-pages.ts.
 import { expect, test, type Browser, type Locator, type Page } from '@playwright/test';
 import { mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { PAGES, env, pageCtx } from './mobile-pages';
-import { SOLUTION_GUID } from './seed';
+import { IDEAS_GUID, SOLUTION_GUID } from './seed';
 import { ADMIN_STATE } from './session';
 import { VIEWPORTS, minGap, minTarget, noHorizontalScroll, touch, type ViewportName } from './viewports';
 
@@ -17,7 +19,7 @@ const screens = fileURLToPath(new URL('../../.tmp/e2e/screens/mobile/', import.m
 test.use({ storageState: ADMIN_STATE });
 
 /** Ошибки JS, CSP и неожиданные HTTP-ответы страницы. */
-function watch(page: Page): string[] {
+function watch(page: Page, allow: (path: string, status: number) => boolean = () => false): string[] {
   const problems: string[] = [];
   page.on('console', (m) => {
     if (m.type() === 'error' && !m.text().startsWith('Failed to load resource')) problems.push(m.text());
@@ -27,7 +29,8 @@ function watch(page: Page): string[] {
     const path = new URL(r.url()).pathname;
     const expected =
       (r.status() === 401 && path.endsWith('/api/v1/auth/me')) ||
-      (r.status() === 404 && path.endsWith('/favicon.ico'));
+      (r.status() === 404 && path.endsWith('/favicon.ico')) ||
+      allow(path, r.status());
     if (r.status() >= 400 && !expected) problems.push(`HTTP ${r.status()} ${r.request().method()} ${path}`);
   });
   return problems;
@@ -356,6 +359,167 @@ test.describe('телефон, сенсорный ввод', () => {
     expect(dProblems, dProblems.join('\n')).toEqual([]);
     await ctx.close();
   });
+
+  test('ideas_groups_accordion_phone', async ({ page }) => {
+    // «Идеи» на телефоне (§5.2 п. 2): фильтры под кнопкой «Фильтры», чипы — полоса, «Группировать
+    // по статусу» — аккордеон `<details>`: открыт первый непустой раздел, число — в заголовке
+    const problems = watch(page);
+    const labels: Record<string, string> = {
+      new: 'Непросмотрено',
+      returned: 'На доработку',
+      accepted: 'В плане',
+      declined: 'Отклонена',
+      done: 'Сделано',
+      deferred: 'Отложена',
+      proposed: 'Предложена',
+    };
+    const counts = await api<Record<string, number>>('GET', `spaces/${IDEAS_GUID}/entries/counts?kind=idea&origin=human`);
+    const c = await pageCtx(page);
+    await open(page, `#/u/${c.user}/s/${IDEAS_GUID}/j/ideas`);
+    await expect(page.getByRole('feed', { name: 'Лента идей' })).toBeVisible();
+
+    const filters = page.getByRole('form', { name: 'Фильтры идей' });
+    await expect(filters).toBeHidden();
+    const toggle = page.getByRole('button', { name: /^Фильтры/ });
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await minTarget(toggle, 44);
+    await toggle.tap();
+    await expect(filters).toBeVisible();
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    await expect(page.getByLabel('Приоритет идей')).toBeVisible();
+    await toggle.tap();
+    await expect(filters).toBeHidden();
+
+    // чипы — одна строка с прокруткой внутри полосы
+    const chips = page.getByRole('group', { name: 'Статус идей' });
+    const boxes = await chips.getByRole('button').evaluateAll((els) => els.map((e) => e.getBoundingClientRect().top));
+    expect(boxes.every((t) => Math.abs(t - boxes[0]) < 1), 'чипы — одна строка').toBe(true);
+    expect(await chips.evaluate((s) => s.scrollWidth > s.clientWidth), 'полоса чипов прокручивается').toBe(true);
+    await minTarget(chips.getByRole('button'), 44);
+    await minGap(chips.getByRole('button'), 8);
+
+    await chips.getByRole('button', { name: /^Все/ }).tap();
+    await expect(chips.getByRole('button', { name: /^Все/ })).toHaveAttribute('aria-pressed', 'true');
+    await page.getByLabel('Группировать по статусу').check();
+    const groups = page.locator('details[data-group]');
+    const expected = Object.keys(labels).filter((s) => (counts[s] ?? 0) > 0);
+    expect(expected.length).toBeGreaterThan(1);
+    await expect(groups).toHaveCount(expected.length);
+    expect(await groups.evaluateAll((els) => els.map((e) => e.getAttribute('data-group')))).toEqual(expected);
+    // число — сервера («k из N», если загружены не все)
+    await expect(groups.locator('summary')).toHaveText(expected.map((s) => new RegExp(`^${labels[s]} (\\d+ из )?${counts[s]}$`)));
+    expect(await groups.evaluateAll((els) => els.map((e) => (e as HTMLDetailsElement).open))).toEqual(expected.map((_, i) => i === 0));
+    const feedOf = (s: string) => page.getByRole('feed', { name: `Идеи раздела «${labels[s]}»` });
+    await expect(feedOf(expected[0])).toBeVisible();
+    await expect(feedOf(expected[1])).toBeHidden();
+    // раскрытие раздела касанием заголовка
+    await groups.nth(1).locator('summary').tap();
+    await expect(feedOf(expected[1])).toBeVisible();
+    await minTarget(groups.locator('summary'), 44);
+    expect(await noHorizontalScroll(page)).toBe(true);
+    await page.screenshot({ path: `${screens}phone-ideas-accordion.png`, fullPage: true });
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+
+  test('insights_compact_rows_phone', async ({ page, browser }) => {
+    // «Insights» на телефоне (§5.2 п. 3): та же таблица (строки считаются), «Вид», «Область»,
+    // «Показы», «Изменено» скрыты, их значения — под заголовком; условие — ширина области журнала.
+    // Открытие записи фильтры не сбрасывает; сбой загрузки повторяется с прежними фильтрами.
+    const problems = watch(page, (path, status) => status === 500 && path.endsWith('/entries'));
+    type Row = {
+      id: string;
+      area: string | null;
+      certainty: string | null;
+      data: { kind?: string };
+      usage?: { shown: number; useful: number; useless: number };
+    };
+    const all = await api<{ items: Row[] }>('GET', `spaces/${SOLUTION_GUID}/entries?kind=insight&limit=100`);
+    expect(all.items.length).toBeGreaterThan(2);
+    const c = await pageCtx(page);
+    const url = `#/u/${c.user}/s/${SOLUTION_GUID}/j/insights`;
+    await open(page, url);
+    const table = page.getByRole('table', { name: 'Insights' });
+    await expect(table.locator('tbody tr')).toHaveCount(all.items.length);
+    await expect(table.getByRole('columnheader')).toHaveText(['Надёжность', 'Заголовок', 'Статус']);
+    await expect(table.locator('tbody tr').first().getByRole('cell')).toHaveCount(3);
+    const x = all.items.find((i) => i.area && i.data.kind) ?? all.items[0];
+    const meta = table.locator(`tr[data-entry="${x.id}"]`).getByTestId('row-meta');
+    if (x.data.kind) await expect(meta).toContainText(x.data.kind);
+    if (x.area) await expect(meta).toContainText(x.area);
+    const u = x.usage ?? { shown: 0, useful: 0, useless: 0 };
+    await expect(meta).toContainText(`показы ${u.shown} / ${u.useful} / ${u.useless}`);
+    expect(await noHorizontalScroll(page)).toBe(true);
+    await page.screenshot({ path: `${screens}phone-insights.png`, fullPage: true });
+    // открытая запись — карточка вместо таблицы, «← Insights» — таблица прежняя
+    await table.locator(`tr[data-entry="${x.id}"]`).getByRole('button').first().tap();
+    await expect(page.getByRole('article', { name: 'Карточка insight' })).toBeVisible();
+    await expect(table).toBeHidden();
+    await page.getByRole('link', { name: '← Insights' }).tap();
+    await expect(table.locator('tbody tr')).toHaveCount(all.items.length);
+
+    // фильтр цел после открытия записи и возврата: таблица не перечитывается и не сбрасывается
+    const lists: string[] = [];
+    page.on('request', (r) => {
+      const u = new URL(r.url());
+      if (u.pathname.endsWith(`/spaces/${SOLUTION_GUID}/entries`) && u.searchParams.get('kind') === 'insight') lists.push(u.search);
+    });
+    const ofCertainty = (cert: string) => all.items.filter((i) => i.certainty === cert);
+    const hyp = ofCertainty('hypothesis');
+    expect(hyp.length).toBeGreaterThan(0);
+    const certainty = page.getByLabel('Надёжность', { exact: true });
+    await certainty.selectOption('hypothesis');
+    await expect(table.locator('tbody tr')).toHaveCount(hyp.length);
+    const n = lists.length;
+    await table.locator(`tr[data-entry="${hyp[0].id}"]`).getByRole('button').first().tap();
+    await expect(page.getByRole('article', { name: 'Карточка insight' })).toBeVisible();
+    await page.getByRole('link', { name: '← Insights' }).tap();
+    await expect(certainty).toHaveValue('hypothesis');
+    await expect(table.locator('tbody tr')).toHaveCount(hyp.length);
+    expect(lists.length, 'таблица не перечитывалась').toBe(n);
+
+    // сбой загрузки — следующий переход повторяет её с прежними фильтрами
+    let fail = true;
+    await page.route(/\/entries\?.*kind=insight/, async (route) => {
+      if (!fail) return route.continue();
+      fail = false;
+      await route.fulfill({ status: 500, contentType: 'text/plain', body: 'сбой для теста' });
+    });
+    const thm = ofCertainty('theorem');
+    await certainty.selectOption('theorem');
+    await expect(page.locator('section.insights').getByRole('alert')).toBeVisible();
+    await expect(table.locator('tbody tr')).toHaveCount(0);
+    await page.evaluate((h) => (location.hash = h), `${url}/${thm[0]?.id ?? x.id}`);
+    await expect(page.getByRole('article', { name: 'Карточка insight' })).toBeVisible();
+    await page.getByRole('link', { name: '← Insights' }).tap();
+    await expect(certainty).toHaveValue('theorem');
+    await expect(table.locator('tbody tr')).toHaveCount(thm.length);
+    await expect(page.locator('section.insights').getByRole('alert')).toHaveCount(0);
+    await page.unroute(/\/entries\?.*kind=insight/);
+    expect(problems, problems.join('\n')).toEqual([]);
+
+    // 1280 × 720 с открытой карточкой: колонка списка рядом с карточкой уже 720 px, но область
+    // журнала шире — таблица полная
+    const ctx = await browser.newContext({ storageState: ADMIN_STATE, viewport: { width: 1280, height: 720 }, hasTouch: false, isMobile: false });
+    const dp = await ctx.newPage();
+    const dProblems = watch(dp);
+    await open(dp, `${url}/${x.id}`);
+    await expect(dp.locator('.jsplit')).toHaveAttribute('data-layout', 'split');
+    await expect(dp.getByRole('article', { name: 'Карточка insight' })).toBeVisible();
+    const dt = dp.getByRole('table', { name: 'Insights' });
+    expect((await dp.locator('.jsplit-list').boundingBox())!.width, 'колонка списка').toBeLessThan(720);
+    await expect(dt.getByRole('columnheader')).toHaveText([
+      'Надёжность',
+      'Заголовок',
+      'Вид',
+      'Статус',
+      'Область',
+      'Показы / полезно / бесполезно',
+      'Изменено',
+    ]);
+    await expect(dt.getByTestId('row-meta')).toHaveCount(0);
+    expect(dProblems, dProblems.join('\n')).toEqual([]);
+    await ctx.close();
+  });
 });
 
 test.describe('планшет, сенсорный ввод', () => {
@@ -531,6 +695,32 @@ test('frame_no_horizontal_scroll', async ({ browser }) => {
       await page.waitForFunction(() => document.getAnimations().every((a) => a.playState !== 'running'));
       if (!(await noHorizontalScroll(page))) wide.push(`${v} ${VIEWPORTS[v].width}: ${p.name}`);
       await page.screenshot({ path: `${screens}frame-${v}-${p.name}.png`, fullPage: true });
+    }
+    expect(problems, `${v}: ${problems.join('\n')}`).toEqual([]);
+    await ctx.close();
+  }
+  expect(wide, 'горизонтальная прокрутка страницы').toEqual([]);
+});
+
+test('journals_split_no_horizontal_scroll', async ({ browser }) => {
+  // Задачи, Идеи, Insights (§5.2 пп. 1–3): без горизонтальной прокрутки на узком телефоне,
+  // планшете и ноутбуке (область 700 px — вкладки доски и компактная таблица)
+  test.setTimeout(120_000);
+  mkdirSync(screens, { recursive: true });
+  const pages = PAGES.filter((p) => ['задачи', 'идеи', 'insights'].includes(p.name));
+  expect(pages).toHaveLength(3);
+  const wide: string[] = [];
+  for (const v of ['phoneS', 'tablet', 'laptop'] as ViewportName[]) {
+    const ctx = await contextAt(browser, v);
+    const page = await ctx.newPage();
+    const problems = watch(page);
+    const c = await pageCtx(page);
+    for (const p of pages) {
+      await open(page, p.path(c));
+      await expect(page.locator('.jsplit')).toBeVisible();
+      await expect(page.getByText('Загрузка…')).toHaveCount(0);
+      if (!(await noHorizontalScroll(page))) wide.push(`${v} ${VIEWPORTS[v].width}: ${p.name}`);
+      await page.screenshot({ path: `${screens}journal-${v}-${p.name}.png`, fullPage: true });
     }
     expect(problems, `${v}: ${problems.join('\n')}`).toEqual([]);
     await ctx.close();

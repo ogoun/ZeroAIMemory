@@ -44,8 +44,8 @@ export const observeWidth: Action<HTMLElement, (w: number) => void> = (node, cb)
 };
 
 /**
- * Полоса (`.strip`, прокрутка вбок): выбранный пункт (`aria-current="page"` или
- * `aria-selected="true"`) — в видимой части полосы. `key` — что выбрано: смена прокручивает
+ * Полоса (`.strip`, прокрутка вбок): выбранный пункт (`aria-current="page"`,
+ * `aria-selected="true"` или нажатый чип `aria-pressed="true"`) — в видимой части полосы. `key` — что выбрано: смена прокручивает
  * полосу снова; изменение ширины полосы (поворот, окно) — тоже. Страница при этом не
  * прокручивается.
  */
@@ -54,7 +54,7 @@ export const revealSelected: Action<HTMLElement, unknown> = (node) => {
   const reveal = () => {
     cancelAnimationFrame(frame);
     frame = requestAnimationFrame(() => {
-      const el = node.querySelector<HTMLElement>('[aria-current="page"], [aria-selected="true"]');
+      const el = node.querySelector<HTMLElement>('[aria-current="page"], [aria-selected="true"], [aria-pressed="true"]');
       if (!el || node.scrollWidth <= node.clientWidth) return;
       // координаты пункта внутри прокручиваемого содержимого полосы
       const box = node.getBoundingClientRect();

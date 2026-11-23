@@ -2,6 +2,7 @@
 // страницы «Код» и исходник Mermaid «Обзора». Символ адресуется постоянным `путь#qual`
 // (`symbol.ref`): id символа меняется при перезагрузке файла.
 import { call } from './api';
+import { plural } from './plural';
 
 export interface CodeCentral {
   id: number;
@@ -220,14 +221,8 @@ export function ageText(secs: number): string {
   return `${Math.floor(s / 86_400)} дн. назад`;
 }
 
-/** Склонение: 1 файл, 2 файла, 5 файлов. */
-export function plural(n: number, one: string, few: string, many: string): string {
-  const d = n % 10;
-  const h = n % 100;
-  if (d === 1 && h !== 11) return one;
-  if (d >= 2 && d <= 4 && (h < 12 || h > 14)) return few;
-  return many;
-}
+/** Склонение: 1 файл, 2 файла, 5 файлов — общее правило WebUI (`plural.ts`). */
+export { plural };
 
 export const filesText = (n: number) => `${n} ${plural(n, 'файл', 'файла', 'файлов')}`;
 export const symbolsText = (n: number) => `${n} ${plural(n, 'символ', 'символа', 'символов')}`;

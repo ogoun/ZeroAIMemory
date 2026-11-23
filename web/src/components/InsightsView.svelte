@@ -5,9 +5,14 @@
   // (author_kind = human). Правка идёт с ревизией открытой записи (If-Match, §11.3): запись
   // изменилась — 409, карточка перечитывается. Столбец «показы / полезно / бесполезно» и
   // кнопки оценки (`POST /entries/{id}/feedback`, источник `webui`, §10.5).
-  import { untrack } from 'svelte';
+  // Узкие экраны (M7.2, спецификация §5.2 п. 3): таблица и карточка — `JournalSplit` (рядом или
+  // карточка вместо таблицы); в области журнала уже 720 px таблица остаётся таблицей (те же строки
+  // и ячейки), столбцы «Вид», «Область», «Показы», «Изменено» скрыты, их значения — строкой под
+  // заголовком. Условие — ширина области журнала, а не колонки списка рядом с карточкой.
+  import { tick, untrack } from 'svelte';
   import CertaintyBadge from './CertaintyBadge.svelte';
   import FileRefs from './FileRefs.svelte';
+  import JournalSplit from './JournalSplit.svelte';
   import Links from './Links.svelte';
   import {
     ApiError,
@@ -34,6 +39,7 @@
     CERTAINTY_TEXT,
     DECIDED_BY_TEXT,
     INSIGHT_KINDS,
+    JOURNAL_TITLE,
     STATUSES,
     STATUS_TEXT,
     TRIGGER_TEXT,
@@ -46,7 +52,9 @@
     fmtTime,
     type Adr,
   } from '../lib/journals';
-  import { go } from '../lib/router';
+  import { BP_TABLET } from '../lib/layout';
+  import { go, href } from '../lib/router';
+  import { observeWidth } from '../lib/viewport.svelte';
   import { supersedeData } from '../lib/adrData';
 
   interface Props {
@@ -77,6 +85,9 @@
   let fHuman = $state(false);
   let refs = $state<RefsByTarget>(new Map());
   let seq = 0;
+  /** Ширина области журнала (CSS px); уже 720 px — компактная таблица (§5.2 п. 3). */
+  let width = $state(0);
+  let compact = $derived(width > 0 && width < BP_TABLET);
 
   // ---- карточка ----
   let cur = $state<Entry | null>(null);
@@ -133,10 +144,22 @@
     set(errorText(e));
   }
 
+  // Таблица — заново только при смене пользователя или пространства: свойства приходят из объекта
+  // маршрута, и эффект перезапускается на каждый переход (открытие записи) — фильтры, загруженные
+  // страницы и прокрутка при этом целы (§5.1 п. 5); неудавшаяся загрузка повторяется при следующем
+  // переходе с прежними фильтрами.
+  let listOf = '';
+  /** Первая страница таблицы не загрузилась: следующий переход повторит загрузку. */
+  let failed = false;
   $effect(() => {
     const u = user;
     const s = space;
     untrack(() => {
+      if (listOf === `${u}|${s}`) {
+        if (failed) load(u, s, true);
+        return;
+      }
+      listOf = `${u}|${s}`;
       fKind = '';
       fStatus = '';
       fCertainty = '';
@@ -144,11 +167,19 @@
       fTag = '';
       fHuman = false;
       load(u, s, true);
-      loadRefs(u, s).then((r) => {
-        if (u === user && s === space) refs = r;
-      });
+      reloadRefs();
     });
   });
+
+  /** Ссылки на файлы записей («возможно устарело»): при входе в журнал и после правки (новая
+   * запись замены приходит со своими ссылками). */
+  function reloadRefs() {
+    const u = user;
+    const s = space;
+    loadRefs(u, s).then((r) => {
+      if (u === user && s === space) refs = r;
+    });
+  }
 
   $effect(() => {
     const id = entry;
@@ -160,6 +191,7 @@
     const my = ++seq;
     loading = true;
     error = '';
+    if (reset) failed = false;
     try {
       const r = await listEntries(u, s, {
         kind: 'insight',
@@ -177,7 +209,10 @@
       next = r.next_cursor;
     } catch (e) {
       if (my !== seq) return;
-      if (reset) items = [];
+      if (reset) {
+        items = [];
+        failed = true;
+      }
       fail(e, (m) => (error = m));
     } finally {
       if (my === seq) loading = false;
@@ -272,10 +307,28 @@
     }
   }
 
+  /** «Показать ещё»: на время загрузки кнопка остаётся (`aria-disabled`), фокус на ней цел;
+   * страниц больше нет и кнопка ушла — фокус на первую догруженную запись. */
+  async function more(e: MouseEvent) {
+    if (loading) return;
+    const btn = e.currentTarget as HTMLElement;
+    const n = items.length;
+    await load(user, space, false);
+    await tick();
+    const a = document.activeElement;
+    const first = items[n]?.id;
+    if (btn.isConnected || (a && a !== document.body) || !first) return;
+    document.querySelector<HTMLElement>(`tr[data-entry="${CSS.escape(first)}"] button`)?.focus();
+  }
+
+  /** Открыть запись: новая запись истории — «назад» браузера возвращает к таблице (§5.1 п. 5). */
   function select(id: string) {
     notice = '';
-    go({ name: 'journal', user, space, journal: 'insights', entry: id }, { replace: true });
+    go({ name: 'journal', user, space, journal: 'insights', entry: id });
   }
+
+  /** Карточка показана (рядом с таблицей или вместо неё). */
+  let detailOpen = $derived(cur !== null || curError !== '');
 
   /** Действие над карточкой: ошибка — понятным текстом, успех — перечитать. */
   async function act(fn: () => Promise<string | void>, done: string) {
@@ -287,6 +340,7 @@
       const target = (await fn()) ?? cur?.id ?? null;
       mode = 'none';
       await reloadList();
+      reloadRefs();
       if (target && target !== entry) {
         select(target);
       } else {
@@ -454,7 +508,23 @@
   };
 </script>
 
-<section class="journal insights">
+<section class="journal insights" use:observeWidth={(w) => (width = w)}>
+  <!-- таблица и карточка — рядом в широкой области, карточка вместо таблицы в узкой (§5.2 п. 3) -->
+  <JournalSplit
+    open={detailOpen}
+    back={{ href: href({ name: 'journal', user, space, journal: 'insights', entry: null }), label: JOURNAL_TITLE.insights }}
+    {entry}
+  >
+    {#snippet list()}
+      {@render table()}
+    {/snippet}
+    {#snippet detail()}
+      {@render insightDetail()}
+    {/snippet}
+  </JournalSplit>
+</section>
+
+{#snippet table()}
   <form class="filters row" onsubmit={applyText}>
     <label class="row">
       Вид
@@ -491,8 +561,11 @@
     <table aria-label="Insights">
       <thead>
         <tr>
-          <th>Надёжность</th><th>Заголовок</th><th>Вид</th><th>Статус</th><th>Область</th>
-          <th title="Показы подсказками / полезно / бесполезно">Показы / полезно / бесполезно</th><th>Изменено</th>
+          <th>Надёжность</th><th>Заголовок</th>{#if !compact}<th>Вид</th>{/if}<th>Статус</th>
+          {#if !compact}
+            <th>Область</th>
+            <th title="Показы подсказками / полезно / бесполезно">Показы / полезно / бесполезно</th><th>Изменено</th>
+          {/if}
         </tr>
       </thead>
       <tbody>
@@ -505,12 +578,20 @@
               {#if staleOf(refs.get(entryRef('insight', e.id))).length}
                 <span class="chip stale" title={staleText(staleOf(refs.get(entryRef('insight', e.id))))}>возможно устарело</span>
               {/if}
+              {#if compact}
+                <!-- скрытые столбцы — строкой под заголовком -->
+                <div class="muted small row-meta" data-testid="row-meta">
+                  {[dataStr(e.data, 'kind'), e.area ?? '', `показы ${usageText(e.usage)}`, fmtTime(e.updated_at)].filter(Boolean).join(' · ')}
+                </div>
+              {/if}
             </td>
-            <td>{dataStr(e.data, 'kind')}</td>
+            {#if !compact}<td>{dataStr(e.data, 'kind')}</td>{/if}
             <td>{e.status ? STATUS_TEXT[e.status] : ''}</td>
-            <td>{e.area ?? ''}</td>
-            <td class="usage">{usageText(e.usage)}</td>
-            <td class="muted">{fmtTime(e.updated_at)}</td>
+            {#if !compact}
+              <td>{e.area ?? ''}</td>
+              <td class="usage">{usageText(e.usage)}</td>
+              <td class="muted">{fmtTime(e.updated_at)}</td>
+            {/if}
           </tr>
         {/each}
       </tbody>
@@ -518,10 +599,12 @@
   </div>
   {#if !loading && items.length === 0 && !error}<p class="muted">Записей нет.</p>{/if}
   {#if loading}<p class="muted">Загрузка…</p>{/if}
-  {#if next && !loading}
-    <button type="button" onclick={() => load(user, space, false)}>Показать ещё</button>
+  {#if next}
+    <button type="button" class="more" aria-disabled={loading} aria-busy={loading} onclick={more}>Показать ещё</button>
   {/if}
+{/snippet}
 
+{#snippet insightDetail()}
   {#if curError}<p class="error" role="alert">{curError}</p>{/if}
   {#if cur}
     {@const c = cur}
@@ -709,7 +792,7 @@
       </div>
     </article>
   {/if}
-</section>
+{/snippet}
 
 {#snippet adrFields()}
   <fieldset class="adr-form">
@@ -738,17 +821,22 @@
 {/snippet}
 
 <style>
+  .more[aria-disabled='true'] {
+    opacity: 0.5;
+    cursor: default;
+  }
   .filters {
     margin-bottom: 12px;
   }
   .filters label {
     gap: 6px;
   }
-  .filters input {
+  .filters input:not([type='checkbox']) {
     width: 130px;
   }
-  .table-wrap {
-    overflow-x: auto;
+  .row-meta {
+    margin-top: 2px;
+    overflow-wrap: anywhere;
   }
   .usage {
     white-space: nowrap;
@@ -783,7 +871,7 @@
     font-size: 12px;
   }
   .card {
-    margin-top: 16px;
+    margin-top: 4px;
   }
   .card h2 {
     margin: 0 0 4px;
