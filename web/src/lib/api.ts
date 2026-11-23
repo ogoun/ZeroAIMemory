@@ -39,9 +39,37 @@ export class ApiError extends Error {
     message: string,
     /** Тело problem+json (RFC 9457) с дополнительными полями, если пришло. */
     public problem: Record<string, unknown> | null = null,
+    /** `Retry-After` ответа в секундах (503 занятого сервера, 429), если пришёл. */
+    public retryAfter: number | null = null,
   ) {
     super(message);
   }
+}
+
+/** `Retry-After` (RFC 9110 §10.2.3): секунды или HTTP-дата → секунды от сейчас; нет — `null`. */
+function retryAfterSecs(v: string | null): number | null {
+  if (!v) return null;
+  const s = v.trim();
+  if (/^\d+$/.test(s)) return Number(s);
+  const at = Date.parse(s);
+  return Number.isNaN(at) ? null : Math.max(0, Math.ceil((at - Date.now()) / 1000));
+}
+
+/** Отказ API → `ApiError`: текст — `detail` problem+json (иначе `statusText`), само тело problem и
+ * `Retry-After`. Один разбор у `request` (fetch) и `importArchive` (XMLHttpRequest). */
+function apiError(status: number, statusText: string, body: string, retryAfter: string | null): ApiError {
+  let detail = statusText;
+  let problem: Record<string, unknown> | null = null;
+  try {
+    const p: unknown = JSON.parse(body);
+    if (p && typeof p === 'object') {
+      problem = p as Record<string, unknown>;
+      if (typeof problem.detail === 'string') detail = problem.detail;
+    }
+  } catch {
+    /* тело не JSON */
+  }
+  return new ApiError(status, detail, problem, retryAfterSecs(retryAfter));
 }
 
 /**
@@ -108,16 +136,13 @@ async function request(method: string, path: string, r: Req = {}): Promise<Respo
     body,
   });
   if (!resp.ok) {
-    let detail = resp.statusText;
-    let problem: Record<string, unknown> | null = null;
+    let text = '';
     try {
-      const p = await resp.json();
-      if (p && typeof p === 'object') problem = p as Record<string, unknown>;
-      if (typeof p.detail === 'string') detail = p.detail;
+      text = await resp.text();
     } catch {
-      /* тело не JSON */
+      /* тело оборвано */
     }
-    throw new ApiError(resp.status, detail, problem);
+    throw apiError(resp.status, resp.statusText, text, resp.headers.get('Retry-After'));
   }
   if (changesCounts(method, path)) notifyEntriesChanged(r.user);
   return resp;
@@ -450,6 +475,132 @@ export const exportUrl = (user: string, space: string) =>
  */
 export const exportProbe = (user: string, space: string) =>
   call<void>('GET', `spaces/${q(space)}/export?probe=true`, undefined, user);
+
+// ---- импорт архива пространства (M6 §12б.5; WebUI — M7.2, спецификация M7 §5.7) ----
+
+/** Флаги импорта (диалог `ImportDialog`). */
+export interface ImportOptions {
+  /** «Это мой архив (перенос с другого сервера)»: id и аксиомы как есть. */
+  own: boolean;
+  /** Элемент уже есть и отличается: в конфликты или новой ревизией. */
+  onConflict: 'skip' | 'revision';
+  /** «Аксиомы чужого архива»: `demote` — понизить до theorem, `keep` — оставить. */
+  axioms: 'demote' | 'keep';
+  /** «Проверить без записи». */
+  dryRun: boolean;
+}
+
+/** Задание импорта принято (202): id и путь опроса от `api/v1`. */
+export interface ImportStarted {
+  job: string;
+  status: string;
+}
+
+/** Этап задания: приём тела, очередь записи, проверка архива, вложения, запись, итог. */
+export type ImportStage = 'receiving' | 'queued' | 'validating' | 'extracting' | 'writing' | 'done' | 'failed';
+
+/** Конфликт итога: элемент (id записи или путь заметки) и причина (`changed`, `path-taken`,
+ * `report-immutable`, `term-conflict`, `release-version`, `report-space`, `invalid`). */
+export interface ImportConflict {
+  id?: string;
+  path?: string;
+  reason: string;
+}
+
+/** Итог импорта (`zam_store::import::ImportReport`): списки — не длиннее 1000, полные длины — в
+ * `*_total`. */
+export interface ImportReport {
+  created: number;
+  revised: number;
+  skipped: number;
+  conflicts: ImportConflict[];
+  demoted_axioms: number;
+  id_remapped: number;
+  remapped: { from: string; to: string }[];
+  unresolved: string[];
+  links_skipped: number;
+  warnings: string[];
+  dry_run: boolean;
+  archive_fingerprint: string;
+  own: boolean;
+  conflicts_total: number;
+  unresolved_total: number;
+  warnings_total: number;
+  remapped_total: number;
+}
+
+/** Состояние задания (`GET /spaces/{space}/imports/{job}`); итог живёт на сервере час (ТЗ §16.4). */
+export interface ImportJob {
+  job: string;
+  state: 'running' | 'done' | 'failed';
+  stage: ImportStage;
+  /** Место в очереди записи — пока этап `queued`. */
+  queue: number | null;
+  dry_run: boolean;
+  progress: { total: number; done: number };
+  report: ImportReport | null;
+  /** problem+json ошибки задания с `status`. */
+  error: Record<string, unknown> | null;
+}
+
+/**
+ * Отправка архива `file` в пространство `space` пользователя `user` (`POST /spaces/{space}/import`
+ * → 202 и задание). Тело — сам файл (`Content-Type: application/zip`, `X-Zam-Expected-Bytes` — его
+ * размер) через `XMLHttpRequest`: у `fetch` нет хода отправки (`onprogress(sent, total)`). CSRF и
+ * выбор пользователя — как у `request`, отказ — `ApiError` тем же разбором (`apiError`) с
+ * `Retry-After`. `axioms: 'demote'` — параметр не передаётся: сервер понижает аксиомы только у
+ * чужого архива, у своего (по описи или `own`) оставляет как есть (ТЗ §16.4); явный
+ * `axioms=demote` понизил бы и свои. Ответ 202 числа разделов не меняет — их помечает итог
+ * задания (`importJob`, пре-флайт N33).
+ */
+export function importArchive(
+  user: string,
+  space: string,
+  file: File,
+  o: ImportOptions,
+  onprogress: (sent: number, total: number) => void,
+): Promise<ImportStarted> {
+  const p = new URLSearchParams({ own: String(o.own), on_conflict: o.onConflict });
+  if (o.axioms === 'keep') p.set('axioms', 'keep');
+  p.set('dry_run', String(o.dryRun));
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open('POST', `api/v1/spaces/${q(space)}/import?${p}`);
+    x.setRequestHeader('Content-Type', 'application/zip');
+    x.setRequestHeader('X-Zam-Expected-Bytes', String(file.size));
+    if (csrf) x.setRequestHeader('X-CSRF-Token', csrf);
+    if (user) x.setRequestHeader(USER_HEADER, user);
+    x.upload.onprogress = (e) => onprogress(e.loaded, e.lengthComputable ? e.total : file.size);
+    x.onload = () => {
+      if (x.status < 200 || x.status >= 300) {
+        reject(apiError(x.status, x.statusText, x.responseText, x.getResponseHeader('Retry-After')));
+        return;
+      }
+      try {
+        resolve(JSON.parse(x.responseText) as ImportStarted);
+      } catch {
+        reject(new ApiError(x.status, 'ответ сервера — не JSON'));
+      }
+    };
+    // отказ до тела сервер дочитывает не больше 16 МиБ и 5 с — у большого архива соединение
+    // рвётся без ответа (как у `zam import`, подсказка — та же)
+    x.onerror = () =>
+      reject(
+        new Error(
+          'сервер прервал приём архива или нет связи; частые причины — архив больше import.max_bytes сервера или сервер занят',
+        ),
+      );
+    x.send(file);
+  });
+}
+
+/** Состояние задания импорта; итог без `dry_run` (готово или ошибка — запись могла начаться)
+ * помечает числа разделов пользователя устаревшими — та же точка, что у `request` (пре-флайт N33). */
+export async function importJob(user: string, space: string, job: string): Promise<ImportJob> {
+  const j = await call<ImportJob>('GET', `spaces/${q(space)}/imports/${q(job)}`, undefined, user);
+  if (j.state !== 'running' && !j.dry_run) notifyEntriesChanged(user);
+  return j;
+}
 
 /** Байты файла вложения (просмотрщики PDF и DOCX разбирают его в браузере). */
 export const blobBytes = async (user: string, sha: string, filename: string): Promise<ArrayBuffer> =>
