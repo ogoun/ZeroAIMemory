@@ -19,7 +19,8 @@
   // уровень (`top_level=1`); у общей — «8/13» (`done/(total − dropped)`, `taskProgress.ts`) и полоса
   // прогресса, «Подзадачи ▸» раскрывает шаги под плиткой (`parent=<id>` в порядке шагов, вложенная
   // общая — со своим счётчиком и раскрытием). Переключатель «Подзадачи на доске» (выключен) —
-  // все задачи по статусам с пометкой «часть k:… «…»», как до волны. Карточка общей — раздел
+  // все задачи по статусам с пометкой «часть k:… «…»», как до волны; «Из идей» — тоже без дерева
+  // (пункты плана — задачи из идей, и шаги тоже), переключатель тогда нажат. Карточка общей — раздел
   // «Подзадачи 8/13» (`subtasks.items`), подзадачи — «Часть: k:<id> «…» (8/13)»; «давно без
   // обновлений» (`stale` сервера) — плашка на плитке и в карточке (не `staleOf`: та — о ссылках на
   // файлы).
@@ -96,6 +97,9 @@
   /** «Подзадачи на доске» (по умолчанию выключен, решение 23): все задачи по статусам с пометкой
    * «часть k:… «…»», как до M7.2; выключен — верхний уровень (`top_level=1`), шаги — под общей. */
   let withSubtasks = $state(false);
+  /** Доска без дерева — все задачи по статусам, у шага «часть …»: переключатель или «Из идей»
+   * (пункты плана — задачи из идей: шаг из идеи под общей не из идеи иначе пропал бы с доски). */
+  let flat = $derived(withSubtasks || fromIdea);
   /** Подзадачи общих задач по id общей (`parent=<id>`, порядок шагов): строки, курсор, запрос. */
   let subs = $state<Record<string, Column>>({});
   /** Номер последнего запроса подзадач общей: ответ устаревшего запроса не применяется. */
@@ -174,6 +178,16 @@
     });
   });
 
+  // Видимые раскрытия загружены, как колонки: вложенная, раскрытая под свёрнутой внешней, после
+  // правки из карточки шагов не имеет (`reloadBoard` перечитывает только видимые) — её шаги грузятся,
+  // когда внешнюю раскроют снова.
+  $effect(() => {
+    const missing = [...unfoldedIds()].filter((id) => !subs[id]);
+    untrack(() => {
+      for (const id of missing) loadSubs(id, true);
+    });
+  });
+
   // Вкладка по умолчанию — когда пришли числа (и запись из адреса, если она есть).
   $effect(() => {
     if (board !== 'tabs' || tab !== null) return;
@@ -219,7 +233,7 @@
   async function loadCounts() {
     const my = ++kseq;
     try {
-      const c = await entryCounts(user, space, { kind: 'task', fromIdea, topLevel: !withSubtasks });
+      const c = await entryCounts(user, space, { kind: 'task', fromIdea, topLevel: !flat });
       if (my !== kseq) return;
       counts = c;
       countsFailed = false;
@@ -242,7 +256,7 @@
         kind: 'task',
         status: [s],
         fromIdea,
-        topLevel: !withSubtasks,
+        topLevel: !flat,
         cursor: reset ? null : c.next,
         limit,
       });
@@ -297,7 +311,8 @@
     return ids;
   }
 
-  /** «Подзадачи ▸»: раскрыть (впервые и после ошибки — запрос `parent=<id>`) или свернуть. */
+  /** «Подзадачи ▸»: раскрыть (впервые и после ошибки — запрос `parent=<id>`; вложенные раскрытия
+   * без шагов загрузит эффект выше) или свернуть. */
   function toggleSubs(path: string, id: string) {
     if (unfolded[path]) {
       delete unfolded[path];
@@ -310,8 +325,8 @@
 
   /** После правки: числа и видимые статусы — заново (задача могла сменить колонку), столько же
    * задач, сколько было загружено «Показать ещё» (до PAGE_MAX); прочие вкладки — при следующем
-   * выборе. Раскрытые подзадачи — заново (статус шага и счётчик вложенной общей), прочие — при
-   * следующем раскрытии. */
+   * выборе. Видимые раскрытия — заново (статус шага и счётчик вложенной общей), шаги прочих
+   * забываются и грузятся при следующем показе (эффект видимых раскрытий). */
   async function reloadBoard() {
     const vis = visible;
     for (const s of TASK_COLUMNS) {
@@ -319,14 +334,14 @@
       cseq[s] = (cseq[s] ?? 0) + 1;
       cols[s] = emptyColumn();
     }
-    const open = unfoldedIds();
+    const openIds = unfoldedIds();
     for (const id of Object.keys(subs)) {
-      if (open.has(id)) continue;
+      if (openIds.has(id)) continue;
       sseq[id] = (sseq[id] ?? 0) + 1;
       delete subs[id];
     }
     const size = (s: EntryStatus) => Math.min(PAGE_MAX, Math.max(PAGE, cols[s].items.length));
-    await Promise.all([loadCounts(), ...vis.map((s) => loadColumn(s, true, size(s))), ...[...open].map((id) => loadSubs(id, true))]);
+    await Promise.all([loadCounts(), ...vis.map((s) => loadColumn(s, true, size(s))), ...[...openIds].map((id) => loadSubs(id, true))]);
   }
 
   /** «Показать ещё» колонки, вкладки или подзадач (`c` — их список, `load` — следующая страница,
@@ -385,7 +400,7 @@
    * своей плитки нет: открытая с доски (из раскрытия под общей) вкладку не меняет, из адреса — вкладка
    * родителя. `null` — вкладку не менять. */
   function tabStatusOf(e: Entry): EntryStatus | null {
-    if (e.parent && !withSubtasks) return tab === null ? e.parent.status : null;
+    if (e.parent && !flat) return tab === null ? e.parent.status : null;
     return e.status;
   }
 
@@ -589,12 +604,16 @@
   <div class="row bar">
     <button type="button" class="primary" onclick={startCreate}>Новая задача</button>
     <button type="button" class="toggle" aria-pressed={fromIdea} onclick={toggleFromIdea} title="Только задачи из идей — пункты плана работ">Из идей</button>
+    <!-- с «Из идей» шаги из идей и так на доске (пункты плана): переключатель нажат и неактивен -->
     <button
       type="button"
       class="toggle"
-      aria-pressed={withSubtasks}
+      aria-pressed={flat}
+      disabled={fromIdea}
       onclick={toggleSubtasks}
-      title="Шаги планов — в колонках по статусам, с пометкой «часть …»; выключено — под общей задачей"
+      title={fromIdea
+        ? 'С «Из идей» на доске все задачи из идей, и шаги планов тоже'
+        : 'Шаги планов — в колонках по статусам, с пометкой «часть …»; выключено — под общей задачей'}
     >
       Подзадачи на доске
     </button>
@@ -627,7 +646,7 @@
   {#if board === 'tabs' && c.loaded && c.items.length === 0 && total !== 0}<p class="muted small">Задач нет.</p>{/if}
   {#each c.items as t (t.id)}
     {@const claim = claimOf(t)}
-    {@const stale = staleOf(refs.get(entryRef('task', t.id)))}
+    {@const staleRefs = staleOf(refs.get(entryRef('task', t.id)))}
     <article class="task" class:selected={t.id === entry} data-task={t.id} data-entry={t.id}>
       <button type="button" class="link title" onclick={() => select(t.id)}>{t.title}</button>
       {#if t.parent}
@@ -649,7 +668,7 @@
         <div class="muted small">длительность {durationText(t.duration_min)}</div>
       {/if}
       {#if t.stale && t.last_activity_at}{@render idle(t.last_activity_at)}{/if}
-      {#if stale.length}<div class="badge small">возможно устарело</div>{/if}
+      {#if staleRefs.length}<div class="badge small">возможно устарело</div>{/if}
       {#if t.subtasks?.total}{@render subtasksOf(t, t.id)}{/if}
     </article>
   {/each}
@@ -669,9 +688,11 @@
   {@const c = subs[t.id]}
   <div class="subs-bar">
     {#if t.subtasks}{@render progress(t.subtasks)}{/if}
+    <!-- имя — с заголовком общей: в списке кнопок экранного диктора раскрытия различимы -->
     <button
       type="button"
       class="link small fold"
+      aria-label="Подзадачи: {t.title}"
       aria-expanded={shown}
       aria-controls={shown ? box : undefined}
       onclick={() => toggleSubs(path, t.id)}

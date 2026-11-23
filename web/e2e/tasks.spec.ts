@@ -556,11 +556,11 @@ test.describe('настольный', () => {
     await expect(bar).toHaveAttribute('aria-valuetext', '8 из 13');
     const singleTile = columnOf(page, 'открыт').locator(`[data-task="${single}"]`);
     await expect(singleTile.getByRole('progressbar')).toHaveCount(0);
-    await expect(singleTile.getByRole('button', { name: 'Подзадачи', exact: true })).toHaveCount(0);
+    await expect(singleTile.getByRole('button', { name: /^Подзадачи:/ })).toHaveCount(0);
 
     // «Подзадачи ▸» — 13 строк в порядке шагов (связей, не создания), все статусы, одним запросом;
-    // кнопка общей — первая в плитке (после раскрытия ниже — ещё кнопка вложенной общей)
-    const fold = tile.getByRole('button', { name: 'Подзадачи', exact: true }).first();
+    // имя кнопки — с заголовком общей (у вложенной ниже — своё)
+    const fold = tile.getByRole('button', { name: 'Подзадачи: Этап', exact: true });
     await expect(fold).toHaveText('Подзадачи ▸');
     await expect(fold).toHaveAttribute('aria-expanded', 'false');
     await fold.click();
@@ -586,9 +586,11 @@ test.describe('настольный', () => {
     const nestedRow = list.locator(`[data-subtask="${nested.id}"]`);
     await expect(nestedRow.getByTestId('task-progress')).toHaveText('1/2');
     await expect(nestedRow.getByRole('progressbar', { name: 'Выполнено подзадач' })).toHaveAttribute('aria-valuenow', '1');
-    await nestedRow.getByRole('button', { name: 'Подзадачи', exact: true }).click();
+    const nestedFold = nestedRow.getByRole('button', { name: `Подзадачи: ${nested.title}`, exact: true });
+    await nestedFold.click();
     const nestedList = nestedRow.getByRole('list', { name: `Подзадачи «${nested.title}»` });
-    await expect(nestedList.getByRole('link')).toHaveText([`${nested.title}.1`, `${nested.title}.2`]);
+    const nestedLinks = [`${nested.title}.1`, `${nested.title}.2`];
+    await expect(nestedList.getByRole('link')).toHaveText(nestedLinks);
     await expect(rows).toHaveCount(13);
     expect(byParent().map((u) => u.searchParams.get('parent'))).toEqual([umbrella, nested.id]);
     await page.screenshot({ path: `${screens}desktop-tasks-subtasks.png` });
@@ -600,6 +602,23 @@ test.describe('настольный', () => {
     await fold.click();
     await expect(rows).toHaveCount(13);
     expect(byParent()).toHaveLength(2);
+
+    // вложенная раскрыта под свёрнутой внешней, правка из карточки перечитывает доску: при следующем
+    // раскрытии внешней шаги вложенной загружаются снова, а не пустое раскрытие
+    await fold.click();
+    await expect(list).toHaveCount(0);
+    await singleTile.getByRole('button', { name: 'Отдельная задача' }).click();
+    const card = page.getByRole('article', { name: 'Карточка задачи' });
+    await card.getByLabel('Следующий шаг').fill('проверить раскрытие');
+    await card.getByRole('button', { name: 'Сохранить шаг' }).click();
+    await expect(card.getByRole('status')).toHaveText('Следующий шаг сохранён.');
+    await page.keyboard.press('Escape');
+    await expect(card).toHaveCount(0);
+    await fold.click();
+    await expect(nestedFold).toHaveAttribute('aria-expanded', 'true');
+    await expect(nestedList.getByRole('link')).toHaveText(nestedLinks);
+    await expect(rows).toHaveCount(13);
+    expect(byParent().map((u) => u.searchParams.get('parent'))).toEqual([umbrella, nested.id, umbrella, nested.id]);
 
     // «Подзадачи на доске» — все задачи по статусам, у шага — «часть k:… «…»» со ссылкой на общую
     const toggle = page.getByRole('button', { name: 'Подзадачи на доске' });
@@ -673,6 +692,132 @@ test.describe('настольный', () => {
     await page.keyboard.press('Escape');
     await expect(sheet).toHaveCount(0);
     await expect(page).toHaveURL(/\/j\/tasks$/);
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+
+  test('tasks_subtask_status_updates_progress', async ({ page }) => {
+    // правка шага из карточки перечитывает доску и видимые раскрытия: у общей «1/3» → «2/3», у
+    // вложенной общей в раскрытии «1/2» → «2/2», статусы строк — новые; после закрытия панели фокус
+    // — на нажатой ссылке раскрытия, и когда та же задача есть на доске ещё и плиткой раньше по DOM
+    const problems = watch(page);
+    const guid = await newSolution('прогресс после правки');
+    const umbrella = await addTask(guid, 'Общая', 'in_progress');
+    const ready = await addTask(guid, 'Общая: готовый шаг', 'done');
+    const next = await addTask(guid, 'Общая: следующий шаг');
+    // создана позже общей — её плитка «в работе» с переключателем идёт раньше плитки общей
+    const nested = await addTask(guid, 'Общая: вложенный план', 'in_progress');
+    for (const s of [ready, next, nested]) await partOf(s, umbrella);
+    const n1 = await addTask(guid, 'Вложенный: шаг 1', 'done');
+    const n2 = await addTask(guid, 'Вложенный: шаг 2');
+    for (const s of [n1, n2]) await partOf(s, nested);
+    const c = await pageCtx(page);
+    await open(page, tasksUrl(c.user, guid));
+    const tile = columnOf(page, 'в работе').locator(`[data-task="${umbrella}"]`);
+    // своё «N/M» плитки — первое (у вложенной в раскрытии — своё)
+    const own = tile.getByTestId('task-progress').first();
+    await expect(own).toHaveText('1/3');
+    await tile.getByRole('button', { name: 'Подзадачи: Общая', exact: true }).click();
+    const list = tile.getByRole('list', { name: 'Подзадачи «Общая»' });
+    const nestedRow = list.locator(`[data-subtask="${nested}"]`);
+    await nestedRow.getByRole('button', { name: 'Подзадачи: Общая: вложенный план', exact: true }).click();
+    await expect(nestedRow.getByTestId('task-progress')).toHaveText('1/2');
+
+    // шаг общей → «выполнен»: «2/3», полоса — 2, строка — «выполнен»; в карточке — «(2/3)»
+    const card = page.getByRole('article', { name: 'Карточка задачи' });
+    const nextLink = list.getByRole('link', { name: 'Общая: следующий шаг' });
+    await nextLink.click();
+    await card.getByRole('button', { name: '→ выполнен' }).click();
+    await card.getByRole('button', { name: 'Применить' }).click();
+    await expect(card.getByRole('status')).toHaveText('Статус: выполнен.');
+    await expect(own).toHaveText('2/3');
+    await expect(tile.getByRole('progressbar', { name: 'Выполнено подзадач' }).first()).toHaveAttribute('aria-valuenow', '2');
+    await expect(list.locator(`[data-subtask="${next}"]`)).toContainText('выполнен');
+    await expect(card.getByTestId('task-parent')).toHaveText(`Часть: k:${umbrella} «Общая» (2/3)`);
+    await page.keyboard.press('Escape');
+    await expect(card).toHaveCount(0);
+    await expect(nextLink).toBeFocused();
+
+    // шаг вложенной → «выполнен»: у вложенной «2/2», у общей по-прежнему «2/3»
+    const n2Link = nestedRow.getByRole('link', { name: 'Вложенный: шаг 2' });
+    await n2Link.click();
+    await card.getByRole('button', { name: '→ выполнен' }).click();
+    await card.getByRole('button', { name: 'Применить' }).click();
+    await expect(card.getByRole('status')).toHaveText('Статус: выполнен.');
+    await expect(nestedRow.getByTestId('task-progress')).toHaveText('2/2');
+    await expect(nestedRow.locator(`[data-subtask="${n2}"]`)).toContainText('выполнен');
+    await expect(own).toHaveText('2/3');
+    await page.keyboard.press('Escape');
+    await expect(card).toHaveCount(0);
+    await expect(n2Link).toBeFocused();
+
+    // «Подзадачи на доске»: вложенная — и плиткой (раньше общей по DOM), и строкой раскрытия общей;
+    // закрытие панели, открытой ссылкой раскрытия, — фокус на этой ссылке, а не на плитке
+    await page.getByRole('button', { name: 'Подзадачи на доске' }).click();
+    const nestedTile = columnOf(page, 'в работе').locator(`[data-task="${nested}"]`);
+    await expect(nestedTile).toBeVisible();
+    await tile.getByRole('button', { name: 'Подзадачи: Общая', exact: true }).click();
+    const nestedLink = list.getByRole('link', { name: 'Общая: вложенный план' });
+    await nestedLink.click();
+    await expect(card.getByRole('heading', { name: 'Общая: вложенный план' })).toBeFocused();
+    await page.keyboard.press('Escape');
+    await expect(card).toHaveCount(0);
+    await expect(nestedLink).toBeFocused();
+    await expect(nestedTile.getByRole('button', { name: 'Общая: вложенный план', exact: true })).not.toBeFocused();
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
+
+  test('tasks_from_idea_shows_steps', async ({ page }) => {
+    // «Из идей» — пункты плана без дерева: шаг из идеи под общей не из идеи виден плиткой с «часть
+    // k:… «…»» (с `top_level=1` его не было бы на доске вовсе), запросы и числа — без `top_level`;
+    // «Подзадачи на доске» тогда нажат и неактивен
+    const problems = watch(page);
+    const guid = await newSolution('из идей и шаги');
+    const idea = await api<{ id: string }>('POST', `spaces/${guid}/entries`, {
+      kind: 'idea',
+      title: 'Идея шага',
+      body: 'Идея шага: замысел.',
+      data: { origin: 'human' },
+    });
+    await api('POST', `entries/${idea.id}/decide`, { decision: 'accept', by: 'human' });
+    const fromIdea = await api<{ items: { id: string }[] }>('GET', `spaces/${guid}/entries?kind=task&from_idea=1`);
+    expect(fromIdea.items).toHaveLength(1);
+    const step = fromIdea.items[0].id;
+    const umbrella = await addTask(guid, 'Общая не из идеи', 'in_progress');
+    await partOf(step, umbrella);
+    const lists = listRequests(page, guid);
+    const counted = countRequests(page, guid);
+    const c = await pageCtx(page);
+    await open(page, tasksUrl(c.user, guid));
+    const board = page.getByRole('group', { name: 'Доска задач' });
+    await expect(board.locator(`[data-task="${umbrella}"]`)).toBeVisible();
+    await expect(board.locator(`[data-task="${step}"]`)).toHaveCount(0);
+    const toggle = page.getByRole('button', { name: 'Подзадачи на доске' });
+    await expect(toggle).toBeEnabled();
+    await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+
+    const before = lists.length;
+    const countsBefore = counted.length;
+    const ideas = page.getByRole('button', { name: 'Из идей' });
+    await ideas.click();
+    const stepTile = columnOf(page, 'открыт').locator(`[data-task="${step}"]`);
+    await expect(stepTile.getByTestId('task-part-of')).toHaveText(`часть k:${umbrella} «Общая не из идеи»`);
+    await expect(stepTile.getByTestId('from-idea')).toContainText('«Идея шага»');
+    await expect(board.locator(`[data-task="${umbrella}"]`)).toHaveCount(0);
+    await expect(columnOf(page, 'открыт').getByRole('heading')).toHaveText('открыт 1');
+    await expect(columnOf(page, 'в работе').getByRole('heading')).toHaveText('в работе 0');
+    await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+    await expect(toggle).toBeDisabled();
+    const after = lists.slice(before);
+    expect(after).toHaveLength(5);
+    expect(after.every((u) => u.searchParams.get('from_idea') === '1' && !u.searchParams.has('top_level')), after.join('\n')).toBe(true);
+    expect(counted.slice(countsBefore).map((u) => `${u.searchParams.get('from_idea')}|${u.searchParams.has('top_level')}`)).toEqual(['1|false']);
+
+    // «Из идей» выключен — снова верхний уровень, переключатель доступен и выключен
+    await ideas.click();
+    await expect(board.locator(`[data-task="${umbrella}"]`)).toBeVisible();
+    await expect(board.locator(`[data-task="${step}"]`)).toHaveCount(0);
+    await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+    await expect(toggle).toBeEnabled();
     expect(problems, problems.join('\n')).toEqual([]);
   });
 
@@ -805,9 +950,11 @@ test.describe('телефон, сенсорный ввод', () => {
   test('tasks_tabs_count_top_level', async ({ page }) => {
     // §5.5 п. 4: числа вкладок — верхнего уровня (`entries/counts?top_level=1`), подзадачи не
     // считаются; «Подзадачи на доске» — числа всех задач. Раскрытие шагов — касанием, цели 44 px
+    // общая — «заблокирован», а вкладка по умолчанию — «В работе» (есть задача в работе верхнего
+    // уровня): «шаг из адреса — вкладка общей» отличима от вкладки по умолчанию
     const problems = watch(page);
     const guid = await newSolution('вкладки без подзадач');
-    const umbrella = await addTask(guid, 'Общая на телефоне', 'in_progress');
+    const umbrella = await addTask(guid, 'Общая на телефоне', 'blocked');
     const titles: string[] = [];
     const steps: string[] = [];
     for (const [i, st] of ['done', 'done', 'done', 'in_progress', 'in_progress', 'open'].entries()) {
@@ -816,21 +963,23 @@ test.describe('телефон, сенсорный ввод', () => {
     }
     for (const s of steps) await partOf(s, umbrella);
     await addTask(guid, 'Отдельная открытая');
+    await addTask(guid, 'Отдельная в работе', 'in_progress');
     const counted = countRequests(page, guid);
     const c = await pageCtx(page);
     await open(page, tasksUrl(c.user, guid));
     const tabs = tablist(page).getByRole('tab');
-    await expect(tabs).toHaveText(['Открыт 1', 'В работе 1', 'Заблокирован 0', 'Выполнен 0', 'Снят 0']);
+    await expect(tabs).toHaveText(['Открыт 1', 'В работе 1', 'Заблокирован 1', 'Выполнен 0', 'Снят 0']);
     await expect(tabOf(page, 'В работе')).toHaveAccessibleName('В работе, 1 задача');
     await expect(tabOf(page, 'В работе')).toHaveAttribute('aria-selected', 'true');
     expect(counted.map((u) => u.searchParams.get('top_level'))).toEqual(['1']);
 
-    // общая — во вкладке «В работе» с прогрессом; шаги — касанием «Подзадачи»
+    // общая — во вкладке «Заблокирован» с прогрессом; шаги — касанием «Подзадачи»
+    await tabOf(page, 'Заблокирован').tap();
     const panel = page.getByRole('tabpanel');
     const tile = panel.locator(`[data-task="${umbrella}"]`);
     await expect(tile.getByTestId('task-progress')).toHaveText('3/6');
     await expect(panel.locator('[data-task]')).toHaveCount(1);
-    const fold = tile.getByRole('button', { name: 'Подзадачи', exact: true });
+    const fold = tile.getByRole('button', { name: 'Подзадачи: Общая на телефоне', exact: true });
     await minTarget(fold, 44);
     await fold.tap();
     const list = tile.getByRole('list', { name: 'Подзадачи «Общая на телефоне»' });
@@ -847,19 +996,21 @@ test.describe('телефон, сенсорный ввод', () => {
     await expect(card.getByTestId('task-parent')).toHaveText(`Часть: k:${umbrella} «Общая на телефоне» (3/6)`);
     await page.getByRole('link', { name: '← Задачи' }).tap();
     await expect(card).toHaveCount(0);
-    await expect(tabOf(page, 'В работе')).toHaveAttribute('aria-selected', 'true');
+    await expect(tabOf(page, 'Заблокирован')).toHaveAttribute('aria-selected', 'true');
     await expect(link).toBeFocused();
-    // шаг из адреса — вкладка общей (у шага на доске верхнего уровня своей плитки нет)
+    // шаг (выполненный) из адреса — вкладка общей «Заблокирован», а не своя и не по умолчанию
+    // (у шага на доске верхнего уровня своей плитки нет)
     await page.goto('about:blank');
     await open(page, tasksUrl(c.user, guid, steps[0]));
     await expect(card.getByRole('heading', { name: 'Шаг телефона 1' })).toBeFocused();
     await page.getByRole('link', { name: '← Задачи' }).tap();
-    await expect(tabOf(page, 'В работе')).toHaveAttribute('aria-selected', 'true');
+    await expect(tabOf(page, 'Заблокирован')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('tabpanel').locator(`[data-task="${umbrella}"]`)).toBeVisible();
 
     // «Подзадачи на доске» — числа всех задач
     const before = counted.length;
     await page.getByRole('button', { name: 'Подзадачи на доске' }).tap();
-    await expect(tabs).toHaveText(['Открыт 2', 'В работе 3', 'Заблокирован 0', 'Выполнен 3', 'Снят 0']);
+    await expect(tabs).toHaveText(['Открыт 2', 'В работе 3', 'Заблокирован 1', 'Выполнен 3', 'Снят 0']);
     expect(counted.slice(before).map((u) => u.searchParams.has('top_level'))).toEqual([false]);
     expect(problems, problems.join('\n')).toEqual([]);
   });
