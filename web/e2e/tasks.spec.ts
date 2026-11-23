@@ -1201,6 +1201,117 @@ test.describe('настольный', () => {
       expect(asked).toBe(1);
       expect(problems, problems.join('\n')).toEqual([]);
     });
+
+    test(`task_edit_cancelled_at_history_limit${suffix}`, async ({ page }) => {
+      // ревью задачи 10, круг 5 (N10): на пределе истории вкладки (50 записей в Chromium) индекс
+      // Navigation API во время `hashchange` новой записи на единицу больше настоящего — откат
+      // считается по ключам. Отменённые «назад» и ссылка оставляют карточку, Esc закрывает панель на
+      // доску, дубля записи нет
+      if (noNavApi) await hideNavApi(page);
+      const problems = watch(page);
+      const guid = await newSolution('предел истории');
+      const passing = await addTask(guid, 'Задача прохода');
+      const umbrella = await addTask(guid, 'Общая у предела');
+      const sub = await addTask(guid, 'Шаг у предела');
+      await partOf(sub, umbrella);
+      const c = await pageCtx(page);
+      await open(page, tasksUrl(c.user, guid));
+      await navApiIs(page, noNavApi);
+      const at = (id: string) => new RegExp(`/j/tasks/${id}$`);
+      // 56 переходов «карточка — доска» (как за день работы во вкладке): история упирается в предел
+      await page.evaluate(
+        async ([card, board]) => {
+          for (let i = 0; i < 56; i++) {
+            await new Promise<void>((done) => {
+              addEventListener('hashchange', () => setTimeout(done, 20), { once: true });
+              location.hash = i % 2 === 0 ? card : board;
+            });
+          }
+        },
+        [tasksUrl(c.user, guid, passing), tasksUrl(c.user, guid)],
+      );
+      await expect(page).toHaveURL(/\/j\/tasks$/);
+      expect(await page.evaluate(() => history.length)).toBe(50);
+      const sheet = page.getByRole('dialog', { name: 'Задача', exact: true });
+      const card = sheet.getByRole('article', { name: 'Карточка задачи' });
+      const form = card.getByRole('form', { name: 'Правка задачи' });
+      await expect(sheet).toHaveCount(0);
+      let asked = 0;
+      page.on('dialog', (d) => {
+        if (d.type() === 'confirm') asked += 1;
+        void d.dismiss();
+      });
+
+      // (а) новая запись на пределе → «назад» с «Отменой»
+      await columnOf(page, 'открыт').getByRole('button', { name: 'Общая у предела', exact: true }).click();
+      await expect(page).toHaveURL(at(umbrella));
+      await card.getByRole('button', { name: 'Изменить', exact: true }).click();
+      await form.getByLabel('Заголовок').fill('Черновик у предела');
+      await page.evaluate(() => history.back());
+      await expect.poll(() => asked).toBe(1);
+      await expect(page).toHaveURL(at(umbrella));
+      await expect(form.getByLabel('Заголовок')).toHaveValue('Черновик у предела');
+      // (б) ссылка «Подзадачи» с «Отменой» — тоже новая запись на пределе
+      await card.getByTestId('task-subtasks').getByRole('link', { name: 'Шаг у предела' }).click();
+      await expect.poll(() => asked).toBe(2);
+      await expect(page).toHaveURL(at(umbrella));
+      await expect(form.getByLabel('Заголовок')).toHaveValue('Черновик у предела');
+      await form.getByRole('button', { name: 'Отмена' }).click();
+      await page.keyboard.press('Escape');
+      await expect(sheet).toHaveCount(0);
+      await expect(page).toHaveURL(/\/j\/tasks$/);
+      // дубля нет: перед доской — карточка прохода, после — общая, за ней отменённая подзадача
+      await page.goBack();
+      await expect(page).toHaveURL(at(passing));
+      await page.goForward();
+      await expect(page).toHaveURL(/\/j\/tasks$/);
+      await page.goForward();
+      await expect(page).toHaveURL(at(umbrella));
+      await page.goForward();
+      await expect(page).toHaveURL(at(sub));
+      expect(asked).toBe(2);
+      expect(problems, problems.join('\n')).toEqual([]);
+    });
+
+    test(`task_edit_cancelled_back_lost_rollback${suffix}`, async ({ page }) => {
+      // ревью задачи 10, круг 5 (N11): откат за пределы истории не приходит (номер записи доски
+      // испорчен — так бывает с записями прежней версии на запасном пути); через `RESTORE_MS` адрес
+      // возвращается к показанной карточке — адрес и экран совпадают, вопрос один. С Navigation API
+      // откат точен по ключу
+      if (noNavApi) await hideNavApi(page);
+      const problems = watch(page);
+      const guid = await newSolution('потерянный откат');
+      const task = await addTask(guid, 'Задача без отката');
+      const c = await pageCtx(page);
+      await open(page, tasksUrl(c.user, guid));
+      await navApiIs(page, noNavApi);
+      await page.evaluate(() => history.replaceState({ zamIdx: -10 }, '', location.href));
+      const sheet = page.getByRole('dialog', { name: 'Задача', exact: true });
+      const card = sheet.getByRole('article', { name: 'Карточка задачи' });
+      const form = card.getByRole('form', { name: 'Правка задачи' });
+      await columnOf(page, 'открыт').getByRole('button', { name: 'Задача без отката', exact: true }).click();
+      await expect(page).toHaveURL(new RegExp(`/j/tasks/${task}$`));
+      await card.getByRole('button', { name: 'Изменить', exact: true }).click();
+      await form.getByLabel('Заголовок').fill('Черновик');
+      let asked = 0;
+      page.on('dialog', (d) => {
+        if (d.type() === 'confirm') asked += 1;
+        void d.dismiss();
+      });
+      await page.evaluate(() => history.back());
+      await expect.poll(() => asked).toBe(1);
+      await expect(page).toHaveURL(new RegExp(`/j/tasks/${task}$`));
+      // ожидание возврата истекло — адрес на месте, второго вопроса нет
+      await page.waitForTimeout(1500);
+      await expect(page).toHaveURL(new RegExp(`/j/tasks/${task}$`));
+      await expect(form.getByLabel('Заголовок')).toHaveValue('Черновик');
+      await form.getByRole('button', { name: 'Отмена' }).click();
+      await page.keyboard.press('Escape');
+      await expect(sheet).toHaveCount(0);
+      await expect(page).toHaveURL(/\/j\/tasks$/);
+      expect(asked).toBe(1);
+      expect(problems, problems.join('\n')).toEqual([]);
+    });
   }
 });
 

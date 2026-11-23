@@ -24,7 +24,7 @@
   // только если фокус не в карточке. Атрибут `data-layout` — текущая раскладка (для e2e).
   import { onDestroy, tick, untrack, type Snippet } from 'svelte';
   import { SPLIT_MIN } from '../lib/layout';
-  import { go, onCancel, parse } from '../lib/router';
+  import { go, onCancel, parse, shownEntryId } from '../lib/router';
   import { observeWidth } from '../lib/viewport.svelte';
 
   interface Props {
@@ -85,8 +85,8 @@
   /** Элемент списка, к которому вернуть фокус при закрытии панели. */
   let returnTo: HTMLElement | null = null;
   /** Адрес открытой панели и как её закрыть: «назад» истории (открыта со списка — переходом,
-   * добавившим запись истории) или заменой адреса. */
-  let opened: { hash: string; pops: boolean } | null = null;
+   * добавившим запись истории) или заменой адреса; `at` — запись истории, на которой открыта. */
+  let opened: { hash: string; pops: boolean; at: string } | null = null;
   /** Последняя смена адреса-хэша (`hashchange`): откуда пришли к открытой записи. */
   let lastChange: { from: string; to: string } | null = null;
   /** Панель закрывается («назад» истории ещё не отработал): повторные закрытия не действуют. */
@@ -228,7 +228,11 @@
    * поля без правок. */
   function openSheet() {
     const h = location.hash;
-    opened = { hash: h, pops: !!lastChange && lastChange.from === back.href && lastChange.to === h };
+    opened = {
+      hash: h,
+      pops: !!lastChange && lastChange.from === back.href && lastChange.to === h,
+      at: shownEntryId(),
+    };
     confirming = false;
     closing = false;
   }
@@ -310,7 +314,9 @@
     onclose?.();
     const h = location.hash;
     if (h === back.href) return;
-    if (opened?.pops && opened.hash === h) {
+    // «назад» — только с той записи истории, на которой панель открыта: после отката, который не
+    // пришёл (роутер поставил адрес на другую запись), «назад» увёл бы мимо списка
+    if (opened?.pops && opened.hash === h && opened.at === shownEntryId()) {
       history.back();
       // запасной путь: «назад» без смены адреса (соседняя запись с тем же адресом — история до
       // номеров роутера) не даёт `hashchange` — тогда заменой адреса, «идёт закрытие» не залипает
