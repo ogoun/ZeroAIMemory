@@ -2,10 +2,12 @@
 // панель, дерево), цели касания 44 px, полоса журналов, «список — карточка» (`JournalSplit`) в
 // «Словаре», «Идеи» (аккордеон разделов, фильтры под кнопкой) и «Insights» (компактная таблица) на
 // телефоне (§5.2 пп. 2–3; доска задач — tasks.spec.ts), сбой ленивого чанка, отсутствие
-// горизонтальной прокрутки. Сессия — общая
-// администратора; на телефоне «Выйти» — в меню аккаунта, поэтому сценарии ждут оболочку по кнопке
+// горизонтальной прокрутки; обход всех страниц `PAGES`, вкладки редактора и варианты «Вопросов»
+// (§5.2 пп. 4, 7). Сессия — общая администратора (у адресов `as: 'user'` — пользователя,
+// `userSession`); на телефоне «Выйти» — в меню аккаунта, поэтому сценарии ждут оболочку по кнопке
 // «Поиск» (есть на всех классах ширины). Размеры и помощники — viewports.ts, адреса — mobile-pages.ts.
-import { expect, test, type Browser, type Locator, type Page } from '@playwright/test';
+import { expect, test, type Browser, type BrowserContext, type Locator, type Page } from '@playwright/test';
+import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { PAGES, env, pageCtx } from './mobile-pages';
@@ -520,6 +522,38 @@ test.describe('телефон, сенсорный ввод', () => {
     expect(dProblems, dProblems.join('\n')).toEqual([]);
     await ctx.close();
   });
+
+  test('questions_options_targets_44', async ({ page }) => {
+    // «Вопросы» (§5.2 п. 4): варианты ответа — кнопками не меньше 44 × 44 с зазором 8 px в ряду,
+    // длинный вариант переносится внутри кнопки, страница вбок не прокручивается. Своё решение:
+    // вопросы решения E2E проверяют другие спецификации.
+    const problems = watch(page);
+    const guid = randomUUID();
+    await api('POST', 'solutions', { agent_solution_id: guid, name: `Вопросы E2E: ${guid.slice(0, 8)}` });
+    const long = 'Оставить прежний порядок и вернуться к вопросу после замеров на рабочей памяти владельца';
+    await api('POST', `spaces/${guid}/entries`, {
+      kind: 'question',
+      title: 'Какой предел выбрать?',
+      body: 'Варианты — ниже.',
+      data: { options: [{ key: 'a', text: 'Да' }, { key: 'b', text: 'Нет' }, { key: 'c', text: long }], recommendation: 'a' },
+    });
+    const c = await pageCtx(page);
+    await open(page, `#/u/${c.user}/s/${guid}/j/questions`);
+    const opts = page.getByRole('group', { name: 'Варианты ответа' }).getByRole('button');
+    await expect(opts).toHaveCount(3);
+    await minTarget(opts, 44);
+    // короткие варианты — в одном ряду с зазором (длинный переносится на свою строку)
+    expect(await minGap(opts.filter({ hasNotText: long }), 8), 'варианты в одном ряду').toBe(1);
+    // длинный вариант — в пределах окна, текст переносится
+    const box = (await opts.nth(2).boundingBox())!;
+    expect(box.x + box.width).toBeLessThanOrEqual(VIEWPORTS.phone.width);
+    expect(box.height).toBeGreaterThan(44);
+    const answer = page.getByRole('form', { name: 'Ответ текстом' });
+    await minTarget(answer.getByRole('button', { name: 'Ответить' }), 44);
+    expect(await noHorizontalScroll(page)).toBe(true);
+    await page.screenshot({ path: `${screens}phone-questions.png`, fullPage: true });
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
 });
 
 test.describe('планшет, сенсорный ввод', () => {
@@ -663,10 +697,15 @@ test.describe('настольный', () => {
   });
 });
 
-/** Новая вкладка с общей сессией администратора на размере `v` (касание — у телефонов и планшетов). */
-async function contextAt(browser: Browser, v: ViewportName) {
+type StorageState = Awaited<ReturnType<BrowserContext['storageState']>>;
+
+/**
+ * Новая вкладка на размере `v` (касание — у телефонов и планшетов); сессия — общая администратора
+ * или `state` (пользователь, {@link userSession}).
+ */
+async function contextAt(browser: Browser, v: ViewportName, state: string | StorageState = ADMIN_STATE) {
   const touchy = v === 'phoneS' || v === 'phone' || v === 'tablet' || v === 'tabletLand';
-  return browser.newContext({ storageState: ADMIN_STATE, viewport: VIEWPORTS[v], ...(touchy ? touch : { hasTouch: false, isMobile: false }) });
+  return browser.newContext({ storageState: state, viewport: VIEWPORTS[v], ...(touchy ? touch : { hasTouch: false, isMobile: false }) });
 }
 
 test('frame_no_horizontal_scroll', async ({ browser }) => {
@@ -726,4 +765,198 @@ test('journals_split_no_horizontal_scroll', async ({ browser }) => {
     await ctx.close();
   }
   expect(wide, 'горизонтальная прокрутка страницы').toEqual([]);
+});
+
+/**
+ * Сессия пользователя (не администратора) для адресов `as: 'user'`: один вход на прогон спецификации
+ * (лимит входа — 5 в минуту на IP), смена пароля при первом входе; cookie — в памяти.
+ */
+let userState: StorageState | null = null;
+async function userSession(browser: Browser): Promise<StorageState> {
+  if (userState) return userState;
+  const pass = ['e2e-mobile-pass-1', 'e2e-mobile-pass-2'];
+  const ac = await browser.newContext({ storageState: ADMIN_STATE });
+  const me = await ac.request.get(`${base()}api/v1/auth/me`);
+  const { csrf } = (await me.json()) as { csrf: string };
+  const name = `e2e-mobile-${Date.now()}`;
+  const u = await ac.request.post(`${base()}api/v1/admin/users`, { headers: { 'X-CSRF-Token': csrf }, data: { name } });
+  expect(u.ok(), `admin/users: HTTP ${u.status()}`).toBe(true);
+  const id = ((await u.json()) as { user: { id: string } }).user.id;
+  const set = await ac.request.post(`${base()}api/v1/admin/users/${id}/password`, {
+    headers: { 'X-CSRF-Token': csrf },
+    data: { password: pass[0] },
+  });
+  expect(set.ok(), `пароль: HTTP ${set.status()}`).toBe(true);
+  await ac.close();
+  const uc = await browser.newContext({ storageState: { cookies: [], origins: [] } });
+  const login = await uc.request.post(`${base()}api/v1/auth/login`, { data: { login: name, password: pass[0] } });
+  expect(login.status(), 'вход пользователя').toBe(200);
+  const mc = ((await login.json()) as { csrf: string }).csrf;
+  const pw = await uc.request.post(`${base()}api/v1/auth/password`, {
+    headers: { 'X-CSRF-Token': mc },
+    data: { old: pass[0], new: pass[1] },
+  });
+  expect(pw.status(), 'смена пароля').toBe(204);
+  userState = await uc.storageState();
+  await uc.close();
+  return userState;
+}
+
+/** Страница догрузилась: нет «Загрузка…», сеть затихла, анимации (панель дерева) закончились. */
+async function settled(page: Page): Promise<void> {
+  await expect(page.locator('main').getByText(/^Загрузка/)).toHaveCount(0, { timeout: 20_000 });
+  await page.waitForLoadState('networkidle');
+  await page.waitForFunction(() => document.getAnimations().every((a) => a.playState !== 'running'));
+}
+
+/** Самые глубокие элементы, выходящие правым краем за окно вне прокручиваемого предка (сообщение). */
+function overflowing(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const vw = document.documentElement.clientWidth;
+    const clips = (e: Element) => ['auto', 'scroll', 'hidden', 'clip'].includes(getComputedStyle(e).overflowX);
+    const out: string[] = [];
+    for (const e of document.body.querySelectorAll('*')) {
+      const r = e.getBoundingClientRect();
+      if (r.width === 0 || r.right <= vw + 0.5) continue;
+      // обрезает только предок — содержащий блок: у абсолютного элемента — позиционированный
+      const abs = ['absolute', 'fixed'].includes(getComputedStyle(e).position);
+      let p = e.parentElement;
+      while (p && p !== document.body && !(clips(p) && (!abs || getComputedStyle(p).position !== 'static'))) p = p.parentElement;
+      if (p && p !== document.body) continue;
+      if ([...e.children].some((ch) => ch.getBoundingClientRect().right > vw + 0.5)) continue;
+      const cls = typeof e.className === 'string' && e.className.trim() ? `.${e.className.trim().split(/\s+/).join('.')}` : '';
+      out.push(`${e.tagName.toLowerCase()}${cls} → ${Math.round(r.right)}`);
+      if (out.length >= 5) break;
+    }
+    return out;
+  });
+}
+
+test('all_pages_no_horizontal_scroll', async ({ browser }) => {
+  // обход узких экранов (§5.2 п. 7): каждый адрес PAGES (и его вкладки) на узком телефоне и
+  // планшете — без горизонтальной прокрутки страницы и без ошибок консоли; снимки — для ревью
+  // глазами (.tmp/e2e/screens/mobile/<размер>-<имя>.png)
+  test.setTimeout(600_000);
+  mkdirSync(screens, { recursive: true });
+  // «Кэш выжимок» с таблицей: выжимка агента с длинным запросом (своя заметка-источник)
+  const src = await api<{ id: string }>('POST', 'nodes', {
+    space: 'knowledge',
+    path: `E2E/Кэш обхода ${Date.now()}`,
+    kind: 'note',
+    content: '# Кэш обхода\n\nИсточник выжимки.\n',
+  });
+  await api('POST', 'cache', {
+    query: 'Как устроен обход узких экранов WebUI и почему таблицы прокручиваются внутри обёртки',
+    summary: 'Таблицы — в .table-wrap, страница вбок не прокручивается.',
+    sources: [{ id: src.id }],
+  });
+  const wide: string[] = [];
+  const problems: string[] = [];
+  for (const v of ['phoneS', 'tablet'] as ViewportName[]) {
+    for (const as of ['admin', 'user'] as const) {
+      const pages = PAGES.filter((p) => (p.as ?? 'admin') === as);
+      if (!pages.length) continue;
+      const ctx = await contextAt(browser, v, as === 'user' ? await userSession(browser) : ADMIN_STATE);
+      const page = await ctx.newPage();
+      const seen = watch(page);
+      const c = await pageCtx(page);
+      const check = async (name: string) => {
+        await settled(page);
+        if (!(await noHorizontalScroll(page))) wide.push(`${v} ${VIEWPORTS[v].width}: ${name} — ${(await overflowing(page)).join('; ')}`);
+        await page.screenshot({ path: `${screens}${v}-${name}.png`, fullPage: true });
+      };
+      for (const p of pages) {
+        // полная загрузка на каждый адрес: «сеть затихла» — о самой странице
+        await page.goto('about:blank');
+        await open(page, p.path(c));
+        await check(p.name);
+        for (const t of p.tabs ?? []) {
+          await page.getByRole('tab', { name: new RegExp(`^${t}`) }).click();
+          await check(`${p.name}-${t}`);
+        }
+      }
+      problems.push(...seen.map((s) => `${v} ${as}: ${s}`));
+      await ctx.close();
+    }
+  }
+  expect(wide, 'горизонтальная прокрутка страницы').toEqual([]);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('editor_phone_modes', async ({ browser }) => {
+  // редактор (§5.2 п. 4): ниже 1024 px — вкладки «Текст | Предпросмотр» (tablist) вместо двух
+  // колонок, правка текста видна в предпросмотре, «Сохранить» — в видимой области; на 1440 — две
+  // колонки рядом, вкладок нет
+  const run = Date.now();
+  const note = await api<{ id: string }>('POST', 'nodes', {
+    space: 'knowledge',
+    path: `E2E/Редактор телефона ${run}`,
+    kind: 'note',
+    content: '# Редактор телефона\n\nисходный текст\n',
+  });
+  const ctx = await contextAt(browser, 'phone');
+  const page = await ctx.newPage();
+  const problems = watch(page);
+  const c = await pageCtx(page);
+  await open(page, `#/u/${c.user}/s/knowledge/n/${note.id}`);
+  await page.getByRole('button', { name: 'Править', exact: true }).click();
+  const editor = page.getByRole('region', { name: 'Редактор заметки' });
+  const tabs = editor.getByRole('tablist', { name: 'Панель редактора' });
+  await expect(tabs.getByRole('tab')).toHaveText(['Текст', 'Предпросмотр']);
+  const text = tabs.getByRole('tab', { name: 'Текст' });
+  const prev = tabs.getByRole('tab', { name: 'Предпросмотр' });
+  await expect(text).toHaveAttribute('aria-selected', 'true');
+  const source = editor.getByRole('tabpanel', { name: 'Текст' });
+  await expect(source.locator('.cm-content')).toBeVisible();
+  await expect(editor.locator('.pane.preview')).toBeHidden();
+  const save = editor.getByRole('button', { name: 'Сохранить' });
+  await expect(save).toBeInViewport();
+  await minTarget(tabs.getByRole('tab'), 44);
+  // правка текста — в предпросмотре
+  await source.locator('.cm-content').click();
+  await page.keyboard.press('Control+End');
+  await page.keyboard.type(`\nправка-${run}\n`);
+  await prev.tap();
+  await expect(prev).toHaveAttribute('aria-selected', 'true');
+  const preview = editor.getByRole('tabpanel', { name: 'Предпросмотр' });
+  await expect(preview).toContainText(`правка-${run}`);
+  await expect(source).toBeHidden();
+  await expect(save).toBeInViewport();
+  expect(await noHorizontalScroll(page)).toBe(true);
+  await page.screenshot({ path: `${screens}phone-editor-preview.png`, fullPage: true });
+  // клавиатура tablist: ←/→ по кругу, Home, End; один tabindex="0"
+  await prev.focus();
+  await page.keyboard.press('ArrowRight');
+  await expect(text).toBeFocused();
+  await expect(text).toHaveAttribute('aria-selected', 'true');
+  await expect(source).toBeVisible();
+  await page.keyboard.press('End');
+  await expect(prev).toBeFocused();
+  await page.keyboard.press('Home');
+  await expect(text).toBeFocused();
+  await expect(tabs.locator('[tabindex="0"]')).toHaveCount(1);
+  await page.screenshot({ path: `${screens}phone-editor-text.png`, fullPage: true });
+  await save.tap();
+  await expect(editor.getByRole('status')).toContainText('Сохранено');
+  expect(problems, problems.join('\n')).toEqual([]);
+  await ctx.close();
+
+  // настольный: две колонки рядом, вкладок нет
+  const dctx = await contextAt(browser, 'desktop');
+  const dp = await dctx.newPage();
+  const dProblems = watch(dp);
+  await open(dp, `#/u/${c.user}/s/knowledge/n/${note.id}`);
+  await dp.getByRole('button', { name: 'Править', exact: true }).click();
+  const de = dp.getByRole('region', { name: 'Редактор заметки' });
+  await expect(de.locator('.cm-content')).toBeVisible();
+  await expect(de.getByRole('tablist')).toHaveCount(0);
+  const dPreview = de.locator('.pane.preview');
+  await expect(dPreview).toContainText(`правка-${run}`);
+  const sBox = (await de.locator('.pane.source').boundingBox())!;
+  const pBox = (await dPreview.boundingBox())!;
+  expect(pBox.x, 'предпросмотр — справа от текста').toBeGreaterThan(sBox.x + sBox.width);
+  expect(Math.abs(pBox.y - sBox.y), 'колонки на одной высоте').toBeLessThan(4);
+  await dp.getByRole('button', { name: 'Отмена' }).click();
+  expect(dProblems, dProblems.join('\n')).toEqual([]);
+  await dctx.close();
 });

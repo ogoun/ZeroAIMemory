@@ -303,6 +303,8 @@
   }
   .q h2 {
     margin: 0;
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
   .body {
     white-space: pre-wrap;
@@ -325,6 +327,6 @@
   }
   form input {
     flex: 1;
-    min-width: 220px;
+    min-width: min(220px, 100%);
   }
 </style>

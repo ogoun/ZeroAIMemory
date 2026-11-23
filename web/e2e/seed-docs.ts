@@ -39,6 +39,27 @@ const HOSTILE_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="60" onload="parent.__pwned=\'svg-onload\'">' +
   '<script>parent.__pwned = "svg-script"</script><rect width="120" height="60" fill="#2f6fed"/></svg>';
 
+/**
+ * Строка кода без пробелов длиннее любого окна (M7.2, §5.2 п. 7): прокручивается внутри блока
+ * кода, страница вбок — нет.
+ */
+const WIDE_CODE = `const ${'w'.repeat(20)} = '${'z'.repeat(268)}';`;
+/** Заметка для обхода узких экранов: таблица в 12 столбцов, длинный путь в тексте, код 300 символов. */
+const WIDE_NOTE = [
+  '# Широкая таблица',
+  '',
+  `Путь без пробелов: \`crates/zam-server/src/api/reports/very_long_module_name_without_spaces/view_handlers.rs\`.`,
+  '',
+  `| ${Array.from({ length: 12 }, (_, i) => `Столбец ${i + 1}`).join(' | ')} |`,
+  `|${' --- |'.repeat(12)}`,
+  ...Array.from({ length: 3 }, (_, r) => `| ${Array.from({ length: 12 }, (_, i) => `значение_${r + 1}_${i + 1}_длинное`).join(' | ')} |`),
+  '',
+  '```js',
+  WIDE_CODE,
+  '```',
+  '',
+].join('\n');
+
 const pad = (i: number) => `Абзац ${i}: ${'обычный текст договора без особых слов. '.repeat(2)}`;
 
 async function api<T>(base: string, token: string, method: string, path: string, init: RequestInit = {}): Promise<T> {
@@ -59,12 +80,13 @@ async function note(base: string, token: string, path: string, content: string):
   return n.id;
 }
 
-async function upload(base: string, token: string, node: string, name: string, data: Buffer | string, type: string) {
+/** Вложение заметки (`POST /blobs`); результат — sha256 файла (адрес просмотрщика). */
+async function upload(base: string, token: string, node: string, name: string, data: Buffer | string, type: string): Promise<string> {
   const form = new FormData();
   form.append('node', node);
   const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : new Uint8Array(data);
   form.append('file', new Blob([bytes], { type }), name);
-  await api(base, token, 'POST', 'blobs', { body: form });
+  return (await api<{ sha256: string }>(base, token, 'POST', 'blobs', { body: form })).sha256;
 }
 
 interface Doc {
@@ -89,6 +111,10 @@ async function waitExtracted(base: string, token: string, nodes: string[]) {
 export interface DocsSeed {
   /** Заметка с документами для просмотрщиков. */
   docs: string;
+  /** sha256 документов заметки `docs` — адреса просмотрщиков (обход узких экранов, M7.2). */
+  sha: { pdf: string; docx: string; xlsx: string; pptx: string };
+  /** Заметка с широкой таблицей и строкой кода в 300 символов (обход узких экранов, M7.2). */
+  wide: string;
   /** Заметка для списка вложений и открепления. */
   attach: string;
   /** Заметка с zip-бомбой под видом DOCX. */
@@ -108,7 +134,7 @@ export async function seedDocs(base: string, token: string): Promise<DocsSeed> {
     ],
     "app.alert('pdf-js-pwned')",
   );
-  await upload(base, token, docs, FILES.pdf, pdf, 'application/pdf');
+  const pdfSha = await upload(base, token, docs, FILES.pdf, pdf, 'application/pdf');
 
   const paras = [
     { heading: 'Введение' },
@@ -119,7 +145,7 @@ export async function seedDocs(base: string, token: string): Promise<DocsSeed> {
     `Здесь встречается ${WORDS.docx} в тексте раздела.`,
     ...Array.from({ length: 10 }, (_, i) => `Хвост ${i + 1}.`),
   ];
-  await upload(
+  const docxSha = await upload(
     base,
     token,
     docs,
@@ -132,7 +158,7 @@ export async function seedDocs(base: string, token: string): Promise<DocsSeed> {
   for (let r = 2; r <= 400; r++) {
     data.push([`R${r}`, r === XLSX_ROW ? `строка с ${WORDS.xlsx}` : `значение ${r}`, r % 2 ? 'нет' : 'да']);
   }
-  await upload(
+  const xlsxSha = await upload(
     base,
     token,
     docs,
@@ -144,7 +170,7 @@ export async function seedDocs(base: string, token: string): Promise<DocsSeed> {
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   );
 
-  await upload(
+  const pptxSha = await upload(
     base,
     token,
     docs,
@@ -180,6 +206,8 @@ export async function seedDocs(base: string, token: string): Promise<DocsSeed> {
   await upload(base, token, attach, FILES.text, 'Обычные текстовые заметки.\n', 'text/plain');
   await upload(base, token, attach, FILES.extra, 'Это вложение открепляется в тесте.\n', 'text/plain');
 
+  const wide = await note(base, token, 'E2E/Широкая таблица', WIDE_NOTE);
+
   await waitExtracted(base, token, [docs, attach, bomb]);
-  return { docs, attach, bomb };
+  return { docs, attach, bomb, wide, sha: { pdf: pdfSha, docx: docxSha, xlsx: xlsxSha, pptx: pptxSha } };
 }

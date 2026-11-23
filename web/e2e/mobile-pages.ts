@@ -20,7 +20,20 @@ export interface MobilePage {
   path: (c: PageCtx) => string;
   /** Чья сессия: по умолчанию — администратор (`ADMIN_STATE`). */
   as?: 'admin' | 'user';
+  /** Вкладки страницы (роль `tab`), которые обход открывает по очереди и проверяет так же. */
+  tabs?: string[];
 }
+
+/**
+ * Журналы решения E2E и Knowledge (`journalsOf`, lib/journals.ts) — для обхода §5.2 п. 7; у решения —
+ * кроме названных в списке отдельно («задачи», «insights», «журнал» — Словарь).
+ */
+const SOLUTION_JOURNALS = ['changelog', 'releases', 'reports', 'code', 'ideas', 'questions', 'vault'];
+const KNOWLEDGE_JOURNALS = ['insights', 'glossary', 'tasks', 'ideas', 'questions', 'vault'];
+
+/** Вложение заметки `E2E_NOTE_DOCS` (seed-docs.ts): `sha` — переменная `E2E_*`, имя — файла. */
+const attachment = (c: PageCtx, sha: string, file: string) =>
+  `#/u/${c.user}/s/knowledge/n/${c.env('E2E_NOTE_DOCS')}/a/${c.env(sha)}/${encodeURIComponent(file)}`;
 
 export const PAGES: MobilePage[] = [
   { name: 'стартовая', path: (c) => `#/u/${c.user}` },
@@ -31,6 +44,30 @@ export const PAGES: MobilePage[] = [
   { name: 'задачи', path: (c) => `#/u/${c.user}/s/${c.solution}/j/tasks` },
   { name: 'идеи', path: (c) => `#/u/${c.user}/s/${IDEAS_GUID}/j/ideas` },
   { name: 'insights', path: (c) => `#/u/${c.user}/s/${c.solution}/j/insights` },
+  // прочие страницы (задача 3, §5.2 пп. 4, 7): все журналы решения и Knowledge, документ с широкой
+  // таблицей и кодом, вложения и просмотрщики, страница отчёта, администрирование, «Аккаунт» и
+  // «Мои решения» пользователя, «Подключение агента», «Кэш»
+  ...SOLUTION_JOURNALS.map((j) => ({ name: `решение-${j}`, path: (c: PageCtx) => `#/u/${c.user}/s/${c.solution}/j/${j}` })),
+  ...KNOWLEDGE_JOURNALS.map((j) => ({ name: `knowledge-${j}`, path: (c: PageCtx) => `#/u/${c.user}/s/knowledge/j/${j}` })),
+  {
+    name: 'документ-таблица-код',
+    path: (c) => `#/u/${c.user}/s/knowledge/n/${c.env('E2E_NOTE_WIDE')}`,
+    tabs: ['История', 'Связи'],
+  },
+  { name: 'вложения', path: (c) => `#/u/${c.user}/s/knowledge/n/${c.env('E2E_NOTE_DOCS')}`, tabs: ['Вложения'] },
+  { name: 'вложение-xlsx', path: (c) => attachment(c, 'E2E_XLSX_SHA', 'таблица.xlsx') },
+  { name: 'вложение-docx', path: (c) => attachment(c, 'E2E_DOCX_SHA', 'договор.docx') },
+  { name: 'вложение-pdf', path: (c) => attachment(c, 'E2E_PDF_SHA', 'отчёт.pdf') },
+  { name: 'вложение-pptx', path: (c) => attachment(c, 'E2E_PPTX_SHA', 'доклад.pptx') },
+  { name: 'отчёт', path: (c) => `#/u/${c.user}/s/${c.solution}/j/reports/${c.env('E2E_REPORT_PRINT')}` },
+  { name: 'пользователи', path: () => '#/admin' },
+  { name: 'решения', path: () => '#/admin/solutions' },
+  { name: 'настройки', path: () => '#/admin/settings' },
+  { name: 'индекс', path: () => '#/admin/index' },
+  { name: 'подключение-агента', path: () => '#/agent-setup' },
+  { name: 'кэш', path: () => '#/cache' },
+  { name: 'аккаунт', path: () => '#/account', as: 'user' },
+  { name: 'мои-решения', path: () => '#/my/solutions', as: 'user' },
   { name: 'журнал', path: (c) => `#/u/${c.user}/s/${c.solution}/j/glossary` },
 ];
 

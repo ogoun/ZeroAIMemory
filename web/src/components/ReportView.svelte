@@ -9,6 +9,8 @@
   // Ссылки тела (M6, задача 15a) — lib/reportLinks.ts: только схемы http, https, mailto, vscode,
   // file; внешним — `rel="noopener noreferrer"`; `file:` — без перехода; у `file:` и `vscode:` —
   // кнопка «копировать путь».
+  // Картинки тела на экране (M7.2, §5.2 п. 5) — серверное превью (`srcset`, `withPreviews`), `src` —
+  // исходник: его берут лайтбокс и печатная копия (`lib/print.ts` строит её из `report.html`).
   import { onDestroy, tick, untrack } from 'svelte';
   import Lightbox from './Lightbox.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
@@ -172,7 +174,8 @@
     const a = t.closest<HTMLAnchorElement>('a');
     const img = t.closest<HTMLImageElement>('img');
     if (img && !a) {
-      lightbox = { src: img.currentSrc || img.src, alt: img.alt };
+      // исходный файл (`src`), а не превью экрана (`currentSrc`)
+      lightbox = { src: img.src, alt: img.alt };
       return;
     }
     if (!a) return;
@@ -189,6 +192,52 @@
 
   /** Первый элемент тела — `<h1>` с текстом заголовка: в шапке заголовок не повторяется. */
   let titleInBody = $derived(report ? bodyStartsWithTitle(report.html, report.entry.title) : false);
+
+  /**
+   * Растровые картинки, у которых сервер строит превью (`thumb_url`, `api/reports/view.rs`): PNG,
+   * JPEG, WebP, GIF; SVG — как есть.
+   */
+  const RASTER = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+  /** Сторона превью картинки на странице (предел сервера — 1024). */
+  const PAGE_PREVIEW_PX = 1024;
+
+  /**
+   * Адрес превью файла отчёта — как `thumb_url` сервера: `user` (администратор от имени другого) —
+   * из адреса самого файла.
+   */
+  function previewUrl(f: EntryAttachment): string {
+    const u = new URLSearchParams(f.url.split('?')[1] ?? '').get('user');
+    return `api/v1/previews/${f.sha256}?kind=thumb&px=${PAGE_PREVIEW_PX}${u ? `&user=${encodeURIComponent(u)}` : ''}`;
+  }
+
+  /**
+   * HTML тела для экрана: у растровых картинок файлов записи — превью в `srcset` (`1x`), `src` —
+   * исходник. Подстановка — до вставки в страницу (разбор в `<template>` ничего не загружает): правка
+   * после вставки начинала бы загрузку исходника. Печать — из `report.html`, без превью.
+   */
+  function withPreviews(html: string, files: EntryAttachment[]): string {
+    const raster = new Map(files.filter((f) => RASTER.includes(f.mime)).map((f) => [f.url, f]));
+    if (!raster.size) return html;
+    const t = document.createElement('template');
+    t.innerHTML = html;
+    let n = 0;
+    for (const img of t.content.querySelectorAll('img')) {
+      const f = raster.get(img.getAttribute('src') ?? '');
+      if (!f) continue;
+      img.setAttribute('srcset', `${previewUrl(f)} 1x`);
+      n++;
+    }
+    return n ? t.innerHTML : html;
+  }
+
+  let screenHtml = $derived(report ? withPreviews(report.html, report.files) : '');
+
+  /** Превью не построилось (422: файл больше предела `[docs]`, повреждён) — один раз исходник
+   * (`src`), как `thumbFailed` ленты; исходник не загрузился — больше попыток нет. */
+  function previewFailed(e: Event) {
+    const img = e.target;
+    if (img instanceof HTMLImageElement && img.hasAttribute('srcset')) img.removeAttribute('srcset');
+  }
 
   let refs = $derived(report ? refsOf(report.entry.data) : []);
   /** Файлы, кроме картинок (картинки — в теле). */
@@ -313,8 +362,9 @@
         </details>
       {/if}
       {#key report}
-        <!-- HTML ответа сервера: санитизирован ammonia, картинки — файлы этой записи -->
-        <div class="doc" bind:this={body}>{@html report.html}</div>
+        <!-- HTML ответа сервера: санитизирован ammonia, картинки — файлы этой записи (на экране —
+             с превью, `withPreviews`); `error` картинок не всплывает — слушается на погружении -->
+        <div class="doc" bind:this={body} onerrorcapture={previewFailed}>{@html screenHtml}</div>
       {/key}
     </div>
     {#if refs.length}

@@ -143,6 +143,27 @@ test('print_waits_for_lazy_modules_images_fonts', async ({ page }) => {
   await expect(page.locator('.print-root.ready')).toHaveCount(1);
 });
 
+test('print_copy_original_images', async ({ page }) => {
+  // превью картинок — только на экране (M7.2, §5.2 п. 5): в печатной копии — исходные файлы отчёта
+  const call = await printed(page);
+  expect(call.imgs).toEqual([true, true, true, true]);
+  const files = /\/api\/v1\/entries\/[^/]+\/attachments\/[0-9a-f]{64}\/(p[123]\.png|nosize\.svg)$/;
+  const copy = await page.locator('.print-root img').evaluateAll((xs) =>
+    xs.map((x) => ({ src: (x as HTMLImageElement).currentSrc, srcset: x.getAttribute('srcset') })),
+  );
+  expect(copy).toHaveLength(4);
+  for (const i of copy) {
+    expect(new URL(i.src).pathname, i.src).toMatch(files);
+    expect(i.srcset, i.src).toBeNull();
+  }
+  // экран — превью у трёх PNG, SVG — сам файл
+  const screen = () => page.locator('article.report .doc img').evaluateAll((xs) => xs.map((x) => (x as HTMLImageElement).currentSrc));
+  await expect
+    .poll(async () => (await screen()).filter((u) => /\/api\/v1\/previews\/[0-9a-f]{64}\?kind=thumb&px=1024$/.test(u)).length)
+    .toBe(3);
+  expect((await screen()).filter((u) => /\/nosize\.svg$/.test(u))).toHaveLength(1);
+});
+
 test('print_svg_without_size_not_blocking', async ({ page }) => {
   // ветка Firefox: SVG только с viewBox (без width/height) там даёт naturalWidth = 0 — Chromium
   // подменяется геттером, растр не трогается

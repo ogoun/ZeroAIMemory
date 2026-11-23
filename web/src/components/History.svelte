@@ -164,9 +164,6 @@
   .history {
     padding: 8px 0 24px;
   }
-  .table-wrap {
-    overflow-x: auto;
-  }
   table {
     font-size: 14px;
   }

@@ -137,64 +137,67 @@
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   {#if notice}<p class="muted" role="status">{notice}</p>{/if}
 
-  <table style="margin-top: 12px;" aria-label="Пользователи">
-    <thead><tr><th>Имя</th><th>Токенов</th><th>Статус</th><th>Вход в WebUI</th><th></th></tr></thead>
-    <tbody>
-      {#each users as u (u.id)}
-        <tr data-user={u.name}>
-          <td>{u.name}{#if u.is_admin} <span class="muted">(админ)</span>{/if}</td>
-          <td>{u.tokens}</td>
-          <td>{u.disabled_at ? 'отключён' : 'активен'}</td>
-          <td class="muted">{passwordText(u)}</td>
-          <td class="row acts">
-            <button onclick={() => toggle(u.id)}>{open === u.id ? 'Скрыть' : 'Токены'}</button>
-            {#if !u.is_admin}
-              <button onclick={() => setPassword(u)}>{u.has_password ? 'Сменить пароль' : 'Задать пароль'}</button>
-              {#if u.has_password}
-                <button class="danger" onclick={() => clearPassword(u)}>Закрыть вход</button>
-              {/if}
-            {/if}
-          </td>
-        </tr>
-        {#if open === u.id}
-          <tr>
-            <td colspan="5">
-              <table>
-                <thead><tr><th>Имя</th><th>Префикс</th><th>Доступ</th><th>Использован</th><th></th></tr></thead>
-                <tbody>
-                  {#each tokens[u.id] ?? [] as t (t.id)}
-                    <tr>
-                      <td>{t.name}</td>
-                      <td><code>zam_{t.prefix}…</code></td>
-                      <td>{t.access}</td>
-                      <td>{t.last_used_at ? localTime(t.last_used_at) : '—'}</td>
-                      <td>
-                        {#if t.revoked_at}
-                          <span class="muted">отозван</span>
-                        {:else}
-                          <button class="danger" onclick={() => revoke(t.id)}>Отозвать</button>
-                        {/if}
-                      </td>
-                    </tr>
-                  {/each}
-                </tbody>
-              </table>
-              {#if !u.disabled_at}
-                <form class="row" style="margin-top: 8px;" onsubmit={(e) => addToken(e, u.id)}>
-                  <input placeholder="Имя токена" bind:value={tokenName} required maxlength="64" />
-                  <select bind:value={tokenAccess} aria-label="Доступ">
-                    <option value="rw">rw (чтение и запись)</option>
-                    <option value="ro">ro (только чтение)</option>
-                  </select>
-                  <button class="primary">Выпустить токен</button>
-                </form>
+  <!-- таблица (и раскрытые строки) — в `.table-wrap` (§5.1 п. 6): прокрутка внутри, страница — нет -->
+  <div class="table-wrap" style="margin-top: 12px;">
+    <table aria-label="Пользователи">
+      <thead><tr><th>Имя</th><th>Токенов</th><th>Статус</th><th>Вход в WebUI</th><th></th></tr></thead>
+      <tbody>
+        {#each users as u (u.id)}
+          <tr data-user={u.name}>
+            <td>{u.name}{#if u.is_admin} <span class="muted">(админ)</span>{/if}</td>
+            <td>{u.tokens}</td>
+            <td>{u.disabled_at ? 'отключён' : 'активен'}</td>
+            <td class="muted">{passwordText(u)}</td>
+            <td class="row acts">
+              <button onclick={() => toggle(u.id)}>{open === u.id ? 'Скрыть' : 'Токены'}</button>
+              {#if !u.is_admin}
+                <button onclick={() => setPassword(u)}>{u.has_password ? 'Сменить пароль' : 'Задать пароль'}</button>
+                {#if u.has_password}
+                  <button class="danger" onclick={() => clearPassword(u)}>Закрыть вход</button>
+                {/if}
               {/if}
             </td>
           </tr>
-        {/if}
-      {/each}
-    </tbody>
-  </table>
+          {#if open === u.id}
+            <tr>
+              <td colspan="5">
+                <table>
+                  <thead><tr><th>Имя</th><th>Префикс</th><th>Доступ</th><th>Использован</th><th></th></tr></thead>
+                  <tbody>
+                    {#each tokens[u.id] ?? [] as t (t.id)}
+                      <tr>
+                        <td>{t.name}</td>
+                        <td><code>zam_{t.prefix}…</code></td>
+                        <td>{t.access}</td>
+                        <td>{t.last_used_at ? localTime(t.last_used_at) : '—'}</td>
+                        <td>
+                          {#if t.revoked_at}
+                            <span class="muted">отозван</span>
+                          {:else}
+                            <button class="danger" onclick={() => revoke(t.id)}>Отозвать</button>
+                          {/if}
+                        </td>
+                      </tr>
+                    {/each}
+                  </tbody>
+                </table>
+                {#if !u.disabled_at}
+                  <form class="row" style="margin-top: 8px;" onsubmit={(e) => addToken(e, u.id)}>
+                    <input placeholder="Имя токена" bind:value={tokenName} required maxlength="64" />
+                    <select bind:value={tokenAccess} aria-label="Доступ">
+                      <option value="rw">rw (чтение и запись)</option>
+                      <option value="ro">ro (только чтение)</option>
+                    </select>
+                    <button class="primary">Выпустить токен</button>
+                  </form>
+                {/if}
+              </td>
+            </tr>
+          {/if}
+        {/each}
+      </tbody>
+    </table>
+  </div>
 </section>
 
 <Prompt bind:ask />
@@ -205,5 +208,11 @@
   }
   .acts button {
     padding: 2px 10px;
+  }
+  /* при касании — зазор между кнопками ряда (`--touch-gap`, app.css) */
+  @media (pointer: coarse) {
+    .acts {
+      gap: var(--touch-gap);
+    }
   }
 </style>
