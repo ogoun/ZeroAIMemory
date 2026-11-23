@@ -243,7 +243,9 @@
 
   /** Панель закрыта: фокус — на строку показанной записи (нажатый в ней элемент, иначе её ссылку
    * или кнопку), без строки — на нажатый элемент списка («Новая задача»); если фокус уже ушёл сам
-   * (щелчок по шапке) — не трогать. Прокрутка — только если строка вне окна. */
+   * (щелчок по шапке) — не трогать. Прокрутка — только если строка вне окна. Запись бывает в списке
+   * не одной строкой (доска задач: плитка шага и он же в раскрытии общей) — нажатый элемент строки
+   * этой записи (ближайший `[data-entry]`) сильнее первой такой строки. */
   async function closeSheet() {
     const back0 = returnTo;
     returnTo = null;
@@ -251,8 +253,9 @@
     const a = document.activeElement;
     if (a && a !== document.body) return;
     const pressed = back0?.isConnected ? back0 : null;
+    const own = !!shownEntry && pressed?.closest<HTMLElement>('[data-entry]')?.dataset.entry === shownEntry;
     const row = shownEntry ? listEl?.querySelector<HTMLElement>(`[data-entry="${CSS.escape(shownEntry)}"]`) : null;
-    const t = row ? (pressed && row.contains(pressed) ? pressed : rowTarget(shownEntry)) : pressed;
+    const t = own ? pressed : row ? (pressed && row.contains(pressed) ? pressed : rowTarget(shownEntry)) : pressed;
     if (!t) return;
     if (!t.matches('a[href], button, [tabindex]')) t.tabIndex = -1;
     t.focus({ preventScroll: true });
