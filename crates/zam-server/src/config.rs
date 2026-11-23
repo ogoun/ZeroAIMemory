@@ -59,6 +59,7 @@ pub struct ServerConfig {
     pub export: ExportSection,
     pub import: ImportSection,
     pub snapshot: SnapshotSection,
+    pub works: WorksSection,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1294,8 +1295,11 @@ pub struct BackupSection {
     pub dir: Option<PathBuf>,
     /// `off` (по умолчанию: копия на том же диске может его заполнить) или `daily`.
     pub schedule: BackupSchedule,
-    /// Время автокопии, `HH:MM` UTC (по умолчанию `03:30`).
+    /// Время автокопии, `HH:MM` в поясе [`BackupSection::tz`] (по умолчанию `03:30`).
     pub at: String,
+    /// Пояс `at` (M7.3 §6.1 п. 3): имя IANA, `UTC` или `±HH:MM` (по умолчанию `UTC` — поведение
+    /// до M7.3).
+    pub tz: String,
     /// Сколько автокопий хранить (1..=365, 7); сверх — удаляются самые старые.
     pub keep: u32,
     /// `GET /index/status` предупреждает `no_recent_backup`, если последней копии больше
@@ -1311,6 +1315,7 @@ impl Default for BackupSection {
             dir: None,
             schedule: BackupSchedule::Off,
             at: "03:30".into(),
+            tz: "UTC".into(),
             keep: 7,
             warn_days: 7,
             flag_max_hours: 6,
@@ -1329,6 +1334,11 @@ impl BackupSection {
         parse_hm(&self.at).unwrap_or((3, 30))
     }
 
+    /// Пояс `at`; проверен [`BackupSection::validate`] (иначе — UTC).
+    pub fn time_zone(&self) -> jiff::tz::TimeZone {
+        crate::schedule::parse_tz(&self.tz).unwrap_or(jiff::tz::TimeZone::UTC)
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         let bad = |key: &str, message: &str| ConfigError::Invalid {
             key: format!("backup.{key}"),
@@ -1336,7 +1346,10 @@ impl BackupSection {
             message: message.into(),
         };
         if parse_hm(&self.at).is_none() {
-            return Err(bad("at", "время HH:MM (UTC), например 03:30"));
+            return Err(bad("at", "время HH:MM (в поясе tz), например 03:30"));
+        }
+        if let Err(e) = crate::schedule::parse_tz(&self.tz) {
+            return Err(bad("tz", &e));
         }
         if !(1..=365).contains(&self.keep) {
             return Err(bad("keep", "от 1 до 365"));
@@ -1384,6 +1397,169 @@ impl SnapshotSection {
         }
         if !(1..=90).contains(&self.keep_days) {
             return Err(bad("keep_days", "от 1 до 90"));
+        }
+        Ok(())
+    }
+}
+
+/// Режим исполнителя внутренних работ (M7.3 §6.1): никто, агент в своей сессии или подключённая
+/// модель.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorksMode {
+    /// Работа не проводится (умолчание новой установки: без явного выбора данные не уходят к
+    /// модели, а агент не тратит токены).
+    #[default]
+    Off,
+    /// Работу делает агент в своей сессии (`memory_recall event=work`).
+    Agent,
+    /// Работу делает подключённая модель (`works.model`, §6.2).
+    Model,
+}
+
+impl WorksMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WorksMode::Off => "off",
+            WorksMode::Agent => "agent",
+            WorksMode::Model => "model",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<WorksMode> {
+        match s {
+            "off" => Some(WorksMode::Off),
+            "agent" => Some(WorksMode::Agent),
+            "model" => Some(WorksMode::Model),
+            _ => None,
+        }
+    }
+}
+
+/// Куда можно слать данные памяти в режиме `model` (§6.2 п. 6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelAccess {
+    /// Куда угодно (вне LAN — с предупреждением).
+    #[default]
+    Any,
+    /// Только в LAN.
+    Lan,
+    /// Режима `model` нет.
+    Off,
+}
+
+/// Ночная проверка памяти (§6.5): каждую ночь или нет (ручной прогон идёт и при `off`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckMode {
+    #[default]
+    Nightly,
+    Off,
+}
+
+/// Секция `[works]` (M7.3 §6.1): исполнитель внутренних работ, ночное окно с поясом, ночная
+/// проверка и пределы обращений к модели.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorksSection {
+    /// Общий выключатель: `false` — ни работ, ни проверки, ни обращений к модели; ручные
+    /// `POST /works/run`, `POST /check/run` — 409 `/problems/works-disabled`.
+    pub enabled: bool,
+    /// Режим пользователя без своей настройки `works.mode` (`off`).
+    pub default_mode: WorksMode,
+    /// Куда можно слать данные в режиме `model` (`any`).
+    pub model_access: ModelAccess,
+    /// Разрешить модели адреса петли, link-local и собственные адреса сервера (`false`).
+    pub allow_loopback: bool,
+    /// Начало ночных работ и проверки, `HH:MM` в поясе [`WorksSection::tz`] (`04:30`).
+    pub at: String,
+    /// Пояс `at`: имя IANA, `UTC` или `±HH:MM` (`UTC`).
+    pub tz: String,
+    /// Окно ночи, минут (10..=720, 120): позже — остаток на следующую ночь.
+    pub window_min: u32,
+    /// Ночная проверка (`nightly`); `off` выключает только ночной прогон.
+    pub check: CheckMode,
+    /// Предел одного прогона проверки, минут (1..=240, 30).
+    pub check_max_min: u32,
+    /// Потолок токенов модели на пользователя в сутки UTC (0..=10⁹, 2 000 000; 0 — обращений
+    /// нет).
+    pub max_daily_tokens: u64,
+    /// Потолок токенов модели на пользователя в месяц UTC (0..=10⁹, 30 000 000).
+    pub max_monthly_tokens: u64,
+    /// Одновременных обращений к модели на сервер (1..=4, 1).
+    pub max_parallel: u32,
+    /// Срок одного обращения, с (10..=3600, 300).
+    pub call_timeout_s: u32,
+    /// Записей (кандидатов) в одном пакете работы (1..=50, 10).
+    pub batch_records: u32,
+}
+
+impl Default for WorksSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_mode: WorksMode::Off,
+            model_access: ModelAccess::Any,
+            allow_loopback: false,
+            at: "04:30".into(),
+            tz: "UTC".into(),
+            window_min: 120,
+            check: CheckMode::Nightly,
+            check_max_min: 30,
+            max_daily_tokens: 2_000_000,
+            max_monthly_tokens: 30_000_000,
+            max_parallel: 1,
+            call_timeout_s: 300,
+            batch_records: 10,
+        }
+    }
+}
+
+impl WorksSection {
+    /// `at` как (часы, минуты); проверено [`WorksSection::validate`].
+    pub fn at_hm(&self) -> (i8, i8) {
+        parse_hm(&self.at).unwrap_or((4, 30))
+    }
+
+    /// Пояс `at`; проверен [`WorksSection::validate`] (иначе — UTC).
+    pub fn time_zone(&self) -> jiff::tz::TimeZone {
+        crate::schedule::parse_tz(&self.tz).unwrap_or(jiff::tz::TimeZone::UTC)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("works.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if parse_hm(&self.at).is_none() {
+            return Err(bad("at", "время HH:MM (в поясе tz), например 04:30"));
+        }
+        if let Err(e) = crate::schedule::parse_tz(&self.tz) {
+            return Err(bad("tz", &e));
+        }
+        if !(10..=720).contains(&self.window_min) {
+            return Err(bad("window_min", "от 10 до 720"));
+        }
+        if !(1..=240).contains(&self.check_max_min) {
+            return Err(bad("check_max_min", "от 1 до 240"));
+        }
+        const TOKENS_MAX: u64 = 1_000_000_000;
+        if self.max_daily_tokens > TOKENS_MAX {
+            return Err(bad("max_daily_tokens", "от 0 до 1000000000"));
+        }
+        if self.max_monthly_tokens > TOKENS_MAX {
+            return Err(bad("max_monthly_tokens", "от 0 до 1000000000"));
+        }
+        if !(1..=4).contains(&self.max_parallel) {
+            return Err(bad("max_parallel", "от 1 до 4"));
+        }
+        if !(10..=3600).contains(&self.call_timeout_s) {
+            return Err(bad("call_timeout_s", "от 10 до 3600"));
+        }
+        if !(1..=50).contains(&self.batch_records) {
+            return Err(bad("batch_records", "от 1 до 50"));
         }
         Ok(())
     }
@@ -1626,6 +1802,7 @@ impl Default for ServerConfig {
             export: ExportSection::default(),
             import: ImportSection::default(),
             snapshot: SnapshotSection::default(),
+            works: WorksSection::default(),
         }
     }
 }
@@ -1805,6 +1982,7 @@ pub fn load(
     cfg.export.validate()?;
     cfg.import.validate()?;
     cfg.snapshot.validate()?;
+    cfg.works.validate()?;
     Ok(cfg)
 }
 
@@ -2986,6 +3164,128 @@ master_key = \"x\"
             let e = load(None, &[env(k, v)], &Default::default());
             assert!(e.unwrap_err().to_string().contains("backup."), "{k}={v}");
         }
+    }
+
+    /// M7.3 §6.1: умолчания `[works]` — таблица спецификации (Global Constraints плана); значения
+    /// вне диапазонов и неизвестный пояс — ошибка с именем ключа; неизвестный ключ секции —
+    /// ошибка; `[backup] tz` — `UTC` по умолчанию и тот же разбор пояса.
+    #[test]
+    fn works_config_defaults_and_bounds() {
+        let w = load(None, &[], &Default::default()).unwrap().works;
+        assert_eq!(w, WorksSection::default());
+        assert!(w.enabled && !w.allow_loopback);
+        assert_eq!(
+            (w.default_mode, w.model_access, w.check),
+            (WorksMode::Off, ModelAccess::Any, CheckMode::Nightly)
+        );
+        assert_eq!((w.at.as_str(), w.tz.as_str()), ("04:30", "UTC"));
+        assert_eq!(w.at_hm(), (4, 30));
+        assert_eq!((w.window_min, w.check_max_min), (120, 30));
+        assert_eq!(
+            (w.max_daily_tokens, w.max_monthly_tokens),
+            (2_000_000, 30_000_000)
+        );
+        assert_eq!(
+            (w.max_parallel, w.call_timeout_s, w.batch_records),
+            (1, 300, 10)
+        );
+        assert_eq!(w.time_zone(), jiff::tz::TimeZone::UTC);
+        let b = load(None, &[], &Default::default()).unwrap().backup;
+        assert_eq!(b.tz, "UTC");
+        for (k, v) in [
+            ("ZAM_WORKS__WINDOW_MIN", "721"),
+            ("ZAM_WORKS__WINDOW_MIN", "9"),
+            ("ZAM_WORKS__CHECK_MAX_MIN", "0"),
+            ("ZAM_WORKS__CHECK_MAX_MIN", "241"),
+            ("ZAM_WORKS__MAX_PARALLEL", "5"),
+            ("ZAM_WORKS__MAX_PARALLEL", "0"),
+            ("ZAM_WORKS__CALL_TIMEOUT_S", "9"),
+            ("ZAM_WORKS__CALL_TIMEOUT_S", "3601"),
+            ("ZAM_WORKS__BATCH_RECORDS", "0"),
+            ("ZAM_WORKS__BATCH_RECORDS", "51"),
+            ("ZAM_WORKS__MAX_DAILY_TOKENS", "1000000001"),
+            ("ZAM_WORKS__MAX_MONTHLY_TOKENS", "1000000001"),
+            ("ZAM_WORKS__TZ", "Mars/Base"),
+            ("ZAM_WORKS__TZ", "+25:00"),
+            ("ZAM_WORKS__AT", "4:30"),
+            ("ZAM_WORKS__AT", "24:00"),
+            ("ZAM_WORKS__DEFAULT_MODE", "auto"),
+            ("ZAM_WORKS__MODEL_ACCESS", "wan"),
+            ("ZAM_WORKS__CHECK", "weekly"),
+        ] {
+            let e = load(None, &[env(k, v)], &Default::default())
+                .unwrap_err()
+                .to_string();
+            let key = k.trim_start_matches("ZAM_WORKS__").to_lowercase();
+            assert!(e.contains(&format!("works.{key}")), "{k}={v}: {e}");
+        }
+        // неизвестный пояс — с примерами
+        let e = load(
+            None,
+            &[env("ZAM_WORKS__TZ", "Mars/Base")],
+            &Default::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("Europe/Moscow") && e.contains("+03:00") && e.contains("UTC"),
+            "{e}"
+        );
+        let e = load(
+            None,
+            &[env("ZAM_BACKUP__TZ", "Mars/Base")],
+            &Default::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("backup.tz"), "{e}");
+        let ok = vec![
+            env("ZAM_WORKS__ENABLED", "false"),
+            env("ZAM_WORKS__DEFAULT_MODE", "agent"),
+            env("ZAM_WORKS__MODEL_ACCESS", "lan"),
+            env("ZAM_WORKS__ALLOW_LOOPBACK", "true"),
+            env("ZAM_WORKS__AT", "23:30"),
+            env("ZAM_WORKS__TZ", "Europe/Moscow"),
+            env("ZAM_WORKS__WINDOW_MIN", "720"),
+            env("ZAM_WORKS__CHECK", "off"),
+            env("ZAM_WORKS__CHECK_MAX_MIN", "240"),
+            env("ZAM_WORKS__MAX_DAILY_TOKENS", "0"),
+            env("ZAM_WORKS__MAX_MONTHLY_TOKENS", "1000000000"),
+            env("ZAM_WORKS__MAX_PARALLEL", "4"),
+            env("ZAM_WORKS__CALL_TIMEOUT_S", "3600"),
+            env("ZAM_WORKS__BATCH_RECORDS", "50"),
+            env("ZAM_BACKUP__TZ", "+03:00"),
+        ];
+        let c = load(None, &ok, &Default::default()).unwrap();
+        let w = &c.works;
+        assert!(!w.enabled && w.allow_loopback);
+        assert_eq!(
+            (w.default_mode, w.model_access, w.check),
+            (WorksMode::Agent, ModelAccess::Lan, CheckMode::Off)
+        );
+        assert_eq!((w.at_hm(), w.tz.as_str()), ((23, 30), "Europe/Moscow"));
+        assert_eq!(
+            (w.window_min, w.check_max_min, w.max_daily_tokens),
+            (720, 240, 0)
+        );
+        assert_eq!(
+            (w.max_parallel, w.call_timeout_s, w.batch_records),
+            (4, 3600, 50)
+        );
+        assert_eq!(c.backup.tz, "+03:00");
+        for v in ["UTC", "-05:30", "America/New_York"] {
+            assert!(
+                load(None, &[env("ZAM_WORKS__TZ", v)], &Default::default()).is_ok(),
+                "{v}"
+            );
+        }
+        let e = load(None, &[env("ZAM_WORKS__AUTO", "true")], &Default::default());
+        assert!(e.is_err(), "неизвестный ключ секции — ошибка");
+        let f = write_in_target("works_unknown.toml", "[works]\nnightly = true\n");
+        let e = load(Some(&f), &[], &Default::default())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("works.nightly"), "{e}");
     }
 
     #[test]

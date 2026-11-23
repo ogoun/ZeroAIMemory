@@ -209,6 +209,15 @@ fn stub_typed(reply: std::sync::Arc<BodyReply>, content_type: &'static str) -> (
     (url, seen)
 }
 
+/// Умолчания сервера тестов, собранного в процессе (`..common::server_defaults()`): без ночной
+/// проверки (M7.3, решение 67 — как `zam-server` `common::cfg_in`): умолчание `check =
+/// "nightly"` в 04:30 UTC запускало бы её в любом тестовом сервере в окне.
+pub fn server_defaults() -> zam_server::config::ServerConfig {
+    let mut c = zam_server::config::ServerConfig::default();
+    c.works.check = zam_server::config::CheckMode::Off;
+    c
+}
+
 /// Бинарник `zam-server` из каталога сборки — рабочий процесс разбора документов (M5). Нет его —
 /// `None` с `SKIP <test>` в stderr; в CI и с `ZAM_REQUIRE_ML` пропуск недопустим (как
 /// `common::ml::have` у `zam-server`).
@@ -240,7 +249,7 @@ pub fn docs_server(data: PathBuf, worker: PathBuf) -> (String, String) {
         rt.block_on(async move {
             let mut cfg = ServerConfig {
                 data_dir: data,
-                ..ServerConfig::default()
+                ..server_defaults()
             };
             cfg.docs.worker_program = Some(worker);
             let (app, _st, rep) = build(cfg, Some("pw".into())).await.unwrap();

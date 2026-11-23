@@ -34,7 +34,9 @@ anyhow = "1"
 http-body-util = "0.1"
 argon2 = { version = "0.5", features = ["std"] }
 fs4 = { version = "1", features = ["sync"] }
-jiff = { version = "0.2", features = ["serde"] }
+# M7.3: база часовых поясов встроена (`jiff-tzdb`, уже в Cargo.lock) — пояс `[works] tz` и
+# `[backup] tz` на Linux без пакета tzdata
+jiff = { version = "0.2", features = ["serde", "tzdb-bundle-always"] }
 base64 = "0.22"
 subtle = "2.6"
 cookie = "0.18"

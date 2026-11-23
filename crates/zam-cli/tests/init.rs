@@ -48,7 +48,7 @@ fn start_n(name: &str, n: usize) -> (String, Vec<String>) {
         rt.block_on(async move {
             let cfg = ServerConfig {
                 data_dir: data,
-                ..ServerConfig::default()
+                ..common::server_defaults()
             };
             let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();
             let u = st.system.create_user("Анна", false).await.unwrap();
@@ -1310,7 +1310,7 @@ fn start_public(name: &str) -> (String, String, String) {
             let public = format!("http://localhost:{port}");
             let mut cfg = ServerConfig {
                 data_dir: data,
-                ..ServerConfig::default()
+                ..common::server_defaults()
             };
             cfg.server.public_url = Some(public.clone());
             let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();

@@ -207,7 +207,7 @@ impl Srv {
             rt.block_on(async move {
                 let mut cfg = ServerConfig {
                     data_dir: data,
-                    ..ServerConfig::default()
+                    ..common::server_defaults()
                 };
                 tweak(&mut cfg);
                 let (app, st, _) = build(cfg, Some(PW.into())).await.unwrap();

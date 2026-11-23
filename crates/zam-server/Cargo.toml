@@ -93,9 +93,10 @@ libc.workspace = true
 
 [features]
 # Тестовые точки (заглушка реранкера `RerankSlot::install`, точка остановки поиска после
-# каналов `AppState::search_hold` на `zam_index::test_hooks::Hold`) — только интеграционным
+# каналов `AppState::search_hold` на `zam_index::test_hooks::Hold`; M7.3 — тик и функции ночи
+# `works::night::test_hooks`, тестовый вид работ `echo` хранилища) — только интеграционным
 # тестам пакета через dev-зависимость на себя; в сборке сервера и релизе их нет.
-test-hooks = ["zam-index/test-hooks"]
+test-hooks = ["zam-index/test-hooks", "zam-store/test-hooks"]
 
 [build-dependencies]
 memory-serve.workspace = true

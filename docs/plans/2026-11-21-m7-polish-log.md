@@ -5086,6 +5086,191 @@ Markdown-выдаче агенту (31). Решения по ходу задач
 | Финальное ревью ветки и волна правок | `9db9aa57..b7348711`: With fixes — Critical нет, Important I1 (несохранённое в Insights, Идеях и Словаре терялось по «←» и переходу), Minor M1–M9; волна правок `743dda54`, `bc287635`, `3008a168`, `3905b63b` (I1, M1–M5 и из триажа — признак правки всех журналов, вкладки DocView, прозрачность, окно конфликта редактора); M6–M9 — в M7.4 (задачи памяти, «Известные ограничения»); повторное ревью — закрыто всё, новых Critical и Important нет, N1 (документы) — `6bb0b755`; итог — `90830595` |
 | Тег `v0.0.15-m7.2`, Release, развёртывание на рабочий сервер памяти (с копией данных) и тестовый стенд, клиент владельца | … |
 
+## Волна M7.3 «Внутренние работы»
+
+Проект — спецификация этапа §6 (решения координатора 32–78 — §12), план —
+`docs/plans/2026-11-23-m7.3-internal.md`. Ветка `m7.3-internal` от `main` после выпуска
+`v0.0.15-m7.2`.
+
+### M7.3 · Задача 1 — Схема 0027, `[works]`, настройки `works.*`, время с поясом, `NightRunner`
+
+Спецификация §6 «Общее для волны», §6.1; worktree `.tmp/m73/wt-t1`, ветка `m7.3-t1` от
+`072e3257`.
+
+**Схема.** `0027_internal_works.sql` — `rebuild: false`, только новые таблицы `probes`,
+`check_runs`, `check_results`, `works`, `work_calls`, `proposals`, `usage_opened` и строка
+`meta.usage_opened_since` (`strftime(…) || '.000000Z'`, формат `fmt_ts`). Индексы — `works_open`
+(частичный, `queued`/`running`), `works_night`, `work_calls_ts`, `probes_active` (частичный,
+`active`), `check_runs_night (trigger_kind, night)`, `proposals_open`, `proposals_dedup`,
+`usage_opened_target`; ключи — `check_results (run_id, probe_id, space_id)` (`WITHOUT ROWID`,
+`space_id DEFAULT ''`), `usage_opened (session_id, target_kind, target_id)` (`WITHOUT ROWID`).
+Внешний ключ — только `check_results.run_id → check_runs(id) ON DELETE CASCADE` (срок прогонов
+365 суток уносит их результаты); на `entries`, `sessions` и `spaces` — нет. CHECK — у
+перечислений спецификации (`probes.kind/split/author_kind/status`, `check_runs.trigger_kind/
+status`, `works.mode/origin/state`, `proposals.status/author_kind`); у `works.kind` и
+`proposals.type` — нет. `zam_store::works::{WorkKind, ProposalType}` (`echo` — под `test-hooks`),
+`zam_store::usage::{OpenedEvent, record_opened, opened_counts_many, usage_opened_since}`.
+
+**Конфигурация.** `[works]` (`WorksSection`, `WorksMode`, `ModelAccess`, `CheckMode`) — умолчания и
+диапазоны таблицы §6.1, ошибка — с именем ключа (`works.tz` — с примерами `Europe/Moscow`, `UTC`,
+`+03:00`); `[backup] tz = "UTC"`. `jiff` — фича `tzdb-bundle-always`; `git diff main -- Cargo.lock`
+— одна строка `"jiff-tzdb"` в зависимостях `jiff`, новых `[[package]]` нет.
+
+**Время.** `zam_server::schedule::{parse_tz, slot, night_window}`; слот автокопий —
+`backup::schedule::slot` через `schedule::slot` с `[backup] tz` (прежние `schedule_tick_cases` —
+без смены ожиданий, зелёные). `works::schedule::tick` — чистая функция на `night_window`.
+
+**Настройки `works.*`.** `works::settings` — ключи, `UserWorks`, `ModelConn` (`vault` в JSON —
+`v:<id>`, хранится id; `pinned: Option<PinnedAddr>` — для задачи 2), `BaseUrl`/`PinnedAddr`,
+`Limits`, `Pause`, `effective_mode` (причины `off`: `disabled`, `model_access_off`, `no_model`,
+`paused`), `load`, `set_pause` (единственный писатель `works.pause`, после записи —
+`user_flags.invalidate`). `PATCH /auth/settings {works: {mode, kinds, model, limits, check}}`:
+выбор `mode`, равный `default_mode`, и `check = on` не хранятся; `works.model` — запись личного
+Vault по имени или `v:<id>` (нет — 422), `model` 1..=200 символов, `max_tokens` 256..=32000,
+`body_extra` — объект до 4 КиБ; аудит `works.model` — без `body_extra`; `PATCH`, сменивший
+действующий режим вида, зовёт `works::queue::on_mode_change`. Ответ — поле `works` (`mode`,
+`kinds`, `model`, `limits`, `check`, `pause`, `effective: {<вид>: {mode, reason}}`).
+
+**`NightRunner`** (`works::night`): тик `WORKS_TICK` = 60 с (первый — через период после старта),
+ночь — `check::night` (при `[works] check = "nightly"`), затем `queue::night`; обе в задаче 1 —
+заглушки, как и `queue::on_start`, `check::on_start` (зовутся один раз после сборки `AppState`
+при любом `enabled`; с круга правок 1 — в фоне раннера) и `queue::on_mode_change`. `AppState::shutdown` —
+`self.night.stop().await` первой строкой; `stop` — признак остановки, ожидание задачи
+`STOP_WAIT` = 5 с, затем `abort`, клон отпускается. `NightCtx` — клон `AppState` и признак
+остановки (`stopping`, `stopped` — для `select!` долгих вызовов задач 2, 3, 5). Тестовые точки
+(`test-hooks`): `works::night::test_hooks::{set_tick, set_jobs, reset, stop_log}`,
+`works::queue::test_hooks::mode_changes`; фича `test-hooks` сервера включает `zam-store/test-hooks`.
+`common::cfg_in` — `works.check = off` (решение 67).
+
+- [решение исполнителя, задача 1] **Клон состояния ночи держит раннер, задача — `Weak`.** Буква
+  решения 56 и плана («клон держит только задача, не поле») оставляет цикл «задача → клон →
+  `AppState.night` → раннер → `JoinHandle`»: `JoinHandle` при уничтожении задачу не снимает, и
+  после ухода последнего внешнего клона без `shutdown` (тесты `boot::first_run_creates_admin_and_
+  token_once`, `revoked_admin_tokens_do_not_issue_new_initial_token` — `drop(app); drop(st);` и
+  новая сборка на том же каталоге) лок каталога данных и базы держались бы до конца рантайма —
+  повторный старт падал бы `DataDirLocked`. Поэтому: раннер хранит `Arc<NightCtx>` в своём поле, у
+  этого клона `night` — отвязанный раннер без задачи с тем же признаком остановки (цикла нет),
+  задача держит `Weak` и берёт сильную ссылку только на время ночи. Уход последнего внешнего клона
+  уничтожает раннер и клон сразу (между ночами); `stop` снимает задачу и отпускает клон. Суть
+  решения 56 сохранена: `NightCtx` — клон `AppState`, создание до сборки, запуск после, остановка
+  первой, в `spawn_blocking` нет ни `Db`, ни `AppState`. Проверка — `boot.rs` (15 passed) и
+  мутация (ниже).
+- [решение исполнителя, задача 1] `night_runner_stops_before_dbs` — переименование файла базы
+  после `shutdown` и ухода клонов теста, пока блокирующий поток работы ещё висит (ожидание — до
+  3 с: фоновые задачи открытия базы отпускают `Db` чуть позже, как в
+  `search_rerank_boosts.rs:438`); порядок «ночь → обслуживание» — журнал `stop_log` раннера.
+- [решение исполнителя, задача 1] `works.model.protocol` хранится строкой: проверка значения
+  (`openai`, иное — 422 «протокол появится в 0.0.19-m7.6») — задача 2 (`protocol_not_openai_422`),
+  как и запрещённые ключи `body_extra`, адрес записи, класс сети и `pinned`. Задача 1 проверяет
+  форму, пределы полей и запись Vault.
+- [решение исполнителя, задача 1] Поле ответа и правки видов — `works.kinds` (имя поля
+  `UserWorks.kinds`), ключ строки — `works.kind.<вид>`; `null` в `kinds` снимает переопределение.
+- [решение исполнителя, задача 1] `Pause {class, since, from?, to?}`: `from`/`to` — хосты «был →
+  стал» паузы `vault_changed` (§6.2 п. 1), заполняет задача 2.
+- [решение исполнителя, задача 1] `probes.space_id` у `negative` — `''` (общие вопросы, §6.4 п. 4);
+  `check_runs.night` у ручного прогона — `NULL` (решение координатора по ревью r1, Minor 5: ночной
+  прогон ночи ищется по `(trigger_kind, night)`).
+- [решение исполнителя, задача 1] Тест `migrate_rebuild::reopen_v25_repairs_late_0025_schema` тоже
+  был привязан к последней схеме (счётчики таблиц): ожидание — прежние таблицы с теми же строками,
+  семь пустых таблиц 0027 и `meta` + 1.
+
+**TDD.** RED: `zam-store --test user_db` — не собирается (`OpenedEvent`, `record_opened`,
+`opened_counts_many`, `usage_opened_since` нет); после регистрации 0027 — `migrate_rebuild` 5
+FAILED (версия 26 и объекты); `zam-server --test works_settings --test works_night` — не
+собирается (нет `works`, `CheckMode`, `ModelAccess`, `WorksMode`, `ServerConfig.works`,
+`AppState.night`). GREEN — ниже.
+
+**Прогоны** (`CARGO_TARGET_DIR=.tmp/m73/wt-t1/target/m73-t1`, `ZAM_REQUIRE_ML=1`):
+- `zam-store --test user_db --test migrate_rebuild` — 11 + 11 passed;
+- `zam-server --lib` (`config::`, `schedule`, `works::`, `user_settings`) — 64 passed (новые:
+  `works_config_defaults_and_bounds`, `slot_tz_moscow_0430_is_0130_utc`, `slot_dst_gap_and_fold`,
+  `slot_fixed_offset`, `backup_tz_default_utc_unchanged`, `works_tick_window_no_catch_up`,
+  `works_tick_restart_in_window_continues`, `works_tick_window_crosses_midnight`,
+  `works_mode_resolution_cases`, `rows_roundtrip_and_garbage`; `example_config_parses_to_defaults`
+  — с `[works]` и `[backup] tz`);
+- `zam-server --test works_settings` — 6 passed, `--test works_night` — 3 passed;
+- `--test backup` — 53 passed (первый прогон: 3 FAILED — в worktree не было `target/deps`
+  (ORT, Qdrant, pdfium); после копии из основного каталога — зелёные), `--test m65_acceptance` — 7
+  passed, `--test boot` — 15 passed, `--test user_login` — 19 passed, `--test ideas_review` — 9
+  passed.
+
+**Мутации** (временные правки, откачены): без отвязанного раннера у клона ночи (цикл `Arc`) —
+`boot::first_run_creates_admin_and_token_once` и `revoked_admin_tokens_do_not_issue_new_initial_
+token` FAILED (`DataDirLocked` при повторной сборке на том же каталоге); остановка ночи после
+обслуживания — `works_night::night_runner_stops_before_dbs` FAILED (порядок журнала). Первая
+мутация показала и дефект самого теста: при падении проверки висящий блокирующий поток держал
+рантайм теста бесконечно — поток теперь отпускает guard `Unblock` и при панике.
+
+**Замер миграции.** Рабочая база владельца — на сервере памяти в LAN, из worktree недоступна; замер
+— на копии самой большой локальной базы пользователя (406 МБ, приёмка M4, схема 14) на H: (HDD):
+14 → 26 — 12,9 с; 0026 → 0027 — **5,09 с**, из них SQL 0027 — **41 мс** (семь пустых таблиц,
+индексы, строка `meta`), остальное — копия `bak-v26` (`VACUUM INTO`, пропорционально размеру
+базы). Временный тест замера в git не входит.
+
+**Круг правок 1** (ревью r1: спецификация ✅, качество Approved; ⚠️1–4, Minor 1–6 — решения
+координатора):
+- ⚠️1 — текст приведён к коду: спецификация §6.1 п. 5 и решение 56, план (задача 1); в задачи 2, 3
+  и 5 плана вписаны правила `NightCtx`: признак остановки — только `ctx.stopping()`/`stopped()`;
+  у `ctx.st().night` (отвязанный раннер) не звать `start`/`stop` (у него они теперь ничего не
+  делают, с WARN); клон `NightCtx`/`AppState` не уносить в `tokio::spawn`, переживающий будущее
+  шага.
+- ⚠️2 — `NightRunner::spawn_tracked(fut) -> Result<(), Stopping>`: учтённые запуски в `JoinSet`
+  общего состояния раннера и его отвязанного двойника; `stop` ждёт задачу и учтённые запуски одним
+  сроком `STOP_WAIT`, затем снимает; после остановки — `Err(Stopping)`. В план задач 3 и 5:
+  `POST /works/run` и `POST /check/run` — только через него.
+- ⚠️3 — шаги старта (`queue::on_start`, `check::on_start`) — в фоне задачи раннера (при любом
+  `enabled`; без `enabled` задача делает только их), `finish` и роутер их не ждут; учтённые
+  запуски начинаются после них (`watch` состояния старта). Тестовая точка `set_on_start`.
+- ⚠️4 — в план задачи 3: строка `works` в `docs/api-compat.md` описывает и форму поля настроек
+  задачи 1.
+- Minor 1 — ошибка `on_mode_change` после записи — WARN, `PATCH` не падает; в план задачи 3 —
+  сверка `effective_mode` перед захватом работы и перед каждым обращением к модели.
+- Minor 2 — `works_model_field_bounds_422`: `model` пусто, из пробелов, 201 символ; `max_tokens`
+  255 и 32001; `body_extra` строка, массив, 4097 байт — 422 с именем поля; границы 200, 256,
+  32000, 4096 байт и `null` — 200; лишнее поле входа `works.model` и `works.limits` — 400.
+- Minor 3 — `deny_unknown_fields` снят с хранимых `ModelConn`, `BaseUrl`, `Limits`; вход `PATCH`
+  строг (`ModelInput`, новый `LimitsInput`); модульный `stored_rows_tolerate_unknown_fields`.
+- Minor 4 — `crates/zam-cli/tests/common::server_defaults()` (`works.check = off`) во всех 28
+  сборках сервера тестов `zam-cli` (`..common::server_defaults()`); модульный тест
+  `zam-server` `lib.rs` — `check = off`; `ServerProc` (процессы `zam-server serve` тестов) —
+  `ZAM_WORKS__CHECK=off` только у бинарника пакета (сервер тега до 0.0.16 ключа не знает).
+  Процесс приёмки `zam-cli::m6_acceptance` (бинарник тега) и xtask — без изменений (план задачи 5).
+- Minor 5 — у ручного прогона `check_runs.night = NULL`: комментарий 0027, спецификация §6.5
+  п. 7, план задачи 5, журнал.
+- Minor 6 — `works_night::drop_without_shutdown_releases_data_dir`: раннер провёл ночь, все клоны
+  ушли без `shutdown`, повторная сборка на том же каталоге — без `DataDirLocked`.
+- Новые тесты `works_night`: `manual_runs_tracked_by_stop` (запуск, смотрящий на остановку, —
+  дождался; висящий — снят; `shutdown` ≤ 6 с; после — `Stopping`; каталог свободен),
+  `startup_steps_run_in_background` (шаги старта висят — вход администратора проходит; учтённый
+  запуск — после них). Мутации (откачены): `stop` без ожидания учтённых —
+  `manual_runs_tracked_by_stop` FAILED; учтённый запуск без ожидания старта —
+  `startup_steps_run_in_background` FAILED; без отвязанного двойника —
+  `drop_without_shutdown_releases_data_dir` FAILED (`DataDirLocked`).
+- Прогоны (`ZAM_REQUIRE_ML=1`): `fmt --check` и `clippy -p zam-store -p zam-server -p zam-cli
+  --all-targets -D warnings` — чисто; `zam-store --test user_db --test migrate_rebuild` — 11 + 11;
+  `zam-server --lib` (фильтр) — 65; `--test works_settings` 7, `works_night` 6, `boot` 15,
+  `backup` 53, `m65_acceptance` 7, `mcp` 79 (процессы `ServerProc` с `ZAM_WORKS__CHECK=off`);
+  `zam-cli --test agent_dates --test idea --test cache` — 1 + 20 + 2; 0 failed.
+
+**Круг правок 2** (повторное ревью r2: Approved, пункты r1 закрыты; новые Minor N1–N3):
+- N1 — шаги старта и каждая ночь идут **задачами учёта раннера** (`step`: `JoinSet` раннера +
+  `oneshot` о конце): паника шага — `StepEnd::Failed`, у старта — состояние `Startup::Failed` и
+  ERROR в журнал; учтённые запуски ждут «не `Running`» и идут, ночной цикл продолжает; `stop` ждёт
+  и снимает шаги вместе с запусками. Тест `startup_panic_keeps_runner_working`.
+- N2 — `spawn_tracked(|ctx: NightCtx| fut)`: контекст строит раннер из своего клона состояния
+  ночи (у клона `night` — двойник), внешний клон в запуск не попадает. Учёт шагов перенесён из
+  общего с двойником состояния в сам раннер (`Arc<Tracked>`): иначе шаг с клоном (через `night` →
+  двойник → общее состояние → учёт) замкнул бы учёт на себя. У двойника `spawn_tracked` —
+  `Err(Stopping)`; при уничтожении раннера учёт снимается сразу. Описание модуля, план (задачи 1,
+  3, 5 — новая сигнатура), спецификация §6.1 п. 5 — поправлены.
+- N3 — `startup_steps_run_in_background`: `api(...)` под `tokio::time::timeout(30 с)` — регрессия
+  падает, а не висит.
+- Прогоны (`ZAM_REQUIRE_ML=1`): `fmt --check` и `clippy -p zam-store -p zam-server -p zam-cli
+  --all-targets -D warnings` — чисто; `zam-server --test works_night` 7, `works_settings` 7,
+  `boot` 15 — 0 failed. Мутация (откачена): шаг старта без задачи учёта —
+  `startup_panic_keeps_runner_working` FAILED («не дождались: учтённый запуск после упавшего шага
+  старта»).
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

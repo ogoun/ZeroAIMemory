@@ -180,7 +180,7 @@ fn start_opt(name: &str, rules_write: bool) -> (String, String) {
         rt.block_on(async move {
             let mut cfg = ServerConfig {
                 data_dir: data,
-                ..ServerConfig::default()
+                ..common::server_defaults()
             };
             // отладочная сборка на HDD: сервер не обрезает сбор (бюджет — у клиента)
             cfg.recall.timeout_ms = 30_000;
