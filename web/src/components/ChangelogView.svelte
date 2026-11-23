@@ -192,9 +192,11 @@
     gap: 8px;
   }
   .entry h3 {
+    min-width: 0;
     margin: 0;
     font-size: 15px;
     font-weight: 600;
+    overflow-wrap: anywhere;
   }
   .kind {
     flex: none;
@@ -235,6 +237,10 @@
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
+    overflow-wrap: anywhere;
+  }
+  .refs code {
+    min-width: 0;
   }
   .focused {
     margin-bottom: 16px;

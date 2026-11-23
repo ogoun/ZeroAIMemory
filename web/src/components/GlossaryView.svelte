@@ -303,7 +303,8 @@
   </div>
 
   {#if groups.length > 1}
-    <nav class="alpha" aria-label="Алфавитный указатель">
+    <!-- указатель букв — полоса (§5.2 п. 4): одна строка с прокруткой на телефоне и планшете -->
+    <nav class="alpha strip" aria-label="Алфавитный указатель">
       {#each groups as [letter] (letter)}
         <button type="button" class="link" onclick={() => jump(letter)}>{letter}</button>
       {/each}
@@ -419,17 +420,9 @@
     flex: 1;
     min-width: 220px;
   }
+  /* раскладка — `.strip` (app.css): при касании буквы — цели по 44 px с зазором `--touch-gap` */
   .alpha {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 2px;
     margin-bottom: 8px;
-  }
-  /* буквы указателя при касании — цели по 44 px с зазором (`--touch-gap`, app.css) */
-  @media (pointer: coarse) {
-    .alpha {
-      gap: var(--touch-gap);
-    }
   }
   .link {
     padding: 0 4px;

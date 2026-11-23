@@ -153,26 +153,29 @@
       показывается один раз; утёкший токен отзовите и выпустите новый.
     </p>
     {#if tokError}<p class="error" role="alert">{tokError}</p>{/if}
-    <table aria-label="Мои токены">
-      <thead><tr><th>Имя</th><th>Префикс</th><th>Доступ</th><th>Использован</th><th></th></tr></thead>
-      <tbody>
-        {#each tokens as t (t.id)}
-          <tr data-token={t.name}>
-            <td>{t.name}</td>
-            <td><code>zam_{t.prefix}…</code></td>
-            <td>{t.access}</td>
-            <td class="muted">{t.last_used_at ? fmtTime(t.last_used_at) : '—'}{#if t.last_ip} · {t.last_ip}{/if}</td>
-            <td>
-              {#if t.revoked_at}
-                <span class="muted">отозван</span>
-              {:else}
-                <button class="danger" onclick={() => revoke(t)}>Отозвать</button>
-              {/if}
-            </td>
-          </tr>
-        {/each}
-      </tbody>
-    </table>
+    <!-- таблица — в `.table-wrap` (§5.1 п. 6): на телефоне прокручивается внутри -->
+    <div class="table-wrap">
+      <table aria-label="Мои токены">
+        <thead><tr><th>Имя</th><th>Префикс</th><th>Доступ</th><th>Использован</th><th></th></tr></thead>
+        <tbody>
+          {#each tokens as t (t.id)}
+            <tr data-token={t.name}>
+              <td>{t.name}</td>
+              <td><code>zam_{t.prefix}…</code></td>
+              <td>{t.access}</td>
+              <td class="muted">{t.last_used_at ? fmtTime(t.last_used_at) : '—'}{#if t.last_ip} · {t.last_ip}{/if}</td>
+              <td>
+                {#if t.revoked_at}
+                  <span class="muted">отозван</span>
+                {:else}
+                  <button class="danger" onclick={() => revoke(t)}>Отозвать</button>
+                {/if}
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
     <form class="row" style="margin-top: 8px;" onsubmit={addToken}>
       <input placeholder="Имя токена" bind:value={tokenName} required maxlength="64" aria-label="Имя токена" />
       <select bind:value={tokenAccess} aria-label="Доступ">

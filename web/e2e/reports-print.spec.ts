@@ -5,6 +5,7 @@
 // таблиц; `data.refs` и прочие файлы — текстом. PDF строит Chromium (`page.pdf`), проверка —
 // pdfjs-dist (уже зависимость WebUI). PDF и снимки — в .tmp/e2e/ (внутри проекта).
 import { expect, test, type Page } from '@playwright/test';
+import { randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { ADMIN_STATE } from './session';
@@ -25,6 +26,8 @@ import {
   REPORT_SESSION,
   SOLUTION_GUID,
   SOLUTION_NAME,
+  makePng,
+  postReport,
 } from './seed';
 
 const env = (k: string) => {
@@ -141,6 +144,42 @@ test('print_waits_for_lazy_modules_images_fonts', async ({ page }) => {
   expect(call.katexFontsLoaded).toBeGreaterThan(0);
   await expect(pdfButton(page)).toBeEnabled();
   await expect(page.locator('.print-root.ready')).toHaveCount(1);
+});
+
+test('print_copy_original_images', async ({ page }) => {
+  // превью картинок — только на экране (M7.2, §5.2 п. 5; у PNG больше 512 КБ — решение
+  // координатора, ревью задачи 3): в печатной копии — исходные файлы отчёта. Своё решение и отчёт:
+  // печатный отчёт сида — с малыми картинками
+  const token = env('E2E_ADMIN_TOKEN');
+  const guid = randomUUID();
+  const reg = await page.request.post(`${base()}api/v1/solutions`, {
+    headers: { Authorization: `Bearer ${token}` },
+    data: { agent_solution_id: guid, name: `Печать картинок E2E: ${guid.slice(0, 8)}` },
+  });
+  expect(reg.status(), await reg.text()).toBe(201);
+  const body = '![большой](big.png)\n\n![малый](small.png)\n';
+  const id = await postReport(base(), token, guid, { title: 'Отчёт E2E: печать большого PNG', body, tags: [] }, [
+    ['big.png', 'image/png', makePng(1280, 200, true)],
+    ['small.png', 'image/png', makePng(160, 90)],
+  ]);
+  const me = ((await (await page.request.get(`${base()}api/v1/auth/me`)).json()) as { user_id: string }).user_id;
+  await spyPrint(page);
+  await page.goto(`${base()}#/u/${me}/s/${guid}/j/reports/${id}`);
+  const screen = page.locator(`article.report[data-report="${id}"] .doc img[alt="большой"]`);
+  // экран — превью большого PNG
+  await expect.poll(() => screen.evaluate((i: HTMLImageElement) => i.complete && i.naturalWidth)).toBe(1024);
+  expect(await screen.evaluate((i: HTMLImageElement) => i.currentSrc)).toMatch(/\/api\/v1\/previews\/[0-9a-f]{64}\?kind=thumb&px=1024$/);
+  await pdfButton(page).click();
+  await expect.poll(() => page.evaluate(() => window.__printCalls.length), { timeout: 30_000 }).toBe(1);
+  expect((await page.evaluate(() => window.__printCalls))[0].imgs).toEqual([true, true]);
+  // печатная копия — исходники, без `srcset`; большой — в полную ширину файла
+  const copy = await page.locator('.print-root img').evaluateAll((xs) =>
+    xs.map((x) => ({ src: (x as HTMLImageElement).currentSrc, srcset: x.getAttribute('srcset'), w: (x as HTMLImageElement).naturalWidth })),
+  );
+  expect(copy.map((i) => [new URL(i.src).pathname.replace(/^.*\/attachments\/[0-9a-f]{64}\//, ''), i.srcset, i.w])).toEqual([
+    ['big.png', null, 1280],
+    ['small.png', null, 160],
+  ]);
 });
 
 test('print_svg_without_size_not_blocking', async ({ page }) => {

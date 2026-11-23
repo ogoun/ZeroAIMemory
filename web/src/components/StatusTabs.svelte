@@ -17,6 +17,7 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import { RECORD_FORMS, countText, type Forms } from '../lib/plural';
+  import { onTabKey } from '../lib/tabs';
 
   interface Props {
     /** Имя списка вкладок. */
@@ -40,19 +41,8 @@
 
   const nameOf = (t: StatusTab) => (t.count === undefined ? t.title : `${t.title}, ${countText(t.count, noun)}`);
 
-  /** Клавиатура tablist: ←/→ по кругу, Home, End; выбор следует за фокусом. */
-  function onkeydown(e: KeyboardEvent, i: number) {
-    const n = tabs.length;
-    let j = -1;
-    if (e.key === 'ArrowRight') j = (i + 1) % n;
-    else if (e.key === 'ArrowLeft') j = (i - 1 + n) % n;
-    else if (e.key === 'Home') j = 0;
-    else if (e.key === 'End') j = n - 1;
-    if (j < 0) return;
-    e.preventDefault();
-    onselect(tabs[j].id);
-    els[j]?.focus();
-  }
+  /** Клавиатура tablist (`lib/tabs.ts`): ←/→ по кругу, Home, End; выбор следует за фокусом. */
+  const onkeydown = (e: KeyboardEvent, i: number) => onTabKey(e, i, tabs.length, els, (j) => onselect(tabs[j].id));
 </script>
 
 <div class="status-tabs" role="tablist" aria-label={label}>

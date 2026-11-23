@@ -491,10 +491,17 @@
   fieldset {
     display: grid;
     gap: 6px;
+    /* по умолчанию у fieldset `min-inline-size: min-content`: длинный пункт списка (имя решения и
+       GUID) раздвигал бы форму шире телефона */
+    min-width: 0;
     margin: 0;
     padding: 8px 12px 10px;
     border: 1px solid var(--border);
     border-radius: 8px;
+  }
+  fieldset select,
+  fieldset input:not([type='radio'], [type='checkbox']) {
+    max-width: 100%;
   }
   legend {
     padding: 0 4px;

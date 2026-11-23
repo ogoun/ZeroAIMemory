@@ -133,64 +133,67 @@
   {#if loading}<p class="muted">Загрузка…</p>{/if}
   {#if !loading && solutions.length === 0 && !error}<p class="muted">Решений пока нет.</p>{/if}
 
-  <table aria-label="Реестр решений">
-    <thead><tr><th>Решение</th><th>Владелец</th><th>Участники</th><th>Запросы</th><th></th></tr></thead>
-    <tbody>
-      {#each solutions as s (s.agent_solution_id)}
-        {@const guid = s.agent_solution_id}
-        <tr data-solution={guid}>
-          <td>
-            <strong>{s.name}</strong>
-            <div class="muted small"><code>{guid}</code> · {fmtTime(s.created_at)}</div>
-            {#if rowErrors[guid]}<p class="error small" role="alert">{rowErrors[guid]}</p>{/if}
-          </td>
-          <td>{s.owner.name ?? s.owner.id}</td>
-          <td>{approvedOf(guid)}</td>
-          <td>
-            {#if pendingOf(guid)}<span class="badge">{pendingOf(guid)}</span>{:else}<span class="muted">—</span>{/if}
-          </td>
-          <td>
-            <button type="button" onclick={() => (open = open === guid ? null : guid)} aria-expanded={open === guid}>
-              {open === guid ? 'Скрыть' : 'Доступ'}
-            </button>
-          </td>
-        </tr>
-        {#if open === guid}
-          <tr>
-            <td colspan="5">
-              {#if (members[guid] ?? []).length === 0}
-                <p class="muted">Запросов доступа нет.</p>
-              {:else}
-                <table aria-label="Участники {s.name}">
-                  <thead><tr><th>Пользователь</th><th>Состояние</th><th>Режим</th><th>Запрошен</th><th>Решение</th><th></th></tr></thead>
-                  <tbody>
-                    {#each members[guid] as m (m.user_id)}
-                      <tr data-member={m.user_name}>
-                        <td>{m.user_name}</td>
-                        <td class="state-{m.state}">{STATE_TEXT[m.state] ?? m.state}</td>
-                        <td>{m.state === 'approved' ? m.access : '—'}</td>
-                        <td class="muted">{fmtTime(m.requested_at)}</td>
-                        <td class="muted">{fmtTime(m.decided_at)}{#if m.decided_by} · {m.decided_by === 'admin' ? 'администратор' : 'владелец'}{/if}</td>
-                        <td class="row acts">
-                          {#if m.state === 'pending'}
-                            <button type="button" class="primary" onclick={() => approve(guid, m, 'rw')}>Одобрить rw</button>
-                            <button type="button" onclick={() => approve(guid, m, 'ro')}>Одобрить ro</button>
-                            <button type="button" class="danger" onclick={() => reject(guid, m)}>Отклонить</button>
-                          {:else if m.state === 'approved'}
-                            <button type="button" class="danger" onclick={() => revoke(guid, m)}>Отозвать</button>
-                          {/if}
-                        </td>
-                      </tr>
-                    {/each}
-                  </tbody>
-                </table>
-              {/if}
+  <!-- таблица (и раскрытые строки) — в `.table-wrap` (§5.1 п. 6): прокрутка внутри, страница — нет -->
+  <div class="table-wrap">
+    <table aria-label="Реестр решений">
+      <thead><tr><th>Решение</th><th>Владелец</th><th>Участники</th><th>Запросы</th><th></th></tr></thead>
+      <tbody>
+        {#each solutions as s (s.agent_solution_id)}
+          {@const guid = s.agent_solution_id}
+          <tr data-solution={guid}>
+            <td>
+              <strong>{s.name}</strong>
+              <div class="muted small"><code>{guid}</code> · {fmtTime(s.created_at)}</div>
+              {#if rowErrors[guid]}<p class="error small" role="alert">{rowErrors[guid]}</p>{/if}
+            </td>
+            <td>{s.owner.name ?? s.owner.id}</td>
+            <td>{approvedOf(guid)}</td>
+            <td>
+              {#if pendingOf(guid)}<span class="badge">{pendingOf(guid)}</span>{:else}<span class="muted">—</span>{/if}
+            </td>
+            <td>
+              <button type="button" onclick={() => (open = open === guid ? null : guid)} aria-expanded={open === guid}>
+                {open === guid ? 'Скрыть' : 'Доступ'}
+              </button>
             </td>
           </tr>
-        {/if}
-      {/each}
-    </tbody>
-  </table>
+          {#if open === guid}
+            <tr>
+              <td colspan="5">
+                {#if (members[guid] ?? []).length === 0}
+                  <p class="muted">Запросов доступа нет.</p>
+                {:else}
+                  <table aria-label="Участники {s.name}">
+                    <thead><tr><th>Пользователь</th><th>Состояние</th><th>Режим</th><th>Запрошен</th><th>Решение</th><th></th></tr></thead>
+                    <tbody>
+                      {#each members[guid] as m (m.user_id)}
+                        <tr data-member={m.user_name}>
+                          <td>{m.user_name}</td>
+                          <td class="state-{m.state}">{STATE_TEXT[m.state] ?? m.state}</td>
+                          <td>{m.state === 'approved' ? m.access : '—'}</td>
+                          <td class="muted">{fmtTime(m.requested_at)}</td>
+                          <td class="muted">{fmtTime(m.decided_at)}{#if m.decided_by} · {m.decided_by === 'admin' ? 'администратор' : 'владелец'}{/if}</td>
+                          <td class="row acts">
+                            {#if m.state === 'pending'}
+                              <button type="button" class="primary" onclick={() => approve(guid, m, 'rw')}>Одобрить rw</button>
+                              <button type="button" onclick={() => approve(guid, m, 'ro')}>Одобрить ro</button>
+                              <button type="button" class="danger" onclick={() => reject(guid, m)}>Отклонить</button>
+                            {:else if m.state === 'approved'}
+                              <button type="button" class="danger" onclick={() => revoke(guid, m)}>Отозвать</button>
+                            {/if}
+                          </td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                {/if}
+              </td>
+            </tr>
+          {/if}
+        {/each}
+      </tbody>
+    </table>
+  </div>
 </section>
 
 <Prompt bind:ask />
@@ -214,6 +217,12 @@
   }
   .acts button {
     padding: 2px 10px;
+  }
+  /* при касании — зазор между кнопками ряда (`--touch-gap`, app.css) */
+  @media (pointer: coarse) {
+    .acts {
+      gap: var(--touch-gap);
+    }
   }
   .state-approved {
     color: var(--callout-tip);

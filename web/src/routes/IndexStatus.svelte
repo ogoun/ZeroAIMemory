@@ -281,7 +281,7 @@
 
     {#if st.failed_items.length}
       <h3>Неудавшиеся задания</h3>
-      <div class="scroll">
+      <div class="table-wrap">
         <table>
           <thead><tr><th>Пользователь</th><th>Заметка</th><th>Операция</th><th>Ошибка</th><th>Попыток</th><th>Когда</th></tr></thead>
           <tbody>
@@ -421,9 +421,6 @@
   }
   .error-text {
     color: var(--danger);
-  }
-  .scroll {
-    overflow-x: auto;
   }
   .err {
     overflow-wrap: anywhere;

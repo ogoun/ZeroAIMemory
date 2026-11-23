@@ -203,25 +203,28 @@
   {#if loaded && !items.length}
     <p class="muted">Выжимок нет.</p>
   {:else if items.length}
-    <table aria-label="Выжимки">
-      <thead><tr><th>Запрос</th><th>Статус</th><th>Автор</th><th>Обращений</th><th>Последнее</th><th></th></tr></thead>
-      <tbody>
-        {#each items as it (it.id)}
-          <tr data-cache={it.query} class:sel={open?.id === it.id}>
-            <td><button type="button" class="link" onclick={() => show(it)}>{it.query}</button></td>
-            <td><span class="st st-{it.state}">{it.state}</span></td>
-            <td>{it.author ?? '—'}</td>
-            <td>{it.hits}</td>
-            <td class="muted">{fmtTime(it.last_used_at)}</td>
-            <td class="row acts">
-              <button type="button" onclick={() => promote(it)} disabled={!!it.promoted_to}
-                title={it.promoted_to ? `уже превращена в ${it.promoted_to}` : undefined}>Превратить в заметку</button>
-              <button type="button" class="danger" onclick={() => remove(it)}>Удалить</button>
-            </td>
-          </tr>
-        {/each}
-      </tbody>
-    </table>
+    <!-- таблица — в `.table-wrap` (§5.1 п. 6): на телефоне прокручивается внутри -->
+    <div class="table-wrap">
+      <table aria-label="Выжимки">
+        <thead><tr><th>Запрос</th><th>Статус</th><th>Автор</th><th>Обращений</th><th>Последнее</th><th></th></tr></thead>
+        <tbody>
+          {#each items as it (it.id)}
+            <tr data-cache={it.query} class:sel={open?.id === it.id}>
+              <td><button type="button" class="link" onclick={() => show(it)}>{it.query}</button></td>
+              <td><span class="st st-{it.state}">{it.state}</span></td>
+              <td>{it.author ?? '—'}</td>
+              <td>{it.hits}</td>
+              <td class="muted">{fmtTime(it.last_used_at)}</td>
+              <td class="row acts">
+                <button type="button" onclick={() => promote(it)} disabled={!!it.promoted_to}
+                  title={it.promoted_to ? `уже превращена в ${it.promoted_to}` : undefined}>Превратить в заметку</button>
+                <button type="button" class="danger" onclick={() => remove(it)}>Удалить</button>
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
   {/if}
 </section>
 
@@ -298,6 +301,12 @@
   }
   .acts button {
     padding: 2px 8px;
+  }
+  /* при касании — зазор между кнопками ряда (`--touch-gap`, app.css) */
+  @media (pointer: coarse) {
+    .acts {
+      gap: var(--touch-gap);
+    }
   }
   .detail h2 {
     margin: 0;
