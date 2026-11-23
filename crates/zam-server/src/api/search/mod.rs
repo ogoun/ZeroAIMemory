@@ -272,6 +272,7 @@ use super::sessions::{McpOrigin, RequestSession, explicit_only, seen_session};
 use crate::app::AppState;
 use crate::attrib::{AREA_HEADER, header_value};
 use crate::auth::Principal;
+use crate::check::Accounting;
 use crate::config::SearchSection;
 use crate::error::ApiError;
 use crate::glossary::{Expansion, alias_groups};
@@ -2483,7 +2484,7 @@ pub async fn search(
     origin: Option<Extension<McpOrigin>>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    search_with(state, p, headers, origin, body, None).await
+    search_with(state, p, headers, origin, body, None, Accounting::Normal).await
 }
 
 /// Проба лёгкого поиска (фича `test-hooks`): запрос, длины слитых каналов и число элементов
@@ -2514,6 +2515,11 @@ pub static TEST_LIGHT_SEARCHES: std::sync::Mutex<Vec<LightProbe>> =
 /// чужого решения больше не исключает это решение до каналов ([`Health::soft`]); такая база
 /// исключается первым же следующим чтением (каналы FTS). `None` — обычный поиск, побайтово
 /// прежний: в API параметра нет.
+///
+/// `acc` — учёт выдачи (M7.3 §6.5 п. 2): [`Accounting::Off`] (ночная проверка памяти) — без
+/// сессии (ни касания, ни отметок выданного, ни `session_tokens`) и без учёта обращения к
+/// выжимкам кэша (`hits`, `last_used_at`); отбор и ранги — те же. [`Accounting::Normal`] —
+/// побайтово прежний поиск.
 pub(crate) async fn search_with(
     State(st): State<AppState>,
     p: Principal,
@@ -2521,6 +2527,7 @@ pub(crate) async fn search_with(
     origin: Option<Extension<McpOrigin>>,
     body: Result<Bytes, BytesRejection>,
     light: Option<LightSearch>,
+    acc: Accounting,
 ) -> Result<Response, ApiError> {
     let total_t = Instant::now();
     let req: SearchReq = json_body(body)?;
@@ -2565,6 +2572,8 @@ pub(crate) async fn search_with(
             None
         }
     };
+    // без учёта (ночная проверка): ни касания и отметок сессии, ни токенов выданного
+    let session = session.filter(|_| acc.records());
     // `mode=chunks` касается сессии вместе с отметкой выданного (одна транзакция)
     if let Some(s) = &session
         && mode != SearchMode::Chunks
@@ -2682,6 +2691,7 @@ pub(crate) async fn search_with(
             &req.query,
             session.as_ref().map(|s| s.touch.id.as_str()),
             vrun.dense.as_deref(),
+            acc,
         )
         .await
     };

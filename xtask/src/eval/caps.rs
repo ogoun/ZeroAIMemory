@@ -14,7 +14,9 @@
 //!   `hint_thresholds` (§9, задача 9), `kind_boost` (§10), `attach_weight` (§11), `snapshot`
 //!   (§8а, задача 17c), `recall_timeout` (§16 п. 19, задача 19), `idea_review` (M6.5 §7,
 //!   ключ `ideas.default_mode`), `post_tool_subject` (M7.1 §4.6 п. 3, ключ
-//!   `recall.post_tool_coverage.common_pct`); `code_recv` (§12а, задача 14) — возможность без ключа конфигурации (в
+//!   `recall.post_tool_coverage.common_pct`), `memory_check` (M7.3 §6.5, ключ `works.check`:
+//!   сервер прогонов замера — без ночной проверки, [`NIGHT_CHECK_OFF`]); `code_recv` (§12а,
+//!   задача 14) — возможность без ключа конфигурации (в
 //!   [`KEYS`] её нет). Пока строки нет, ключ этой сборке не шлётся (а прогон с ним — не
 //!   сравнивается);
 //! - `features` нет — выпуск по таблице [`RELEASES`]: версия и коммит (`git`, 12 знаков) должны
@@ -230,7 +232,21 @@ pub const KEYS: &[(&str, Since)] = &[
     ("snapshot.keep_days", F("snapshot")),
     ("recall.max_timeout_ms", F("recall_timeout")),
     ("ideas.default_mode", F("idea_review")),
+    ("works.check", F("memory_check")),
 ];
+
+/// Ночная проверка памяти сервера прогонов (M7.3, решение координатора 67): `works.check = off` —
+/// в окне ночи проверка не нагружает CPU посреди замера. Ключ — под признаком `memory_check`:
+/// старому серверу не шлётся ([`night_check_off`]).
+pub const NIGHT_CHECK_OFF: (&str, &str) = ("works.check", "off");
+
+/// [`NIGHT_CHECK_OFF`], если сервер `caps` знает ключ; иначе — пусто.
+pub fn night_check_off(caps: &ServerCaps) -> Option<(String, String)> {
+    let (k, v) = NIGHT_CHECK_OFF;
+    caps.keys
+        .contains(k)
+        .then(|| (k.to_string(), v.to_string()))
+}
 
 /// Цели корпуса ТС-1, которые сервер умеет создать (загрузчик `--via mcp`): связь
 /// `contradicts` (с 0.0.6-m4.5) и вложения `eval/docs` (с 0.0.7-m5).
@@ -535,6 +551,15 @@ mod tests {
         );
         let m65 = caps_from(&health("0.0.12-m6.5", "abc", Some(&["m6", "idea_review"]))).unwrap();
         assert!(m65.keys.contains("ideas.default_mode"));
+        // ночная проверка памяти (M7.3, решение 67): `works.check = off` — только серверу с
+        // `memory_check`, старому — ни ключа, ни переопределения
+        assert_eq!(night_check_off(&m65), None);
+        assert!(!m65.keys.contains("works.check"));
+        let m73 = caps_from(&health("0.0.16-m7.3", "abc", Some(&["m6", "memory_check"]))).unwrap();
+        assert_eq!(
+            night_check_off(&m73),
+            Some(("works.check".to_string(), "off".to_string()))
+        );
         // features без "m6" — не сборка ветки M6
         assert!(caps_from(&health("0.0.10-m5.7", "abc", Some(&["focus"]))).is_err());
     }

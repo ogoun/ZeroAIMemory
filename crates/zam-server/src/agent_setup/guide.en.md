@@ -190,6 +190,14 @@ If a session broke off (a limit, a closed window) and the task's `next_step` was
 - With `hooks.checkpoint_impact = true` (client), before stopping the hook adds up to 3 lines “правка затрагивает `<path>[#symbol]` → i:<id> «…»” (the edit affects) — knowledge your edit may have made wrong: recheck it and confirm (`zam refs verify`) or replace it (`supersede`).
 - With hooks (`zam hook …`, installed by `zam init`) hints arrive by themselves: at session start (digest), on a prompt, before a file edit or a command, on a file read, after an error, at subagent start. The same error for the third time — a hint to check memory. Exit code 1 of a simple `grep`, `rg`, `diff`, `cmp`, `test` or `git diff --quiet` without stderr is not an error, no hints; a failure that a retry will not fix (401, 403, quota, no disk space, 429, 400/422) brings a line “… не повторяй” (do not repeat) — check the key, permissions, limit or request first. Before stopping, the hook reminds you to record the outcome if there were edits but no memory writes.
 
+## Memory check
+
+- At night the server checks memory by itself: it asks its probe questions through the same search and hints you use, without traces in the accounting, and compares with previous nights. You do not need to do anything for it.
+- If it got worse, the digest of the session's first start has the line “Ночная проверка памяти: ухудшение поиска (…) — zam check report” (nightly memory check: search got worse). **Tell the human in one line** and continue their task; details — `zam check report` (verdict, metrics against the median of previous nights, failed probes with “what to fix” advice).
+- **Fix it when the human asks**: the asker's words are missing — extend the record or add a term (`term`); a neighbouring record ranks above the target — `supersede` or merge; the index — `GET /index/status`, `zam-server reindex` (done by the administrator); worse after a server update — report it to the developer.
+- **Only the human accepts a new norm** (WebUI “Проверка памяти” → “Принять как норму”); with a token — 403: do not hide a regression.
+- A manual run — `zam check run` (runs outside the night window too), the latest verdict — `zam check status`. Probe references `x:` are not for `memory_read`.
+
 ## Spaces
 
 - Solution (GUID from `solution.toml`) — project memory; Knowledge — the user's general knowledge; Rules — rules read at the start of every session (agent writes only if the administrator allowed them); Human — the person's notes, not available to agents.

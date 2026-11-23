@@ -284,6 +284,7 @@ use super::user_settings::{UserFlags, cached_user_flags};
 use crate::app::AppState;
 use crate::attrib::{AREA_HEADER, SESSION_HEADER};
 use crate::auth::{Principal, target_user_id};
+use crate::check::Accounting;
 use crate::config::{IdeasMode, RecallSection};
 use crate::error::ApiError;
 
@@ -439,6 +440,14 @@ fn collect_timeout(
             timeout_field_max(cfg)
         }
     })
+}
+
+/// Первый `session_start` сессии (M7.3 §6.5 п. 7): источник хука — не `compact`, `resume` или
+/// `clear` (у них сессия та же, а строки волны — раз за сессию).
+fn first_start(req: &RecallReq) -> bool {
+    req.source
+        .as_deref()
+        .is_none_or(|s| !EPOCH_SOURCES.contains(&s.trim()))
 }
 
 /// Событие учёта выданных токенов (`session_tokens`, M4.5 §9.5): пакет восстановления — и по
@@ -1693,6 +1702,8 @@ async fn digest(
         rules_hidden,
         rules_cut,
         snapshot,
+        // строку регрессии ставит [`recall_with`] на первом `session_start` сессии
+        check_line: None,
     };
     Ok((lines, sections))
 }
@@ -2232,6 +2243,9 @@ struct Lines {
     rules_cut: bool,
     /// «Последнее известное состояние» — снимок сессии (M6 §8а, [`super::snapshot`]).
     snapshot: Option<super::snapshot::Shown>,
+    /// Строка регрессии ночной проверки памяти (M7.3 §6.5 п. 7): первый `session_start` сессии,
+    /// последняя из служебных строк волны (идеи → работы → регрессия).
+    check_line: Option<String>,
 }
 
 /// Правило раздела для урезания под предел вывода: место в приоритете ([`rule_order`]),
@@ -2789,6 +2803,8 @@ async fn inner_search(
                 .map_err(|_| ApiError::BadRequest("area: печатные символы".into()))?,
         );
     }
+    // без сессии и с `no_cache` внутренний поиск ничего не учитывает (показанное учитывает сам
+    // `/recall`) — и у ночной проверки, которая зовёт `/recall` без учёта
     let search = super::search::search_with(
         State(st.clone()),
         p.clone(),
@@ -2796,6 +2812,7 @@ async fn inner_search(
         None,
         Ok(Bytes::from(body.to_string())),
         light,
+        Accounting::Normal,
     );
     let Some(r) = deadline.step(search).await else {
         return Ok(None);
@@ -3262,6 +3279,7 @@ fn arrange<'c>(
         rules_hidden,
         rules_cut,
         snapshot,
+        check_line,
         ..
     } = lines;
     let mut snapshot = snapshot;
@@ -3340,6 +3358,14 @@ fn arrange<'c>(
             out.packed.push(sec);
             out.picked.push(std::mem::take(&mut ideas));
         }
+        // строка регрессии ночной проверки (M7.3 §6.5 п. 7) — после строк идей и работ
+        if title == Some(SECTION_ANSWERS)
+            && !recovery
+            && let Some(l) = &check_line
+        {
+            out.line(None, vec![l.clone()], KEEP_MANDATORY);
+            out.omit_last(OMIT_CHECK);
+        }
         // снимок сессии — после ответов и идей; в пакете восстановления — после решений и
         // уведомлений: задачи, ответы, доступы и идеи он не вытесняет (M6 §8а)
         if (title == Some(SECTION_ANSWERS) && !recovery)
@@ -3398,6 +3424,9 @@ fn keep_of(title: Option<&str>) -> u8 {
 
 /// Адрес снятой строки снимка сессии: сам снимок — на странице сессии WebUI.
 const OMIT_SNAPSHOT: Omit = ("строк снимка сессии", "WebUI «Сессии»");
+
+/// Адрес снятой строки регрессии ночной проверки памяти (M7.3 §6.5 п. 7).
+const OMIT_CHECK: Omit = ("строк проверки памяти", "zam check report");
 
 /// Адрес снятой строки открытых вопросов.
 const OMIT_OPEN_QUESTIONS: Omit = ("строк открытых вопросов", "memory_search kinds=[question]");
@@ -3487,11 +3516,26 @@ impl Arranged<'_> {
 
 /// `POST /recall`.
 pub async fn recall(
+    state: State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    origin: Option<Extension<McpOrigin>>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<Value>, ApiError> {
+    recall_with(state, p, headers, origin, body, Accounting::Normal).await
+}
+
+/// [`recall`] с учётом выдачи `acc` (M7.3 §6.5 п. 2): [`Accounting::Off`] (ночная проверка
+/// памяти) — без сессии (ни касания, ни новой эпохи, ни фильтра показанного) и без учёта показа
+/// (`session_seen`, `session_tokens`, `usage`); отбор подсказок — тот же. У обработчика axum
+/// лишнего параметра быть не может — как пара `search`/`search_with`.
+pub(crate) async fn recall_with(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
     origin: Option<Extension<McpOrigin>>,
     body: Result<Bytes, BytesRejection>,
+    acc: Accounting,
 ) -> Result<Json<Value>, ApiError> {
     let t0 = Instant::now();
     let req: RecallReq = json_body(body)?;
@@ -3562,6 +3606,10 @@ pub async fn recall(
             None
         }
     };
+    // без учёта (ночная проверка памяти): как запрос без сессии
+    if !acc.records() {
+        session = None;
+    }
     // новая эпоха не записалась (M6 §7.2): ответ без фильтра повторов текущей эпохи
     let mut epoch_failed = false;
     if let Some(s) = &mut session {
@@ -3749,6 +3797,14 @@ pub async fn recall(
                 idea_cands = c;
                 l.ideas_queue = n;
             }
+            // строка регрессии ночной проверки памяти (M7.3 §6.5 п. 7) — на первом
+            // `session_start` сессии (не после сжатия, возобновления и очистки)
+            if req.event == Event::SessionStart && !recovery && first_start(&req) {
+                l.check_line = deadline
+                    .step(crate::check::digest_line(&st, user))
+                    .await
+                    .flatten();
+            }
             (l, s, true)
         }
         // словарь, поиск, задача, идеи — у каждого раздела свой предел (подмодуль `prompt`)
@@ -3907,7 +3963,7 @@ pub async fn recall(
 
     // учёт показа — если полный срок ещё не вышел; иначе собранное отдаётся без учёта
     let rt = Instant::now();
-    let record_ms = if req.record == Some(false) {
+    let record_ms = if req.record == Some(false) || !acc.records() {
         None
     } else if rt < total_deadline {
         // выданное сессии по событию (§9.5): пустой ответ — не выдача; вызов из MCP учитывает

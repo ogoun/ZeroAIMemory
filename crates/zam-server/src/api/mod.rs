@@ -6,6 +6,7 @@ pub mod backups;
 pub mod big_body;
 pub mod blobs;
 pub mod cache;
+pub mod check;
 pub mod code;
 pub mod doc_locator;
 pub mod downloads;
@@ -232,6 +233,13 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
         .route("/api/v1/code/symbols", get(code::symbols))
         .route("/api/v1/code/symbols/{id}", get(code::symbol))
         .route("/api/v1/code/impact", post(code::impact).layer(code_limit))
+        // ночная проверка памяти (M7.3 §6.4–§6.5): чтение и ручной прогон — не запись памяти
+        .route("/api/v1/check/status", get(check::status))
+        .route("/api/v1/check/runs", get(check::runs))
+        .route("/api/v1/check/runs/{id}", get(check::run))
+        .route("/api/v1/check/run", post(check::start))
+        .route("/api/v1/check/accept", post(check::accept))
+        .route("/api/v1/check/probes", get(check::probes))
         .route("/api/v1/health", get(health::health))
         .route("/api/v1/ready", get(health::ready))
         .route("/api/v1/auth/login", post(login::login))

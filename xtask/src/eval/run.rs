@@ -1300,7 +1300,7 @@ pub fn run_modes(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) ->
             None => r.clone(),
         });
     }
-    let spec = RunSpec {
+    let mut spec = RunSpec {
         name: run_name(model.as_deref(), label.as_deref()),
         model,
         device: a.device,
@@ -1314,6 +1314,19 @@ pub fn run_modes(a: &EvalArgs, p: &Paths, corpus: &Corpus, queries: &[Query]) ->
     } else {
         Session::start(p, &spec, &server, !a.reuse)?
     };
+    // без ночной проверки памяти (M7.3, решение 67): возможности сервера известны только после
+    // старта, а ключ `works.check` старому серверу слать нельзя — перезапуск на том же каталоге
+    // (до загрузки корпуса; токен — из файла прогона)
+    if let Some(q) = super::caps::probe(&s.base)
+        .ok()
+        .as_ref()
+        .and_then(super::caps::night_check_off)
+        && !spec.sets.iter().any(|(k, _)| *k == q.0)
+    {
+        s.stop()?;
+        spec.sets.push(q);
+        s = Session::start(p, &spec, &server, false)?;
+    }
     s.check_model()?;
     println!(
         "сервер {}: модель {}, устройство {}",

@@ -77,6 +77,7 @@
 | `backup_api` | M7 §5.6 п. 1 | Копии из WebUI, только сессии администратора (токену и пользователю — 403): `GET /admin/backups` — каталог копий, расписание, идущая копия `running`, итог `last_run` и готовые копии по описи; `POST /admin/backups` → 202 — копия в процессе сервера под одним замком с автокопией (занято — 409 `/problems/backup-running`); `DELETE /admin/backups/{name}` — только готовая копия каталога копий по имени-шаблону (иначе 404); `GET /index/status?only=backup` → `{backup}` (раздел «Копии из WebUI» ниже). Скачивания и восстановления копии через API нет. Сервер без флага на маршруты отвечает 404, а `only=backup` — 400. |
 | `entries_trash` | M7 §5.9 п. 3 | Корзина любого журнала: `GET /spaces/{space}/entries?kind=<вид>&deleted=only` — удалённые записи вида, новые удаления первыми; права — как у восстановления этого вида: у отчётов — прежние (владелец решения в своей сессии WebUI), у прочих — право записи пространства, как у `DELETE` и `POST /entries/{id}/restore` (токен `ro` и участник `ro` — 403) (раздел «Корзина журналов» ниже). Сервер без флага на `deleted=only` с видом не `report` отвечает 400. |
 | `agent_text_masked` | M7 §4.3.1–4.3.2 | Выдача агенту по токену — с `‹secret›` вместо значений секретов: тексты заметок и записей (`/read` — L1, L2, `section`, `range`, фокус, дифф `since_rev`; `GET /nodes` и `/entries`, ревизии и дифф истории, поле `diff` ответа 409), заголовки, `frontmatter`, поиск (`expand=section`, карточки), подсказки `/recall`, выжимки кэша, индекс `GET /file-refs`, 409 `term-conflict`, итог задания импорта, предпросмотр текста и листа, экспорт архива (опись `secrets_masked: true` — только если маска что-то заменила); флаги командной строки — только внутри кода Markdown. В тексте для правки текущей ревизии (L2 узла, поля `title`, `body`, `data`, `tags`, `area` записи журнала) — метки `‹secret-T-N›` (T — объект, ревизия и версия сканера, N — сквозной номер маски объекта); запись агента (`PUT`/`PATCH` узла, `PATCH` записи журнала, замещение) возвращает значения только у `‹secret-T-N›` — по меткам этого объекта и любой его ревизии; `‹secret›` и прочая метка записываются как есть (литерал, значение не восстанавливается) с предупреждением `secret_mark_kept`; значение, которое в итоге не покрыто находкой сканера, — 422 `secret_context_changed`; замещение с метками без ревизии старой записи — 428 (поле `supersedes_rev`). Сессии WebUI — исходник; раскрытие Vault и файлы `GET /blobs/…` — как есть (раздел «Секреты в выдаче агенту» ниже). Сервер без флага отдаёт токену исходник. |
+| `memory_check` | M7 §6.4–§6.5 | Ночная проверка памяти: пробы (`probes`, ссылка `x:`), прогоны и вердикт к базе — `GET /check/status`, `GET /check/runs?limit=`, `GET /check/runs/{id}`, `POST /check/run` (ручной прогон: человек или токен `rw`, 202 `{run}`; идёт — 409 `/problems/check-running`; `[works] enabled = false` — 409 `/problems/works-disabled`), `POST /check/accept {run}` («Принять как норму» — только сессия WebUI, токен — 403; не последний ночной прогон эпизода — 409 `/problems/check-accept-not-latest`), `GET /check/probes?kind=&status=&split=`; строка дайджеста `session_start` при регрессии; ключ конфигурации `[works] check`, настройка пользователя `works.check`. Раздел «Ночная проверка памяти» ниже. Сервер без флага маршрутов `/check` не знает (404). |
 
 Правило для разработки сервера: задача, которая вводит возможность или ключ конфигурации,
 добавляет строку в `FEATURES` (`crates/zam-server/src/api/health.rs`) и строку в эту таблицу;
@@ -336,6 +337,45 @@ recall.timeout_ms)` (`recall.max_timeout_ms` по умолчанию — 2000), 
 - Прежний ответ ленты без `deleted=only` не меняется. Сервер без флага на `deleted=only` с видом не
   `report` отвечает 400 («только у ленты отчётов»); MCP и `zam` корзину не используют, WebUI
   встроен в сервер той же версии и признак не проверяет.
+
+## Ночная проверка памяти (`memory_check`)
+
+С 0.0.16-m7.3 (M7 §6.4–§6.5, флаг `memory_check`). Сервер ночью (окно `[works] at`/`tz`, до
+работ) прогоняет пробы каждой базы тем же поиском и подсказками, что у агента, без учёта
+выданного, и сравнивает с базой прежних ночей. Токену — вопросы проб с маской `‹secret›`,
+сессии WebUI — исходник.
+
+- **`GET /check/status`** → `{last, running, trend, failing, advice, probes, check}`: `last` —
+  последний законченный прогон `{run, trigger: nightly|manual, night, status: done|skipped|
+  timeout|failed, started_at, finished_at, fingerprint, fp_hash, context, metrics, verdict,
+  flags, episode, accepted_at, accepted_by, error, compared_with}` или `null`; `trend` — до 30
+  прогонов `{run, date, trigger, status, verdict, hit_search, hit_prompt, negatives_shown,
+  p95}` (`hit_*` — часть `test`); `failing` — до 20 проваленных проб `{probe, question, kind,
+  split, target, rank, advice, advice_text, neighbor?}` (у посторонних — `shown`); `advice` —
+  `[{code, text}]`; `probes` — `{active, by_kind, by_split}`; `check` — `{server: nightly|off,
+  user: on|off}`.
+- **Вердикт** (`verdict`) — `{kind: baseline|ok|regression|changed|degraded, flags: [{name:
+  hit_search|hit_prompt|negatives_shown|p95|lost_steady|degraded, value?, median?, delta_pp?,
+  lost?, steady?}], after_update, after_update_version?, few, episode?, base_n, base_of: 5,
+  changed?: {what: model|device|reranker|qdrant|check_version, from, to}, compared_with?:
+  {hit_search, hit_prompt, negatives_shown, p95, common}}`. Неизвестные значения `kind` и
+  `name` клиент пропускает.
+- **`metrics`** — `{dev, test, all: {n, hit_search, mrr10, none, beyond, hit_prompt, prompt_n,
+  hard, hard_n}, negatives_shown, negatives_n, search_p50_ms, search_p95_ms, prompt_p50_ms,
+  prompt_p95_ms, degraded, prompt_on, failing}`; доли — 0..=1, `null` — не считалось
+  (`hooks.prompt = false` у пользователя — `hit_prompt` и `negatives_shown`).
+- **`GET /check/runs/{id}`** — прогон и `results: [{probe, space, question, kind, split, targets,
+  search_rank, search_cut, deep_rank, prompt_rank, search_ms, prompt_ms}]`; посторонний вопрос —
+  строка на решение (`space` — решение или `null`), `prompt_rank` у него — число показанных
+  подсказок.
+- **`GET /check/probes`** → `{items: [{id: "x:…", space, question, kind: probe|cache|negative|
+  manual, targets: [{ref, rev}], split: dev|test, overlap, author_kind, author, work, status:
+  active|retired, retired_reason, created_at, retired_at}]}`; `limit` 1..=1000 (200).
+- **Строка дайджеста** первого `session_start` сессии (не после `compact`, `resume`, `clear`):
+  «Ночная проверка памяти: ухудшение поиска (hit −12 п. п.) — zam check report» (у эпизода после
+  обновления — «… после обновления до <версия> …»), пока последний ночной прогон — `regression`
+  и норма не принята; `reason` у строки нет — это служебная строка, не подсказка записи.
+- Пробы, прогоны и результаты — в копии сервера; в экспорт пространства и архив — нет.
 
 ## Подсказки к запросу (`POST /recall`, `event: prompt`)
 

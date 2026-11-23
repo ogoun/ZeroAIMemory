@@ -1790,6 +1790,9 @@ pub fn main(a: &EvalArgs, p: &Paths) -> Result<()> {
                 .into_owned(),
         ));
     }
+    // без ночной проверки памяти (M7.3, решение 67): и у индекса, и у точек (ключ — только
+    // серверу с `memory_check`)
+    index_sets.extend(caps::night_check_off(&caps));
     let index_name = run::run_name(model.as_deref(), Some(&format!("tokens-{label}-index")));
     // штатная остановка (Ctrl+Break): Qdrant и SQLite сбрасывают WAL до копирования, иначе
     // каждая копия восстанавливает коллекцию по WAL (на HDD — до 1,5 мин)

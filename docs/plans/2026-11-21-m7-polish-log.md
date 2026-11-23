@@ -5469,6 +5469,86 @@ or_test`, `http_external_refused`, `model_test_409_on_vault_changed`, `loopback_
   `vault_url_change_by_token_pauses`), `--lib works::` — `classify_embedded_ipv4` FAILED; GREEN —
   в отчёте задачи.
 
+### M7.3 · Задача 5 — Ночная проверка: прогон, отпечаток и контекст, вердикт, `/check`, `zam check`
+
+Спецификация §6.4 пп. 1, 3–5, §6.5; worktree `.tmp/m73/wt-t5`, ветка `m7.3-t5` от `4c287ef5`
+(задачи 1 и 2 слиты).
+
+**Хранилище**: `zam_store::probes` (`insert_probe` — `Inserted | Duplicate | Full`, предел 500
+активных проб с целью; `active_probes`, `list_probes`, `probe_counts`, `retire_probe`,
+`retire_gone`, `new_probes_since` по `works.origin`, `kind_since`, `sync_negatives`,
+`cache_candidates`), `zam_store::check` (`start_run`, `finish_run` — итог и результаты одной
+транзакцией, `mark_interrupted`, `has_nightly` по `(trigger_kind, night)` кроме `failed`, `runs`,
+`nightly_done`, `get_run`, `results`, `results_of`, `accept_run` — проверка «последний ночной
+прогон эпизода» в транзакции писателя, `gc`). `cache_lookup_with(db, q, touch)` — чтение выжимок без
+`hits`/`last_used_at`.
+
+**Поиск**: `zam_search::eval` — `probe_split`, `split_by_rank` (перенос из xtask, сторож
+`split_by_rank_unchanged`: holdout ТС-1 — 18 сценариев, ТС-2 — 8 сессий, прежние), `overlap`,
+`QueryMetrics`/`score` (перенос из `xtask/src/eval/metrics.rs`), `check_metrics`/`part_metrics`,
+`median`, `percentile` (ближайший ранг).
+
+**Сервер**: `crate::check` (`night`, `run_night`, `run_now`, `start_manual`, `on_start`,
+`ensure_marked`, `digest_line`, `Accounting`, тестовые точки), `check::run` (прогон), `check::verdict`
+(`decide`, JSON вердикта, строки дайджеста), `check::negatives` (набор `eval/check-negative.toml`,
+`NEGATIVES_HASH` закреплён тестом), `api::check` (`/check/*`), `ApiError::Typed` (problem с типом и
+кодом без отдельного варианта). `search_with(…, Accounting)`, `recall_with(…, Accounting)` (обработчик
+`recall` — обёртка с `Normal`), строка регрессии в дайджесте — `Lines.check_line` после раздела идей,
+`maintenance::gc_check_runs` (365 суток). `zam check status | report [--json] | run [--no-wait]`.
+xtask: `("works.check", F("memory_check"))` в `KEYS`, `caps::night_check_off` — у ТС-2, MCP-токенов и
+`eval` ТС-1 (перезапуск сервера после пробы возможностей, до загрузки корпуса).
+
+- [решение исполнителя, задача 5] **Пометка прерванных прогонов — при первом обращении к базе
+  после старта** (`check::ensure_marked`: статус, списки, ночной и ручной прогон), а `on_start` —
+  без открытия баз. Почему: шаг старта держит клон состояния, и открытие всех баз пользователей в
+  нём держало лок каталога данных после ухода последнего внешнего клона без `shutdown` — падали
+  `boot::first_run_creates_admin_and_token_once` и `revoked_admin_tokens_do_not_issue_new_initial_token`
+  (пересборка сервера на том же каталоге сразу). Наблюдаемо то же: читатель видит `failed
+  (interrupted)`, ночь им не занята. ⚠️ Тот же риск у `queue::on_start` задачи 3
+  (`requeue_model_running` по всем базам).
+- [решение исполнителя, задача 5] Тип части `Split` — в `zam_core::split` (реэкспорт в
+  `zam_search::eval` и `zam_store::probes`): `NewProbe.split` без перевода между двумя одинаковыми
+  перечислениями и без ребра `zam-store → zam-search`.
+- [решение исполнителя, задача 5] База без проб с целью ночью не проверяется (посторонние вопросы
+  без своих записей ничего не меряют); ручной прогон идёт и без них.
+- [решение исполнителя, задача 5] Все критерии регрессии — по части `test` (шапка §6.5 п. 5), в том
+  числе потеря устойчивых; `few` — меньше 20 **общих** проб `test`; посторонние вопросы —
+  по всем частям, общие для прогона и базы; у постороннего вопроса поиск не идёт (метрика — только
+  подсказки), `prompt_rank` в `check_results` — число показанных подсказок.
+- [решение исполнителя, задача 5] Цель пробы из кэша — до 5 источников: проба снимается, когда не
+  осталось ни одной живой цели; «найдена» — если найдена любая цель.
+- [решение исполнителя, задача 5] Ручной прогон эпизода не начинает (в базу он не входит), но
+  показывает идущий; строку дайджеста держит последний **ночной** прогон.
+- [решение исполнителя, задача 5] Отпечаток без загруженной модели (и устройства) берёт их из
+  прошлого прогона: деградация не выглядит сменой модели (`changed`), иначе переход «с векторами
+  → без» никогда не дал бы регрессию.
+- [решение исполнителя, задача 5] Разница в п. п. для порогов округляется до десятой (0,92 − 1,0 =
+  −7,999… — это −8): граница −8 п. п. срабатывает ровно.
+- [решение исполнителя, задача 5] Первый `session_start` сессии — источник хука не `compact`,
+  `resume`, `clear` (сессия та же); у явного вызова без `source` — тоже первый.
+- [решение исполнителя, задача 5] Флаг `backup_overlap` — у прогона, во время которого копия шла
+  хоть раз между пробами (ночной прогон её дожидается до начала, у ручного она может идти и с
+  начала).
+- [решение исполнителя, задача 5] `FEATURES` — строка `memory_check` в конце массива (указание
+  координатора к кругу 2; правило «перед последним» Global Constraints — под ним).
+- [решение исполнителя, задача 5] `web/e2e/global-setup.ts` (`ZAM_WORKS__CHECK=off`) не тронут —
+  файл задачи 8 (решение 67); прочие режимы xtask (`--hints`, `--docs`, `--glossary`, `bench`,
+  `smoke`) ключ не шлют — короткие прогоны вне тихого окна.
+
+**Замер** (машина разработки, Windows, CPU, HDD; MiniLM int8, внешний Qdrant теста;
+`check_timing_100_probes`, `--ignored`, отладочная сборка): ручной прогон 100 проб и 30
+посторонних вопросов (без решения) — **11,0 с**, ≈ 85 мс на запрос с паузой 25 мс; основной поиск
+p50 23 мс, p95 36 мс; подсказки к запросу p50 30 мс, p95 46 мс; `hit_search` 1,0. Предел
+`check_max_min = 30` при таком темпе — около 21 000 запросов. Замер на рабочем сервере (CPU, HDD,
+релизная сборка) — задача 9.
+
+TDD: RED — `negatives_hash_pinned` (пустой отпечаток), `check_thresholds` (−7,999 п. п.), сторож
+`split_by_rank_unchanged` (пустые списки holdout), `boot::health_features_documented`
+(`memory_check` без строки `api-compat`), `boot::first_run_creates_admin_and_token_once` и
+`revoked_admin_tokens_do_not_issue_new_initial_token` (лок каталога при пометке в `on_start`),
+`check_run` — 7 FAILED (ревизия узла, токен после перезапуска), `ml::check_regression_on_index_damage`
+(общие слова вопроса и заметки — цель находил FTS); GREEN — в отчёте задачи.
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

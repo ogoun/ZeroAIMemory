@@ -9,7 +9,8 @@
 //! `report`, файлы `entry_attachments`; M5.5), карта кода решения (`code_*`, ссылки на символы;
 //! M5.6), журнал идей (вид записи `idea`; M5.7), эпохи выданного сессии, учёт без сессии и
 //! снимки сессий (`session_snapshots`; M6), виды внутренних работ и открытия подсказок
-//! (`works`, `usage_opened`; M7.3), журнал отправок подключённой модели (`work_calls`; M7.3).
+//! (`works`, `usage_opened`; M7.3), журнал отправок подключённой модели (`work_calls`; M7.3), пробы
+//! ночной проверки памяти, её прогоны и результаты (`probes`, `check_runs`, `check_results`; M7.3).
 
 pub mod access;
 pub mod archive;
@@ -18,6 +19,7 @@ pub mod backup;
 pub mod blobs;
 pub mod cache;
 pub mod certainty;
+pub mod check;
 pub mod code;
 pub mod counts;
 pub mod datadir;
@@ -35,6 +37,7 @@ pub mod links;
 pub mod migrate;
 pub mod nodes;
 pub mod paths;
+pub mod probes;
 pub mod questions;
 mod schema_repair;
 pub mod search;
@@ -78,9 +81,9 @@ pub use blobs::{
 pub use cache::{
     CACHE_LOOKUP_MAX, CACHE_QUERY_MAX_CHARS, CACHE_SOURCES_MAX, CacheDep, CacheEntry, CacheError,
     CacheFilter, CacheGc, CacheHit, CachePut, CacheQuery, PromoteAs, SourceSpec, StaleKind,
-    StaleSource, cache_count, cache_delete, cache_get, cache_list, cache_lookup, cache_promote,
-    cache_put, cache_put_with, gc_cache, invalidate_target, mark_new_sources, normalize_query,
-    scope_hash, section_text,
+    StaleSource, cache_count, cache_delete, cache_get, cache_list, cache_lookup, cache_lookup_with,
+    cache_promote, cache_put, cache_put_with, gc_cache, invalidate_target, mark_new_sources,
+    normalize_query, scope_hash, section_text,
 };
 pub use certainty::{
     CertaintyChange, CertaintyError, Evidence, check_certainty, check_final_state,

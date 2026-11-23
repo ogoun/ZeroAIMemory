@@ -106,6 +106,16 @@ pub enum ApiError {
     /// «Копии» или по расписанию (один замок); тело несёт `running {started_at, by}`.
     #[error("копия уже идёт ({}): дождитесь её конца", backup_by_text(.0.by))]
     BackupRunning(crate::backup::runner::Running),
+    /// Ошибка с типом problem `kind` и кодом `status` без отдельного варианта на каждый тип
+    /// (M7.3: `/problems/works-disabled`, `/problems/check-running`,
+    /// `/problems/check-accept-not-latest`); `extra` — поля тела рядом с `detail`.
+    #[error("{detail}")]
+    Typed {
+        status: StatusCode,
+        kind: &'static str,
+        detail: String,
+        extra: Map<String, Value>,
+    },
     /// 422 `/problems/option-required` (M5.7 §5.3): ответ на вопрос-предложение без варианта.
     #[error("{0}")]
     OptionRequired(String),
@@ -277,6 +287,9 @@ impl ApiError {
             ApiError::BackupRunning(_) => {
                 (StatusCode::CONFLICT, "/problems/backup-running", "Conflict")
             }
+            ApiError::Typed { status, kind, .. } => {
+                (*status, kind, status.canonical_reason().unwrap_or("Error"))
+            }
             ApiError::OptionRequired(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "/problems/option-required",
@@ -436,7 +449,9 @@ impl IntoResponse for ApiError {
             "detail": self.to_string(),
         });
         if let (
-            ApiError::Conflict { extra, .. } | ApiError::PossibleDuplicate { extra, .. },
+            ApiError::Conflict { extra, .. }
+            | ApiError::PossibleDuplicate { extra, .. }
+            | ApiError::Typed { extra, .. },
             Value::Object(o),
         ) = (&self, &mut body)
         {

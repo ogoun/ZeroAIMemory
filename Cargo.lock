@@ -7108,6 +7108,7 @@ dependencies = [
 name = "zam-search"
 version = "0.0.15-m7.2"
 dependencies = [
+ "blake3",
  "jiff",
  "regex",
  "serde",
