@@ -1,10 +1,11 @@
 // Сквозные сценарии журнала «Отчёты» (M5.5): журнал в дереве решения, лента (дата, автор,
 // теги, миниатюра, курсор), фильтры и полнотекстовый поиск, страница отчёта (KaTeX, Mermaid,
-// картинки, таблица, код; с M7.2 картинки — превью сервера), SVG без исполнения скриптов, прочие
-// файлы на скачивание, ссылки `data.refs`, Ctrl+K, отсутствие правки, удаление и восстановление
-// только владельцем.
+// картинки, таблица, код; с M7.2 PNG больше 512 КБ — превью сервера), SVG без исполнения
+// скриптов, прочие файлы на скачивание, ссылки `data.refs`, Ctrl+K, отсутствие правки, удаление и
+// восстановление только владельцем.
 // Данные — seedReports (global-setup, отчёты агента по токену). Снимки — в .tmp/e2e/screens/.
 import { expect, test, type Browser, type Page } from '@playwright/test';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { ADMIN_STATE } from './session';
 import {
@@ -26,6 +27,7 @@ import {
   SOLUTION_NAME,
   SVG_FLAG,
   makePng,
+  postReport,
 } from './seed';
 
 const env = (k: string) => {
@@ -260,33 +262,80 @@ const pathOf = (u: string) => {
   return `${x.pathname}${x.search}`;
 };
 
-test('report_page_images_use_preview', async ({ page }) => {
-  // страница отчёта (M7.2, §5.2 п. 5): растровая картинка тела загружается серверным превью
-  // `kind=thumb&px=1024`, исходник страница не тянет; лайтбокс — исходник; SVG — сам файл; отказ
-  // превью (422) — один раз исходник. Печатная копия — исходники (reports-print.spec.ts).
+/** SVG — показ самим файлом (превью SVG сервер не строит). */
+const SVG_IMG = '<svg xmlns="http://www.w3.org/2000/svg" width="60" height="30"><rect width="60" height="30" fill="#58a"/></svg>';
+/** 1 × 1 GIF (прозрачный пиксель): тип файла — GIF, показ — сам файл. */
+const GIF_1PX = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+/** PNG больше порога превью страницы (512 КБ): шум 1280 × 200 ≈ 768 КБ; превью — 1024 px. */
+const BIG_PNG = makePng(1280, 200, true);
+
+/** JPEG 120 × 80 — кодером браузера (`canvas.toDataURL`). */
+async function makeJpeg(page: Page): Promise<Buffer> {
+  const url = await page.evaluate(() => {
+    const c = document.createElement('canvas');
+    c.width = 120;
+    c.height = 80;
+    const x = c.getContext('2d')!;
+    x.fillStyle = '#3a7';
+    x.fillRect(0, 0, 120, 80);
+    return c.toDataURL('image/jpeg', 0.9);
+  });
+  return Buffer.from(url.slice(url.indexOf(',') + 1), 'base64');
+}
+
+const IMG_BODY = '# Картинки\n\n![большой](big.png)\n\n![малый](small.png)\n\n![фото](photo.jpg)\n\n![анимация](anim.gif)\n\n![схема](diag.svg)\n';
+
+test('report_page_images_use_preview', async ({ page, browser }) => {
+  // страница отчёта (M7.2, §5.2 п. 5; решение координатора, ревью задачи 3): превью сервера
+  // `kind=thumb&px=1024` — только у PNG больше 512 КБ, исходник страница не тянет; малый PNG, JPEG,
+  // GIF (анимация) и SVG — сами файлы; лайтбокс — исходник; отказ превью (422) — один раз исходник.
+  // Печатная копия — исходники (reports-print.spec.ts). Своё решение: отчёты решения E2E считает лента.
+  test.setTimeout(90_000);
   const problems = watch(page, (status, path) => status === 422 && path.includes('/api/v1/previews/'));
   const asked: string[] = [];
   page.on('request', (r) => {
     const p = pathOf(r.url());
     if (/^\/api\/v1\/(previews|entries\/[^/]+\/attachments)\//.test(p)) asked.push(p);
   });
-  await openReport(page, env('E2E_REPORT_FULL'));
-  const png = page.locator('article.report .doc img[alt="Кривая потерь"]');
-  await expect.poll(() => png.evaluate((i: HTMLImageElement) => i.complete && i.naturalWidth)).toBe(160);
-  expect(pathOf(await png.evaluate((i: HTMLImageElement) => i.currentSrc))).toMatch(
-    /^\/api\/v1\/previews\/[0-9a-f]{64}\?kind=thumb&px=1024$/,
-  );
-  const svg = page.locator('article.report .doc img[alt="Схема"]');
-  await expect.poll(() => svg.evaluate((i: HTMLImageElement) => i.complete && i.naturalWidth > 0)).toBe(true);
-  expect(pathOf(await svg.evaluate((i: HTMLImageElement) => i.currentSrc))).toMatch(/\/attachments\/[0-9a-f]{64}\/diag\.svg$/);
-  expect(asked.filter((p) => p.includes('/previews/')), 'превью — только у PNG').toHaveLength(1);
-  expect(asked.filter((p) => p.endsWith('/loss.png')), 'исходник PNG страница не загружала').toEqual([]);
+  const token = env('E2E_ADMIN_TOKEN');
+  const guid = randomUUID();
+  const reg = await page.request.post(`${base()}api/v1/solutions`, {
+    headers: { Authorization: `Bearer ${token}` },
+    data: { agent_solution_id: guid, name: `Картинки отчёта E2E: ${guid.slice(0, 8)}` },
+  });
+  expect(reg.status(), await reg.text()).toBe(201);
+  const id = await postReport(base(), token, guid, { title: 'Отчёт E2E: картинки', body: IMG_BODY, tags: [] }, [
+    ['big.png', 'image/png', BIG_PNG],
+    ['small.png', 'image/png', makePng(160, 90)],
+    ['photo.jpg', 'image/jpeg', await makeJpeg(page)],
+    ['anim.gif', 'image/gif', GIF_1PX],
+    ['diag.svg', 'image/svg+xml', SVG_IMG],
+  ]);
+  expect(BIG_PNG.length, 'большой PNG — больше порога').toBeGreaterThan(512 * 1024);
+  const url = `${base()}#/u/${await admin(page)}/s/${guid}/j/reports/${id}`;
+  await page.goto(url);
+  const doc = page.locator(`article.report[data-report="${id}"] .doc`);
+  await expect(doc).toBeVisible();
+  const img = (alt: string) => doc.locator(`img[alt="${alt}"]`);
+  const src = (alt: string) => img(alt).evaluate((i: HTMLImageElement) => i.currentSrc);
+  const loaded = (alt: string) => expect.poll(() => img(alt).evaluate((i: HTMLImageElement) => i.complete && i.naturalWidth > 0)).toBe(true);
+  for (const alt of ['большой', 'малый', 'фото', 'анимация', 'схема']) await loaded(alt);
+  // большой PNG — превью (1024 px из 1280), исходник не запрашивался
+  expect(pathOf(await src('большой'))).toMatch(/^\/api\/v1\/previews\/[0-9a-f]{64}\?kind=thumb&px=1024$/);
+  expect(await img('большой').evaluate((i: HTMLImageElement) => i.naturalWidth)).toBe(1024);
+  expect(asked.filter((p) => p.endsWith('/big.png')), 'исходник большого PNG').toEqual([]);
+  // остальные — сами файлы, без превью
+  for (const [alt, file] of [['малый', 'small.png'], ['фото', 'photo.jpg'], ['анимация', 'anim.gif'], ['схема', 'diag.svg']]) {
+    expect(pathOf(await src(alt)), alt).toMatch(new RegExp(`/attachments/[0-9a-f]{64}/${file.replace('.', '\\.')}$`));
+    expect(await img(alt).getAttribute('srcset'), alt).toBeNull();
+  }
+  expect(asked.filter((p) => p.includes('/previews/')), 'превью — только у большого PNG').toHaveLength(1);
 
   // лайтбокс — исходный файл
-  await png.click();
-  const big = page.getByRole('dialog', { name: 'Кривая потерь' }).locator('img');
-  await expect(big).toHaveAttribute('src', /\/attachments\/[0-9a-f]{64}\/loss\.png$/);
-  await expect.poll(() => big.evaluate((i: HTMLImageElement) => i.complete && i.naturalWidth)).toBe(160);
+  await img('большой').click();
+  const big = page.getByRole('dialog', { name: 'большой' }).locator('img');
+  await expect(big).toHaveAttribute('src', /\/attachments\/[0-9a-f]{64}\/big\.png$/);
+  await expect.poll(() => big.evaluate((i: HTMLImageElement) => i.complete && i.naturalWidth)).toBe(1280);
   await page.keyboard.press('Escape');
   await expect(page.getByRole('dialog')).toHaveCount(0);
 
@@ -295,22 +344,40 @@ test('report_page_images_use_preview', async ({ page }) => {
     r.fulfill({ status: 422, contentType: 'application/json', body: JSON.stringify({ error: 'превью не построено: parse_error' }) }),
   );
   for (const failOriginal of [false, true]) {
-    if (failOriginal) await page.route(/\/attachments\/[0-9a-f]{64}\/loss\.png$/, (r) => r.abort('failed'));
+    if (failOriginal) await page.route(/\/attachments\/[0-9a-f]{64}\/big\.png$/, (r) => r.abort('failed'));
     asked.length = 0;
     await page.reload();
-    await expect(page.locator(`article.report[data-report="${env('E2E_REPORT_FULL')}"] .doc`)).toBeVisible();
+    await expect(doc).toBeVisible();
     if (failOriginal) {
-      await expect.poll(() => asked.filter((p) => p.endsWith('/loss.png')).length).toBe(1);
+      await expect.poll(() => asked.filter((p) => p.endsWith('/big.png')).length).toBe(1);
       await page.waitForTimeout(500);
     } else {
-      await expect.poll(() => png.evaluate((i: HTMLImageElement) => i.complete && i.naturalWidth)).toBe(160);
-      expect(pathOf(await png.evaluate((i: HTMLImageElement) => i.currentSrc))).toMatch(/\/attachments\/[0-9a-f]{64}\/loss\.png$/);
+      await expect.poll(() => img('большой').evaluate((i: HTMLImageElement) => i.complete && i.naturalWidth)).toBe(1280);
+      expect(pathOf(await src('большой'))).toMatch(/\/attachments\/[0-9a-f]{64}\/big\.png$/);
     }
-    expect(asked.filter((p) => p.includes('/previews/')), `превью (исходник ${failOriginal ? 'не' : ''}загружен)`).toHaveLength(1);
-    expect(asked.filter((p) => p.endsWith('/loss.png')), 'исходник — один раз').toHaveLength(1);
+    expect(asked.filter((p) => p.includes('/previews/')), `превью (исходник ${failOriginal ? 'не ' : ''}загружен)`).toHaveLength(1);
+    expect(asked.filter((p) => p.endsWith('/big.png')), 'исходник — один раз').toHaveLength(1);
   }
   await page.unroute(/\/api\/v1\/previews\//);
-  await page.unroute(/\/attachments\/[0-9a-f]{64}\/loss\.png$/);
+  await page.unroute(/\/attachments\/[0-9a-f]{64}\/big\.png$/);
+
+  // администратор от имени другого — превью с `&user=<владелец>` (из адреса файла)
+  const m = await member(browser, page, 'ro');
+  const mg = randomUUID();
+  const auth = { Authorization: `Bearer ${m.token}` };
+  const mreg = await m.ctx.request.post(`${base()}api/v1/solutions`, { headers: auth, data: { agent_solution_id: mg, name: 'E2E картинки пользователя' } });
+  expect(mreg.status()).toBe(201);
+  const mid = await postReport(base(), m.token, mg, { title: 'Отчёт пользователя E2E: картинка', body: '![большой](big.png)\n', tags: [] }, [
+    ['big.png', 'image/png', BIG_PNG],
+  ]);
+  await m.ctx.close();
+  await page.goto(`${base()}#/u/${m.id}/s/${mg}/j/reports/${mid}`);
+  const mimg = page.locator(`article.report[data-report="${mid}"] .doc img`);
+  await expect.poll(() => mimg.evaluate((i: HTMLImageElement) => i.complete && i.naturalWidth)).toBe(1024);
+  expect(pathOf(await mimg.evaluate((i: HTMLImageElement) => i.currentSrc))).toMatch(
+    new RegExp(`^/api/v1/previews/[0-9a-f]{64}\\?kind=thumb&px=1024&user=${m.id}$`),
+  );
+  await expect(mimg).toHaveAttribute('src', new RegExp(`/big\\.png\\?user=${m.id}$`));
   await page.screenshot({ path: `${screens}report-page-preview.png`, fullPage: true });
   expect(problems, problems.join('\n')).toEqual([]);
 });
@@ -605,10 +672,6 @@ test('report_admin_for_user_no_trash_ui_files_with_user', async ({ page, browser
   const img = page.locator('article.report .doc img');
   await expect(img).toHaveAttribute('src', new RegExp(`\\?user=${m.id}$`));
   await expect.poll(() => img.evaluate((i: HTMLImageElement) => i.complete && i.naturalWidth)).toBe(80);
-  // на экране — превью от имени владельца (M7.2, §5.2 п. 5): `user` — из адреса файла
-  expect(await img.evaluate((i: HTMLImageElement) => i.currentSrc)).toMatch(
-    new RegExp(`/api/v1/previews/[0-9a-f]{64}\\?kind=thumb&px=1024&user=${m.id}$`),
-  );
   await expect(page.getByRole('button', { name: 'Удалить' })).toHaveCount(0);
   expect(problems, problems.join('\n')).toEqual([]);
 });

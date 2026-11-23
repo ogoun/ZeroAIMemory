@@ -33,6 +33,7 @@
   import { LINE_ANCHOR_HINT, isLineAnchor, symbolEntry } from '../lib/codeRef';
   import { JOURNAL_OF_KIND } from '../lib/journals';
   import { href } from '../lib/router';
+  import { onTabKey } from '../lib/tabs';
 
   interface Props {
     user: string;
@@ -300,19 +301,8 @@
     return j ? href({ name: 'journal', user, space: sp, journal: j, entry: id }) : null;
   }
 
-  /** Клавиатура tablist: ←/→ по кругу, Home, End; выбор следует за фокусом. */
-  function ontabkey(e: KeyboardEvent, i: number) {
-    const n = TABS.length;
-    let j = -1;
-    if (e.key === 'ArrowRight') j = (i + 1) % n;
-    else if (e.key === 'ArrowLeft') j = (i - 1 + n) % n;
-    else if (e.key === 'Home') j = 0;
-    else if (e.key === 'End') j = n - 1;
-    if (j < 0) return;
-    e.preventDefault();
-    selectTab(TABS[j].id);
-    tabEls[j]?.focus();
-  }
+  /** Клавиатура tablist (`lib/tabs.ts`): ←/→ по кругу, Home, End; выбор следует за фокусом. */
+  const ontabkey = (e: KeyboardEvent, i: number) => onTabKey(e, i, TABS.length, tabEls, (j) => selectTab(TABS[j].id));
 
   const pct = (x: number) => `${Math.round(x * 100)} %`;
   const rankText = (r: number) => r.toFixed(4);

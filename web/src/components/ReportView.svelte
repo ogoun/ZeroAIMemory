@@ -9,8 +9,8 @@
   // Ссылки тела (M6, задача 15a) — lib/reportLinks.ts: только схемы http, https, mailto, vscode,
   // file; внешним — `rel="noopener noreferrer"`; `file:` — без перехода; у `file:` и `vscode:` —
   // кнопка «копировать путь».
-  // Картинки тела на экране (M7.2, §5.2 п. 5) — серверное превью (`srcset`, `withPreviews`), `src` —
-  // исходник: его берут лайтбокс и печатная копия (`lib/print.ts` строит её из `report.html`).
+  // Большие PNG тела на экране (M7.2, §5.2 п. 5) — серверное превью (`srcset`, `withPreviews`), `src`
+  // — исходник: его берут лайтбокс и печатная копия (`lib/print.ts` строит её из `report.html`).
   import { onDestroy, tick, untrack } from 'svelte';
   import Lightbox from './Lightbox.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
@@ -194,10 +194,13 @@
   let titleInBody = $derived(report ? bodyStartsWithTitle(report.html, report.entry.title) : false);
 
   /**
-   * Растровые картинки, у которых сервер строит превью (`thumb_url`, `api/reports/view.rs`): PNG,
-   * JPEG, WebP, GIF; SVG — как есть.
+   * Превью на странице — только у PNG больше 512 КБ **[решение координатора, ревью задачи 3
+   * M7.2]**: превью сервера всегда PNG (`zam-docs/src/thumb.rs`), и у JPEG, WebP или небольшого PNG
+   * оно не легче исходника. GIF (анимация), JPEG, WebP и SVG — как есть; список уже, чем у
+   * миниатюр ленты (`thumb_url`, `api/reports/view.rs`): там — первый кадр 256 px, здесь — сам файл.
    */
-  const RASTER = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+  const PREVIEW_MIME = 'image/png';
+  const PREVIEW_MIN_BYTES = 512 * 1024;
   /** Сторона превью картинки на странице (предел сервера — 1024). */
   const PAGE_PREVIEW_PX = 1024;
 
@@ -211,18 +214,20 @@
   }
 
   /**
-   * HTML тела для экрана: у растровых картинок файлов записи — превью в `srcset` (`1x`), `src` —
-   * исходник. Подстановка — до вставки в страницу (разбор в `<template>` ничего не загружает): правка
-   * после вставки начинала бы загрузку исходника. Печать — из `report.html`, без превью.
+   * HTML тела для экрана: у больших PNG файлов записи (тип и размер — из `files` ответа) — превью в
+   * `srcset` (`1x`), `src` — исходник. Подстановка — до вставки в страницу (разбор в `<template>`
+   * ничего не загружает): правка после вставки начинала бы загрузку исходника. Печать — из
+   * `report.html`, без превью.
    */
   function withPreviews(html: string, files: EntryAttachment[]): string {
-    const raster = new Map(files.filter((f) => RASTER.includes(f.mime)).map((f) => [f.url, f]));
-    if (!raster.size) return html;
+    const big = files.filter((f) => f.mime === PREVIEW_MIME && f.size > PREVIEW_MIN_BYTES);
+    const byUrl = new Map(big.map((f) => [f.url, f]));
+    if (!byUrl.size) return html;
     const t = document.createElement('template');
     t.innerHTML = html;
     let n = 0;
     for (const img of t.content.querySelectorAll('img')) {
-      const f = raster.get(img.getAttribute('src') ?? '');
+      const f = byUrl.get(img.getAttribute('src') ?? '');
       if (!f) continue;
       img.setAttribute('srcset', `${previewUrl(f)} 1x`);
       n++;

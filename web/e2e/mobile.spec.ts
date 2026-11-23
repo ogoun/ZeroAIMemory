@@ -874,6 +874,10 @@ test('all_pages_no_horizontal_scroll', async ({ browser }) => {
           await page.getByRole('tab', { name: new RegExp(`^${t}`) }).click();
           await check(`${p.name}-${t}`);
         }
+        for (const b of p.buttons ?? []) {
+          await page.getByRole('button', { name: b, exact: true }).first().click();
+          await check(`${p.name}-${b}`);
+        }
       }
       problems.push(...seen.map((s) => `${v} ${as}: ${s}`));
       await ctx.close();
@@ -892,7 +896,8 @@ test('editor_phone_modes', async ({ browser }) => {
     space: 'knowledge',
     path: `E2E/Редактор телефона ${run}`,
     kind: 'note',
-    content: '# Редактор телефона\n\nисходный текст\n',
+    // блок кода — в предпросмотре есть цель фокуса («Копировать»)
+    content: '# Редактор телефона\n\nисходный текст\n\n```\nкод\n```\n',
   });
   const ctx = await contextAt(browser, 'phone');
   const page = await ctx.newPage();
@@ -936,6 +941,32 @@ test('editor_phone_modes', async ({ browser }) => {
   await expect(text).toBeFocused();
   await expect(tabs.locator('[tabindex="0"]')).toHaveCount(1);
   await page.screenshot({ path: `${screens}phone-editor-text.png`, fullPage: true });
+
+  // смена ширины с несохранённой правкой (поворот, окно): CodeMirror тот же — текст, предпросмотр
+  // и история отмены целы; на настольном — колонки без вкладок
+  const edited = editor.locator('.pane.source .cm-content');
+  await page.setViewportSize(VIEWPORTS.desktop);
+  await expect(editor.getByRole('tablist')).toHaveCount(0);
+  await expect(edited).toContainText(`правка-${run}`);
+  await expect(editor.locator('.pane.preview')).toContainText(`правка-${run}`);
+  await expect(editor.locator('.pane.preview')).toBeVisible();
+  await expect(editor.getByRole('status')).toHaveText('Есть несохранённые изменения');
+  // сужение с фокусом в предпросмотре — выбрана вкладка «Предпросмотр», фокус на месте
+  const copy = editor.locator('.pane.preview .copy-code');
+  await copy.focus();
+  await page.setViewportSize(VIEWPORTS.phone);
+  await expect(prev).toHaveAttribute('aria-selected', 'true');
+  await expect(copy).toBeFocused();
+  await expect(source).toBeHidden();
+  await text.tap();
+  await expect(edited).toContainText(`правка-${run}`);
+  // история отмены цела: Ctrl+Z снимает правку (ввод — несколькими шагами), затем ввод заново
+  await edited.click();
+  for (let k = 0; k < 10 && (await edited.textContent())?.includes(`правка-${run}`); k++) await page.keyboard.press('Control+z');
+  await expect(edited).not.toContainText(`правка-${run}`);
+  await expect(editor.getByRole('status')).toHaveText(/^Ревизия \d+$/);
+  await page.keyboard.press('Control+End');
+  await page.keyboard.type(`\nправка-${run}\n`);
   await save.tap();
   await expect(editor.getByRole('status')).toContainText('Сохранено');
   expect(problems, problems.join('\n')).toEqual([]);

@@ -22,6 +22,8 @@ export interface MobilePage {
   as?: 'admin' | 'user';
   /** Вкладки страницы (роль `tab`), которые обход открывает по очереди и проверяет так же. */
   tabs?: string[];
+  /** Кнопки (первая с таким именем), которые обход нажимает по очереди — раскрытые строки таблиц. */
+  buttons?: string[];
 }
 
 /**
@@ -60,8 +62,9 @@ export const PAGES: MobilePage[] = [
   { name: 'вложение-pdf', path: (c) => attachment(c, 'E2E_PDF_SHA', 'отчёт.pdf') },
   { name: 'вложение-pptx', path: (c) => attachment(c, 'E2E_PPTX_SHA', 'доклад.pptx') },
   { name: 'отчёт', path: (c) => `#/u/${c.user}/s/${c.solution}/j/reports/${c.env('E2E_REPORT_PRINT')}` },
-  { name: 'пользователи', path: () => '#/admin' },
-  { name: 'решения', path: () => '#/admin/solutions' },
+  // раскрытые строки: токены пользователя, участники решения (вложенные таблицы и форма в ячейке)
+  { name: 'пользователи', path: () => '#/admin', buttons: ['Токены'] },
+  { name: 'решения', path: () => '#/admin/solutions', buttons: ['Доступ'] },
   { name: 'настройки', path: () => '#/admin/settings' },
   { name: 'индекс', path: () => '#/admin/index' },
   { name: 'подключение-агента', path: () => '#/agent-setup' },

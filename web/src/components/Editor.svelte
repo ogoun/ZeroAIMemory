@@ -24,6 +24,7 @@
   import { codeOf, flashButton } from '../lib/hydrate/dom';
   import { hydrateRendered } from '../lib/hydrate/render';
   import { anchorId, href, parse, setGuard } from '../lib/router';
+  import { onTabKey } from '../lib/tabs';
   import { viewport } from '../lib/viewport.svelte';
 
   interface Props {
@@ -74,20 +75,25 @@
   let pane = $state<Pane>('source');
   const uid = $props.id();
   let tabEls = $state<HTMLButtonElement[]>([]);
+  let previewPane = $state<HTMLDivElement | null>(null);
 
-  /** Клавиатура вкладок: ←/→ по кругу, Home, End; выбор следует за фокусом. */
-  function ontabkey(e: KeyboardEvent, i: number) {
-    const n = PANES.length;
-    let j = -1;
-    if (e.key === 'ArrowRight') j = (i + 1) % n;
-    else if (e.key === 'ArrowLeft') j = (i - 1 + n) % n;
-    else if (e.key === 'Home') j = 0;
-    else if (e.key === 'End') j = n - 1;
-    if (j < 0) return;
-    e.preventDefault();
-    pane = PANES[j];
-    tabEls[j]?.focus();
-  }
+  // Окно сузилось (поворот, окно) — выбранной становится панель с фокусом: иначе фокус ушёл бы со
+  // скрытой панели. До обновления DOM (`$effect.pre`): панель ещё видна и фокус на месте.
+  let wasTabbed = false;
+  $effect.pre(() => {
+    const t = tabbed;
+    untrack(() => {
+      if (t && !wasTabbed) {
+        const a = document.activeElement;
+        if (previewPane?.contains(a)) pane = 'preview';
+        else if (host?.contains(a)) pane = 'source';
+      }
+      wasTabbed = t;
+    });
+  });
+
+  /** Клавиатура вкладок (`lib/tabs.ts`): ←/→ по кругу, Home, End; выбор следует за фокусом. */
+  const ontabkey = (e: KeyboardEvent, i: number) => onTabKey(e, i, PANES.length, tabEls, (j) => (pane = PANES[j]));
 
   const message = (e: unknown) => (e instanceof Error ? e.message : 'Ошибка');
   const isDirty = () => cm !== null && cm.text() !== saved;
@@ -413,6 +419,7 @@
     <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions, a11y_no_noninteractive_tabindex -->
     <div
       class="pane preview"
+      bind:this={previewPane}
       id={`${uid}-preview`}
       role={tabbed ? 'tabpanel' : undefined}
       aria-labelledby={tabbed ? `${uid}-tab-preview` : undefined}
