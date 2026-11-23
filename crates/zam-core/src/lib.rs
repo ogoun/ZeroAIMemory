@@ -7,6 +7,7 @@ pub mod shell;
 pub mod snapshot;
 pub mod solution;
 pub mod space;
+pub mod split;
 pub mod target;
 pub mod text;
 pub mod time;

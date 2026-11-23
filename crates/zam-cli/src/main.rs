@@ -308,6 +308,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CacheCmd,
     },
+    /// Ночная проверка памяти: последний вердикт, отчёт с советами, ручной прогон
+    Check {
+        #[command(subcommand)]
+        cmd: CheckCmd,
+    },
     /// Сессии агентов: выданное по событию (токены, «уже выдавалось»), снимок сессии
     #[command(alias = "session")]
     Sessions {
@@ -1331,6 +1336,37 @@ enum CacheCmd {
         #[command(flatten)]
         common: Common,
     },
+}
+
+#[derive(Subcommand)]
+enum CheckCmd {
+    /// Последний прогон и вердикт, пробы, выключатели ночной проверки
+    Status {
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Вердикт, метрики к медиане базы, тренд, проваленные пробы с советами (--json — ответ
+    /// сервера)
+    Report {
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Ручной прогон проверки (ночная настройка его не выключает); ждёт конца
+    Run {
+        /// Не ждать конца прогона
+        #[arg(long)]
+        no_wait: bool,
+        #[command(flatten)]
+        common: Common,
+    },
+}
+
+fn check(c: CheckCmd) -> Result<(), CliError> {
+    match c {
+        CheckCmd::Status { common } => cmd::check::status(&cmd::connect(&common)?),
+        CheckCmd::Report { common } => cmd::check::report(&cmd::connect(&common)?),
+        CheckCmd::Run { no_wait, common } => cmd::check::run(&cmd::connect(&common)?, !no_wait),
+    }
 }
 
 #[derive(Subcommand)]
@@ -2381,6 +2417,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
         Cmd::Work { cmd } => work(cmd),
         Cmd::Cache { cmd } => cache(cmd),
         Cmd::Sessions { cmd } => sessions(cmd),
+        Cmd::Check { cmd } => check(cmd),
         Cmd::Vault { cmd } => vault(cmd),
         Cmd::Release {
             cmd:

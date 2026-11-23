@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 pub mod api;
 pub mod attach;
+pub mod check;
 pub mod heavy;
 pub mod ml;
 pub mod mock_model;

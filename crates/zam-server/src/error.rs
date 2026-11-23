@@ -114,6 +114,14 @@ pub enum ApiError {
     /// «Копии» или по расписанию (один замок); тело несёт `running {started_at, by}`.
     #[error("копия уже идёт ({}): дождитесь её конца", backup_by_text(.0.by))]
     BackupRunning(crate::backup::runner::Running),
+    /// 409 `/problems/check-running` (M7.3 §6.5 п. 1): у пользователя уже идёт прогон проверки
+    /// памяти; тело несёт `run` — идущий прогон.
+    #[error("прогон проверки памяти уже идёт — дождитесь его конца")]
+    CheckRunning { run: zam_core::Id },
+    /// 409 `/problems/check-accept-not-latest` (M7.3 §6.5 п. 5): принять как норму можно только
+    /// последний ночной прогон идущего эпизода регрессии.
+    #[error("принять как норму можно только последний ночной прогон идущего эпизода регрессии")]
+    CheckAcceptNotLatest,
     /// 422 `/problems/option-required` (M5.7 §5.3): ответ на вопрос-предложение без варианта.
     #[error("{0}")]
     OptionRequired(String),
@@ -293,6 +301,14 @@ impl ApiError {
             ApiError::BackupRunning(_) => {
                 (StatusCode::CONFLICT, "/problems/backup-running", "Conflict")
             }
+            ApiError::CheckRunning { .. } => {
+                (StatusCode::CONFLICT, "/problems/check-running", "Conflict")
+            }
+            ApiError::CheckAcceptNotLatest => (
+                StatusCode::CONFLICT,
+                "/problems/check-accept-not-latest",
+                "Conflict",
+            ),
             ApiError::OptionRequired(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "/problems/option-required",
@@ -460,6 +476,9 @@ impl IntoResponse for ApiError {
                 // стандартные поля problem не перекрываются
                 o.entry(k.clone()).or_insert_with(|| v.clone());
             }
+        }
+        if let (ApiError::CheckRunning { run }, Value::Object(o)) = (&self, &mut body) {
+            o.insert("run".into(), json!(run.to_string()));
         }
         if let (ApiError::TermConflict(c), Value::Object(o)) = (&self, &mut body) {
             o.insert("conflicts".into(), json!(c));

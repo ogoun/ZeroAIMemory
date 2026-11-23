@@ -1,0 +1,128 @@
+# Посторонние вопросы ночной проверки памяти (спецификация M7 §6.4 п. 4): 30 вопросов ru/en вне
+# тем памяти агента — быт, спорт, география. Они идут подсказкой к запросу (`/recall` `prompt`) в
+# области каждого решения пользователя; доля запросов, к которым память показала хоть одну
+# подсказку, — метрика `negatives_shown` (подсказки не по делу).
+#
+# Набор встроен в сервер (`include_str!`, `crates/zam-server/src/check/negatives.rs`) и общий для
+# всех пользователей. Смена набора делает числа несопоставимыми: вместе с правкой файла поднимите
+# `CHECK_VERSION` и `NEGATIVES_HASH` (тест `negatives_hash_pinned` напомнит).
+
+[[question]]
+lang = "ru"
+text = "Сколько минут нужно варить куриное яйцо всмятку, чтобы желток остался жидким?"
+
+[[question]]
+lang = "ru"
+text = "Как быстро отстирать пятно от красного вина со светлой хлопковой скатерти?"
+
+[[question]]
+lang = "ru"
+text = "При какой температуре лучше стирать шерстяной свитер, чтобы он не сел?"
+
+[[question]]
+lang = "ru"
+text = "Как часто нужно поливать комнатный кактус зимой в квартире с отоплением?"
+
+[[question]]
+lang = "ru"
+text = "Чем заменить разрыхлитель теста, если он закончился перед выпечкой пирога?"
+
+[[question]]
+lang = "ru"
+text = "Сколько игроков одной команды одновременно находятся на поле в футболе?"
+
+[[question]]
+lang = "ru"
+text = "Какова длина марафонской дистанции в километрах и откуда взялось это число?"
+
+[[question]]
+lang = "ru"
+text = "Сколько сетов нужно выиграть мужчине в финале теннисного турнира Большого шлема?"
+
+[[question]]
+lang = "ru"
+text = "Как правильно дышать при беге на длинную дистанцию, чтобы не кололо в боку?"
+
+[[question]]
+lang = "ru"
+text = "В каком городе проходили летние Олимпийские игры тысяча девятьсот восьмидесятого года?"
+
+[[question]]
+lang = "ru"
+text = "Какая река самая длинная в Европе и в какое море она впадает?"
+
+[[question]]
+lang = "ru"
+text = "Какой город является столицей Австралии, если это не Сидней и не Мельбурн?"
+
+[[question]]
+lang = "ru"
+text = "На каком материке находится пустыня Атакама и почему там почти нет дождей?"
+
+[[question]]
+lang = "ru"
+text = "Какое озеро считается самым глубоким на планете и где оно расположено?"
+
+[[question]]
+lang = "ru"
+text = "Сколько часовых поясов проходит через территорию России с запада на восток?"
+
+[[question]]
+lang = "en"
+text = "How long should I boil pasta so that it stays firm to the bite?"
+
+[[question]]
+lang = "en"
+text = "What is the best way to remove a coffee stain from a white cotton shirt?"
+
+[[question]]
+lang = "en"
+text = "How often should a potted orchid be watered during the summer months indoors?"
+
+[[question]]
+lang = "en"
+text = "Can baking soda be used instead of baking powder when making pancakes at home?"
+
+[[question]]
+lang = "en"
+text = "How do I keep fresh basil leaves from turning black in the fridge?"
+
+[[question]]
+lang = "en"
+text = "How many players are on the court for each team in a basketball game?"
+
+[[question]]
+lang = "en"
+text = "How many holes are played in a standard round of professional golf?"
+
+[[question]]
+lang = "en"
+text = "What is the official distance of a half marathon in miles and kilometres?"
+
+[[question]]
+lang = "en"
+text = "How long does a regular ice hockey match last without overtime periods?"
+
+[[question]]
+lang = "en"
+text = "Which country has won the most football World Cup titles so far?"
+
+[[question]]
+lang = "en"
+text = "What is the highest mountain in Africa and how tall is it?"
+
+[[question]]
+lang = "en"
+text = "Which river flows through Cairo before reaching the Mediterranean Sea?"
+
+[[question]]
+lang = "en"
+text = "What is the capital city of Canada and in which province is it located?"
+
+[[question]]
+lang = "en"
+text = "Which ocean is the largest by area and which continents does it touch?"
+
+[[question]]
+lang = "en"
+text = "How many countries share a land border with Germany in central Europe?"
