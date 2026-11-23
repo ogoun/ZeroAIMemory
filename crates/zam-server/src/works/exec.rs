@@ -1,4 +1,4 @@
-//! Исполнение пакета работы подключённой моделью (M7.3, спецификация §6.2 пп. 4, 6; §6.3 п. 3):
+//! Исполнение пакета работы подключённой моделью (M7.3, спецификация §6.2 пп. 4–8; §6.3 п. 3):
 //! пакет → второй скан → вызов → разбор JSON с одним повтором.
 //!
 //! - **Пакет** ([`Payload`]) — инструкция и схема итога (системное сообщение) и элементы
@@ -10,21 +10,19 @@
 //! - **JSON** ([`extract_json`], [`json_step`]): первый блок кода `json` или первый
 //!   сбалансированный объект текста; не разобрался — **один** повтор той же беседы с сообщением
 //!   «ответ не JSON: <ошибка разбора>; верни только JSON по схеме», второй сбой — `bad_json`.
+//! - **Выполнение** ([`run_payload`]): окно ночи, «стоп до следующей ночи» по строкам журнала
+//!   **своего** запуска ([`RunKey`], столбец `work_calls.run`; решение координатора 77), второй
+//!   скан, подключение ([`super::conn::prepare`]), затем на **каждое** обращение: действующий
+//!   режим вида и пауза (иначе `blocked` без запроса), пределы суток и месяца, слот сервера
+//!   (`max_parallel`; у пользователя — одно обращение, замок на весь пакет), аудит
+//!   `works.model.key_use` раз на запуск, вызов в отдельном потоке, строка журнала; повторы
+//!   `rate` и `unavailable`, пауза `auth`/`not_found` ([`super::pause`]).
+//! - **Остановка** не ждёт висящий вызов: по `ctx.stopped()` обращение бросается (строка
+//!   `aborted` без длительности), а сам вызов идёт в **отвязанном** потоке `std::thread` — он не
+//!   держит ни пул блокирующих задач рантайма, ни выход процесса (Review Focus 5).
 //!
-//! - **Выполнение** ([`run_payload`]): режим вида — `model` (иначе запроса нет), окно ночи,
-//!   «стоп до следующей ночи» по журналу отправок этой ночи или ручного запуска ([`RunKey`];
-//!   решение координатора 77), второй скан, подключение ([`prepare`]: запись Vault, сверка
-//!   закреплённого адреса, маршрут, ключ), пределы суток и месяца, вызов в `spawn_blocking` (не
-//!   больше `max_parallel` на сервер, у пользователя — один), повторы `rate` и `unavailable`,
-//!   журнал каждого обращения, пауза и аудит `works.model.paused`, `works.model.key_use` раз на
-//!   запуск.
-//! - **Пауза** (§6.2 п. 5): `auth`, `not_found` — после ответа; `blocked`, `vault`,
-//!   `vault_changed` — запрос не отправляется. Её пишет только этот модуль
-//!   ([`super::settings::set_pause`]), снимают человек сохранением подключения и успешная
-//!   проверка подключения (у `vault_changed` — только сохранение).
-//!
-//! Блокирующее замыкание получает только данные запроса (подключение, маршрут, ключ, беседу) —
-//! ни `Db`, ни `AppState` (решение координатора 56); остановка — `ctx.stopping()`/`ctx.stopped()`.
+//! Поток вызова получает только данные запроса (подключение, маршрут, ключ, беседу) — ни `Db`, ни
+//! `AppState` (решение координатора 56); остановка — `ctx.stopping()`/`ctx.stopped()`.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -35,12 +33,12 @@ use serde_json::{Value, json};
 use zam_core::Id;
 use zam_store::work_calls::{self, CallRow};
 use zam_store::works::WorkKind;
-use zeroize::Zeroizing;
 
-use super::egress::{self, Policy, Route, RouteError};
+use super::conn::{self, Prepared};
 use super::model::{self, CallClass, CallError, ChatMessage, ModelConn, ModelReply};
 use super::night::NightCtx;
-use super::settings::{self, ModelAuth, Pause, UserWorks};
+use super::pause;
+use super::settings::{self, UserWorks};
 use crate::config::{WorksMode, WorksSection};
 
 /// Разделитель элементов пользовательского сообщения.
@@ -249,22 +247,19 @@ pub fn json_step(convo: &[ChatMessage], reply: &ModelReply, retried: bool) -> Js
     }
 }
 
-// ---------- выполнение: пределы, журнал, пауза (§6.2 пп. 5, 7, 8) ----------
+// ---------- выполнение: запуск, пределы, журнал, повторы (§6.2 пп. 5, 7, 8) ----------
 
 /// Ожидание перед повторами `unavailable` (§6.2 п. 5): через 10 и через 60 с.
 pub const UNAVAILABLE_RETRY: [Duration; 2] = [Duration::from_secs(10), Duration::from_secs(60)];
 /// `rate`: `retry-after` не дольше стольких секунд — ожидание и один повтор, иначе стоп.
 pub const RATE_WAIT_MAX_S: u64 = 60;
-/// Столько `unavailable` за ночь (ручной запуск) — стоп до следующей ночи.
+/// Столько `unavailable` за запуск (ночь, ручной запуск) — стоп до следующей ночи.
 pub const UNAVAILABLE_STOP: usize = 3;
-/// Срок проверки подключения — не дольше этого (и не дольше `call_timeout_s`).
-pub const TEST_TIMEOUT_MAX: Duration = Duration::from_secs(120);
-/// Кто ставит паузу и пишет аудит исполнителя.
-const ACTOR: &str = "system";
 
-/// Запуск, по журналу которого считаются «стоп до следующей ночи» и аудит `key_use` «раз за
-/// ночь» (решение координатора 77): ночь (дата слота) или ручной запуск — его id (UUIDv7, время
-/// запуска — в самом id).
+/// Запуск, по строкам журнала которого считаются «стоп до следующей ночи» и аудит `key_use`
+/// «раз за ночь» (решение координатора 77): ночь (дата слота) или ручной запуск — его id
+/// (один на весь ручной запуск, создаётся в его начале). Строка журнала несёт запуск в столбце
+/// `run` ([`RunKey::run`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunKey {
     Night(civil::Date),
@@ -272,27 +267,24 @@ pub enum RunKey {
 }
 
 impl RunKey {
-    /// Строки журнала запуска — `[from, until)`: у ночи — её окно (`[works] at`, `tz`,
-    /// `window_min`; ночные обращения идут только в нём), у ручного запуска — от момента его id
-    /// без верхней границы.
-    pub fn window(&self, s: &WorksSection) -> (Timestamp, Option<Timestamp>) {
+    /// Значение столбца `work_calls.run`: `night:<дата>` или `manual:<id>`.
+    pub fn run(&self) -> String {
         match self {
-            RunKey::Night(d) => {
-                let start = crate::schedule::slot(*d, s.at_hm(), &s.time_zone());
-                let len = SignedDuration::from_mins(i64::from(s.window_min));
-                (start, start.checked_add(len).ok())
-            }
-            RunKey::Manual(id) => (id_time(*id), None),
+            RunKey::Night(d) => format!("night:{d}"),
+            RunKey::Manual(id) => format!("manual:{id}"),
         }
     }
-}
 
-/// Начало ручного запуска по его id (UUIDv7: старшие 48 бит — миллисекунды эпохи Unix),
-/// округлённое вверх до следующей миллисекунды: строки, записанные в ту же миллисекунду **до**
-/// создания id (прежний запуск), в запуск не попадают.
-fn id_time(id: Id) -> Timestamp {
-    let ms = i64::try_from(id.as_uuid().as_u128() >> 80).unwrap_or(0);
-    Timestamp::from_millisecond(ms.saturating_add(1)).unwrap_or(Timestamp::UNIX_EPOCH)
+    /// Окно ночи `[slot(d), slot(d) + window_min)` по `[works] at`, `tz`, `window_min`; у
+    /// ручного запуска окна нет.
+    pub fn night_window(&self, s: &WorksSection) -> Option<(Timestamp, Timestamp)> {
+        let RunKey::Night(d) = self else {
+            return None;
+        };
+        let start = crate::schedule::slot(*d, s.at_hm(), &s.time_zone());
+        let len = SignedDuration::from_mins(i64::from(s.window_min));
+        Some((start, start.checked_add(len).unwrap_or(start)))
+    }
 }
 
 /// Итог пакета: JSON ответа модели (`null` — после второго скана отправлять было нечего) и
@@ -319,7 +311,7 @@ impl CallSlots {
         }
     }
 
-    fn user(&self, user: Id) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn user(&self, user: Id) -> Arc<tokio::sync::Mutex<()>> {
         self.users
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -390,276 +382,15 @@ pub fn stopped(rows: &[CallRow]) -> Option<CallClass> {
     (unavailable >= UNAVAILABLE_STOP).then_some(CallClass::Unavailable)
 }
 
-/// Отказ до отправки: класс и пояснение человеку (причина запрета, «был → стал», что с записью
-/// Vault).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Refusal {
-    pub error: CallError,
-    pub detail: Option<String>,
-    /// У `vault_changed` — хосты «был → стал».
-    pub change: Option<(String, String)>,
-}
-
-impl Refusal {
-    fn new(class: CallClass, detail: impl Into<String>) -> Refusal {
-        Refusal {
-            error: CallError::new(class),
-            detail: Some(detail.into()),
-            change: None,
-        }
-    }
-}
-
-/// Внутренний сбой (хранилище, задача): запрос не отправлен, класс для вызывающего — `aborted`,
-/// подробности — в журнал сервера.
-fn internal(what: &str, e: impl std::fmt::Display) -> Refusal {
-    tracing::warn!(error = %e, "внутренние работы: {what}");
-    Refusal {
-        error: CallError::new(CallClass::Aborted),
-        detail: None,
-        change: None,
-    }
-}
-
-/// Подключение, готовое к обращениям: настройки, проверенный маршрут, ключ (у `auth = "key"`).
-pub struct Prepared {
-    pub conn: ModelConn,
-    pub route: Route,
-    /// Хост для журнала и аудита (без пути).
-    pub host: String,
-    key: Option<Zeroizing<String>>,
-}
-
-impl std::fmt::Debug for Prepared {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Prepared")
-            .field("host", &self.host)
-            .field("external", &self.route.external)
-            .field("key", &self.key.as_ref().map(|_| "‹secret›"))
-            .finish_non_exhaustive()
-    }
-}
-
-/// Ставит паузу исполнителя (§6.2 п. 5) с аудитом `works.model.paused {class}` (у
-/// `vault_changed` — и `works.model.vault_changed {from, to}`). Сбой записи — WARN.
-pub async fn set_paused(
-    ctx: &NightCtx,
-    user: Id,
-    class: CallClass,
-    change: Option<(String, String)>,
-) {
-    let st = ctx.st();
-    let (from, to) = change.clone().unzip();
-    let pause = Pause {
-        class: class.as_str().to_string(),
-        since: zam_store::time::now(),
-        from,
-        to,
-    };
-    if let Err(e) = settings::set_pause(st, user, Some(pause)).await {
-        tracing::warn!(user = %user, error = %e, "внутренние работы: пауза не записана");
-    }
-    let target = user.to_string();
-    let _ = st
-        .system
-        .audit(
-            ACTOR,
-            Some(user),
-            "works.model.paused",
-            Some(&target),
-            None,
-            json!({"class": class.as_str()}),
-        )
-        .await;
-    if let Some((from, to)) = change {
-        let _ = st
-            .system
-            .audit(
-                ACTOR,
-                Some(user),
-                "works.model.vault_changed",
-                Some(&target),
-                None,
-                json!({"from": from, "to": to}),
-            )
-            .await;
-    }
-}
-
-/// Снимает паузу исполнителя (если есть) с аудитом `works.model.pause_cleared {class, by}`;
-/// `by` — `save` (сохранение подключения) или `test` (успешная проверка).
-pub async fn clear_pause(st: &crate::app::AppState, user: Id, works: &UserWorks, by: &str) {
-    let Some(p) = &works.pause else {
-        return;
-    };
-    if let Err(e) = settings::set_pause(st, user, None).await {
-        tracing::warn!(user = %user, error = %e, "внутренние работы: пауза не снята");
-        return;
-    }
-    let _ = st
-        .system
-        .audit(
-            ACTOR,
-            Some(user),
-            "works.model.pause_cleared",
-            Some(&user.to_string()),
-            None,
-            json!({"class": p.class, "by": by}),
-        )
-        .await;
-}
-
-async fn refuse_paused(
-    ctx: &NightCtx,
-    user: Id,
-    class: CallClass,
-    detail: String,
-    change: Option<(String, String)>,
-) -> Refusal {
-    set_paused(ctx, user, class, change.clone()).await;
-    Refusal {
-        error: CallError::new(class),
-        detail: Some(detail),
-        change,
-    }
-}
-
-/// Подключение пользователя к обращению (§6.2 пп. 1, 6) — перед каждым пакетом и проверкой:
-/// запись личного Vault (удалена, перенесена, Vault заблокирован, нет значения — пауза
-/// `vault`), сверка её адреса с закреплённым (расхождение — пауза `vault_changed` и аудит
-/// `{from, to}`: токен, поправивший `data.url`, не уведёт пакеты и ключ), маршрут по политике
-/// `[works]` (запрет — пауза `blocked`; имя не разрешилось — `unavailable` без паузы), ключ.
-pub async fn prepare(ctx: &NightCtx, user: Id, works: &UserWorks) -> Result<Prepared, Refusal> {
-    let st = ctx.st();
-    let Some(conn) = works.model.clone() else {
-        return Err(Refusal::new(
-            CallClass::Blocked,
-            "нет подключения works.model",
-        ));
-    };
-    let db = st
-        .users
-        .get(user)
-        .await
-        .map_err(|e| internal("база пользователя", e))?;
-    let (meta, blob) = match zam_store::vault_get(&db, conn.vault).await {
-        Ok((m, b)) if m.scope == zam_store::VaultScope::Knowledge => (m, b),
-        Ok(_) => {
-            return Err(refuse_paused(
-                ctx,
-                user,
-                CallClass::Vault,
-                "запись Vault подключения перенесена из личного Vault".into(),
-                None,
-            )
-            .await);
-        }
-        Err(zam_store::StoreError::NotFound) => {
-            return Err(refuse_paused(
-                ctx,
-                user,
-                CallClass::Vault,
-                "записи Vault подключения нет (удалена)".into(),
-                None,
-            )
-            .await);
-        }
-        Err(e) => return Err(internal("запись Vault", e)),
-    };
-    let current = egress::vault_address(&meta.data)
-        .ok_or_else(|| "нет адреса".to_string())
-        .and_then(egress::parse_base_url);
-    let base = match (current, &conn.pinned) {
-        (Ok(base), Some(pinned)) if base == *pinned => base,
-        (current, pinned) => {
-            let from = pinned
-                .as_ref()
-                .map_or_else(|| "не закреплён".to_string(), egress::host_label);
-            let to = current
-                .as_ref()
-                .map_or_else(|_| "нет адреса".to_string(), egress::host_label);
-            return Err(refuse_paused(
-                ctx,
-                user,
-                CallClass::VaultChanged,
-                format!(
-                    "адрес подключения изменён: был {from} → стал {to} — подтвердите, сохранив \
-                     подключение заново"
-                ),
-                Some((from, to)),
-            )
-            .await);
-        }
-    };
-    let policy = Policy::of(&st.cfg.works);
-    let b = base.clone();
-    let route = tokio::task::spawn_blocking(move || egress::route(&b, policy))
-        .await
-        .map_err(|e| internal("разрешение имени", e))?;
-    let route = match route {
-        Ok(r) => r,
-        Err(RouteError::Unresolved) => {
-            return Err(Refusal::new(
-                CallClass::Unavailable,
-                format!("имя {} не разрешилось", base.host),
-            ));
-        }
-        Err(RouteError::Blocked(reason)) => {
-            return Err(refuse_paused(ctx, user, CallClass::Blocked, reason.message(), None).await);
-        }
-    };
-    let key = match conn.auth {
-        ModelAuth::None => None,
-        ModelAuth::Key if blob.is_empty() => {
-            return Err(refuse_paused(
-                ctx,
-                user,
-                CallClass::Vault,
-                "у записи Vault подключения нет значения (ключа)".into(),
-                None,
-            )
-            .await);
-        }
-        ModelAuth::Key => match st.vault.decrypt(user, meta.id, meta.rev, &blob).await {
-            Ok(plain) => match String::from_utf8(plain.to_vec()) {
-                Ok(k) => Some(Zeroizing::new(k)),
-                Err(_) => {
-                    return Err(refuse_paused(
-                        ctx,
-                        user,
-                        CallClass::Vault,
-                        "значение записи Vault — не текст".into(),
-                        None,
-                    )
-                    .await);
-                }
-            },
-            Err(e) => {
-                let detail = match e {
-                    crate::error::ApiError::VaultLocked(_) => "Vault заблокирован",
-                    _ => "значение записи Vault не расшифровалось",
-                };
-                return Err(refuse_paused(ctx, user, CallClass::Vault, detail.into(), None).await);
-            }
-        },
-    };
-    let host = egress::host_label(&route.base);
-    Ok(Prepared {
-        conn,
-        route,
-        host,
-        key,
-    })
-}
-
 /// Что пишется в строку журнала одного обращения.
-struct Meta<'a> {
-    kind: &'a str,
-    work: Option<Id>,
-    items: Option<u32>,
+pub(crate) struct Meta<'a> {
+    pub(crate) kind: &'a str,
+    pub(crate) work: Option<Id>,
+    pub(crate) items: Option<u32>,
+    pub(crate) run: Option<String>,
 }
 
-fn row_of(
+pub(crate) fn row_of(
     p: &Prepared,
     m: &Meta<'_>,
     outcome: &str,
@@ -682,19 +413,24 @@ fn row_of(
         http_status,
         external: p.route.external,
         items: m.items,
+        run: m.run.clone(),
     }
 }
 
-async fn journal(db: &zam_store::Db, row: CallRow) {
+pub(crate) async fn journal(db: &zam_store::Db, row: CallRow) {
     if let Err(e) = work_calls::record_call(db, &row).await {
-        tracing::warn!(error = %e, "внутренние работы: строка журнала отправок не записана");
+        tracing::warn!(
+            outcome = %row.outcome,
+            error = %e,
+            "внутренние работы: строка журнала отправок не записана"
+        );
     }
 }
 
 /// Пределы токенов (§6.2 п. 7): оценка «вход (счётчик выдачи) + `max_tokens`» помещается в
 /// остаток суток и месяца UTC пользователя (`works.limits`, не выше потолков `[works]`); расход
 /// — сумма по журналу отправок.
-async fn fits_limits(
+pub(crate) async fn fits_limits(
     db: &zam_store::Db,
     works: &UserWorks,
     s: &WorksSection,
@@ -727,49 +463,63 @@ fn month_start_utc(t: Timestamp) -> Timestamp {
 }
 
 /// Оценка расхода обращения: вход счётчиком выдачи + предел ответа.
-fn estimate(conn: &ModelConn, convo: &[ChatMessage]) -> u64 {
+pub(crate) fn estimate(conn: &ModelConn, convo: &[ChatMessage]) -> u64 {
     let joined: Vec<&str> = convo.iter().map(|m| m.content.as_str()).collect();
     (zam_store::count_tokens(&joined.join("\n")) as u64).saturating_add(u64::from(conn.max_tokens))
 }
 
-/// Одно обращение: слот сервера, вызов в `spawn_blocking` (замыкание — только данные запроса),
-/// срок `timeout`; остановка сервера — `aborted` (висящий вызов брошен). Второе — мс обращения.
-async fn attempt(
+/// Слот сервера (`max_parallel`); остановка сервера раньше — `None`.
+pub(crate) async fn slot(ctx: &NightCtx) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let slots = ctx.st().model_calls.server.clone();
+    tokio::select! {
+        p = slots.acquire_owned() => p.ok(),
+        () = ctx.stopped() => None,
+    }
+}
+
+/// Одно обращение в **отвязанном** потоке `std::thread` (ни пул блокирующих задач рантайма, ни
+/// выход процесса он не держит); поток получает только данные запроса. Второе — мс обращения;
+/// остановка сервера (`ctx.stopped()`) — `aborted` без длительности, вызов брошен (поток доживёт
+/// до срока `ureq` и ответ выбросит).
+pub(crate) async fn call(
     ctx: &NightCtx,
     p: &Prepared,
     convo: &[ChatMessage],
     timeout: Duration,
-) -> (Result<ModelReply, CallError>, u64) {
-    let slots = ctx.st().model_calls.server.clone();
-    let permit = tokio::select! {
-        p = slots.acquire_owned() => p.ok(),
-        () = ctx.stopped() => None,
-    };
-    let Some(_permit) = permit else {
-        return (Err(CallError::new(CallClass::Aborted)), 0);
-    };
-    let (conn, route) = (p.conn.clone(), p.route.clone());
-    let key = p.key.clone();
+) -> (Result<ModelReply, CallError>, Option<u64>) {
+    let (conn, route, key) = (p.conn.clone(), p.route.clone(), p.key_clone());
     let convo = convo.to_vec();
+    let (tx, rx) = tokio::sync::oneshot::channel();
     let started = Instant::now();
-    let call = tokio::task::spawn_blocking(move || {
-        model::call_chat_blocking(
-            &conn,
-            &route,
-            key.as_ref().map(|k| k.as_str()),
-            &convo,
-            timeout,
-        )
-    });
-    let r = tokio::select! {
-        r = call => r.unwrap_or_else(|e| {
-            tracing::warn!(panic = e.is_panic(), "внутренние работы: вызов модели прерван");
-            Err(CallError::new(CallClass::Aborted))
-        }),
-        () = ctx.stopped() => Err(CallError::new(CallClass::Aborted)),
-    };
-    let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    (r, ms)
+    let spawned = std::thread::Builder::new()
+        .name("works-model-call".into())
+        .spawn(move || {
+            let r = model::call_chat_blocking(
+                &conn,
+                &route,
+                key.as_ref().map(|k| k.as_str()),
+                &convo,
+                timeout,
+            );
+            let _ = tx.send(r);
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "внутренние работы: поток вызова модели не запущен");
+        return (Err(CallError::new(CallClass::Aborted)), None);
+    }
+    tokio::select! {
+        r = rx => match r {
+            Ok(r) => {
+                let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                (r, Some(ms))
+            }
+            Err(_) => {
+                tracing::warn!("внутренние работы: поток вызова модели завершился без ответа");
+                (Err(CallError::new(CallClass::Aborted)), None)
+            }
+        },
+        () = ctx.stopped() => (Err(CallError::new(CallClass::Aborted)), None),
+    }
 }
 
 /// Ожидание с остановкой: `false` — сервер останавливается.
@@ -784,8 +534,8 @@ async fn wait(ctx: &NightCtx, d: Duration) -> bool {
 struct Run<'a> {
     ctx: &'a NightCtx,
     user: Id,
+    kind: WorkKind,
     db: &'a zam_store::Db,
-    works: &'a UserWorks,
     p: &'a Prepared,
     meta: Meta<'a>,
     /// Уже было обращение с ключом в этом запуске (аудит `key_use` — раз на запуск).
@@ -795,10 +545,13 @@ struct Run<'a> {
 }
 
 impl Run<'_> {
-    /// Одно обращение с повторами (§6.2 п. 5): предел перед каждым (не помещается — строка
-    /// `limit`, запроса нет), аудит `key_use` перед первым обращением запуска, строка журнала
-    /// на каждое; `rate` с `retry-after` ≤ 60 с — ожидание и один повтор; `unavailable` — до двух
-    /// повторов (через 10 и 60 с), пока строк запуска меньше трёх; `auth`, `not_found` — пауза.
+    /// Одно обращение с повторами (§6.2 пп. 5, 7). Перед **каждой** попыткой: действующий режим
+    /// вида и пауза (выключил человек, пока шло ожидание повтора, — `blocked` без запроса; ревью
+    /// r1 Important 2), предел (не помещается — строка `limit`, запроса нет), слот сервера, аудит
+    /// `key_use` перед первым обращением запуска (не записался — обращения нет); строка журнала
+    /// на каждое обращение; `rate` с `retry-after` ≤ 60 с — ожидание и один повтор; `unavailable`
+    /// — до двух повторов (через 10 и 60 с), пока строк запуска меньше трёх; `auth`, `not_found`
+    /// — пауза.
     async fn send(&mut self, convo: &[ChatMessage]) -> Result<ModelReply, CallError> {
         let st = self.ctx.st();
         let cfg = &st.cfg.works;
@@ -808,9 +561,15 @@ impl Run<'_> {
             if self.ctx.stopping() {
                 return Err(CallError::new(CallClass::Aborted));
             }
+            let works = settings::load(&st.system, self.user)
+                .await
+                .map_err(|e| conn::internal("настройки исполнителя", e).error)?;
+            if settings::effective_mode(self.kind, &works, cfg).0 != WorksMode::Model {
+                return Err(CallError::new(CallClass::Blocked));
+            }
             let now = zam_store::time::now();
             let need = estimate(&self.p.conn, convo);
-            match fits_limits(self.db, self.works, cfg, now, need).await {
+            match fits_limits(self.db, &works, cfg, now, need).await {
                 Ok(true) => {}
                 Ok(false) => {
                     journal(
@@ -827,30 +586,35 @@ impl Run<'_> {
                     .await;
                     return Err(CallError::new(CallClass::Limit));
                 }
-                Err(e) => return Err(internal("расход токенов", e).error),
+                Err(e) => return Err(conn::internal("расход токенов", e).error),
             }
-            if self.p.key.is_some() && !self.key_used {
+            let Some(_permit) = slot(self.ctx).await else {
+                return Err(CallError::new(CallClass::Aborted));
+            };
+            if self.p.has_key() && !self.key_used {
+                let logged = pause::audit(
+                    st,
+                    pause::SYSTEM,
+                    None,
+                    self.user,
+                    "works.model.key_use",
+                    json!({"vault": format!("v:{}", self.p.conn.vault), "host": self.p.host}),
+                )
+                .await;
+                // ключ без следа в аудите наружу не уходит
+                if !logged {
+                    return Err(CallError::new(CallClass::Aborted));
+                }
                 self.key_used = true;
-                let _ = st
-                    .system
-                    .audit(
-                        ACTOR,
-                        Some(self.user),
-                        "works.model.key_use",
-                        Some(&self.user.to_string()),
-                        None,
-                        json!({"vault": format!("v:{}", self.p.conn.vault), "host": self.p.host}),
-                    )
-                    .await;
             }
-            let (r, ms) = attempt(self.ctx, self.p, convo, timeout).await;
+            let (r, ms) = call(self.ctx, self.p, convo, timeout).await;
             let row = match &r {
                 Ok(reply) => row_of(
                     self.p,
                     &self.meta,
                     work_calls::OUTCOME_OK,
                     Some(reply.usage()),
-                    Some(ms),
+                    ms,
                     Some(200),
                 ),
                 Err(e) => row_of(
@@ -858,7 +622,7 @@ impl Run<'_> {
                     &self.meta,
                     e.class.as_str(),
                     e.usage,
-                    Some(ms),
+                    ms,
                     e.http_status,
                 ),
             };
@@ -869,7 +633,7 @@ impl Run<'_> {
             };
             match e.class {
                 CallClass::Auth | CallClass::NotFound => {
-                    set_paused(self.ctx, self.user, e.class, None).await;
+                    pause::set_paused(st, self.user, e.class, None, pause::SYSTEM, None).await;
                     return Err(e);
                 }
                 CallClass::Rate
@@ -898,11 +662,12 @@ impl Run<'_> {
 
 /// Выполняет пакет работы подключённой моделью (§6.2, §6.3 п. 7). Запроса нет вовсе (класс
 /// `blocked`, без паузы), если действующий режим вида не `model` (`[works] enabled = false`,
-/// режим `off`/`agent`, нет подключения, `model_access = "off"`, пауза); у ночи — вне её окна
-/// (`aborted`); после «стопа до следующей ночи» этого запуска (класс стопа); нулевой потолок и
-/// предел — `limit`. Второй скан выбрасывает элементы с находкой (`dropped`); после него
-/// пусто — запроса нет, `json = null`. Ответ не JSON — один повтор беседы, затем `bad_json`.
-/// `work` — работа `j:<id>` (строки журнала).
+/// режим `off`/`agent`, нет подключения, `model_access = "off"`, пауза) — и перед каждым
+/// обращением, а не только в начале; у ночи — вне её окна (`aborted`); после «стопа до следующей
+/// ночи» этого запуска (класс стопа); нулевой потолок и предел — `limit`. Второй скан
+/// выбрасывает элементы с находкой (`dropped`); после него пусто — запроса нет, `json = null`.
+/// Ответ не JSON — один повтор беседы, затем `bad_json`. `work` — работа `j:<id>` (строки
+/// журнала). Паузу (`auth`, `not_found`, `blocked`, `vault`, `vault_changed`) ставит сам.
 pub async fn run_payload(
     ctx: &NightCtx,
     user: Id,
@@ -923,26 +688,24 @@ pub async fn run_payload(
     };
     let works = settings::load(&st.system, user)
         .await
-        .map_err(|e| internal("настройки исполнителя", e).error)?;
+        .map_err(|e| conn::internal("настройки исполнителя", e).error)?;
     if settings::effective_mode(kind, &works, cfg).0 != WorksMode::Model {
         return Err(CallError::new(CallClass::Blocked));
     }
     let now = zam_store::time::now();
-    let (from, until) = run.window(cfg);
-    if matches!(run, RunKey::Night(_)) && !(from <= now && until.is_some_and(|u| now < u)) {
+    if let Some((from, until)) = run.night_window(cfg)
+        && !(from <= now && now < until)
+    {
         return Err(CallError::new(CallClass::Aborted));
     }
     let db = st
         .users
         .get(user)
         .await
-        .map_err(|e| internal("база пользователя", e).error)?;
-    let rows: Vec<CallRow> = work_calls::calls_between(&db, from, until)
+        .map_err(|e| conn::internal("база пользователя", e).error)?;
+    let rows: Vec<CallRow> = work_calls::calls_of_run(&db, &run.run())
         .await
-        .map_err(|e| internal("журнал отправок", e).error)?
-        .into_iter()
-        .filter(|r| r.kind != work_calls::KIND_TEST)
-        .collect();
+        .map_err(|e| conn::internal("журнал отправок", e).error)?;
     if let Some(class) = stopped(&rows) {
         return Err(CallError::new(class));
     }
@@ -953,30 +716,32 @@ pub async fn run_payload(
             dropped,
         });
     }
-    let p = match prepare(ctx, user, &works).await {
+    let items = u32::try_from(payload.items.len()).ok();
+    let p = match conn::prepare(ctx, user, &works, pause::SYSTEM, None).await {
         Ok(p) => p,
         Err(r) => {
-            // имя не разрешилось — строка без отправки: три `unavailable` за ночь — стоп
+            // имя не разрешилось — строка без отправки: три `unavailable` за запуск — стоп
             if r.error.class == CallClass::Unavailable
-                && let Some(conn) = &works.model
+                && let Some(c) = &works.model
             {
-                let host = conn.pinned.as_ref().map(egress::host_label);
+                let host = c.pinned.as_ref();
                 journal(
                     &db,
                     CallRow {
                         ts: zam_store::time::now(),
                         work_id: work,
                         kind: kind.as_str().to_string(),
-                        host: host.unwrap_or_default(),
-                        model: conn.model.clone(),
+                        host: host.map(super::egress::host_label).unwrap_or_default(),
+                        model: c.model.clone(),
                         input_tokens: 0,
                         output_tokens: 0,
                         estimated: false,
                         ms: None,
                         outcome: CallClass::Unavailable.as_str().to_string(),
                         http_status: None,
-                        external: false,
-                        items: u32::try_from(payload.items.len()).ok(),
+                        external: host.is_none_or(|b| super::egress::assumed_external(&b.host)),
+                        items,
+                        run: Some(run.run()),
                     },
                 )
                 .await;
@@ -984,16 +749,17 @@ pub async fn run_payload(
             return Err(r.error);
         }
     };
-    let mut run = Run {
+    let mut call_run = Run {
         ctx,
         user,
+        kind,
         db: &db,
-        works: &works,
         p: &p,
         meta: Meta {
             kind: kind.as_str(),
             work,
-            items: u32::try_from(payload.items.len()).ok(),
+            items,
+            run: Some(run.run()),
         },
         key_used: rows.iter().any(CallRow::sent),
         unavailable: rows
@@ -1007,7 +773,7 @@ pub async fn run_payload(
     ];
     let mut retried = false;
     loop {
-        let reply = run.send(&convo).await?;
+        let reply = call_run.send(&convo).await?;
         match json_step(&convo, &reply, retried) {
             JsonStep::Done(json) => return Ok(ModelOutcome { json, dropped }),
             JsonStep::Retry(next) => {
@@ -1017,228 +783,6 @@ pub async fn run_payload(
             JsonStep::Failed(e) => return Err(e),
         }
     }
-}
-
-/// Итог проверки подключения (§6.2 п. 9): `{ok, ms, class?, hint?, thinking?}`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TestOutcome {
-    pub ok: bool,
-    pub ms: Option<u64>,
-    pub class: Option<CallClass>,
-    pub hint: Option<String>,
-    /// В ответе было рассуждение или предел съели размышления.
-    pub thinking: bool,
-}
-
-impl TestOutcome {
-    pub fn to_json(&self) -> Value {
-        let mut v = json!({"ok": self.ok, "ms": self.ms});
-        if let Some(c) = self.class {
-            v["class"] = json!(c.as_str());
-        }
-        if let Some(h) = &self.hint {
-            v["hint"] = json!(h);
-        }
-        if self.thinking {
-            v["thinking"] = json!(true);
-        }
-        v
-    }
-
-    fn refused(r: Refusal) -> TestOutcome {
-        TestOutcome {
-            ok: false,
-            ms: None,
-            class: Some(r.error.class),
-            hint: r
-                .detail
-                .or_else(|| r.error.class.hint().map(str::to_string)),
-            thinking: false,
-        }
-    }
-}
-
-/// Почему проверка подключения не идёт (ответ не 200).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TestRefusal {
-    /// `[works] enabled = false` или `model_access = "off"` — 409.
-    Disabled(&'static str),
-    /// Нет подключения `works.model` — 422.
-    NoConnection,
-    /// Пауза `vault_changed` (или адрес изменён сейчас) — 409 «был → стал».
-    VaultChanged { from: String, to: String },
-    /// У пользователя идёт обращение к модели — 409.
-    Busy,
-}
-
-/// Системное и пользовательское сообщения проверки подключения: без данных памяти.
-pub const TEST_SYSTEM: &str = "Ты — проверка подключения. Ответь одним JSON-объектом.";
-pub const TEST_USER: &str = "ответь JSON {\"ok\": true}";
-
-/// Проверка подключения (§6.2 п. 9): фиксированный запрос без данных памяти; строка журнала
-/// `kind = test`; на паузе `vault_changed` (и при изменённом адресе) — без обращения;
-/// распознаёт размышления и советует `body_extra`; успешная — снимает паузу (кроме
-/// `vault_changed`). Сбой с ответом (`auth`, …) — `ok: false` с классом и подсказкой.
-pub async fn test_connection(ctx: &NightCtx, user: Id) -> Result<TestOutcome, TestRefusal> {
-    let st = ctx.st();
-    let cfg = &st.cfg.works;
-    if !cfg.enabled {
-        return Err(TestRefusal::Disabled(
-            "внутренние работы выключены ([works] enabled = false)",
-        ));
-    }
-    if cfg.model_access == crate::config::ModelAccess::Off {
-        return Err(TestRefusal::Disabled(
-            "обращения к модели выключены ([works] model_access = \"off\")",
-        ));
-    }
-    let lock = st.model_calls.user(user);
-    let Ok(_guard) = lock.try_lock_owned() else {
-        return Err(TestRefusal::Busy);
-    };
-    let works = match settings::load(&st.system, user).await {
-        Ok(w) => w,
-        Err(e) => return Ok(TestOutcome::refused(internal("настройки исполнителя", e))),
-    };
-    if works.model.is_none() {
-        return Err(TestRefusal::NoConnection);
-    }
-    if let Some(p) = works
-        .pause
-        .as_ref()
-        .filter(|p| p.class == CallClass::VaultChanged.as_str())
-    {
-        return Err(TestRefusal::VaultChanged {
-            from: p.from.clone().unwrap_or_default(),
-            to: p.to.clone().unwrap_or_default(),
-        });
-    }
-    let p = match prepare(ctx, user, &works).await {
-        Ok(p) => p,
-        Err(Refusal {
-            change: Some((from, to)),
-            ..
-        }) => return Err(TestRefusal::VaultChanged { from, to }),
-        Err(r) => return Ok(TestOutcome::refused(r)),
-    };
-    let db = match st.users.get(user).await {
-        Ok(db) => db,
-        Err(e) => return Ok(TestOutcome::refused(internal("база пользователя", e))),
-    };
-    let convo = [
-        ChatMessage::system(TEST_SYSTEM),
-        ChatMessage::user(TEST_USER),
-    ];
-    let meta = Meta {
-        kind: work_calls::KIND_TEST,
-        work: None,
-        items: None,
-    };
-    match fits_limits(
-        &db,
-        &works,
-        cfg,
-        zam_store::time::now(),
-        estimate(&p.conn, &convo),
-    )
-    .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            return Ok(TestOutcome::refused(Refusal::new(
-                CallClass::Limit,
-                "проверка не помещается в остаток токенов суток или месяца (works.limits, \
-                 [works] max_daily_tokens, max_monthly_tokens)",
-            )));
-        }
-        Err(e) => return Ok(TestOutcome::refused(internal("расход токенов", e))),
-    }
-    if p.key.is_some() {
-        let _ = st
-            .system
-            .audit(
-                ACTOR,
-                Some(user),
-                "works.model.key_use",
-                Some(&user.to_string()),
-                None,
-                json!({"vault": format!("v:{}", p.conn.vault), "host": p.host, "test": true}),
-            )
-            .await;
-    }
-    let timeout = call_timeout(cfg).min(TEST_TIMEOUT_MAX);
-    let (r, ms) = attempt(ctx, &p, &convo, timeout).await;
-    let out = match r {
-        Ok(reply) => {
-            let parsed = extract_json(&reply.text);
-            journal(
-                &db,
-                row_of(
-                    &p,
-                    &meta,
-                    work_calls::OUTCOME_OK,
-                    Some(reply.usage()),
-                    Some(ms),
-                    Some(200),
-                ),
-            )
-            .await;
-            match parsed {
-                Ok(_) => {
-                    clear_pause(st, user, &works, "test").await;
-                    TestOutcome {
-                        ok: true,
-                        ms: Some(ms),
-                        class: None,
-                        hint: reply.reasoning.then(|| {
-                            "у модели включены размышления: для коротких работ выключите их в \
-                             body_extra (например, {\"chat_template_kwargs\": {\"enable_thinking\": \
-                             false}}) — меньше токенов и времени"
-                                .to_string()
-                        }),
-                        thinking: reply.reasoning,
-                    }
-                }
-                Err(_) => TestOutcome {
-                    ok: false,
-                    ms: Some(ms),
-                    class: Some(CallClass::BadJson),
-                    hint: Some(
-                        "модель ответила не JSON: для работ задайте в body_extra \
-                         {\"response_format\": {\"type\": \"json_object\"}}, если поставщик его \
-                         понимает"
-                            .into(),
-                    ),
-                    thinking: reply.reasoning,
-                },
-            }
-        }
-        Err(e) => {
-            journal(
-                &db,
-                row_of(
-                    &p,
-                    &meta,
-                    e.class.as_str(),
-                    e.usage,
-                    Some(ms),
-                    e.http_status,
-                ),
-            )
-            .await;
-            if matches!(e.class, CallClass::Auth | CallClass::NotFound) {
-                set_paused(ctx, user, e.class, None).await;
-            }
-            TestOutcome {
-                ok: false,
-                ms: Some(ms),
-                class: Some(e.class),
-                hint: e.class.hint().map(str::to_string),
-                thinking: e.class == CallClass::Thinking,
-            }
-        }
-    };
-    Ok(out)
 }
 
 /// Тестовые точки исполнения (фича `test-hooks`): срок обращения и ожидания повторов в
@@ -1290,7 +834,7 @@ pub mod test_hooks {
         set(|h| *h = Hooks::default());
     }
 
-    pub(super) fn call_timeout() -> Option<Duration> {
+    pub(crate) fn call_timeout() -> Option<Duration> {
         get().call_timeout
     }
 
@@ -1416,5 +960,23 @@ mod tests {
             CallClass::SecretInPayload
         );
         assert_eq!(p.system(), "инструкция\n\n{}");
+    }
+
+    /// Начало месяца UTC — первое число, а не начало суток (ревью r1 Minor 4: граница месяца).
+    #[test]
+    fn month_start_is_first_of_month() {
+        let t = |s: &str| s.parse::<Timestamp>().unwrap();
+        assert_eq!(
+            month_start_utc(t("2026-11-23T10:00:00Z")),
+            t("2026-11-01T00:00:00Z")
+        );
+        assert_eq!(
+            month_start_utc(t("2026-12-01T00:00:00Z")),
+            t("2026-12-01T00:00:00Z")
+        );
+        assert_eq!(
+            month_start_utc(t("2026-03-31T23:59:59Z")),
+            t("2026-03-01T00:00:00Z")
+        );
     }
 }

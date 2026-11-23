@@ -3,10 +3,11 @@
 //! 403: агент не проверяет и не читает подключение владельца).
 //!
 //! - `POST /works/model/test[?user=<id>]` → `{ok, ms, class?, hint?, thinking?}`: фиксированный
-//!   запрос без данных памяти ([`crate::works::exec::test_connection`]); строка журнала
+//!   запрос без данных памяти ([`crate::works::conn::test_connection`]); строка журнала
 //!   `kind = test`; успешная проверка снимает паузу (кроме `vault_changed`). На паузе
 //!   `vault_changed` (и при адресе записи Vault, изменённом после сохранения) — 409 «адрес
-//!   изменён: был <хост> → стал <хост> — подтвердите» **без обращения**; `[works] enabled =
+//!   изменён: был <хост> → стал <хост> — подтвердите» `{code: vault_changed, was, now}` **без
+//!   обращения** (подтверждение — `PATCH works.model {confirm_host}`); `[works] enabled =
 //!   false` или `model_access = "off"` — 409; у пользователя уже идёт обращение — 409; нет
 //!   подключения `works.model` — 422.
 //! - `GET /works/calls?days=&user=` → `{days, calls: […]}`: метаданные обращений за `days`
@@ -25,10 +26,10 @@ use zam_store::work_calls::{self, CallRow};
 
 use super::{parse_id, query};
 use crate::app::AppState;
-use crate::auth::Principal;
+use crate::auth::{Client, Principal};
 use crate::error::ApiError;
 use crate::works::NightCtx;
-use crate::works::exec::{self, TestRefusal};
+use crate::works::conn::{self, TestRefusal};
 
 /// Строк журнала в ответе `GET /works/calls` — не больше.
 pub const CALLS_LIMIT: usize = 1000;
@@ -80,13 +81,15 @@ fn conflict(code: &str, detail: String, extra: &[(&str, Value)]) -> ApiError {
 /// `POST /works/model/test[?user=]` → `{ok, ms, class?, hint?, thinking?}`.
 pub async fn test(
     State(st): State<AppState>,
+    client: Client,
     p: Principal,
     q: Result<Query<UserQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let q = query(q)?;
     let user = target_user(&st, &p, q.user.as_deref()).await?;
     let ctx = NightCtx::new(st.clone());
-    match exec::test_connection(&ctx, user).await {
+    let ip = client.ip.to_string();
+    match conn::test_connection(&ctx, user, &p.actor(), Some(&ip)).await {
         Ok(out) => Ok(Json(out.to_json())),
         Err(TestRefusal::Disabled(why)) => Err(conflict("works_disabled", why.into(), &[])),
         Err(TestRefusal::Busy) => Err(conflict(
@@ -99,12 +102,13 @@ pub async fn test(
              модель)"
                 .into(),
         )),
-        Err(TestRefusal::VaultChanged { from, to }) => Err(conflict(
+        Err(TestRefusal::VaultChanged { was, now }) => Err(conflict(
             "vault_changed",
             format!(
-                "адрес изменён: был {from} → стал {to} — подтвердите, сохранив подключение заново"
+                "адрес изменён: был {was} → стал {now} — подтвердите: сохраните подключение с \
+                 confirm_host = \"{now}\""
             ),
-            &[("from", json!(from)), ("to", json!(to))],
+            &[("was", json!(was)), ("now", json!(now))],
         )),
     }
 }
@@ -125,6 +129,7 @@ fn call_json(c: &CallRow) -> Value {
         "http_status": c.http_status,
         "external": c.external,
         "items": c.items,
+        "run": c.run,
     })
 }
 

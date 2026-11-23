@@ -100,10 +100,11 @@ const SETTINGS: &str = "/api/v1/auth/settings";
 const TEST: &str = "/api/v1/works/model/test";
 const CALLS: &str = "/api/v1/works/calls";
 
-/// Короткие сроки исполнения: обращение — 3 с, повторы `unavailable` — 10 и 20 мс, единица
-/// `retry-after` — 1 мс (общие для процесса; у всех тестов файла одинаковые).
+/// Короткие сроки исполнения: обращение — 20 с (дольше задержки модели в
+/// `shutdown_releases_hanging_call`), повторы `unavailable` — 10 и 20 мс, единица `retry-after` —
+/// 1 мс (общие для процесса; у всех тестов файла одинаковые).
 fn short_waits() {
-    exec::test_hooks::set_call_timeout_ms(3000);
+    exec::test_hooks::set_call_timeout_ms(20_000);
     exec::test_hooks::set_retry_delays_ms(10, 20);
     exec::test_hooks::set_rate_unit_ms(1);
 }
@@ -1271,7 +1272,9 @@ async fn error_classes_reactions() {
 }
 
 /// Пауза любого класса снимается сохранением подключения (и без изменений) и успешной
-/// проверкой; `vault_changed` — только сохранением (проверка — 409 без обращения).
+/// проверкой; `vault_changed` — только сохранением **с подтверждением** хоста, который видел
+/// человек (`confirm_host`; проверка — 409 без обращения, сохранение без подтверждения — 409).
+/// Снятие — в аудите от имени человека.
 #[tokio::test]
 async fn pause_cleared_by_patch_or_test() {
     let m = MockModel::start();
@@ -1302,11 +1305,26 @@ async fn pause_cleared_by_patch_or_test() {
     assert_eq!(r.json()["code"], "vault_changed");
     assert_eq!(m.count(), n);
     assert_eq!(pause_of(&a).await.unwrap().class, "vault_changed");
+    // вслепую не подтвердить: сохранение без подтверждения — 409, пауза остаётся
+    let r = patch(&a, json!({"works": {"model": conn_input("llm")}})).await;
+    ok(&r, StatusCode::CONFLICT);
+    assert_eq!(r.json()["code"], "vault_changed");
+    assert_eq!(pause_of(&a).await.unwrap().class, "vault_changed");
+    let mut c = conn_input("llm");
+    c["confirm_host"] = json!(format!("127.0.0.1:{}", m.port()));
     ok(
-        &patch(&a, json!({"works": {"model": conn_input("llm")}})).await,
+        &patch(&a, json!({"works": {"model": c}})).await,
         StatusCode::OK,
     );
     assert!(pause_of(&a).await.is_none());
+    // кто снял паузу — человек (вход администратора), а не система
+    let rows = a.st.system.list_audit(1000, None).await.unwrap();
+    let cleared: Vec<_> = rows
+        .iter()
+        .filter(|r| r.action == "works.model.pause_cleared")
+        .collect();
+    assert_eq!(cleared.len(), 3, "{cleared:?}");
+    assert!(cleared.iter().all(|r| r.actor != "system"), "{cleared:?}");
 }
 
 /// Токен `rw` правит `data.url` записи Vault подключения: перед обращением адрес не совпал с
@@ -1347,13 +1365,88 @@ async fn vault_url_change_by_token_pauses() {
         vec![json!({"class": "vault_changed"})]
     );
     assert_eq!((m.count(), other.count()), (0, 0));
-    // подтверждение человека — повторное сохранение подключения
-    let r = patch(&a, json!({"works": {"model": conn_input("llm")}})).await;
+    // подтверждение человека — сохранение подключения с хостом, который он видел
+    let mut c = conn_input("llm");
+    c["confirm_host"] = json!(now);
+    let r = patch(&a, json!({"works": {"model": c}})).await;
     ok(&r, StatusCode::OK);
     assert_eq!(r.json()["works"]["model"]["pinned"]["port"], other.port());
+    assert!(r.json()["works"]["model"].get("confirm_host").is_none());
     other.push(json_reply(1, 1));
     run(&a, manual(), &["з"]).await.unwrap();
     assert_eq!((m.count(), other.count()), (0, 1));
+}
+
+/// «Подтвердить адрес» — только явно (§6.2 п. 1, ревью r1 Important 1): адрес правится дважды
+/// (A → B, затем B → C); подтверждение «B», которое человек видел, — 409 с «был A → стал C»,
+/// ничего не закреплено и пауза остаётся; подтверждение «C» — закреплено, пауза снята. Адрес
+/// изменён, а обращения ещё не было: сохранение без подтверждения — 409 и пауза.
+#[tokio::test]
+async fn vault_confirm_requires_seen_host() {
+    let (ma, mb, mc) = (MockModel::start(), MockModel::start(), MockModel::start());
+    let a = server("vault-confirm", |_| {}).await;
+    let id = connect(&a, &ma).await;
+    let host = |m: &MockModel| format!("127.0.0.1:{}", m.port());
+    let set_url = |url: String| {
+        let a = &a;
+        let id = id.clone();
+        async move {
+            let r = a
+                .t(
+                    Method::PATCH,
+                    &format!("/api/v1/vault/{id}"),
+                    Some(json!({"data": {"type": "token", "url": url}})),
+                )
+                .await;
+            ok(&r, StatusCode::OK);
+        }
+    };
+    set_url(mb.base_url()).await;
+    assert_eq!(
+        run(&a, manual(), &["з"]).await.unwrap_err().class,
+        CallClass::VaultChanged
+    );
+    set_url(mc.base_url()).await;
+    let confirm = |h: String| {
+        let mut c = conn_input("llm");
+        c["confirm_host"] = json!(h);
+        json!({"works": {"model": c}})
+    };
+    let r = patch(&a, confirm(host(&mb))).await;
+    ok(&r, StatusCode::CONFLICT);
+    let v = r.json();
+    assert_eq!(
+        (v["code"].clone(), v["was"].clone(), v["now"].clone()),
+        (json!("vault_changed"), json!(host(&ma)), json!(host(&mc)))
+    );
+    let w = works_settings::load(&a.st.system, a.st.admin_id)
+        .await
+        .unwrap();
+    assert_eq!(w.model.unwrap().pinned.unwrap().port, ma.port());
+    assert_eq!(w.pause.unwrap().class, "vault_changed");
+    ok(&patch(&a, confirm(host(&mc))).await, StatusCode::OK);
+    assert!(pause_of(&a).await.is_none());
+    mc.push(json_reply(1, 1));
+    run(&a, manual(), &["з"]).await.unwrap();
+    assert_eq!((ma.count(), mb.count(), mc.count()), (0, 0, 1));
+
+    // адрес изменён, обращения не было: сохранение (например, смена модели) — 409 и пауза
+    set_url(mb.base_url()).await;
+    let mut c = conn_input("llm");
+    c["model"] = json!("другая-модель");
+    let r = patch(&a, json!({"works": {"model": c}})).await;
+    ok(&r, StatusCode::CONFLICT);
+    assert_eq!(r.json()["now"], host(&mb));
+    let p = pause_of(&a).await.unwrap();
+    assert_eq!(
+        (p.class.as_str(), p.from.as_deref(), p.to.as_deref()),
+        (
+            "vault_changed",
+            Some(host(&mc).as_str()),
+            Some(host(&mb).as_str())
+        )
+    );
+    assert_eq!(mb.count(), 0);
 }
 
 /// Смена одного ключа записи паузы не даёт: запрос идёт с новым ключом.
@@ -1402,8 +1495,8 @@ async fn model_test_409_on_vault_changed() {
         ok(&r, StatusCode::CONFLICT);
         let v = r.json();
         assert_eq!(v["code"], "vault_changed");
-        assert_eq!(v["from"], format!("127.0.0.1:{}", m.port()));
-        assert_eq!(v["to"], format!("127.0.0.1:{}", other.port()));
+        assert_eq!(v["was"], format!("127.0.0.1:{}", m.port()));
+        assert_eq!(v["now"], format!("127.0.0.1:{}", other.port()));
         assert!(v["detail"].as_str().unwrap().contains("был"), "{v}");
     }
     assert_eq!(pause_of(&a).await.unwrap().class, "vault_changed");
@@ -1637,7 +1730,10 @@ async fn model_test_detects_thinking() {
     assert!(v["ms"].is_u64());
     // тело проверки — без данных памяти
     let body = m.last().json();
-    assert_eq!(body["messages"][1]["content"], exec::TEST_USER);
+    assert_eq!(
+        body["messages"][1]["content"],
+        zam_server::works::conn::TEST_USER
+    );
     let rows = journal(&a).await;
     assert_eq!(rows.len(), 3);
     assert!(rows.iter().all(|r| r.kind == "test" && r.items.is_none()));
@@ -1732,6 +1828,7 @@ async fn work_calls_retention_180_days() {
                 http_status: Some(200),
                 external: true,
                 items: Some(1),
+                run: None,
             },
         )
         .await
@@ -1743,4 +1840,374 @@ async fn work_calls_retention_180_days() {
     // время хранится с точностью до микросекунд
     let kept = now - day * 179;
     assert!(rows[0].ts.duration_since(kept).abs() < jiff::SignedDuration::from_millis(1));
+}
+
+// ---------- круг правок 1 ----------
+
+/// Ждёт, пока подставная модель получит `n` запросов (не дольше 10 с).
+async fn wait_requests(m: &MockModel, n: usize) {
+    for _ in 0..1000 {
+        if m.count() >= n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("подставная модель не получила {n} запросов: {}", m.count());
+}
+
+/// Режим и пауза сверяются перед **каждым** обращением (§6.2 п. 7; ревью r1 Important 2):
+/// человек выключил режим, пока шла первая попытка (`500` с задержкой), — повтора нет,
+/// `blocked`.
+#[tokio::test]
+async fn mode_rechecked_before_retry() {
+    let m = MockModel::start();
+    let a = server("mode-recheck", |_| {}).await;
+    connect(&a, &m).await;
+    m.push(MockReply::json(500, json!({"error": "временно"})).delay(Duration::from_millis(600)));
+    let (c, user) = (ctx(&a), a.st.admin_id);
+    let h = tokio::spawn(async move {
+        exec::run_payload(&c, user, manual(), payload(&["з"]), WorkKind::Probes, None).await
+    });
+    wait_requests(&m, 1).await;
+    ok(
+        &patch(&a, json!({"works": {"mode": "agent"}})).await,
+        StatusCode::OK,
+    );
+    let e = h.await.unwrap().unwrap_err();
+    assert_eq!(e.class, CallClass::Blocked);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(m.count(), 1, "после выключения режима запросов нет");
+}
+
+/// Остановка не ждёт висящий вызов модели (Review Focus 5; ревью r1 Important 3): модель держит
+/// ответ дольше срока остановки — `shutdown` укладывается в срок, рантайм уничтожается сразу
+/// (вызов не держит пул блокирующих задач), в журнале — строка `aborted` без длительности.
+#[test]
+fn shutdown_releases_hanging_call() {
+    let m = MockModel::start();
+    m.set_default(MockReply::chat("{\"items\": []}").delay(Duration::from_secs(15)));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (stop_took, db_path) = rt.block_on(async {
+        let a = server("shutdown-hang", |_| {}).await;
+        connect(&a, &m).await;
+        let user = a.st.admin_id;
+        a.st.night
+            .spawn_tracked(move |c: NightCtx| async move {
+                let _ = exec::run_payload(
+                    &c,
+                    user,
+                    RunKey::Manual(Id::new()),
+                    payload(&["з"]),
+                    WorkKind::Probes,
+                    None,
+                )
+                .await;
+            })
+            .unwrap();
+        wait_requests(&m, 1).await;
+        let db = a.st.data_dir.users_dir().join(format!("{user}.db"));
+        let t = std::time::Instant::now();
+        a.st.shutdown().await;
+        (t.elapsed(), db)
+    });
+    let t = std::time::Instant::now();
+    drop(rt);
+    let drop_took = t.elapsed();
+    assert!(
+        stop_took < Duration::from_secs(7),
+        "shutdown: {stop_took:?}"
+    );
+    assert!(drop_took < Duration::from_secs(3), "рантайм: {drop_took:?}");
+    let c = rusqlite::Connection::open(&db_path).unwrap();
+    let (outcome, ms): (String, Option<i64>) = c
+        .query_row(
+            "SELECT outcome, ms FROM work_calls ORDER BY id DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((outcome.as_str(), ms), ("aborted", None));
+}
+
+/// Ключ, который не годится для заголовка (перевод строки, управляющий символ), — пауза
+/// `vault` до отправки: ни запроса, ни `key_use`, ни строки «отправлено» (ревью r1 Minor 1).
+#[tokio::test]
+async fn vault_key_bad_header_pauses() {
+    let m = MockModel::start();
+    let a = server("bad-key", |_| {}).await;
+    let id = connect(&a, &m).await;
+    let bad = format!("{}{}", "sk-line1\n", "line2");
+    ok(
+        &a.t(
+            Method::PATCH,
+            &format!("/api/v1/vault/{id}"),
+            Some(json!({ "secret": bad })),
+        )
+        .await,
+        StatusCode::OK,
+    );
+    let e = run(&a, manual(), &["з"]).await.unwrap_err();
+    assert_eq!(e.class, CallClass::Vault);
+    assert_eq!(pause_of(&a).await.unwrap().class, "vault");
+    assert_eq!(m.count(), 0);
+    assert!(audits(&a, "works.model.key_use").await.is_empty());
+    assert!(journal(&a).await.iter().all(|r| !r.sent()));
+}
+
+/// Пауза `vault` на уровне `run_payload` (ревью r1 Minor 4): запись удалена, перенесена в
+/// решение, у записи нет значения; ни одного запроса.
+#[tokio::test]
+async fn vault_record_problems_pause() {
+    const G: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e31";
+    let m = MockModel::start();
+    m.set_default(json_reply(1, 1));
+    let a = server("vault-problems", |_| {}).await;
+    // удалена
+    let id = connect(&a, &m).await;
+    ok(
+        &a.t(Method::DELETE, &format!("/api/v1/vault/{id}"), None)
+            .await,
+        StatusCode::NO_CONTENT,
+    );
+    assert_eq!(
+        run(&a, manual(), &["з"]).await.unwrap_err().class,
+        CallClass::Vault
+    );
+    assert_eq!(pause_of(&a).await.unwrap().class, "vault");
+    // перенесена в решение
+    let id = vault_item(&a, "llm-2", &m.base_url(), &key()).await;
+    ok(
+        &patch(&a, json!({"works": {"model": conn_input("llm-2")}})).await,
+        StatusCode::OK,
+    );
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G, "name": "Своё"})),
+        )
+        .await;
+    ok(&r, StatusCode::CREATED);
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            &format!("/api/v1/vault/{id}/move"),
+            Some(json!({ "space": G })),
+            &[("x-zam-session", "works-model-s1"), ("x-zam-machine", "ci")],
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(
+        run(&a, manual(), &["з"]).await.unwrap_err().class,
+        CallClass::Vault
+    );
+    // запись окружения без значения
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/spaces/knowledge/vault",
+            Some(json!({"title": "llm-host", "data": {"type": "host", "url": m.base_url()}})),
+        )
+        .await;
+    ok(&r, StatusCode::CREATED);
+    ok(
+        &patch(&a, json!({"works": {"model": conn_input("llm-host")}})).await,
+        StatusCode::OK,
+    );
+    assert!(pause_of(&a).await.is_none());
+    assert_eq!(
+        run(&a, manual(), &["з"]).await.unwrap_err().class,
+        CallClass::Vault
+    );
+    assert_eq!(pause_of(&a).await.unwrap().class, "vault");
+    assert_eq!(m.count(), 0);
+}
+
+/// Адрес, разрешённый при сохранении, стал запрещённым (имя теперь разрешается в петлю), —
+/// пауза `blocked` до отправки (ревью r1 Minor 4).
+#[tokio::test]
+async fn address_now_blocked_pauses() {
+    let m = MockModel::start();
+    let a = server("now-blocked", |c| c.works.allow_loopback = false).await;
+    let host = "model-moves.example.com";
+    test_hooks::set_host(host, &[ip("10.203.113.7")]);
+    vault_item(&a, "llm", &format!("http://{host}:{}/v1", m.port()), &key()).await;
+    ok(
+        &patch(
+            &a,
+            json!({"works": {"model": conn_input("llm"), "mode": "model"}}),
+        )
+        .await,
+        StatusCode::OK,
+    );
+    test_hooks::set_host(host, &[ip("127.0.0.1")]);
+    assert_eq!(
+        run(&a, manual(), &["з"]).await.unwrap_err().class,
+        CallClass::Blocked
+    );
+    assert_eq!(pause_of(&a).await.unwrap().class, "blocked");
+    assert_eq!(m.count(), 0);
+    test_hooks::clear_host(host);
+}
+
+/// Строки журнала — своего запуска (ревью r1 Minor 7): `limit` ручного запуска не
+/// останавливает ночь, стоп ночи — ручной запуск; `key_use` — у каждого запуска свой; имя без
+/// адресов вне LAN — строка `unavailable` с `external` (ревью r1 Minor 9).
+#[tokio::test]
+async fn run_key_isolation() {
+    let m = MockModel::start();
+    m.set_default(json_reply(200, 100));
+    let mut night = None;
+    let a = server("run-isolation", |c| night = Some(night_now(c))).await;
+    let night = night.unwrap();
+    connect(&a, &m).await;
+    // ручной запуск упирается в предел
+    ok(
+        &patch(
+            &a,
+            json!({"works": {"limits": {"daily_tokens": 4300, "monthly_tokens": 1_000_000}}}),
+        )
+        .await,
+        StatusCode::OK,
+    );
+    let rk = manual();
+    run(&a, rk, &["з"]).await.unwrap();
+    assert_eq!(
+        run(&a, rk, &["з"]).await.unwrap_err().class,
+        CallClass::Limit
+    );
+    // ночь стопа ручного запуска не наследует
+    ok(
+        &patch(&a, json!({"works": {"limits": null}})).await,
+        StatusCode::OK,
+    );
+    run(&a, night, &["з"]).await.unwrap();
+    assert_eq!(m.count(), 2);
+    assert_eq!(audits(&a, "works.model.key_use").await.len(), 2);
+    // три unavailable ночи не останавливают новый ручной запуск
+    for _ in 0..3 {
+        m.push(MockReply::json(500, json!({"error": "x"})));
+    }
+    assert_eq!(
+        run(&a, night, &["з"]).await.unwrap_err().class,
+        CallClass::Unavailable
+    );
+    assert_eq!(
+        run(&a, night, &["з"]).await.unwrap_err().class,
+        CallClass::Unavailable
+    );
+    let n = m.count();
+    run(&a, manual(), &["з"]).await.unwrap();
+    assert_eq!(m.count(), n + 1);
+    // имя пропало из DNS: строка без отправки, вне LAN
+    let b = server("unresolved-ext", |_| {}).await;
+    let host = "gone.example.com";
+    test_hooks::set_host(host, &[ip("203.0.113.10")]);
+    vault_item(&b, "llm", &format!("https://{host}/v1"), &key()).await;
+    ok(
+        &patch(
+            &b,
+            json!({"works": {"model": conn_input("llm"), "mode": "model"}}),
+        )
+        .await,
+        StatusCode::OK,
+    );
+    test_hooks::set_host(host, &[]);
+    assert_eq!(
+        run(&b, manual(), &["з"]).await.unwrap_err().class,
+        CallClass::Unavailable
+    );
+    let rows = journal(&b).await;
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].external && !rows[0].sent(), "{rows:?}");
+    test_hooks::clear_host(host);
+}
+
+/// `model_access = "off"` — обращений нет (ревью r1 Minor 4): `run_payload` — `blocked`,
+/// проверка подключения — 409.
+#[tokio::test]
+async fn model_access_off_zero_requests() {
+    let m = MockModel::start();
+    let a = server("access-off", |c| c.works.model_access = ModelAccess::Off).await;
+    vault_item(&a, "llm", &m.base_url(), &key()).await;
+    ok(
+        &patch(&a, json!({"works": {"model": conn_input("llm")}})).await,
+        StatusCode::OK,
+    );
+    assert_eq!(
+        run(&a, manual(), &["з"]).await.unwrap_err().class,
+        CallClass::Blocked
+    );
+    let r = a.adm(Method::POST, TEST, None, None).await;
+    ok(&r, StatusCode::CONFLICT);
+    assert_eq!(r.json()["code"], "works_disabled");
+    assert_eq!(m.count(), 0);
+}
+
+/// Сессия пользователя WebUI: свой журнал — 200, чужой `?user=` — 403 (ревью r1 Minor 4).
+#[tokio::test]
+async fn works_calls_user_session_foreign_403() {
+    let a = server("calls-user", |_| {}).await;
+    let (uid, _) = a.new_user("Вера").await;
+    let (pw, new_pw) = ("first-pass-123", "second-pass-456");
+    ok(
+        &a.adm(
+            Method::POST,
+            &format!("/api/v1/admin/users/{uid}/password"),
+            Some(json!({ "password": pw })),
+            None,
+        )
+        .await,
+        StatusCode::OK,
+    );
+    let body = json!({"login": "Вера", "password": pw});
+    let r = a
+        .send(
+            common::api::req(Method::POST, "/api/v1/auth/login", Some(&body))
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    let cookie = r
+        .header("set-cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = r.json()["csrf"].as_str().unwrap().to_string();
+    let web = |m: Method, uri: &str, body: Option<Value>| {
+        let b = common::api::req(m, uri, body.as_ref())
+            .header(axum::http::header::COOKIE, &cookie)
+            .header("x-csrf-token", &csrf);
+        b.body(body.map_or_else(axum::body::Body::empty, |v| {
+            axum::body::Body::from(v.to_string())
+        }))
+        .unwrap()
+    };
+    ok(
+        &a.send(web(
+            Method::POST,
+            "/api/v1/auth/password",
+            Some(json!({"old": pw, "new": new_pw})),
+        ))
+        .await,
+        StatusCode::NO_CONTENT,
+    );
+    ok(
+        &a.send(web(Method::GET, &format!("{CALLS}?user={uid}"), None))
+            .await,
+        StatusCode::OK,
+    );
+    let admin = a.st.admin_id.to_string();
+    ok(
+        &a.send(web(Method::GET, &format!("{CALLS}?user={admin}"), None))
+            .await,
+        StatusCode::FORBIDDEN,
+    );
 }

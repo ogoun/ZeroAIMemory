@@ -5391,6 +5391,56 @@ or_test`, `http_external_refused`, `model_test_409_on_vault_changed`, `loopback_
 (подмена резолвера действует и на соединение). `git diff main -- Cargo.lock` — строка `"ureq"` в
 зависимостях `zam-server`, новых `[[package]]` нет.
 
+**Круг правок 1** (ревью r1: 0 Critical / 4 Important / 10 Minor; решения координатора):
+- Important 1 — **подтверждение адреса только явное**: `PATCH works.model {confirm_host}` (хост
+  «стал», который видел человек; не хранится). Та же запись Vault, а адрес не совпал с
+  `pinned` или пауза `vault_changed`: без подтверждения или с устаревшим хостом — 409
+  `{code: vault_changed, was, now}`, ничего не записано, пауза ставится (если её не было) и
+  остаётся; совпал — закреплено, пауза снята. Новая запись Vault — новое подключение, без
+  подтверждения. 409 проверки подключения — тоже `{code, was, now}`.
+- Important 2 — режим вида и пауза сверяются перед **каждым** обращением и повтором
+  (`Run::send`: `settings::load` + `effective_mode`; не `model` — `blocked` без запроса).
+- Important 3 — вызов модели — в **отвязанном** `std::thread` (не `spawn_blocking`): остановка
+  его не ждёт ни в `NightRunner::stop`, ни при уничтожении рантайма; строка `aborted` — `ms =
+  NULL` (`CallRow::sent` — `ms` или `aborted`); `main.rs` — `rt.shutdown_timeout(5 с)`, как у
+  службы Windows.
+- Important 4 — аудит не глотается: `works::pause::audit` — WARN с действием и пользователем;
+  `key_use` не записался — обращения с ключом нет (`aborted`).
+- Minor 1 — ключ проверяется в `prepare` (края обрезаются; перевод строки, управляющий символ,
+  не-ASCII — пауза `vault` до отправки). Minor 2 — слот сервера берётся до аудита `key_use`,
+  без слота (остановка) — без строки «отправлено». Minor 3 — оговорка «кроме прокси» в
+  README и ТЗ §7.15, цена — в спецификации §12 п. 78. Minor 4 — тесты пауз `vault` (удалена,
+  перенесена в решение, без значения) и `blocked` (имя стало петлёй), `model_access = "off"`,
+  чужой `?user=` сессии пользователя, начало месяца. Minor 5 — размер `body_extra` — одна
+  проверка (`check_body_extra`). Minor 6 — аудит паузы, снятия и `key_use` — от имени того, кто
+  действовал (человек с IP или `system`). Minor 7 — столбец **`work_calls.run`**
+  (`night:<дата>` | `manual:<id>`) и индекс `work_calls_run` прямо в 0027 (миграция не выпущена;
+  тесты миграций задачи 1 — зелёные): стоп и `key_used` — по строкам своего запуска
+  (`calls_of_run`), пересечения ночи и ручного запуска нет. Minor 8 — `prepare` и
+  `test_connection` — `works/conn.rs`, пауза и аудит — `works/pause.rs`. Minor 9 — строка «имя не
+  разрешилось» — `external` по `egress::assumed_external` (литерал — по классу, имя — вне LAN).
+  Minor 10 — IPv4-совместимый `::a.b.c.d`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16` — по
+  вложенному IPv4.
+- ⚠️ План: Interfaces задачи 2 (как сделано) и задачи 3 («Контракт задачи 2»: `kind: WorkKind`,
+  один `RunKey::Manual(Id::new())` на ручной запуск, `json: Null`, `Blocked` без паузы, стоп),
+  Global Constraints — `work_calls.run` в 0027.
+- [решение исполнителя, задача 2, круг 1] `confirm_host` сравнивается с `host_label` текущего
+  адреса (хост и порт, порт схемы по умолчанию опущен) без учёта регистра; адрес изменён без
+  паузы (обращений ещё не было) — `PATCH` той же записи тоже требует подтверждения и ставит
+  паузу.
+- [решение исполнителя, задача 2, круг 1] Остановка во время вызова — строка `aborted` с `ms =
+  NULL` (по решению координатора), отправленной её считает `CallRow::sent` (ключ ушёл —
+  `key_use` в этом запуске уже был).
+- TDD круга: RED — `works_model` 32 passed / 8 FAILED (`run_key_isolation`,
+  `model_test_409_on_vault_changed`, `mode_rechecked_before_retry`, `pause_cleared_by_patch_or_test`,
+  `vault_confirm_requires_seen_host`, `vault_key_bad_header_pauses`,
+  `vault_url_change_by_token_pauses`, `shutdown_releases_hanging_call` — «рантайм: 9.06 s»),
+  `--lib works::` — `classify_embedded_ipv4` FAILED; GREEN — `works_model` 40 passed, `--lib
+  works::` 23 passed. Тесты покрытия Minor 4 (`vault_record_problems_pause`,
+  `address_now_blocked_pauses`, `model_access_off_zero_requests`,
+  `works_calls_user_session_foreign_403`, `month_start_is_first_of_month`) прошли и до правок —
+  они закрывают непокрытые пути, а не новое поведение.
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

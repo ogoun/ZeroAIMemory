@@ -67,10 +67,11 @@ use crate::auth::{AdminOnly, Client, Principal};
 use crate::config::{IdeasMode, ModelAccess, WorksMode, WorksSection};
 use crate::error::ApiError;
 use crate::works::egress;
+use crate::works::model::CallClass;
 use crate::works::settings::{
-    self as works_settings, BODY_EXTRA_MAX_BYTES, BaseUrl, Limits, MAX_TOKENS_RANGE,
-    MODEL_NAME_MAX, ModelAuth, ModelConn, TokenField, UserWorks, WORKS_CHECK, WORKS_KIND_PREFIX,
-    WORKS_LIMITS, WORKS_MODE, WORKS_MODEL,
+    self as works_settings, BaseUrl, Limits, MAX_TOKENS_RANGE, MODEL_NAME_MAX, ModelAuth,
+    ModelConn, TokenField, UserWorks, WORKS_CHECK, WORKS_KIND_PREFIX, WORKS_LIMITS, WORKS_MODE,
+    WORKS_MODEL,
 };
 use zam_store::works::WorkKind;
 
@@ -533,6 +534,10 @@ struct ModelInput {
     token_field: TokenField,
     #[serde(default)]
     body_extra: Option<Value>,
+    /// Подтверждение изменённого адреса записи (§6.2 п. 1): хост («стал»), который видел
+    /// человек; не хранится.
+    #[serde(default)]
+    confirm_host: Option<String>,
 }
 
 fn protocol_default() -> String {
@@ -550,10 +555,18 @@ fn max_tokens_default() -> u32 {
 /// allow_loopback`, вне LAN при `model_access = "lan"`, имя без адресов — 422. Адрес
 /// закрепляется (`pinned`: схема, хост, порт, путь). Второе — хост, если адрес вне LAN
 /// (предупреждение `works_model_external`).
+///
+/// **Подтверждение адреса** (§6.2 п. 1; ревью r1 задачи 2, Important 1): та же запись Vault, а
+/// её адрес не совпал с закреплённым (или исполнитель на паузе `vault_changed`), — закрепляется
+/// только при `confirm_host`, равном текущему хосту записи («стал», который видел человек).
+/// Нет подтверждения или оно устарело — 409 `{code: vault_changed, was, now}`, ничего не
+/// записано, пауза `vault_changed` ставится (если её не было) и остаётся.
 async fn resolve_model(
     st: &AppState,
     user: Id,
     raw: Value,
+    current: &UserWorks,
+    who: (&str, &str),
 ) -> Result<(Value, Option<String>), ApiError> {
     let input: ModelInput = serde_json::from_value(raw)
         .map_err(|e| ApiError::BadRequest(format!("works.model: {e}")))?;
@@ -582,11 +595,7 @@ async fn resolve_model(
             ));
         }
     };
-    if Value::Object(body_extra.clone()).to_string().len() > BODY_EXTRA_MAX_BYTES {
-        return Err(ApiError::Unprocessable(format!(
-            "works.model.body_extra: не больше {BODY_EXTRA_MAX_BYTES} байт"
-        )));
-    }
+    // размер (до 4 КиБ) и ключи сервера — одна проверка клиента модели
     crate::works::model::check_body_extra(&body_extra)
         .map_err(|e| ApiError::Unprocessable(format!("works.model.body_extra: {e}")))?;
     let wanted = input.vault.trim();
@@ -602,6 +611,16 @@ async fn resolve_model(
         )));
     };
     let (base, external) = check_model_address(st, item).await?;
+    confirm_address(
+        st,
+        user,
+        current,
+        item.id,
+        &base,
+        input.confirm_host.as_deref(),
+        who,
+    )
+    .await?;
     let conn = ModelConn {
         protocol,
         vault: item.id,
@@ -613,6 +632,60 @@ async fn resolve_model(
         pinned: Some(base),
     };
     Ok((json!(conn), external))
+}
+
+/// Подтверждение изменённого адреса (см. [`resolve_model`]): нужно, если сохраняется та же
+/// запись Vault, что у подключения, а её адрес `base` не совпал с закреплённым или исполнитель
+/// на паузе `vault_changed`. Новая запись Vault — новое подключение: подтверждение не нужно.
+async fn confirm_address(
+    st: &AppState,
+    user: Id,
+    current: &UserWorks,
+    vault: Id,
+    base: &BaseUrl,
+    confirm: Option<&str>,
+    who: (&str, &str),
+) -> Result<(), ApiError> {
+    let Some(old) = current.model.as_ref().filter(|m| m.vault == vault) else {
+        return Ok(());
+    };
+    let paused = current
+        .pause
+        .as_ref()
+        .filter(|p| p.class == CallClass::VaultChanged.as_str());
+    if paused.is_none() && old.pinned.as_ref() == Some(base) {
+        return Ok(());
+    }
+    let now = egress::host_label(base);
+    if confirm.is_some_and(|h| h.trim().eq_ignore_ascii_case(&now)) {
+        return Ok(());
+    }
+    let was = old
+        .pinned
+        .as_ref()
+        .map_or_else(|| "не закреплён".to_string(), egress::host_label);
+    if paused.is_none() {
+        crate::works::pause::set_paused(
+            st,
+            user,
+            CallClass::VaultChanged,
+            Some((was.clone(), now.clone())),
+            who.0,
+            Some(who.1),
+        )
+        .await;
+    }
+    let mut extra = Map::new();
+    extra.insert("code".into(), json!("vault_changed"));
+    extra.insert("was".into(), json!(was));
+    extra.insert("now".into(), json!(now));
+    Err(ApiError::Conflict {
+        detail: format!(
+            "адрес подключения изменён: был {was} → стал {now} — подтвердите: сохраните \
+             подключение с confirm_host = \"{now}\""
+        ),
+        extra,
+    })
 }
 
 /// Адрес записи Vault подключения (§6.2 пп. 1, 6): разбор и маршрут по политике `[works]` (при
@@ -751,7 +824,8 @@ async fn apply(
     let (mut saved_model, mut external) = (false, None);
     for (k, v) in edits.iter_mut() {
         if k == WORKS_MODEL && !v.is_null() {
-            let (conn, ext) = resolve_model(st, user, std::mem::take(v)).await?;
+            let (conn, ext) =
+                resolve_model(st, user, std::mem::take(v), &works_cur, (actor, ip)).await?;
             *v = conn;
             saved_model = true;
             external = ext;
@@ -844,10 +918,10 @@ async fn apply(
         // правка настроек — и способ самолечения кэша
         st.user_flags.invalidate(user);
     }
-    // и подключение без изменений: повторное сохранение — подтверждение человека (у
-    // `vault_changed` — единственное, §6.2 п. 1); после снятия работ — пауза не режим вида
+    // и подключение без изменений: сохранение снимает паузу (у `vault_changed` сюда доходит
+    // только подтверждённое `confirm_host`, §6.2 п. 1); после снятия работ — пауза не режим вида
     if saved_model {
-        crate::works::exec::clear_pause(st, user, &works_cur, "save").await;
+        crate::works::pause::clear_pause(st, user, &works_cur, "save", actor, Some(ip)).await;
     }
     let mut out = settings_json(st, user).await?;
     if let Some(host) = external {

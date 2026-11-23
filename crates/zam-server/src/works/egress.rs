@@ -394,12 +394,31 @@ pub fn endpoint(base: &BaseUrl, tail: &str) -> String {
     )
 }
 
-/// IPv4-в-IPv6 (`::ffff:a.b.c.d`) — как IPv4.
+/// IPv4-в-IPv6 (`::ffff:a.b.c.d`) — как IPv4 (и для соединения: сокет IPv6 Windows по
+/// умолчанию — только IPv6).
 fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
         v4 => v4,
     }
+}
+
+/// IPv4, вложенный в адрес IPv6 (ревью r1 Minor 10; только для класса — соединение идёт по
+/// адресу IPv6): IPv4-совместимый `::a.b.c.d` (кроме `::` и `::1`), NAT64 `64:ff9b::/96`, 6to4
+/// `2002::/16` (биты 16..48).
+fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = v6.segments();
+    let tail = |a: u16, b: u16| Ipv4Addr::from((u32::from(a) << 16) | u32::from(b));
+    if s[..6] == [0; 6] && !(v6.is_unspecified() || v6.is_loopback()) {
+        return Some(tail(s[6], s[7]));
+    }
+    if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return Some(tail(s[6], s[7]));
+    }
+    if s[0] == 0x2002 {
+        return Some(tail(s[1], s[2]));
+    }
+    None
 }
 
 /// Петля по §6.2 п. 6: `127/8`, `0.0.0.0/8`, `::1`, `::`.
@@ -435,6 +454,11 @@ pub fn classify_ip(ip: IpAddr) -> Reach {
     let ip = canonical(ip);
     if is_loopback_range(ip) {
         return Reach::Loopback;
+    }
+    if let IpAddr::V6(v6) = ip
+        && let Some(v4) = embedded_v4(v6)
+    {
+        return classify_ip(IpAddr::V4(v4));
     }
     if is_own(ip) {
         return Reach::SelfNode;
@@ -534,6 +558,16 @@ fn lookup(host: &str, port: u16) -> Result<Vec<IpAddr>, RouteError> {
             Ok(out)
         }
         _ => Err(RouteError::Unresolved),
+    }
+}
+
+/// «Вне LAN» строки журнала, когда имя не разрешилось (ревью r1 Minor 9): литерал — по классу,
+/// `localhost` — нет, прочие имена — да (адреса неизвестны — считаются внешними).
+pub fn assumed_external(host: &str) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    match h.parse::<IpAddr>() {
+        Ok(ip) => classify_ip(ip) == Reach::External,
+        Err(_) => !is_localhost_name(h),
     }
 }
 
@@ -775,6 +809,30 @@ mod tests {
             ("198.51.100.7", Reach::External),
             ("2001:db8::10", Reach::External),
             ("fec0::1", Reach::External),
+        ];
+        for (s, want) in cases {
+            assert_eq!(classify_ip(ip(s)), want, "{s}");
+        }
+    }
+
+    /// IPv6 со вложенным IPv4 (ревью r1 Minor 10) — по вложенному адресу: IPv4-совместимый
+    /// `::a.b.c.d`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`; `::` и `::1` — петля.
+    #[test]
+    fn classify_embedded_ipv4() {
+        let cases = [
+            ("::10.203.113.7", Reach::Lan),
+            ("::127.0.0.1", Reach::Loopback),
+            ("::203.0.113.10", Reach::External),
+            ("64:ff9b::10.203.113.7", Reach::Lan),
+            ("64:ff9b::127.0.0.1", Reach::Loopback),
+            ("64:ff9b::169.254.169.254", Reach::LinkLocal),
+            ("64:ff9b::203.0.113.10", Reach::External),
+            ("2002:acb:7107::1", Reach::Lan),
+            ("2002:7f00:1::5", Reach::Loopback),
+            ("2002:cb00:710a::1", Reach::External),
+            ("::", Reach::Loopback),
+            ("::1", Reach::Loopback),
+            ("2001:db8::10", Reach::External),
         ];
         for (s, want) in cases {
             assert_eq!(classify_ip(ip(s)), want, "{s}");

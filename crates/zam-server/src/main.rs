@@ -291,10 +291,14 @@ fn main() -> anyhow::Result<()> {
     if let Cmd::DocWorker { pdfium, max_frame } = cmd {
         std::process::exit(zam_server::docs::worker::run(pdfium, max_frame));
     }
-    tokio::runtime::Builder::new_multi_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(async_main(cmd))
+        .build()?;
+    let res = rt.block_on(async_main(cmd));
+    // как у службы Windows (`service/windows.rs`): фоновые задачи после штатной остановки уже
+    // завершены, а зависшая блокирующая задача выход процесса не держит (M7.3, ревью r1 задачи 2)
+    rt.shutdown_timeout(std::time::Duration::from_secs(5));
+    res
 }
 
 fn service_cmd(cmd: ServiceCmd) -> Result<(), zam_server::service::ServiceError> {

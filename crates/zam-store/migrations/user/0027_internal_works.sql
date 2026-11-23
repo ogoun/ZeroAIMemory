@@ -112,8 +112,11 @@ CREATE INDEX works_night ON works(origin, night);
 -- ---------- журнал отправок модели (§6.2 п. 8) ----------
 -- Метаданные обращения к подключённой модели — без текста пакета и ответа. `kind` — вид работы
 -- или `test` (проверка подключения, §6.2 п. 9); `outcome` — `ok`, класс ошибки или `aborted`;
--- `items` — элементов в пакете. Расход токенов суток и месяца и «стоп до следующей ночи» —
--- суммы по журналу (`work_calls_ts`), отдельного счётчика нет. Хранение — 180 суток.
+-- `items` — элементов в пакете. Расход токенов суток и месяца — сумма по журналу
+-- (`work_calls_ts`), отдельного счётчика нет. `run` — запуск обращения: `night:<дата ночи>` или
+-- `manual:<id запуска>` (у проверки подключения — NULL): «стоп до следующей ночи» и аудит
+-- `key_use` «раз за ночь» считаются по строкам своего запуска (`work_calls_run`; решение
+-- координатора 77, ревью r1 задачи 2). Хранение — 180 суток.
 CREATE TABLE work_calls (
   id INTEGER PRIMARY KEY,
   ts TEXT NOT NULL,
@@ -128,8 +131,10 @@ CREATE TABLE work_calls (
   outcome TEXT NOT NULL,
   http_status INTEGER,
   external INTEGER NOT NULL DEFAULT 0,
-  items INTEGER);
+  items INTEGER,
+  run TEXT);
 CREATE INDEX work_calls_ts ON work_calls(ts);
+CREATE INDEX work_calls_run ON work_calls(run) WHERE run IS NOT NULL;
 
 -- ---------- предложения человеку: кандидаты в Rules (§6.7 п. 1) ----------
 -- Предложение `o:<id>`: `type` без CHECK (`ProposalType`; в M7.3 — `rule`, уборка M7.5 добавит
