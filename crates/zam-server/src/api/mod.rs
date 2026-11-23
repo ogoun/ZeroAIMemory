@@ -40,6 +40,7 @@ pub mod transfer;
 pub mod triggers;
 pub mod user_settings;
 pub mod vault;
+pub mod works_model;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -246,6 +247,9 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
             "/api/v1/auth/settings",
             get(user_settings::get_own).patch(user_settings::patch_own),
         )
+        // подключённая модель исполнителя (M7.3 §6.2 пп. 8, 9): только человек, токену — 403
+        .route("/api/v1/works/model/test", post(works_model::test))
+        .route("/api/v1/works/calls", get(works_model::calls))
         .route("/api/v1/spaces", get(spaces::list))
         .route("/api/v1/spaces/{space}/tree", get(spaces::tree))
         // число записей разделов (M7 §5.3): чтение, не запись памяти

@@ -6,6 +6,7 @@ pub mod api;
 pub mod attach;
 pub mod heavy;
 pub mod ml;
+pub mod mock_model;
 pub mod process;
 pub mod qdrant;
 pub mod read;

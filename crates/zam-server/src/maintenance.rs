@@ -6,7 +6,8 @@
 //! `usage` хранится бессрочно; срок жизни кэша выжимок (§9.4): выжимки без обращений дольше
 //! `cache.ttl_days` и сверх `cache.max_entries` на базу (LRU) удаляются, превращённые в записи
 //! — нет; снимки сессий (M6 §8а) старше `snapshot.keep_days` от `taken_at` удаляются
-//! ([`gc_snapshots`]). Работает и без модели (в отличие от воркера индексации).
+//! ([`gc_snapshots`]); журнал отправок подключённой модели (`work_calls`, M7.3) — 180 суток от
+//! `ts` ([`gc_work_calls`]). Работает и без модели (в отличие от воркера индексации).
 //!
 //! Автокопии (M6 §12б.4): раз в [`BACKUP_TICK`] — решение [`crate::backup::schedule::tick`]
 //! по `[backup]`; копию снимает тот же код, что `zam-server backup` (в блокирующем потоке),
@@ -31,6 +32,8 @@ use crate::app::AppState;
 
 /// Срок хранения сессии без обращений.
 pub const SESSION_TTL: SignedDuration = SignedDuration::from_hours(24 * 30);
+/// Срок хранения строки журнала отправок модели от `ts` (M7.3 §6.2 п. 8).
+pub const WORK_CALLS_TTL: SignedDuration = SignedDuration::from_hours(24 * 180);
 /// Период прохода обслуживания.
 pub const PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 /// Задержка первого прохода после старта: не мешать прогреву и перенарезке при открытии,
@@ -77,6 +80,7 @@ impl Maintenance {
             loop {
                 tick.tick().await;
                 gc_sessions_in(&system, &users, zam_store::time::now()).await;
+                gc_work_calls_in(&system, &users, zam_store::time::now()).await;
                 gc_cache_in(&system, &users, &cache, zam_store::time::now()).await;
                 gc_snapshots_in(&system, &users, keep_days, zam_store::time::now()).await;
             }
@@ -136,6 +140,41 @@ async fn gc_sessions_in(system: &SystemStore, users: &UserDbs, now: Timestamp) -
                 total += n;
             }
             Err(e) => tracing::warn!(user = %u.id, error = %e, "обслуживание: сессии не очищены"),
+        }
+    }
+    total
+}
+
+/// Один проход срока хранения журнала отправок модели ([`WORK_CALLS_TTL`] от `ts`, M7.3 §6.2
+/// п. 8) на момент `now` по всем базам; число удалённых строк.
+pub async fn gc_work_calls(st: &AppState, now: Timestamp) -> u64 {
+    gc_work_calls_in(&st.system, &st.users, now).await
+}
+
+async fn gc_work_calls_in(system: &SystemStore, users: &UserDbs, now: Timestamp) -> u64 {
+    let list = match system.list_users().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "обслуживание: список пользователей недоступен");
+            return 0;
+        }
+    };
+    let cutoff = now - WORK_CALLS_TTL;
+    let mut total = 0;
+    for u in list {
+        let r = match users.get(u.id).await {
+            Ok(db) => zam_store::work_calls::gc(&db, cutoff).await,
+            Err(e) => Err(e),
+        };
+        match r {
+            Ok(0) => {}
+            Ok(n) => {
+                tracing::info!(user = %u.id, deleted = n, "обслуживание: удалены старые строки журнала отправок");
+                total += n;
+            }
+            Err(e) => {
+                tracing::warn!(user = %u.id, error = %e, "обслуживание: журнал отправок не очищен")
+            }
         }
     }
     total

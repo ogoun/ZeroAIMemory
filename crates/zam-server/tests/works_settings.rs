@@ -37,7 +37,8 @@ async fn audit_details(a: &Api) -> Vec<Value> {
         .collect()
 }
 
-/// Запись личного Vault администратора с адресом модели (RFC 5737); id записи.
+/// Запись личного Vault администратора с адресом модели (RFC 5737; вне LAN — `https`: `http`
+/// вне LAN `PATCH works.model` отвергает, задача 2); id записи.
 async fn vault_item(a: &Api, title: &str) -> String {
     // фиктивный ключ — склейкой (push protection)
     let secret = format!("{}{}", "sk-test-", "Zm9vYmFyYmF6cXV4");
@@ -47,7 +48,7 @@ async fn vault_item(a: &Api, title: &str) -> String {
             "/api/v1/spaces/knowledge/vault",
             Some(json!({
                 "title": title,
-                "data": {"type": "token", "url": "http://192.0.2.10:8080/v1"},
+                "data": {"type": "token", "url": "https://192.0.2.10:8443/v1"},
                 "secret": secret,
             })),
         )

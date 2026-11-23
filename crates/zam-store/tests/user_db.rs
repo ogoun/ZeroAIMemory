@@ -302,6 +302,7 @@ async fn migrate_v26_to_v27_new_tables_only() {
         ("works_open", "works"),
         ("works_night", "works"),
         ("work_calls_ts", "work_calls"),
+        ("work_calls_run", "work_calls"),
         ("probes_active", "probes"),
         ("check_runs_night", "check_runs"),
         ("proposals_open", "proposals"),

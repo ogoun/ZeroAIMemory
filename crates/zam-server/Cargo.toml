@@ -28,6 +28,9 @@ zam-code = { path = "../zam-code" }
 zam-index = { path = "../zam-index" }
 zam-ml = { path = "../zam-ml" }
 zam-fetch = { path = "../zam-fetch" }
+# M7.3: клиент подключённой модели (OpenAI-совместимый Chat Completions, `works::model`); уже в
+# дереве через `zam-fetch`, те же фичи (`rustls`)
+ureq.workspace = true
 zam-search = { path = "../zam-search" }
 # M5: извлечение документов; PDF (pdfium) и миниатюры изображений — только в рабочем процессе
 # `doc-worker`
