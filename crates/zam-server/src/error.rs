@@ -102,6 +102,14 @@ pub enum ApiError {
     /// 409 `/problems/already-adopted` (M5.7 §5.4): идея уже человека.
     #[error("идея уже принята как своя")]
     AlreadyAdopted,
+    /// 409 `/problems/works-disabled` (M7.3 §6.1, решение координатора 76): `[works] enabled =
+    /// false` — ручные запуски внутренних работ и проверки памяти, проверка подключения модели.
+    #[error("{0}")]
+    WorksDisabled(String),
+    /// 409 `/problems/work-not-claimed` (M7.3 §6.3 п. 4): итог или возврат работы не от сессии,
+    /// захватившей её (`running`), — работа снята, истекла, закрыта или захвачена другой сессией.
+    #[error("{0}")]
+    WorkNotClaimed(String),
     /// 409 `/problems/backup-running` (M7 §5.6): копия в процессе сервера уже идёт — со страницы
     /// «Копии» или по расписанию (один замок); тело несёт `running {started_at, by}`.
     #[error("копия уже идёт ({}): дождитесь её конца", backup_by_text(.0.by))]
@@ -272,6 +280,14 @@ impl ApiError {
             ApiError::AlreadyAdopted => (
                 StatusCode::CONFLICT,
                 "/problems/already-adopted",
+                "Conflict",
+            ),
+            ApiError::WorksDisabled(_) => {
+                (StatusCode::CONFLICT, "/problems/works-disabled", "Conflict")
+            }
+            ApiError::WorkNotClaimed(_) => (
+                StatusCode::CONFLICT,
+                "/problems/work-not-claimed",
                 "Conflict",
             ),
             ApiError::BackupRunning(_) => {

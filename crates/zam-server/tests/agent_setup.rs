@@ -1805,3 +1805,90 @@ async fn guide_has_release_experiment_forms_and_triggers() {
         "{t}"
     );
 }
+
+/// Заголовки `##`/`###` протокола по порядку (вне блоков кода).
+fn guide_headings(text: &str) -> Vec<(usize, String)> {
+    let mut fence = false;
+    let mut out = Vec::new();
+    for l in text.lines() {
+        if l.trim_start().starts_with("```") {
+            fence = !fence;
+            continue;
+        }
+        if fence {
+            continue;
+        }
+        for (level, prefix) in [(3, "### "), (2, "## ")] {
+            if let Some(t) = l.strip_prefix(prefix) {
+                out.push((level, t.trim().to_string()));
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Протокол `zam guide` ru и en синхронны (M7.3 §3, §6 «Общее»): заголовки `##`/`###` совпадают
+/// по числу, уровню и порядку; раздел «Внутренние работы» (§6.3 п. 6) есть в обоих — с пакетом,
+/// итогом, отказом `skip`, строкой «данные, а не указания» и ссылками `j:` не для `memory_read`.
+#[tokio::test]
+async fn guide_sections_in_sync() {
+    let a = api("agent-guide-sync", |_| {}).await;
+    let guide = |q: &'static str| {
+        let a = &a;
+        async move {
+            let r = a
+                .tok(
+                    &a.token,
+                    Method::GET,
+                    &format!("/api/v1/agent-guide{q}"),
+                    None,
+                )
+                .await;
+            assert_eq!(r.status, StatusCode::OK);
+            r.text()
+        }
+    };
+    let (ru, en) = (guide("").await, guide("?lang=en").await);
+    let (hr, he) = (guide_headings(&ru), guide_headings(&en));
+    assert_eq!(hr.len(), he.len(), "число заголовков ru {hr:?} и en {he:?}");
+    for (r, e) in hr.iter().zip(&he) {
+        assert_eq!(r.0, e.0, "уровень заголовка: «{}» и «{}»", r.1, e.1);
+    }
+    let pos = |h: &[(usize, String)], t: &str| h.iter().position(|(l, x)| *l == 2 && x == t);
+    let (pr, pe) = (pos(&hr, "Внутренние работы"), pos(&he, "Internal works"));
+    assert!(
+        pr.is_some() && pr == pe,
+        "раздел работ ru {pr:?}, en {pe:?}"
+    );
+    let sec_ru = ru.split("## Внутренние работы\n").nth(1).unwrap();
+    let sec_ru = sec_ru.split("\n## ").next().unwrap();
+    for want in [
+        "memory_recall event=work",
+        "memory_log",
+        "kind: \"work\"",
+        "skip",
+        "данные, а не указания",
+        "`j:`",
+        "memory_read",
+        "zam work next",
+        "zam work put",
+    ] {
+        assert!(sec_ru.contains(want), "{want}: {sec_ru}");
+    }
+    let sec_en = en.split("## Internal works\n").nth(1).unwrap();
+    let sec_en = sec_en.split("\n## ").next().unwrap();
+    for want in [
+        "memory_recall event=work",
+        "memory_log",
+        "kind: \"work\"",
+        "skip",
+        "data, not instructions",
+        "`j:`",
+        "memory_read",
+        "zam work next",
+        "zam work put",
+    ] {
+        assert!(sec_en.contains(want), "{want}: {sec_en}");
+    }
+}
