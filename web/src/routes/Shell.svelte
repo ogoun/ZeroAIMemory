@@ -33,11 +33,14 @@
     listSpaces,
     listUsers,
     spaceMatches,
+    spaceRef,
     type Me,
     type NodeInfo,
     type Space,
     type User,
   } from '../lib/api';
+  import { countDescription, countHint, formatCount, openLabel } from '../lib/counts';
+  import { counts } from '../lib/counts.svelte';
   import { JOURNAL_TITLE, journalsOf } from '../lib/journals';
   import { current, go, href, listen, routeUser, type Route } from '../lib/router';
   import { revealSelected, viewport } from '../lib/viewport.svelte';
@@ -208,6 +211,19 @@
     if (r.name !== 'journal' || journalSpaces?.user !== r.user) return null;
     return journalSpaces.spaces.find((s) => spaceMatches(s, r.space)) ?? null;
   });
+  /** Открытый журнал «пользователь | пространство | журнал» (без записи: карточка числа не меняет). */
+  let journalKey = $derived(
+    route.name === 'journal' && journalSpace ? `${route.user}|${spaceRef(journalSpace)}|${route.journal}` : '',
+  );
+  // открытие журнала перечитывает числа полосы (§5.3 п. 3): запись агента видна без перезагрузки
+  $effect(() => {
+    const [u, ref] = journalKey.split('|');
+    if (ref) untrack(() => counts.invalidate(u, ref));
+  });
+  /** Числа разделов пространства открытого журнала (ключ — как в дереве: `spaceRef`). */
+  let journalCounts = $derived(
+    route.name === 'journal' && journalSpace ? counts.get(route.user, spaceRef(journalSpace)) : null,
+  );
 
   /** Пользователь, в заметках которого ищет Ctrl+K: открытый, иначе свой. */
   let searchUser = $derived(routeUser(route) ?? me.user_id);
@@ -371,10 +387,25 @@
             use:revealSelected={`${r.journal}|${journalSpace?.kind ?? ''}`}
           >
             {#each journalsOf(journalSpace?.kind ?? '') as j (j)}
+              {@const n = journalCounts?.journals[j]}
+              {@const oq = j === 'questions' ? (journalCounts?.open.questions ?? 0) : 0}
+              {@const w = n !== undefined ? `${formatCount(n).length}ch` : undefined}
+              <!-- число — отдельный элемент поверх правого поля ссылки (вне её имени и текста, N3):
+                   место под него ссылка оставляет полем, перенос строки их не разделяет -->
               <a
                 href={href({ name: 'journal', user: r.user, space: r.space, journal: j, entry: null })}
+                class:counted={n !== undefined}
+                style:--num-w={w}
+                aria-describedby={n !== undefined ? `strip-count-${j}` : undefined}
                 aria-current={r.journal === j ? 'page' : undefined}>{JOURNAL_TITLE[j]}</a
               >
+              {#if n !== undefined}
+                <span class="strip-num" class:zero={n === 0} style:--num-w={w} data-count={j} aria-hidden="true" title={countHint(j)}
+                  >{formatCount(n)}</span
+                >
+                {#if oq > 0}<span class="tag open" aria-hidden="true">{openLabel(oq)}</span>{/if}
+                <span id="strip-count-{j}" hidden>{countDescription(j, n, oq)}</span>
+              {/if}
             {/each}
           </nav>
         </header>
@@ -717,6 +748,35 @@
     color: var(--text);
     border-bottom-color: var(--accent);
   }
+  /* числа полосы журналов (§5.3 п. 2) — поверх правого поля своей ссылки: ссылка оставляет под
+     число место (`--num-w` — число знаков × 1ch, цифры моноширинные), число сдвинуто влево на поле,
+     свою ширину и зазор полосы (2 px, `.strip` в app.css) — в ряду оно места не занимает: перенос
+     строки на настольном не отрывает его от ссылки, щелчок по нему попадает в ссылку */
+  .subnav a.counted {
+    padding-right: calc(18px + var(--num-w));
+  }
+  .strip-num {
+    width: var(--num-w);
+    margin: 0 12px 0 calc(-12px - var(--num-w) - 2px);
+    align-self: center;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+    pointer-events: none;
+    scroll-snap-align: none;
+  }
+  .strip-num.zero {
+    opacity: 0.55;
+  }
+  /* «открыто N» у «Вопросов» — акцентом, вплотную к числу */
+  .subnav .tag.open {
+    margin-left: -8px;
+    align-self: center;
+    background: var(--accent);
+    color: var(--accent-text);
+    pointer-events: none;
+    scroll-snap-align: none;
+  }
   .welcome {
     max-width: 640px;
     margin: 10vh auto 0;
@@ -744,6 +804,10 @@
     .search-btn {
       min-width: 44px;
       min-height: 44px;
+    }
+    /* зазор полосы при касании — `--touch-gap` */
+    .strip-num {
+      margin-left: calc(-12px - var(--num-w) - var(--touch-gap));
     }
   }
 

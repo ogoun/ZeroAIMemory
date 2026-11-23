@@ -1,4 +1,5 @@
 // Клиент REST API. Пути относительные: разрешаются от <base href>, который подставляет сервер.
+import { changesCounts } from './counts';
 
 export interface User {
   id: string;
@@ -64,7 +65,30 @@ interface Req {
   headers?: Record<string, string>;
 }
 
-/** Запрос к API: CSRF для изменяющих методов, выбор пользователя, разбор problem+json. */
+// ---- устаревание чисел разделов (M7.2, спецификация §5.3 п. 3) ----
+
+/** Подписчик: числа разделов пользователя `user` устарели (`undefined` — запрос без выбора
+ * пользователя: свой или любой). */
+type EntriesChanged = (user: string | undefined) => void;
+const entriesChanged = new Set<EntriesChanged>();
+
+/** Подписка на изменения записей журналов и заметок из WebUI (кэш чисел разделов,
+ * `counts.svelte.ts`): одна точка — успешный изменяющий запрос `request` по правилу
+ * `changesCounts` (`counts.ts`), а не страницы. Возвращает отписку. Модуль подписчика
+ * импортирует `api.ts`, а не наоборот — без кругового импорта (пре-флайт N40). */
+export function onEntriesChanged(cb: EntriesChanged): () => void {
+  entriesChanged.add(cb);
+  return () => entriesChanged.delete(cb);
+}
+
+/** Сообщить подписчикам об изменении записей пользователя `user`. Задание импорта (M6 §12б.5)
+ * кончается позже ответа `POST …/import` — его итог без `dry_run` зовёт это сам (пре-флайт N33). */
+function notifyEntriesChanged(user: string | undefined): void {
+  for (const cb of entriesChanged) cb(user);
+}
+
+/** Запрос к API: CSRF для изменяющих методов, выбор пользователя, разбор problem+json; успешный
+ * запрос, меняющий числа разделов (`changesCounts`, `counts.ts`), помечает их устаревшими. */
 async function request(method: string, path: string, r: Req = {}): Promise<Response> {
   const headers: Record<string, string> = { ...r.headers };
   let body: BodyInit | undefined;
@@ -95,6 +119,7 @@ async function request(method: string, path: string, r: Req = {}): Promise<Respo
     }
     throw new ApiError(resp.status, detail, problem);
   }
+  if (changesCounts(method, path)) notifyEntriesChanged(r.user);
   return resp;
 }
 
@@ -270,6 +295,18 @@ export const listChildren = (user: string, space: string, path: string) =>
     undefined,
     user,
   );
+/** Число записей разделов пространства (`GET /spaces/{space}/counts`, M7.2 §5.3 п. 1). */
+export interface SpaceCounts {
+  /** Журнал WebUI вида пространства → живые записи без корзины, все статусы; `code` — файлы карты
+   * кода, `vault` — записи Vault зрителя. Токену — без `reports`. */
+  journals: Partial<Record<string, number>>;
+  /** Вопросы `open`; задачи `open`, `in_progress`, `blocked`. */
+  open: { questions: number; tasks: number };
+  /** Живые заметки без папок. */
+  notes: number;
+}
+export const spaceCounts = (user: string, space: string) =>
+  call<SpaceCounts>('GET', `spaces/${q(space)}/counts`, undefined, user);
 export const getNode = (user: string, id: string) =>
   call<{ node: NodeInfo; content: string | null; rev: number }>(
     'GET',

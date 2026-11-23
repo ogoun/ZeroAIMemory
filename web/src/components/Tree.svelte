@@ -34,6 +34,8 @@
   } from '../lib/api';
   import { JOURNAL_TITLE, journalsOf } from '../lib/journals';
   import { go, href, routeUser, type Journal, type Route } from '../lib/router';
+  import { NOTES_HINT, countDescription, countHint, formatCount, notesLabel, openLabel } from '../lib/counts';
+  import { counts } from '../lib/counts.svelte';
   import IndexBadge from './IndexBadge.svelte';
 
   interface Props {
@@ -160,6 +162,17 @@
     open[key] = !open[key];
     if (open[key] && !loaded) await load();
   }
+
+  /** Раскрытие и сворачивание пространства; раскрытие перечитывает числа разделов (§5.3 п. 3):
+   * запись агента видна без перезагрузки страницы. */
+  function toggleSpace(uid: string, ref: string) {
+    const k = kSpace(uid, ref);
+    void toggle(k, () => loadKids(uid, ref, ''), !!kids[k]);
+    if (open[k]) counts.invalidate(uid, ref);
+  }
+
+  /** Id описания числа в дереве (`aria-describedby`): пользователь, пространство, журнал. */
+  const countId = (uid: string, ref: string, j = '') => `tree-count-${uid}-${ref}${j ? `-${j}` : ''}`;
 
   /** Перечитывает раскрытые уровни пространства после изменения. */
   async function refreshSpace(uid: string, ref: string) {
@@ -506,6 +519,9 @@
   {@const ref = spaceRef(s)}
   {@const k = kSpace(uid, ref)}
   {@const target = { uid, space: s, node: null }}
+  {@const c = counts.get(uid, ref, !!open[k])}
+  <!-- числа разделов (§5.3 п. 2): свёрнутое пространство — уже загруженные, раскрытое — загружает;
+       число — отдельный элемент вне имени кнопки и ссылки, для чтения с экрана — описание (N3) -->
   <li>
     <div class="tree-row space" style:--depth={depth} oncontextmenu={(e) => menuAt(e, target)} role="presentation">
       <button
@@ -513,17 +529,26 @@
         class="twisty"
         aria-expanded={!!open[k]}
         aria-label={open[k] ? `Свернуть ${s.name}` : `Развернуть ${s.name}`}
-        onclick={() => toggle(k, () => loadKids(uid, ref, ''), !!kids[k])}
+        onclick={() => toggleSpace(uid, ref)}
       >
         {@render chevron(!!open[k])}
       </button>
-      <button type="button" class="label" onclick={() => toggle(k, () => loadKids(uid, ref, ''), !!kids[k])}>
+      <button
+        type="button"
+        class="label"
+        aria-describedby={c ? countId(uid, ref) : undefined}
+        onclick={() => toggleSpace(uid, ref)}
+      >
         {@render icon(s.kind)}<span class="name">{s.name}</span>
         {#each roleTags(s) as t (t.text)}<span class="tag role" title={t.title}>{t.text}</span>{/each}
         {#if s.kind === 'rules' && rules[uid]?.warning === 'rules_heavy'}
           <span class="tag heavy" title={rulesHeavyText(rules[uid]!)}>много правил</span>
         {/if}
       </button>
+      {#if c}
+        <span class="num" class:zero={c.notes === 0} data-count="notes" aria-hidden="true" title={NOTES_HINT}>{formatCount(c.notes)}</span>
+        <span id={countId(uid, ref)} hidden>{notesLabel(c.notes)}</span>
+      {/if}
       <button type="button" class="more" aria-label="Действия: {s.name}" onclick={(e) => menuBelow(e, target)}>⋯</button>
     </div>
     {@render status(kExport(uid, ref))}
@@ -535,6 +560,8 @@
       {#if js.length}
         <ul class="journals" aria-label="Журналы: {s.name}">
           {#each js as j (j)}
+            {@const n = c?.journals[j]}
+            {@const oq = j === 'questions' ? (c?.open.questions ?? 0) : 0}
             <li>
               <div class="tree-row" class:selected={isJournal(uid, ref, j)} style:--depth={depth + 1}>
                 <span class="twisty"></span>
@@ -542,9 +569,15 @@
                   class="label journal"
                   href={href({ name: 'journal', user: uid, space: ref, journal: j, entry: null })}
                   aria-current={isJournal(uid, ref, j) ? 'page' : undefined}
+                  aria-describedby={n !== undefined ? countId(uid, ref, j) : undefined}
                 >
                   {@render icon(`j-${j}`)}<span class="name">{JOURNAL_TITLE[j]}</span>
                 </a>
+                {#if n !== undefined}
+                  {#if oq > 0}<span class="tag open" aria-hidden="true">{openLabel(oq)}</span>{/if}
+                  <span class="num" class:zero={n === 0} data-count={j} aria-hidden="true" title={countHint(j)}>{formatCount(n)}</span>
+                  <span id={countId(uid, ref, j)} hidden>{countDescription(j, n, oq)}</span>
+                {/if}
               </div>
             </li>
           {/each}
@@ -768,6 +801,22 @@
     background: var(--accent);
     color: var(--accent-text);
     text-decoration: none;
+  }
+  /* числа разделов (§5.3 п. 2): справа в строке, ноль — приглушённее; «открыто N» — акцентом,
+     как «запросы: N» */
+  .num {
+    flex: none;
+    padding: 0 4px;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    color: var(--muted);
+  }
+  .num.zero {
+    opacity: 0.55;
+  }
+  .tag.open {
+    background: var(--accent);
+    color: var(--accent-text);
   }
   .label.journal .name {
     color: var(--muted);
