@@ -14,6 +14,15 @@
   // вкладки, решение 19); на вкладках грузится только выбранная. Числа колонок и вкладок —
   // `entries/counts` сервера, с фильтром «Из идей». Вкладка по умолчанию — «В работе», при пустой —
   // «Открыт»; задача, открытая из адреса, выбирает вкладку своего статуса (решение 18).
+  //
+  // Подзадачи `part_of` (M7.2, спецификация §5.5, решения 21–23): доска, её колонки и числа — верхний
+  // уровень (`top_level=1`); у общей — «8/13» (`done/(total − dropped)`, `taskProgress.ts`) и полоса
+  // прогресса, «Подзадачи ▸» раскрывает шаги под плиткой (`parent=<id>` в порядке шагов, вложенная
+  // общая — со своим счётчиком и раскрытием). Переключатель «Подзадачи на доске» (выключен) —
+  // все задачи по статусам с пометкой «часть k:… «…»», как до волны. Карточка общей — раздел
+  // «Подзадачи 8/13» (`subtasks.items`), подзадачи — «Часть: k:<id> «…» (8/13)»; «давно без
+  // обновлений» (`stale` сервера) — плашка на плитке и в карточке (не `staleOf`: та — о ссылках на
+  // файлы).
   import { tick, untrack } from 'svelte';
   import FileRefs from './FileRefs.svelte';
   import JournalSplit from './JournalSplit.svelte';
@@ -46,6 +55,7 @@
   import { BOARD_MIN } from '../lib/layout';
   import { TASK_FORMS } from '../lib/plural';
   import { go, href } from '../lib/router';
+  import { progressText, progressValue, staleText, type ProgressOf } from '../lib/taskProgress';
   import { observeWidth } from '../lib/viewport.svelte';
 
   interface Props {
@@ -83,6 +93,17 @@
   let refs = $state<RefsByTarget>(new Map());
   /** Только задачи из идей (пункты плана). */
   let fromIdea = $state(false);
+  /** «Подзадачи на доске» (по умолчанию выключен, решение 23): все задачи по статусам с пометкой
+   * «часть k:… «…»», как до M7.2; выключен — верхний уровень (`top_level=1`), шаги — под общей. */
+  let withSubtasks = $state(false);
+  /** Подзадачи общих задач по id общей (`parent=<id>`, порядок шагов): строки, курсор, запрос. */
+  let subs = $state<Record<string, Column>>({});
+  /** Номер последнего запроса подзадач общей: ответ устаревшего запроса не применяется. */
+  const sseq: Record<string, number> = {};
+  /** Раскрытые списки подзадач по пути плитки («<общая>», «<общая>/<вложенная>»): одна задача в
+   * двух местах доски раскрывается отдельно, id элементов не повторяются. */
+  let unfolded = $state<Record<string, boolean>>({});
+  const uid = $props.id();
 
   /** Ширина области доски (CSS px); 0 — ещё не измерена. */
   let width = $state(0);
@@ -131,6 +152,7 @@
       if (listOf !== `${u}|${s}`) {
         listOf = `${u}|${s}`;
         fromIdea = false;
+        withSubtasks = false;
         tab = null;
         tabFor = '';
         resetBoard();
@@ -139,6 +161,7 @@
       }
       if (countsFailed) loadCounts();
       for (const st of visible) if (cols[st].error) loadColumn(st, true);
+      for (const id of unfoldedIds()) if (subs[id]?.error) loadSubs(id, true);
     });
   });
 
@@ -162,7 +185,7 @@
     if (entry && !e && !ce) return;
     untrack(() => {
       if (e) tabFor = e.id;
-      tab = boardTab(c, e?.status ?? null);
+      tab = boardTab(c, e ? tabStatusOf(e) : null);
     });
   });
 
@@ -181,10 +204,13 @@
     });
   }
 
-  /** Всё заново: числа и колонки (видимые загрузит эффект выше). */
+  /** Всё заново: числа и колонки (видимые загрузит эффект выше), раскрытия подзадач — свёрнуты. */
   function resetBoard() {
     for (const s of TASK_COLUMNS) cseq[s] = (cseq[s] ?? 0) + 1;
     cols = emptyColumns();
+    for (const id of Object.keys(sseq)) sseq[id]++;
+    subs = {};
+    unfolded = {};
     counts = null;
     countsFailed = false;
     loadCounts();
@@ -193,7 +219,7 @@
   async function loadCounts() {
     const my = ++kseq;
     try {
-      const c = await entryCounts(user, space, { kind: 'task', fromIdea });
+      const c = await entryCounts(user, space, { kind: 'task', fromIdea, topLevel: !withSubtasks });
       if (my !== kseq) return;
       counts = c;
       countsFailed = false;
@@ -216,6 +242,7 @@
         kind: 'task',
         status: [s],
         fromIdea,
+        topLevel: !withSubtasks,
         cursor: reset ? null : c.next,
         limit,
       });
@@ -236,9 +263,55 @@
     }
   }
 
+  /** Подзадачи общей `id` — все статусы в порядке шагов, страница PAGE_MAX (план целиком — одной
+   * страницей, `docs/api-compat.md`); `reset` — с начала, иначе следующая по курсору. При ошибке
+   * перечитывания загруженное остаётся. */
+  async function loadSubs(id: string, reset: boolean) {
+    if (!subs[id]) subs[id] = emptyColumn();
+    const c = subs[id];
+    const my = (sseq[id] = (sseq[id] ?? 0) + 1);
+    c.loading = true;
+    c.error = '';
+    try {
+      const r = await listEntries(user, space, { kind: 'task', parent: id, cursor: reset ? null : c.next, limit: PAGE_MAX });
+      if (my !== sseq[id]) return;
+      c.items = reset ? r.items : [...c.items, ...r.items];
+      c.next = r.next_cursor;
+      c.loaded = true;
+    } catch (e) {
+      if (my !== sseq[id]) return;
+      fail(e, (m) => (c.error = m));
+    } finally {
+      if (my === sseq[id]) c.loading = false;
+    }
+  }
+
+  /** id общих задач с раскрытыми и видимыми подзадачами: путь раскрыт целиком (свёрнутая внешняя
+   * прячет вложенные, но их раскрытие помнит). */
+  function unfoldedIds(): Set<string> {
+    const ids = new Set<string>();
+    for (const p of Object.keys(unfolded)) {
+      const parts = p.split('/');
+      if (parts.every((_, i) => unfolded[parts.slice(0, i + 1).join('/')])) ids.add(parts[parts.length - 1]);
+    }
+    return ids;
+  }
+
+  /** «Подзадачи ▸»: раскрыть (впервые и после ошибки — запрос `parent=<id>`) или свернуть. */
+  function toggleSubs(path: string, id: string) {
+    if (unfolded[path]) {
+      delete unfolded[path];
+      return;
+    }
+    unfolded[path] = true;
+    const c = subs[id];
+    if (!c || c.error || (!c.loaded && !c.loading)) loadSubs(id, true);
+  }
+
   /** После правки: числа и видимые статусы — заново (задача могла сменить колонку), столько же
    * задач, сколько было загружено «Показать ещё» (до PAGE_MAX); прочие вкладки — при следующем
-   * выборе. */
+   * выборе. Раскрытые подзадачи — заново (статус шага и счётчик вложенной общей), прочие — при
+   * следующем раскрытии. */
   async function reloadBoard() {
     const vis = visible;
     for (const s of TASK_COLUMNS) {
@@ -246,23 +319,29 @@
       cseq[s] = (cseq[s] ?? 0) + 1;
       cols[s] = emptyColumn();
     }
+    const open = unfoldedIds();
+    for (const id of Object.keys(subs)) {
+      if (open.has(id)) continue;
+      sseq[id] = (sseq[id] ?? 0) + 1;
+      delete subs[id];
+    }
     const size = (s: EntryStatus) => Math.min(PAGE_MAX, Math.max(PAGE, cols[s].items.length));
-    await Promise.all([loadCounts(), ...vis.map((s) => loadColumn(s, true, size(s)))]);
+    await Promise.all([loadCounts(), ...vis.map((s) => loadColumn(s, true, size(s))), ...[...open].map((id) => loadSubs(id, true))]);
   }
 
-  /** «Показать ещё» колонки или вкладки. Кнопка на время загрузки остаётся (`aria-disabled`),
-   * фокус на ней цел; страниц больше нет и кнопка ушла — фокус на первую догруженную задачу. */
-  async function more(s: EntryStatus, e: MouseEvent) {
-    const c = cols[s];
+  /** «Показать ещё» колонки, вкладки или подзадач (`c` — их список, `load` — следующая страница,
+   * `rows` — строки от родителя кнопки). Кнопка на время загрузки остаётся (`aria-disabled`), фокус
+   * на ней цел; страниц больше нет и кнопка ушла — фокус на первую догруженную строку. */
+  async function more(c: Column, load: () => Promise<void>, rows: string, e: MouseEvent) {
     if (c.loading) return;
     const btn = e.currentTarget as HTMLElement;
     const box = btn.parentElement;
     const first = c.items.length;
-    await loadColumn(s, false);
+    await load();
     await tick();
     const a = document.activeElement;
     if (btn.isConnected || (a && a !== document.body)) return;
-    box?.querySelectorAll<HTMLElement>('[data-task]')[first]?.querySelector<HTMLElement>('button')?.focus();
+    box?.querySelectorAll<HTMLElement>(rows)[first]?.querySelector<HTMLElement>('a[href], button')?.focus();
   }
 
   function selectTab(s: EntryStatus) {
@@ -290,15 +369,24 @@
       cur = e;
       stepDraft = str(e.data, 'next_step');
       // запись из адреса — вкладка её статуса; правка статуса из карточки вкладку не меняет
-      if (e.id !== tabFor && e.status && TASK_COLUMNS.includes(e.status)) {
+      const st = e.id !== tabFor ? tabStatusOf(e) : null;
+      if (st && TASK_COLUMNS.includes(st)) {
         tabFor = e.id;
-        tab = e.status;
+        tab = st;
       }
     } catch (e) {
       if (my !== eseq) return;
       cur = null;
       fail(e, (m) => (curError = m));
     }
+  }
+
+  /** Вкладка открытой задачи `e` — её статус (решение 18). У подзадачи на доске верхнего уровня
+   * своей плитки нет: открытая с доски (из раскрытия под общей) вкладку не меняет, из адреса — вкладка
+   * родителя. `null` — вкладку не менять. */
+  function tabStatusOf(e: Entry): EntryStatus | null {
+    if (e.parent && !withSubtasks) return tab === null ? e.parent.status : null;
+    return e.status;
   }
 
   const str = (d: Record<string, unknown>, k: string) => (typeof d[k] === 'string' ? (d[k] as string) : '');
@@ -328,6 +416,14 @@
     fromIdea = !fromIdea;
     resetBoard();
   }
+
+  function toggleSubtasks() {
+    withSubtasks = !withSubtasks;
+    resetBoard();
+  }
+
+  /** Адрес задачи на доске (ссылки подзадач и «часть …»): открытие — новая запись истории. */
+  const taskHref = (id: string) => href({ name: 'journal', user, space, journal: 'tasks', entry: id });
 
   /** Ссылка на идею задачи: идея в пространстве задачи — в нём же, иначе — Knowledge (задача
    * «начать» общей идеи бывает в решении той же базы). */
@@ -493,6 +589,15 @@
   <div class="row bar">
     <button type="button" class="primary" onclick={startCreate}>Новая задача</button>
     <button type="button" class="toggle" aria-pressed={fromIdea} onclick={toggleFromIdea} title="Только задачи из идей — пункты плана работ">Из идей</button>
+    <button
+      type="button"
+      class="toggle"
+      aria-pressed={withSubtasks}
+      onclick={toggleSubtasks}
+      title="Шаги планов — в колонках по статусам, с пометкой «часть …»; выключено — под общей задачей"
+    >
+      Подзадачи на доске
+    </button>
   </div>
 
   {#if boardError}<p class="error" role="alert">{boardError}</p>{/if}
@@ -525,6 +630,11 @@
     {@const stale = staleOf(refs.get(entryRef('task', t.id)))}
     <article class="task" class:selected={t.id === entry} data-task={t.id} data-entry={t.id}>
       <button type="button" class="link title" onclick={() => select(t.id)}>{t.title}</button>
+      {#if t.parent}
+        <a class="small part-of" href={taskHref(t.parent.id)} onclick={() => (notice = '')} data-testid="task-part-of">
+          часть {entryRef('task', t.parent.id)} «{t.parent.title}»
+        </a>
+      {/if}
       {#if t.idea}
         <a class="small from-idea" href={ideaHref(t, t.idea.id, t.idea.space_id)} data-testid="from-idea">
           из идеи {entryRef('idea', t.idea.id)} «{t.idea.title}»{#if (t.ideas?.length ?? 1) > 1}&nbsp;и ещё {(t.ideas?.length ?? 1) - 1}{/if}
@@ -538,12 +648,100 @@
       {#if t.status === 'done' && t.duration_min !== undefined && t.duration_min !== null}
         <div class="muted small">длительность {durationText(t.duration_min)}</div>
       {/if}
+      {#if t.stale && t.last_activity_at}{@render idle(t.last_activity_at)}{/if}
       {#if stale.length}<div class="badge small">возможно устарело</div>{/if}
+      {#if t.subtasks?.total}{@render subtasksOf(t, t.id)}{/if}
     </article>
   {/each}
   {#if c.next}
-    <button type="button" class="more" aria-disabled={c.loading} aria-busy={c.loading} onclick={(e) => more(s, e)}>Показать ещё</button>
+    <button type="button" class="more" aria-disabled={c.loading} aria-busy={c.loading} onclick={(e) => more(c, () => loadColumn(s, false), '[data-task]', e)}>
+      Показать ещё
+    </button>
   {/if}
+{/snippet}
+
+<!-- Счётчик, полоса прогресса и «Подзадачи ▸» общей задачи `t`; раскрытый список — под ними (путь
+     `path` — раскрытие этого места доски). Строка подзадачи — статус, заголовок-ссылка, захват,
+     «давно без обновлений»; вложенная общая — со своим счётчиком и раскрытием. -->
+{#snippet subtasksOf(t: Entry, path: string)}
+  {@const shown = !!unfolded[path]}
+  {@const box = `${uid}-subs-${path.replaceAll('/', '-')}`}
+  {@const c = subs[t.id]}
+  <div class="subs-bar">
+    {#if t.subtasks}{@render progress(t.subtasks)}{/if}
+    <button
+      type="button"
+      class="link small fold"
+      aria-expanded={shown}
+      aria-controls={shown ? box : undefined}
+      onclick={() => toggleSubs(path, t.id)}
+    >
+      Подзадачи <span aria-hidden="true">{shown ? '▾' : '▸'}</span>
+    </button>
+  </div>
+  {#if shown}
+    <div class="subtasks" id={box}>
+      {#if c?.loading && !c.loaded}<p class="muted small">Загрузка…</p>{/if}
+      {#if c?.error}<p class="error small" role="alert">{c.error}</p>{/if}
+      {#if c?.loaded && c.items.length === 0}<p class="muted small">Подзадач нет.</p>{/if}
+      {#if c?.items.length}
+        <ol aria-label="Подзадачи «{t.title}»">
+          {#each c.items as k (k.id)}
+            {@const claim = claimOf(k)}
+            <li class:selected={k.id === entry} data-subtask={k.id} data-entry={k.id}>
+              <div class="sub-head">
+                <span class="chip">{k.status ? STATUS_TEXT[k.status] : ''}</span>
+                <a class="title" href={taskHref(k.id)} onclick={() => (notice = '')}>{k.title}</a>
+              </div>
+              {#if claim}<div class="claim small">{claimText(claim)}</div>{/if}
+              {#if k.stale && k.last_activity_at}{@render idle(k.last_activity_at)}{/if}
+              {#if k.subtasks?.total}{@render subtasksOf(k, `${path}/${k.id}`)}{/if}
+            </li>
+          {/each}
+        </ol>
+      {/if}
+      {#if c?.next}
+        <button
+          type="button"
+          class="more small"
+          aria-disabled={c.loading}
+          aria-busy={c.loading}
+          onclick={(e) => more(c, () => loadSubs(t.id, false), ':scope > ol > li', e)}
+        >
+          Показать ещё
+        </button>
+      {/if}
+    </div>
+  {/if}
+{/snippet}
+
+<!-- «8/13» и полоса прогресса (`done/(total − dropped)`); подзадач без снятых нет — ничего. Число
+     для чтения с экрана — в полосе («8 из 13»), видимое — не повторяется. -->
+{#snippet progress(s: ProgressOf)}
+  {@const v = progressValue(s)}
+  {#if v.max > 0}
+    <span class="progress-text" aria-hidden="true" data-testid="task-progress">{progressText(s)}</span>
+    {@render progressBar(v)}
+  {/if}
+{/snippet}
+
+{#snippet progressBar(v: { now: number; max: number })}
+  <span
+    class="progress"
+    role="progressbar"
+    aria-label="Выполнено подзадач"
+    aria-valuemin={0}
+    aria-valuemax={v.max}
+    aria-valuenow={v.now}
+    aria-valuetext="{v.now} из {v.max}"
+  >
+    <span class="progress-fill" style:width="{(100 * v.now) / v.max}%"></span>
+  </span>
+{/snippet}
+
+<!-- «Давно без обновлений» (`stale` сервера): часы от `last_activity_at`, точное время — в подсказке. -->
+{#snippet idle(last: string)}
+  <div class="idle small" data-testid="task-idle" title="последнее обновление — {fmtTime(last)}">{staleText(last, Date.now())}</div>
 {/snippet}
 
 {#snippet taskDetail()}
@@ -558,7 +756,14 @@
           <span class="chip status">{c.status ? STATUS_TEXT[c.status] : ''}</span>
           <span class="muted small">{AUTHOR_TEXT[c.author.kind] ?? c.author.kind} · ревизия {c.rev} · {fmtTime(c.updated_at)}</span>
         </div>
+        {#if c.stale && c.last_activity_at}{@render idle(c.last_activity_at)}{/if}
       </header>
+      {#if c.parent}
+        {@const pp = progressText(c.parent.subtasks)}
+        <p class="part-of" data-testid="task-parent">
+          Часть: <a href={taskHref(c.parent.id)} onclick={() => (notice = '')}>{entryRef('task', c.parent.id)} «{c.parent.title}»</a>{pp ? ` (${pp})` : ''}
+        </p>
+      {/if}
       {#if c.body}<p class="body">{c.body}</p>{/if}
       {#if c.ideas?.length}
         <div class="ideas" data-testid="task-ideas">
@@ -568,6 +773,32 @@
             {#if i.status}<span class="chip">{entryStatusText('idea', i.status)}</span>{/if}
           {/each}
         </div>
+      {/if}
+      {#if c.subtasks?.total}
+        {@const s = c.subtasks}
+        {@const pt = progressText(s)}
+        {@const items = s.items ?? []}
+        <!-- раздел «Подзадачи 8/13»: шаги в порядке связей (`subtasks.items`, до 200) -->
+        <section class="subtasks-card" aria-labelledby="{uid}-subs-title" data-testid="task-subtasks">
+          <h3 id="{uid}-subs-title">Подзадачи{pt ? ` ${pt}` : ''}</h3>
+          {#if pt}{@render progressBar(progressValue(s))}{/if}
+          {#if items.length}
+            <ol>
+              {#each items as k (k.id)}
+                <li>
+                  <span class="chip">{k.status ? STATUS_TEXT[k.status] : ''}</span>
+                  <a href={taskHref(k.id)} onclick={() => (notice = '')}>{k.title}</a>
+                  {#if k.claimed}
+                    <span class="claim small" data-testid="subtask-claim" title="до {fmtTime(k.claimed.until)}">в работе у {k.claimed.agent || 'агент'}</span>
+                  {/if}
+                </li>
+              {/each}
+            </ol>
+          {/if}
+          {#if s.truncated}
+            <p class="muted small">… и ещё {s.total - items.length}: полный список — «Подзадачи» под задачей на доске.</p>
+          {/if}
+        </section>
       {/if}
       {#if claim}
         <p class="claim" data-testid="claim">{claimText(claim)}</p>
@@ -644,8 +875,95 @@
     color: var(--accent);
     background: var(--selected);
   }
-  .from-idea {
+  .from-idea,
+  .part-of {
     overflow-wrap: anywhere;
+  }
+  /* подзадачи (§5.5): счётчик, полоса прогресса и раскрытие под плиткой */
+  .subs-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+  }
+  .progress-text {
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  .progress {
+    display: block;
+    flex: 1 1 48px;
+    max-width: 120px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--border);
+    overflow: hidden;
+  }
+  .progress-fill {
+    display: block;
+    height: 100%;
+    background: var(--callout-tip);
+  }
+  .subtasks-card .progress {
+    margin: 4px 0 8px;
+  }
+  .subtasks {
+    min-width: 0;
+    padding-left: 8px;
+    border-left: 2px solid var(--border);
+  }
+  .subtasks ol,
+  .subtasks-card ol {
+    display: grid;
+    gap: 4px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .subtasks li {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+    padding: 2px 4px;
+    border-radius: 4px;
+  }
+  .subtasks li.selected {
+    background: var(--selected);
+  }
+  .sub-head,
+  .subtasks-card li {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px 6px;
+    overflow-wrap: anywhere;
+  }
+  .subtasks-card {
+    margin-top: 12px;
+  }
+  .subtasks-card h3 {
+    margin: 0;
+    font-size: 15px;
+  }
+  .idle {
+    justify-self: start;
+    padding: 0 6px;
+    border-radius: 8px;
+    background: var(--warn-bg);
+    color: var(--warn-text);
+  }
+  header .idle {
+    display: inline-block;
+    margin-top: 4px;
+  }
+  /* ссылки строк подзадач — цели касания 44 px, как кнопки (§5.1 п. 2) */
+  @media (pointer: coarse) {
+    .sub-head a,
+    .subtasks-card li a {
+      display: inline-flex;
+      align-items: center;
+      min-height: 44px;
+    }
   }
   .ideas {
     display: flex;

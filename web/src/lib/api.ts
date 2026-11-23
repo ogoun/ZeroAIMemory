@@ -797,6 +797,48 @@ export interface Entry {
   /** У задачи из идеи (запись и лента, M6.5 §9): первая идея плана; `ideas` — все её идеи. */
   idea?: TaskIdea;
   ideas?: TaskIdea[];
+  /** У задачи (запись, лента, эхо; M7 §5.4 п. 2): родитель подзадачи `part_of` со сводкой его
+   * подзадач; `null` — задача верхнего уровня. */
+  parent?: TaskParent | null;
+  /** У общей задачи: сводка прямых подзадач (подзадач нет — поля нет); строки `items` — только в
+   * `GET /entries/{id}`. */
+  subtasks?: SubtaskSummary;
+  /** У задачи: наибольшее `updated_at` задачи и её прямых подзадач. */
+  last_activity_at?: string;
+  /** У задачи «в работе» без живого захвата, не менявшейся (с подзадачами) 12 ч; иначе поля нет. */
+  stale?: true;
+}
+
+/** Сводка прямых подзадач общей задачи (M7 §5.4 п. 2): прогресс — `done/(total − dropped)`
+ * (`taskProgress.ts`). */
+export interface SubtaskSummary {
+  total: number;
+  done: number;
+  dropped: number;
+  open: number;
+  in_progress: number;
+  blocked: number;
+  /** Только `GET /entries/{id}`: строки подзадач в порядке шагов (порядок связей), до 200. */
+  items?: SubtaskItem[];
+  /** Рядом с `items`: подзадач больше 200. */
+  truncated?: boolean;
+}
+
+/** Строка подзадачи карточки общей задачи; `claimed` — живой захват агентом. */
+export interface SubtaskItem {
+  id: string;
+  title: string;
+  status: EntryStatus | null;
+  updated_at: string;
+  claimed: { agent: string | null; until: string } | null;
+}
+
+/** Родитель подзадачи и сводка его подзадач («Часть: k:<id> «…» (8/13)» без второго запроса). */
+export interface TaskParent {
+  id: string;
+  title: string;
+  status: EntryStatus | null;
+  subtasks: Pick<SubtaskSummary, 'total' | 'done' | 'dropped'>;
 }
 
 /** Идея задачи плана (поле `idea` задачи); `space_id` — пространство идеи (у идеи Knowledge
@@ -846,11 +888,16 @@ export interface EntryQuery {
   priority?: 'low' | 'normal' | 'high';
   /** Только `kind: task`: задачи из идей (пункты плана, M6.5 §9). */
   fromIdea?: boolean;
+  /** Только `kind: task`: без подзадач — верхний уровень доски (`top_level=1`, M7 §5.4 п. 3). */
+  topLevel?: boolean;
+  /** Только `kind: task`: прямые подзадачи задачи `<id>` в порядке шагов (курсор — позиция). */
+  parent?: string;
   cursor?: string | null;
   limit?: number;
 }
 
-/** Лента записей пространства (новые — первыми), курсор — `next_cursor`. */
+/** Лента записей пространства (новые — первыми; `parent` — в порядке шагов), курсор —
+ * `next_cursor`. */
 export function listEntries(user: string, space: string, f: EntryQuery) {
   const p = new URLSearchParams();
   if (f.kind) p.set('kind', f.kind);
@@ -863,6 +910,8 @@ export function listEntries(user: string, space: string, f: EntryQuery) {
   if (f.origin) p.set('origin', f.origin);
   if (f.priority) p.set('priority', f.priority);
   if (f.fromIdea) p.set('from_idea', '1');
+  if (f.topLevel) p.set('top_level', '1');
+  if (f.parent) p.set('parent', f.parent);
   if (f.cursor) p.set('cursor', f.cursor);
   if (f.limit) p.set('limit', String(f.limit));
   return call<{ items: Entry[]; next_cursor: string | null }>(
@@ -874,11 +923,11 @@ export function listEntries(user: string, space: string, f: EntryQuery) {
 }
 
 /** Число живых записей вида по статусам с фильтрами ленты (`GET …/entries/counts`, M6.5 §9):
- * все статусы вида, нулевые тоже. */
+ * все статусы вида, нулевые тоже; `topLevel` — задачи без подзадач (вкладки доски, M7 §5.5 п. 4). */
 export function entryCounts(
   user: string,
   space: string,
-  f: Pick<EntryQuery, 'kind' | 'area' | 'tag' | 'origin' | 'priority' | 'fromIdea'> & { kind: EntryKind },
+  f: Pick<EntryQuery, 'kind' | 'area' | 'tag' | 'origin' | 'priority' | 'fromIdea' | 'topLevel'> & { kind: EntryKind },
 ) {
   const p = new URLSearchParams({ kind: f.kind });
   if (f.area) p.set('area', f.area);
@@ -886,6 +935,7 @@ export function entryCounts(
   if (f.origin) p.set('origin', f.origin);
   if (f.priority) p.set('priority', f.priority);
   if (f.fromIdea) p.set('from_idea', '1');
+  if (f.topLevel) p.set('top_level', '1');
   return call<Partial<Record<EntryStatus, number>>>('GET', `spaces/${q(space)}/entries/counts?${p}`, undefined, user);
 }
 
