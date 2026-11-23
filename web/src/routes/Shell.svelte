@@ -224,6 +224,8 @@
   let journalCounts = $derived(
     route.name === 'journal' && journalSpace ? counts.get(route.user, spaceRef(journalSpace)) : null,
   );
+  /** Измеренная рамка числа (и «открыто N») каждого журнала полосы: ссылка оставляет под неё поле. */
+  let stripOver = $state<Record<string, DOMRectReadOnly | undefined>>({});
 
   /** Пользователь, в заметках которого ищет Ctrl+K: открытый, иначе свой. */
   let searchUser = $derived(routeUser(route) ?? me.user_id);
@@ -389,9 +391,11 @@
             {#each journalsOf(journalSpace?.kind ?? '') as j (j)}
               {@const n = journalCounts?.journals[j]}
               {@const oq = j === 'questions' ? (journalCounts?.open.questions ?? 0) : 0}
-              {@const w = n !== undefined ? `${formatCount(n).length}ch` : undefined}
-              <!-- число — отдельный элемент поверх правого поля ссылки (вне её имени и текста, N3):
-                   место под него ссылка оставляет полем, перенос строки их не разделяет -->
+              {@const ow = stripOver[j]?.width}
+              {@const w = n === undefined ? undefined : ow ? `${ow}px` : `${formatCount(n).length}ch`}
+              <!-- число и «открыто N» — отдельный элемент поверх правого поля ссылки (вне её имени и
+                   текста, N3): место под него ссылка оставляет полем по его измеренной ширине, перенос
+                   строки их не разделяет -->
               <a
                 href={href({ name: 'journal', user: r.user, space: r.space, journal: j, entry: null })}
                 class:counted={n !== undefined}
@@ -400,10 +404,10 @@
                 aria-current={r.journal === j ? 'page' : undefined}>{JOURNAL_TITLE[j]}</a
               >
               {#if n !== undefined}
-                <span class="strip-num" class:zero={n === 0} style:--num-w={w} data-count={j} aria-hidden="true" title={countHint(j)}
-                  >{formatCount(n)}</span
-                >
-                {#if oq > 0}<span class="tag open" aria-hidden="true">{openLabel(oq)}</span>{/if}
+                <span class="strip-over" style:--num-w={w} bind:contentRect={stripOver[j]} aria-hidden="true">
+                  <span class="strip-num" class:zero={n === 0} data-count={j} title={countHint(j)}>{formatCount(n)}</span>
+                  {#if oq > 0}<span class="tag open">{openLabel(oq)}</span>{/if}
+                </span>
                 <span id="strip-count-{j}" hidden>{countDescription(j, n, oq)}</span>
               {/if}
             {/each}
@@ -748,34 +752,36 @@
     color: var(--text);
     border-bottom-color: var(--accent);
   }
-  /* числа полосы журналов (§5.3 п. 2) — поверх правого поля своей ссылки: ссылка оставляет под
-     число место (`--num-w` — число знаков × 1ch, цифры моноширинные), число сдвинуто влево на поле,
-     свою ширину и зазор полосы (2 px, `.strip` в app.css) — в ряду оно места не занимает: перенос
-     строки на настольном не отрывает его от ссылки, щелчок по нему попадает в ссылку */
+  /* числа полосы журналов (§5.3 п. 2) — с «открыто N» у «Вопросов» одним элементом поверх правого
+     поля своей ссылки: ссылка оставляет под него место (`--num-w` — измеренная ширина элемента, до
+     замера — число знаков × 1ch), элемент сдвинут влево на поле, свою ширину и зазор полосы (2 px,
+     `.strip` в app.css) — в ряду он места не занимает: перенос строки на настольном не отрывает ни
+     число, ни метку от журнала (ревью r1, M3), щелчок по ним попадает в ссылку */
   .subnav a.counted {
     padding-right: calc(18px + var(--num-w));
   }
-  .strip-num {
-    width: var(--num-w);
+  .strip-over {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     margin: 0 12px 0 calc(-12px - var(--num-w) - 2px);
     align-self: center;
-    text-align: right;
-    font-variant-numeric: tabular-nums;
-    color: var(--muted);
     pointer-events: none;
     scroll-snap-align: none;
+  }
+  /* ноль — `--muted` без прозрачности: на `--bg` 4,64 : 1 (светлая) и 6,98 : 1 (тёмная), WCAG AA
+     (ревью r1, M2); прочие числа — цветом текста */
+  .strip-num {
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
   }
   .strip-num.zero {
-    opacity: 0.55;
+    color: var(--muted);
   }
-  /* «открыто N» у «Вопросов» — акцентом, вплотную к числу */
-  .subnav .tag.open {
-    margin-left: -8px;
-    align-self: center;
+  .strip-over .tag.open {
+    margin-left: 0;
     background: var(--accent);
     color: var(--accent-text);
-    pointer-events: none;
-    scroll-snap-align: none;
   }
   .welcome {
     max-width: 640px;
@@ -806,7 +812,7 @@
       min-height: 44px;
     }
     /* зазор полосы при касании — `--touch-gap` */
-    .strip-num {
+    .strip-over {
       margin-left: calc(-12px - var(--num-w) - var(--touch-gap));
     }
   }

@@ -237,32 +237,47 @@ mod tests {
         }
     }
 
-    /// Журналы — те же и в том же порядке, что `journalsOf` WebUI (без Vault); у Knowledge —
-    /// подмножество журналов решения.
+    /// Журналы вида пространства из исходника WebUI: массив, который `journalsOf`
+    /// (`web/src/lib/journals.ts`) возвращает при `kind === '<kind>'`.
+    fn webui_journals(src: &str, kind: &str) -> Vec<String> {
+        let body = src
+            .split("export function journalsOf")
+            .nth(1)
+            .expect("journalsOf в journals.ts");
+        let at = body
+            .find(&format!("kind === '{kind}'"))
+            .unwrap_or_else(|| panic!("ветка {kind} в journalsOf"));
+        let rest = &body[at..];
+        let open = rest.find('[').expect("[");
+        let close = open + rest[open..].find(']').expect("]");
+        rest[open + 1..close]
+            .split(',')
+            .map(|s| s.trim().trim_matches('\'').to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    /// Журналы — те же и в том же порядке, что `journalsOf` WebUI: список сверяется с исходником
+    /// `web/src/lib/journals.ts` (ревью r1, M5), у хранилища — без Vault (его считает сервер по
+    /// базе зрителя); у Rules и Human журналов нет.
     #[test]
-    fn journals_mirror_webui() {
-        let names = |k| journals_of(k).iter().map(|(n, _)| *n).collect::<Vec<_>>();
-        assert_eq!(
-            names(SpaceKind::Solution),
-            [
-                "changelog",
-                "releases",
-                "reports",
-                "code",
-                "insights",
-                "glossary",
-                "tasks",
-                "ideas",
-                "questions"
-            ]
-        );
-        assert_eq!(
-            names(SpaceKind::Knowledge),
-            ["insights", "glossary", "tasks", "ideas", "questions"]
-        );
-        for j in &KNOWLEDGE {
-            assert!(SOLUTION.contains(j), "{j:?}");
+    fn journals_match_webui_source() {
+        let p =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/src/lib/journals.ts");
+        let src = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        for (kind, name) in [
+            (SpaceKind::Solution, "solution"),
+            (SpaceKind::Knowledge, "knowledge"),
+        ] {
+            let mut ours: Vec<String> = journals_of(kind)
+                .iter()
+                .map(|(n, _)| n.to_string())
+                .collect();
+            ours.push("vault".into());
+            assert_eq!(ours, webui_journals(&src, name), "{name}");
         }
-        assert!(names(SpaceKind::Rules).is_empty() && names(SpaceKind::Human).is_empty());
+        assert!(
+            journals_of(SpaceKind::Rules).is_empty() && journals_of(SpaceKind::Human).is_empty()
+        );
     }
 }

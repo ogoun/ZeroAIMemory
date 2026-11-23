@@ -802,17 +802,23 @@
     color: var(--accent-text);
     text-decoration: none;
   }
-  /* числа разделов (§5.3 п. 2): справа в строке, ноль — приглушённее; «открыто N» — акцентом,
-     как «запросы: N» */
+  /* числа разделов (§5.3 п. 2): справа в строке; ноль — приглушённо, цветом `--muted` без
+     прозрачности: контраст на `--panel` 4,98 : 1 (светлая тема) и 6,27 : 1 (тёмная), WCAG AA ≥ 4,5
+     (ревью r1, M2). На подсвеченной и выбранной строке светлой темы `--muted` даёт 4,50 и 4,26 —
+     там ноль цветом текста, как прочие числа. «Открыто N» — акцентом, как «запросы: N» */
   .num {
     flex: none;
     padding: 0 4px;
     font-size: 12px;
     font-variant-numeric: tabular-nums;
-    color: var(--muted);
+    color: var(--text);
   }
   .num.zero {
-    opacity: 0.55;
+    color: var(--muted);
+  }
+  .tree-row:hover .num,
+  .tree-row.selected .num {
+    color: var(--text);
   }
   .tag.open {
     background: var(--accent);

@@ -19,7 +19,8 @@ export const JOURNAL_TITLE: Record<Journal, string> = {
 
 /** Журналы пространства: у решения — все, у Knowledge — без Changelog, Releases, Отчётов
  * (отчёты пишутся только в решение, M5.5) и Кода (карта кода — у решения, M5.6), иначе — нет.
- * «Идеи» (M5.7) — после «Задач» у обоих. */
+ * «Идеи» (M5.7) — после «Задач» у обоих. Те же списки считает сервер (`GET /spaces/{space}/counts`,
+ * `crates/zam-store/src/counts.rs`; модульный тест `journals_match_webui_source` читает их отсюда). */
 export function journalsOf(kind: string): Journal[] {
   if (kind === 'solution')
     return ['changelog', 'releases', 'reports', 'code', 'insights', 'glossary', 'tasks', 'ideas', 'questions', 'vault'];

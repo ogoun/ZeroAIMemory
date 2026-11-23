@@ -2,7 +2,7 @@
 // замещение insight, повышение до theorem с доказательством, раскрытие секрета Vault,
 // вкладка «Связи» с обратной ссылкой, карточки записей в поиске Ctrl+K.
 // Данные — seedJournals (global-setup). Снимки — в .tmp/e2e/screens/ (под .gitignore).
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 import { ADMIN_STATE } from './session';
 import { SOLUTION_GUID, SOLUTION_NAME, VAULT_SECRET } from './seed';
@@ -471,12 +471,29 @@ test('tree_and_tabs_show_counts', async ({ page }) => {
       );
     }
     await expect(strip.getByText(`открыто ${fmt(c.open.questions)}`, { exact: true })).toBeVisible();
-    // число — поверх правого поля ссылки: внутри её рамки
-    const [lb, nb] = await Promise.all([
-      strip.getByRole('link', { name: 'Идеи', exact: true }).boundingBox(),
-      stripNum('ideas').boundingBox(),
-    ]);
-    expect(lb && nb && nb.x >= lb.x && nb.x + nb.width <= lb.x + lb.width + 0.5, 'число внутри ссылки').toBe(true);
+    // число и «открыто N» — поверх правого поля ссылки: внутри её рамки, перенос строки их не
+    // разделяет (ревью r1, M3)
+    const inside = async (title: string, part: Locator) => {
+      const [lb, nb] = await Promise.all([strip.getByRole('link', { name: title, exact: true }).boundingBox(), part.boundingBox()]);
+      return !!lb && !!nb && nb.x >= lb.x - 0.5 && nb.x + nb.width <= lb.x + lb.width + 0.5 && nb.y >= lb.y - 0.5;
+    };
+    expect(await inside('Идеи', stripNum('ideas')), 'число внутри ссылки').toBe(true);
+    expect(await inside('Вопросы', strip.getByText(`открыто ${fmt(c.open.questions)}`, { exact: true })), 'метка внутри ссылки').toBe(true);
+    // ноль — цветом `--muted` без прозрачности (контраст WCAG AA, ревью r1 M2); в дереве — кроме
+    // выбранной строки «Идеи» под указателем: там все числа цветом текста
+    for (const [key] of JOURNALS.filter(([k]) => c.journals[k] === 0)) {
+      for (const el of key === 'ideas' ? [stripNum(key)] : [treeNum(key), stripNum(key)]) {
+        const [color, muted, opacity] = await el.evaluate((e) => {
+          const probe = document.createElement('span');
+          probe.style.color = 'var(--muted)';
+          e.parentElement!.append(probe);
+          const m = getComputedStyle(probe).color;
+          probe.remove();
+          return [getComputedStyle(e).color, m, getComputedStyle(e).opacity];
+        });
+        expect([color, opacity], key).toEqual([muted, '1']);
+      }
+    }
     await page.screenshot({ path: `${screens}journal-counts.png` });
 
     // новая идея из WebUI — «Идеи» +1 в дереве и в полосе без перезагрузки
