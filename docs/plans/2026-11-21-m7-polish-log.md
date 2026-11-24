@@ -5271,6 +5271,17 @@ token` FAILED (`DataDirLocked` при повторной сборке на то�
   `startup_panic_keeps_runner_working` FAILED («не дождались: учтённый запуск после упавшего шага
   старта»).
 
+**Правка m57 и тестов схемы** (CI ветки волны после слияния задач 1–5): `m57_acceptance::
+acceptance_migration_from_m56_db` FAILED — сравнение прежних объектов схемы базы 0023 не знало
+объектов 0027 (в задаче 1 поправлены `migrate_rebuild` и `m65_acceptance`, этот тест пропущен:
+поиск шёл по версии 26, а не по всем сравнениям `sqlite_master`). Общий помощник
+`tests/common::{TABLES_0027, objects_0027}` (по `tbl_name`: индекс `work_calls_run` задачи 2
+учтён сам), `m57_acceptance` и `m65_acceptance` — на нём. Прочие тесты, сверяющие версию и состав
+схемы базы пользователя (`git grep` `sqlite_master`, `USER_MIGRATIONS`, `user_version`), прогнаны
+с `ZAM_REQUIRE_ML=1` — зелёные без правок: `zam-server` `m57_acceptance` 13, `m65_acceptance` 7,
+`m56_acceptance` 8, `m6_acceptance` 1 (+2 ignored), `agent_dates` 4, `vault` 31, `backup` 53;
+`zam-store` целиком (`--lib` 127 и все наборы); `zam-cli` `m45_acceptance` 7.
+
 ### M7.3 · Задача 2 — Клиент модели: протокол, данные наружу, пределы, журнал отправок
 
 Спецификация §6.2; worktree `.tmp/m73/wt-t2`, ветка `m7.3-t2`. Этап 1 (`f47f5490`, от
