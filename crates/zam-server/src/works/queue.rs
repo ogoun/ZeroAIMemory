@@ -436,7 +436,7 @@ async fn execute(
             };
             let state = a.state;
             match store::finish_claimed(db, w.id, None, state, a.result, None, a.writes).await? {
-                store::Closed::Closed => {
+                store::Closed::Closed { .. } => {
                     tracing::debug!(work = %w.id, state = state.as_str(), "внутренние работы: работа модели закрыта");
                 }
                 // работу сняли или вернули, пока шло обращение: итог и записи не приняты

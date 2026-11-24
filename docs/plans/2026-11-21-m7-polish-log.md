@@ -5821,6 +5821,40 @@ TDD: RED — `has_code_block_cases` (заглушка `false`), `proposals_rules
 41, `works_night` 7, `agent_setup` 21, `nodes` 20, `zam-markdown` и `zam-store --lib`, `zam-cli`
 (`--bin zam` 237, `--test rules` 2); clippy `-D warnings` и `fmt --check` — чисто.
 
+**Круг правок 1** (ревью r1: 3 Important, 8 Minor; Minor 7 и ⚠️ 1 — не делать: `proposals` в
+хвосте `FEATURES` — по указанию координатора, как `works` и `memory_check`). Решения исполнителя
+выше о заголовке почти-дубля, повторе отозванного и пределе при закрытии — заменены:
+- сборщик: ловушки и приёмы (`gotcha | pattern`) — **только из Knowledge**, аксиомы-решения — из
+  Knowledge и решений (§6.7 п. 3; `works::rules::source_kind`); тест `rules_work_sources_and_skip`
+  — ловушка решения с сигналами не берётся, аксиома решения берётся;
+- `sources` карточки: токену заметки пространств, которых он не читает (Human), и скрытые записи
+  (`hidden_entry`: отчёт) — как несуществующие (`{ref, rev, live: false}`), тест
+  `proposals_sources_hidden_for_token`;
+- почти-дубль по векторам — тест с моделью `rules_near_duplicate_by_vector` (MiniLM int8, свой
+  Qdrant теста): тот же смысл под другим заголовком и путём — 409 `reason: vector`, балл ≥ 0,90;
+  правило на ту же тему (CRLF у `.bat`) — 201; порог insight для правил подошёл, своего не нужно;
+- Minor 1: замок решений `DECIDING` — у принятия, отклонения и отзыва;
+- Minor 2: заголовок почти-дубля — только явный (`# …`), имя заметки не сравнивается; текст —
+  «похоже на заметку Rules (…): проверьте, нет ли там этого правила, или предложите другое»;
+- Minor 3: сбой хранилища при проверке — `RuleError::Store` → 500 у REST, у элемента работы —
+  «повторите позже»;
+- Minor 4: контекст `n="0"` — до 50 заметок, путь целиком, L0 до 160 символов (маска до обрезки),
+  без обрезки записи до 1500 символов; тест `rules_context_lists_50_notes`;
+- Minor 5: `withdrawn` повтором не считается (`insert_tx`, `existing_keys`): отзыв — не отказ
+  человека; сборщик `rules` не берёт `accepted_refs` (отсев принятых — строками `proposals`);
+  тесты `withdraw_by_author` (тот же текст — новое `o:`), `withdrawn_source_back_as_candidate`;
+- Minor 6: элемент без места или с предложением у источника — отказ с причиной при проверке;
+  гонка с закрытием — `apply_write` отдаёт предупреждение, `Closed::Closed { warnings }`,
+  `warnings` в итоге работы и его копии для повтора (REST, MCP, `zam work put`); тест
+  `rules_item_full_or_existing_reported`;
+- Minor 8: `has_code_block` — и HTML-блок с `<pre>`/`<code>` (HTML внутри абзаца — нет).
+
+TDD круга: RED — `has_code_block_cases` (`<pre>`), `proposals_rules` — 7 FAILED по ожидаемым
+причинам (ловушка решения в пакете, `sources` с заголовком Human, контекст обрезан, элемент
+«принят» при 50 открытых, «почти-дубль» `git/style`/`rust/style` и прежний текст, отозванное —
+прежнее `o:`, источник не возвращается); `rules_near_duplicate_by_vector` — зелёный и на прежнем
+коде (покрытие существующей ветки). GREEN — отчёт задачи, «Круг правок 1».
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

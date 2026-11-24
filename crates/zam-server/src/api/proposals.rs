@@ -17,7 +17,7 @@
 //! - `GET /proposals/counts` → `{rules}` — открытых кандидатов (метка дерева «кандидаты: N»).
 //! - `GET /proposals/{id}` (`o:<id>` или id) → карточка и `rules_tokens {now, after}` (оценка
 //!   Rules в дайджесте сейчас и с кандидатом, §6.7 п. 4), `sources` (ссылки основания с
-//!   заголовками).
+//!   заголовками; токену заметки Human и отчёты — как несуществующие).
 //! - `POST /proposals/{id}/accept {path?, content?}` — **только сессия WebUI** (токену — 403):
 //!   путь и текст можно поправить (человек вправе дописать адрес или пример — решение 58; маска
 //!   секрета — 422); заметка Rules создаётся **тем же кодом, что заметка WebUI**
@@ -70,9 +70,10 @@ pub const RW_REQUIRED_DETAIL: &str = "кандидат в Rules требует �
 pub const HUMAN_ONLY_DETAIL: &str = "кандидата в Rules принимает и отклоняет только человек \
      (WebUI «Кандидаты в Rules»); своё агент отзывает — POST /proposals/{id}/withdraw";
 
-/// Принятия — по одному (создание заметки и решение — два шага): второе принятие того же
-/// кандидата ждёт первое и видит его итог.
-static ACCEPTING: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(Default::default);
+/// Решения по предложениям — по одному: у принятия создание заметки и решение — два шага, и
+/// отклонение или отзыв между ними оставили бы заметку при ответе 409 (ревью r1, Minor 1); второе
+/// решение того же кандидата ждёт первое и видит его итог.
+static DECIDING: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(Default::default);
 
 /// Предложение по ссылке `o:<id>` или id.
 fn proposal_id(raw: &str) -> Result<Id, ApiError> {
@@ -335,8 +336,21 @@ pub async fn counts(
     Ok(Json(json!({"rules": c.rules})))
 }
 
-/// Ссылки основания и источников с заголовками (записи журнала и заметки базы).
-async fn sources(db: &zam_store::Db, x: &Proposal) -> Result<Vec<Value>, ApiError> {
+/// Ссылки основания и источников с заголовками (записи журнала и заметки базы). Ссылки `basis`
+/// задаёт агент, поэтому доступ — по принципалу (ревью r1, Important 2): токену заметки и записи
+/// пространств, которых он не читает (Human), и скрытые записи (`hidden_entry`: отчёт) — как
+/// несуществующие, `{ref, rev, live: false}` без пути, вида и заголовка.
+async fn sources(p: &Principal, db: &zam_store::Db, x: &Proposal) -> Result<Vec<Value>, ApiError> {
+    let spaces: std::collections::HashMap<Id, zam_store::Space> = zam_store::list_spaces(db)
+        .await?
+        .into_iter()
+        .map(|s| (s.id, s))
+        .collect();
+    let readable = |space: Id| {
+        spaces
+            .get(&space)
+            .is_some_and(|s| super::scope::token_can_read(p, s))
+    };
     let mut refs: Vec<(String, Option<i64>)> = x
         .targets
         .iter()
@@ -353,13 +367,19 @@ async fn sources(db: &zam_store::Db, x: &Proposal) -> Result<Vec<Value>, ApiErro
         let id = raw.parse::<Id>().ok();
         let found = match (letter, id) {
             ("n", Some(id)) => match zam_store::get_node(db, id).await {
-                Ok(n) if n.deleted_at.is_none() => Some((n.path, n.current_rev, "note".into())),
+                Ok(n) if n.deleted_at.is_none() && readable(n.space_id) => {
+                    Some((n.path, n.current_rev, "note".into()))
+                }
                 Ok(_) | Err(zam_store::StoreError::NotFound) => None,
                 Err(e) => return Err(e.into()),
             },
             (l, Some(id)) if zam_store::is_entry_ref_letter(l) => {
                 match zam_store::get_entry(db, id).await {
-                    Ok(e) if e.deleted_at.is_none() => {
+                    Ok(e)
+                        if e.deleted_at.is_none()
+                            && readable(e.space_id)
+                            && !super::scope::hidden_entry(p, &e) =>
+                    {
                         Some((e.title, e.rev, e.kind.as_str().to_string()))
                     }
                     Ok(_) | Err(zam_store::StoreError::NotFound) => None,
@@ -394,7 +414,7 @@ pub async fn get(
     let add = (x.status == ProposalStatus::Proposed).then(|| (x.path(), x.content()));
     let (now, after) = rules::rules_tokens(&db, space, add).await?;
     v["rules_tokens"] = json!({"now": now, "after": after});
-    let mut src = Value::from(sources(&db, &x).await?);
+    let mut src = Value::from(sources(&p, &db, &x).await?);
     if agent_view::masks(&p) {
         agent_view::mask_value(&mut src);
     }
@@ -453,7 +473,7 @@ pub async fn accept(
     }
     let b: AcceptBody = body_or_default(body)?;
     let (user, db) = user_db(&st, &p, &headers).await?;
-    let _one = ACCEPTING.lock().await;
+    let _one = DECIDING.lock().await;
     let x = load(&db, &raw).await?;
     if x.status != ProposalStatus::Proposed {
         return Err(not_open(&x));
@@ -557,6 +577,7 @@ pub async fn decline(
         )));
     }
     let (user, db) = user_db(&st, &p, &headers).await?;
+    let _one = DECIDING.lock().await;
     let x = load(&db, &raw).await?;
     let d = Decision {
         to: DecisionKind::Declined,
@@ -595,6 +616,7 @@ pub async fn withdraw(
     }
     require_rw(&p).map_err(|_| ApiError::Denied(RW_REQUIRED_DETAIL.into()))?;
     let (_, db) = user_db(&st, &p, &headers).await?;
+    let _one = DECIDING.lock().await;
     let x = load(&db, &raw).await?;
     if x.author_kind != ProposalAuthor::Agent {
         return Err(ApiError::Denied(

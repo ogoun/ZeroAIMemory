@@ -466,16 +466,29 @@ async fn candidate_token_ro_403() {
     );
 }
 
-/// §6.7 п. 3: сборщик `rules` — аксиомы-решения и ловушки/приёмы с `useful ≥ 2` или
-/// `opened ≥ 3`; в пакете — заголовки заметок Rules; итог: принятый элемент — кандидат (автор —
-/// сессия), `skip` — строка `skipped`, отклонённый проверкой — с причиной; следующая ночь не
-/// берёт источник с предложением и пропущенный в той же ревизии, а отклонённый проверкой и без
-/// итога — берёт.
+/// §6.7 п. 3: сборщик `rules` — аксиомы-решения (Knowledge и решения) и ловушки/приёмы
+/// **Knowledge** с `useful ≥ 2` или `opened ≥ 3` (полезная ловушка решения — факт проекта, не
+/// берётся; ревью r1, Important 1); в пакете — заголовки заметок Rules; итог: принятый элемент —
+/// кандидат (автор — сессия), `skip` — строка `skipped`, отклонённый проверкой — с причиной;
+/// следующая ночь не берёт источник с предложением и пропущенный в той же ревизии, а отклонённый
+/// проверкой и без итога — берёт.
 #[tokio::test]
 async fn rules_work_sources_and_skip() {
     let _g = SERIAL.lock().await;
     let a = server("sources", |_| {}).await;
     set_mode(&a, "agent").await;
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G1, "name": "Решение"})),
+        )
+        .await;
+    ok(&r, StatusCode::CREATED);
+    let sol_gotcha = insight(&a, G1, "gotcha", None, "Ловушка решения").await;
+    useful(&a, &sol_gotcha, 3).await;
+    opened(&a, &sol_gotcha, 4).await;
+    let sol_axiom = insight(&a, G1, "decision", Some("axiom"), "Аксиома решения").await;
     rule_note(
         &a,
         "process/commits",
@@ -506,9 +519,15 @@ async fn rules_work_sources_and_skip() {
         ws[0].space_id,
         space_id(&a, zam_store::SpaceKind::Rules).await
     );
+    // Knowledge, затем решения; ловушка решения — не источник
     assert_eq!(
         last_targets(&a).await,
-        [axiom.clone(), gotcha.clone(), pattern.clone()]
+        [
+            axiom.clone(),
+            gotcha.clone(),
+            pattern.clone(),
+            sol_axiom.clone()
+        ]
     );
     let r = a
         .tok_h(
@@ -569,7 +588,7 @@ async fn rules_work_sources_and_skip() {
     );
     night(&a, 1).await;
     assert_eq!(rules_works(&a).await.len(), 2);
-    assert_eq!(last_targets(&a).await, [pattern]);
+    assert_eq!(last_targets(&a).await, [pattern, sol_axiom]);
 }
 
 /// §6.7 п. 3: проверка кандидата — `content` до 200 токенов (201 — отказ); без URL и блоков
@@ -668,6 +687,23 @@ async fn rules_validator_cases() {
         v["similar"][0]["ref"],
         format!("n:{}", note["id"].as_str().unwrap())
     );
+    assert_eq!(v["similar"][0]["reason"], "title", "{v}");
+    assert!(
+        v["detail"]
+            .as_str()
+            .unwrap()
+            .contains("похоже на заметку Rules"),
+        "{v}"
+    );
+    // без явных заголовков имя заметки не сравнивается: `git/style` и `rust/style` — разные
+    // правила (ревью r1, Minor 2)
+    rule_note(
+        &a,
+        "git/style",
+        "Сообщение коммита — по-русски, в повелительном виде.",
+    )
+    .await;
+    proposed(&a, "rust/style", "Форматируй код rustfmt перед коммитом.").await;
 }
 
 /// §6.3 п. 4, §6.7 п. 3 (решение 59): текст с маской секрета — отказ: спонтанный кандидат —
@@ -995,6 +1031,246 @@ async fn withdraw_by_author() {
             .await,
         StatusCode::FORBIDDEN,
     );
+    // отзыв — не отказ человека (ревью r1, Minor 5): тот же путь и текст — новое предложение
+    let r = propose(&a, &a.token, "w/rule", "Правило, которое отзовут.", REASON).await;
+    ok(&r, StatusCode::CREATED);
+    assert_eq!(r.json()["existing"], false, "{}", r.text());
+    assert_ne!(r.json()["proposal"], o.as_str());
+}
+
+/// Ревью r1, Minor 5: отозванное автором предложение из работы не исключает источник навсегда —
+/// следующая ночь предлагает его снова (в отличие от отказа человека, решение 64).
+#[tokio::test]
+async fn withdrawn_source_back_as_candidate() {
+    let _g = SERIAL.lock().await;
+    let a = server("withdrawn-source", |_| {}).await;
+    set_mode(&a, "agent").await;
+    let axiom = insight(&a, "knowledge", "decision", Some("axiom"), "Аксиома").await;
+    night(&a, 0).await;
+    do_work(
+        &a,
+        json!([rule_item(1, "w/src", "Держись решения владельца.")]),
+    )
+    .await;
+    let r = a.t(Method::GET, PROPOSALS, None).await;
+    let o = r.json()["proposals"][0]["id"].as_str().unwrap().to_string();
+    ok(
+        &a.t(Method::POST, &format!("{PROPOSALS}/{o}/withdraw"), None)
+            .await,
+        StatusCode::OK,
+    );
+    night(&a, 1).await;
+    assert_eq!(rules_works(&a).await.len(), 2);
+    assert_eq!(last_targets(&a).await, [axiom]);
+}
+
+/// §6.7 п. 4, ревью r1, Important 2: `sources` карточки токену — без Human и отчётов (как
+/// несуществующие: `live: false`, без пути и заголовка); человеку — с заголовками.
+#[tokio::test]
+async fn proposals_sources_hidden_for_token() {
+    let _g = SERIAL.lock().await;
+    let a = server("sources-hidden", |_| {}).await;
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G1, "name": "Решение"})),
+        )
+        .await;
+    ok(&r, StatusCode::CREATED);
+    let r = a
+        .adm(
+            Method::POST,
+            "/api/v1/nodes",
+            Some(
+                json!({"space": "human", "path": "личное/дневник", "kind": "note",
+                        "content": "Личная заметка человека."}),
+            ),
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::CREATED);
+    let human = format!("n:{}", r.json()["id"].as_str().unwrap());
+    let r = a
+        .t(
+            Method::POST,
+            &format!("/api/v1/spaces/{G1}/entries"),
+            Some(json!({"kind": "report", "title": "Отчёт для человека"})),
+        )
+        .await;
+    ok(&r, StatusCode::CREATED);
+    let report = format!("p:{}", r.json()["id"].as_str().unwrap());
+    let open = insight(&a, "knowledge", "gotcha", None, "Открытая ловушка").await;
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            PROPOSALS,
+            Some(
+                json!({"type": "rule", "path": "src/rule", "content": "Правило с основанием.",
+                        "reason": REASON, "basis": [human, report, open]}),
+            ),
+            &[("x-zam-session", S1)],
+        )
+        .await;
+    ok(&r, StatusCode::CREATED);
+    let o = r.json()["proposal"].as_str().unwrap().to_string();
+    let r = a.t(Method::GET, &format!("{PROPOSALS}/{o}"), None).await;
+    ok(&r, StatusCode::OK);
+    let src = r.json()["sources"].clone();
+    for (i, hidden) in [(0, true), (1, true), (2, false)] {
+        let s = &src[i];
+        assert_eq!(s["live"], !hidden, "{src}");
+        assert_eq!(s.get("title").is_some(), !hidden, "{src}");
+        assert_eq!(s.get("kind").is_some(), !hidden, "{src}");
+    }
+    assert!(
+        !r.text().contains("дневник") && !r.text().contains("Отчёт для"),
+        "{}",
+        r.text()
+    );
+    let r = a
+        .adm(Method::GET, &format!("{PROPOSALS}/{o}"), None, None)
+        .await;
+    let src = r.json()["sources"].clone();
+    assert_eq!(src[0]["title"], "личное/дневник", "{src}");
+    assert_eq!(src[1]["title"], "Отчёт для человека", "{src}");
+    assert_eq!(src[1]["kind"], "report", "{src}");
+}
+
+/// Ревью r1, Minor 4: контекст пакета `rules` — до 50 заметок Rules целиком (без обрезки записи
+/// до 1500 символов); 51-я — не входит.
+#[tokio::test]
+async fn rules_context_lists_50_notes() {
+    let _g = SERIAL.lock().await;
+    let a = server("context-50", |_| {}).await;
+    set_mode(&a, "agent").await;
+    for i in 0..51 {
+        rule_note(
+            &a,
+            &format!("r{i:02}/rule"),
+            &format!("Правило номер {i}: подробное описание поведения агента во всех проектах."),
+        )
+        .await;
+    }
+    insight(&a, "knowledge", "decision", Some("axiom"), "Аксиома").await;
+    night(&a, 0).await;
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            RECALL,
+            Some(json!({"event": "work", "kind": "rules"})),
+            &[("x-zam-session", S1)],
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    let text = r.json()["text"].as_str().unwrap().to_string();
+    let ctx = text
+        .split("<record n=\"0\"")
+        .nth(1)
+        .and_then(|s| s.split("</record>").next())
+        .unwrap_or_else(|| panic!("нет записи n=0: {text}"));
+    for i in 0..50 {
+        assert!(ctx.contains(&format!("r{i:02}/rule")), "{i}: {ctx}");
+    }
+    assert!(!ctx.contains("r50/rule"), "{ctx}");
+    assert!(!ctx.contains('…'), "контекст обрезан: {ctx}");
+}
+
+/// Ревью r1, Minor 6: элемент `rules`, которому нет места (открытых кандидатов 50) или у
+/// источника которого уже есть предложение, — отказ с причиной при проверке; если место кончилось
+/// между проверкой и закрытием работы — предупреждение в итоге (`warnings`), строки нет.
+#[tokio::test]
+async fn rules_item_full_or_existing_reported() {
+    let _g = SERIAL.lock().await;
+    let a = server("item-full", |_| {}).await;
+    set_mode(&a, "agent").await;
+    let axiom = insight(&a, "knowledge", "decision", Some("axiom"), "Аксиома").await;
+    night(&a, 0).await;
+    for i in 0..50 {
+        proposed(
+            &a,
+            &format!("f/{i}"),
+            &format!("Правило {i} для всех проектов."),
+        )
+        .await;
+    }
+    let v = do_work(
+        &a,
+        json!([rule_item(1, "f/item", "Держись решения владельца.")]),
+    )
+    .await;
+    assert_eq!(v["accepted"], json!([]), "{v}");
+    assert!(
+        v["rejected"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("открытых кандидатов"),
+        "{v}"
+    );
+    // гонка: место кончилось после проверки — закрытие работы пишет предупреждение, а не строку
+    let db = db(&a).await;
+    let rules = space_id(&a, zam_store::SpaceKind::Rules).await;
+    let w = store::enqueue(
+        &db,
+        NewWork {
+            kind: WorkKind::Rules,
+            space: rules,
+            mode: WorkMode::Agent,
+            origin: Origin::Manual,
+            night: None,
+            items: vec![WorkItem {
+                n: 1,
+                target: axiom.clone(),
+                rev: 1,
+                kind: "insight".into(),
+                title: "Аксиома".into(),
+                text: "текст".into(),
+                signals: Vec::new(),
+            }],
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    store::claim_next(&db, &[rules], None, S1, SignedDuration::from_hours(2))
+        .await
+        .unwrap()
+        .unwrap();
+    let write = store::ItemWrite::Rule {
+        target: axiom.clone(),
+        rev: 1,
+        path: "f/race".into(),
+        content: "Правило гонки.".into(),
+        reason: REASON.into(),
+        author_kind: zam_store::proposals::ProposalAuthor::Agent,
+        author: S1.into(),
+        session: Some(S1.into()),
+    };
+    let closed = store::finish_claimed(
+        &db,
+        w.id,
+        Some(S1),
+        WorkState::Done,
+        json!({"accepted": [], "response": {"work": format!("j:{}", w.id)}}),
+        None,
+        vec![write],
+    )
+    .await
+    .unwrap();
+    let store::Closed::Closed { warnings } = closed else {
+        panic!("{closed:?}")
+    };
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains(&axiom) && warnings[0].contains("50"),
+        "{warnings:?}"
+    );
+    let w = store::get(&db, w.id).await.unwrap().unwrap();
+    let res = w.result.unwrap();
+    assert_eq!(res["response"]["warnings"], json!(warnings), "{res}");
+    assert_eq!(counts(&a).await, json!({"rules": 50}));
 }
 
 /// §6 «Общее» (маскировка): ответы `/proposals` токену — с маской `‹secret›`, человеку — исходник.
@@ -1282,4 +1558,65 @@ async fn guide_rules_candidates_section() {
             assert!(sec.contains(want), "{q} {want}: {sec}");
         }
     }
+}
+
+/// §6.7 п. 3, ревью r1, Important 3 (модель и Qdrant; без них — пропуск, в CI — падение):
+/// почти-дубль по dense-косинусу — тот же смысл под другим заголовком и путём — 409
+/// `rule_duplicate` с `reason: vector` и баллом не ниже `insights.dedup_threshold`; другое правило
+/// на ту же тему — 201 (сторож ложных срабатываний порога insight на коротких правилах).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rules_near_duplicate_by_vector() {
+    use common::ml::{MINILM, external, have, ml, until, vector_ready};
+    use common::qdrant::TestQdrant;
+    if !have(MINILM) {
+        return;
+    }
+    let _g = SERIAL.lock().await;
+    let q = TestQdrant::start("rules-vec");
+    let a = server("vector", |c| {
+        ml(c, MINILM);
+        external(c, &q);
+    })
+    .await;
+    vector_ready(&a).await;
+    let body = "A shell script saved with Windows CRLF line endings fails on Linux with a bad \
+                interpreter error. Convert the file to LF line endings before running it.";
+    let note = rule_note(
+        &a,
+        "shell/line-endings",
+        &format!("# Shell scripts need LF line endings\n\n{body}"),
+    )
+    .await;
+    let nid: Id = note["id"].as_str().unwrap().parse().unwrap();
+    let db = db(&a).await;
+    a.st.index.worker.notify();
+    until(
+        "заметка Rules проиндексирована",
+        Duration::from_secs(240),
+        async || zam_store::get_node(&db, nid).await.unwrap().index_state == "indexed",
+    )
+    .await;
+    let r = propose(
+        &a,
+        &a.token,
+        "scripts/lf",
+        &format!("# Scripts require LF line endings\n\n{body}"),
+        REASON,
+    )
+    .await;
+    ok(&r, StatusCode::CONFLICT);
+    let v = r.json();
+    assert_eq!(v["code"], "rule_duplicate", "{v}");
+    let s = &v["similar"][0];
+    assert_eq!(s["ref"], format!("n:{nid}"), "{v}");
+    assert_eq!(s["reason"], "vector", "{v}");
+    let threshold = f64::from(a.st.cfg.insights.dedup_threshold);
+    assert!(s["score"].as_f64().unwrap() >= threshold, "{v}");
+    proposed(
+        &a,
+        "windows/batch",
+        "# Keep Windows batch files in CRLF\n\nWindows .bat and .cmd files must keep CRLF line \
+         endings: do not convert them to LF.",
+    )
+    .await;
 }

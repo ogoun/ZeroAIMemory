@@ -1594,6 +1594,10 @@ fn work_result_md(v: &Value) -> String {
             r["reason"].as_str().unwrap_or("")
         ));
     }
+    // записи принятого, которые не сделаны при закрытии (кандидат в Rules: повтор, предел)
+    for w in v["warnings"].as_array().into_iter().flatten() {
+        s.push_str(&format!("\n- предупреждение: {}", w.as_str().unwrap_or("")));
+    }
     s
 }
 

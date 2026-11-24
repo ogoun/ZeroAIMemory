@@ -785,13 +785,16 @@ CLI `zam`, свой клиент) получает значения, похож�
   кандидат, только токен `rw` (токен `ro` и сессия WebUI — 403). `path` — путь заметки Rules
   (`rules:/<путь>` или путь; другое пространство — 400). Проверка — та же, что у элемента работы
   вида `rules`: `content` до 200 токенов (счётчик выдачи), без маски `‹secret›`, URL и блоков кода
-  (огороженных и отступом — по разбору Markdown; вложенный список и однострочный код — можно) —
-  иначе 422; `reason` — 20..=2000 символов (422); путь занят — 409 `code: path_taken` (`path`,
-  `node`); почти-дубль заметки Rules (тот же нормализованный заголовок или dense-косинус не ниже
-  `insights.dedup_threshold`) — 409 `code: rule_duplicate` (`similar: [{ref, path, reason, score}]`);
+  (огороженных, отступом и HTML-блоков `<pre>`/`<code>` — по разбору Markdown; вложенный список и
+  однострочный код — можно) — иначе 422; `reason` — 20..=2000 символов (422); путь занят — 409
+  `code: path_taken` (`path`, `node`); почти-дубль заметки Rules (тот же нормализованный явный
+  заголовок `# …` или dense-косинус не ниже `insights.dedup_threshold`) — 409 `code:
+  rule_duplicate` (`similar: [{ref, path, reason: title | vector, score}]`); сбой сервера при
+  проверке — 500;
   `basis` — до 20 ссылок (`i:<id>`, `n:<id>`, `file:<путь>`, `commit:<sha>`). Ответ 201
   `{proposal: "o:<id>", status: "proposed", existing: false}`; тот же путь и текст — 200 с прежним
-  `o:` и его статусом (`existing: true`); открытых кандидатов 50 — 409 `/problems/proposals-full`.
+  `o:` и его статусом (`existing: true`; отозванное автором — не повтор, будет новое предложение);
+  открытых кандидатов 50 — 409 `/problems/proposals-full`.
   Автор — сессия запроса (`X-Zam-Session`, `session_id`), если есть.
 - **`GET /proposals?type=&status=&author=&limit=`** → `{proposals: [{id: "o:<id>", type, status,
   space, path, content, reason, basis, targets: [{ref, rev}], author_kind, author, work, session,
@@ -803,7 +806,8 @@ CLI `zam`, свой клиент) получает значения, похож�
 - **`GET /proposals/counts`** → `{rules}` — открытых кандидатов (метка дерева «кандидаты: N»).
 - **`GET /proposals/{id}`** (`o:<id>` или id) — карточка и `rules_tokens {now, after}` (оценка Rules
   в дайджесте сейчас и с кандидатом, токенов), `sources: [{ref, rev, current_rev?, kind?, title?,
-  live}]` — источники и основание.
+  live}]` — источники и основание; токену заметки Human и отчёты — как несуществующие (`live:
+  false`, без пути, вида и заголовка).
 - **`POST /proposals/{id}/accept {path?, content?}`** — только сессия WebUI (токен — 403): путь и
   текст можно поправить (маска секрета — 422); заметка Rules создаётся тем же кодом, что заметка
   WebUI (автор — человек, сообщение ревизии — «из предложения o:<id> (model:<имя> | сессия <id>)»);
@@ -813,15 +817,18 @@ CLI `zam`, свой клиент) получает значения, похож�
 - **`POST /proposals/{id}/decline {note?}`** — только сессия WebUI: `declined` (источник работы
   больше не предлагается ни в какой ревизии); аудит `proposal.decline {id, type}`.
 - **`POST /proposals/{id}/withdraw`** — автор отзывает своё: токен `rw` пользователя и предложение
-  агента (`author_kind = agent`); человеку и предложению модели — 403.
+  агента (`author_kind = agent`); человеку и предложению модели — 403. Отзыв — не отказ человека:
+  источник работы снова кандидат, тот же текст можно предложить заново.
 - **403 записи в Rules** по токену без `rules.agent_write`: тип прежний (`about:blank`), `detail` —
   «… предложите правило: memory_write {path: "rules:/<путь>", content, candidate: {reason}} …».
 - **MCP**: поле `candidate {reason, basis?}` у `memory_write` с `path: "rules:/<путь>"` и
   `content` → `POST /proposals` (без `base_rev`, `ops`, `l0`).
 - **Вид работы `rules`** (внутренние работы, флаг `works`): источники — действующие insight
-  `decision` с `certainty = axiom` и `gotcha | pattern` с `useful ≥ 2` или `opened ≥ 3` из
-  Knowledge и решений (без записей участников); элемент итога — `{n, rule: {path, title, content},
-  reason}` (та же проверка), отказ `{n, skip}` — строка `skipped` (до новой ревизии источника);
-  запись пакета `n="0"` — действующие заметки Rules (итога для неё нет).
+  `decision` с `certainty = axiom` из Knowledge и решений и `gotcha | pattern` **Knowledge** с
+  `useful ≥ 2` или `opened ≥ 3` (без записей участников); элемент итога — `{n, rule: {path, title,
+  content}, reason}` (та же проверка; нет места или у источника уже есть предложение — отказ с
+  причиной, то же в гонке с закрытием работы — `warnings` ответа итога), отказ `{n, skip}` — строка
+  `skipped` (до новой ревизии источника); запись пакета `n="0"` — действующие заметки Rules (до 50,
+  путь и L0 до 160 символов; итога для неё нет).
 - **CLI** `zam rules candidate <путь> --file F --reason R [--basis ID]…`, `zam rules candidates
   [--status S]`; сервер без флага — код 1 «обновите zam-server до 0.0.16-m7.3 или новее».

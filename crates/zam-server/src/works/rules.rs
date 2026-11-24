@@ -5,25 +5,29 @@
 //!
 //! **Проверка** ([`check_candidate`]): `content` — до [`RULE_MAX_TOKENS`] токенов счётчиком
 //! выдачи (правило читается L1 в каждом дайджесте, ТЗ §7.1), без маски секрета (§6.3 п. 4), без
-//! URL и без блоков кода — огороженных и отступом, по разбору Markdown
-//! ([`zam_markdown::has_code_block`], решение координатора 58: правило «для всех проектов» их не
-//! требует, а они — главный канал внедрения команд); `reason` — [`REASON_CHARS`] символов; путь —
-//! допустимый и свободный путь Rules ([`rule_path`]); не почти-дубль заметки Rules: тот же
-//! нормализованный заголовок или dense-косинус не ниже `insights.dedup_threshold`
-//! (`nearest_dense` по Rules владельца — как дедупликация insight, `api::insights::dedup`); без
-//! модели — только заголовок.
+//! URL и без блоков кода — огороженных, отступом и HTML-блоков `<pre>`/`<code>`, по разбору
+//! Markdown ([`zam_markdown::has_code_block`], решение координатора 58: правило «для всех
+//! проектов» их не требует, а они — главный канал внедрения команд); `reason` — [`REASON_CHARS`]
+//! символов; путь — допустимый и свободный путь Rules ([`rule_path`]); не почти-дубль заметки
+//! Rules: тот же нормализованный **явный** заголовок (имя заметки не сравнивается) или
+//! dense-косинус не ниже `insights.dedup_threshold` (`nearest_dense` по Rules владельца — как
+//! дедупликация insight, `api::insights::dedup`); без модели — только заголовок. Сбой хранилища
+//! при проверке — сбой сервера (REST 500), а не отказ кандидату.
 //!
 //! **Сборщик** ([`collect`]; §6.7 п. 3): источники без предложения — действующие (`active`)
-//! insight `decision` с `certainty = axiom` (решения владельца) и insight `gotcha | pattern` с
-//! `useful ≥ 2` или `opened ≥ 3` из Knowledge и решений базы пользователя; записи, к которым
-//! приложил руку участник общего решения, не берутся (`zam_store::works::owner_entries`, решение
-//! 62); источник, выброшенный вторым сканом (`secret_in_payload`), — до новой ревизии
-//! (`excluded_refs`, решение 72); источник с предложением — никогда, с отказом исполнителя
-//! (`skipped`) — до новой ревизии (`zam_store::proposals::existing_keys`, решение 64). Сколько
-//! кандидатов — не больше свободных мест до [`zam_store::proposals::PROPOSALS_OPEN_MAX`]
-//! открытых. Пакет получает ещё запись `n="0"` — действующие заметки Rules (до
-//! [`RULES_TITLES_MAX`], путь и L0, [`context`]), чтобы исполнитель их не повторял; итога для неё
-//! нет.
+//! insight `decision` с `certainty = axiom` (решения владельца) из Knowledge и решений базы
+//! пользователя и insight `gotcha | pattern` **Knowledge** с `useful ≥ 2` или `opened ≥ 3`
+//! (ловушка решения — факт проекта); записи, к которым приложил руку участник общего решения, не
+//! берутся (`zam_store::works::owner_entries`, решение 62); источник, выброшенный вторым сканом
+//! (`secret_in_payload`), — до новой ревизии (`excluded_refs`, решение 72); источник с
+//! предложением — никогда (кроме отозванного автором), с отказом исполнителя (`skipped`) — до новой
+//! ревизии (`zam_store::proposals::existing_keys`, решение 64). Сколько кандидатов — не больше
+//! свободных мест до [`zam_store::proposals::PROPOSALS_OPEN_MAX`] открытых. Пакет получает ещё
+//! запись `n="0"` — действующие заметки Rules (до [`RULES_TITLES_MAX`], путь и L0 до
+//! [`CONTEXT_L0_MAX_CHARS`], [`context`]), чтобы исполнитель их не повторял; итога для неё нет.
+//! Элемент, которому нет места или у источника которого уже есть предложение, отклоняется
+//! проверкой ([`accept`]); то же, случившееся между проверкой и закрытием работы, — предупреждение
+//! итога (`warnings`).
 //!
 //! Итог не меняет знания (решение координатора 33): принятый элемент — строка `proposals`
 //! ([`ItemWrite::Rule`]), заметку Rules создаёт человек, принимая кандидата
@@ -83,6 +87,9 @@ pub enum RuleError {
     PathTaken { path: String, node: Id },
     /// Почти-дубль заметки Rules (409 `code: rule_duplicate`).
     Duplicate(Vec<Similar>),
+    /// Сбой хранилища при проверке (REST — 500; элемент работы — отказ «повторите позже»);
+    /// подробности — в журнал.
+    Store(String),
 }
 
 impl RuleError {
@@ -90,6 +97,7 @@ impl RuleError {
     pub fn reason(&self) -> String {
         match self {
             RuleError::BadPath(m) | RuleError::Invalid(m) => m.clone(),
+            RuleError::Store(_) => "проверка кандидата не завершилась — повторите позже".into(),
             RuleError::PathTaken { path, node } => format!(
                 "путь rules:/{path} занят заметкой n:{node} — предложите другой путь (например, \
                  {path}-2) или дополните ту заметку"
@@ -100,7 +108,8 @@ impl RuleError {
                     .map(|x| format!("n:{} rules:/{}", x.node, x.path))
                     .collect();
                 format!(
-                    "почти-дубль заметки Rules ({}): правило уже есть — не повторяйте его",
+                    "похоже на заметку Rules ({}): проверьте, нет ли там этого правила, или \
+                     предложите другое (путь и текст)",
                     list.join(", ")
                 )
             }
@@ -114,6 +123,8 @@ impl From<RuleError> for ApiError {
         match e {
             RuleError::BadPath(m) => ApiError::BadRequest(m),
             RuleError::Invalid(m) => ApiError::Unprocessable(m),
+            // сбой сервера, а не клиента: не 422 «не повторяй»
+            RuleError::Store(m) => ApiError::Internal(format!("проверка кандидата в Rules: {m}")),
             RuleError::PathTaken { path, node } => {
                 let mut extra = serde_json::Map::new();
                 extra.insert("code".into(), json!("path_taken"));
@@ -141,9 +152,9 @@ impl From<RuleError> for ApiError {
 
 impl From<StoreError> for RuleError {
     fn from(e: StoreError) -> RuleError {
-        // сбой хранилища при проверке — отказ с общей причиной (подробности — в журнал)
+        // сбой хранилища при проверке — сбой сервера (подробности — в журнал)
         tracing::warn!(error = %e, "кандидат в Rules: проверка не завершилась");
-        RuleError::Invalid("проверка кандидата не завершилась — повторите позже".into())
+        RuleError::Store(e.to_string())
     }
 }
 
@@ -267,14 +278,15 @@ pub async fn check_free(db: &Db, rules: Id, path: &NodePath) -> Result<(), RuleE
     }
 }
 
-/// Заголовок правила для сравнения: первый заголовок Markdown текста, иначе имя заметки (последний
-/// сегмент пути).
-pub fn rule_title(path: &str, content: &str) -> String {
+/// Явный заголовок правила для сравнения — первый заголовок Markdown текста; без него — `None`
+/// (имя заметки не сравнивается: `git/style` и `rust/style` — разные правила, ревью r1, Minor 2;
+/// тот же путь — уже «путь занят»).
+pub fn rule_title(content: &str) -> Option<String> {
     zam_markdown::parse(content)
         .headings
         .first()
         .map(|h| h.text.clone())
-        .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path).to_string())
+        .filter(|t| !zam_store::normalize_title(t).is_empty())
 }
 
 /// Живые заметки Rules с текстом текущей ревизии (по пути).
@@ -305,15 +317,15 @@ pub async fn similar_rules(
     path: &str,
     content: &str,
 ) -> Result<Vec<Similar>, StoreError> {
-    let title = rule_title(path, content);
-    let norm = zam_store::normalize_title(&title);
+    let title = rule_title(content);
+    let norm = title.as_deref().map(zam_store::normalize_title);
     let notes = rule_notes(db, rules).await?;
     let mut out: Vec<Similar> = notes
         .iter()
         .filter(|(n, text)| {
             n.path != path
-                && !norm.is_empty()
-                && zam_store::normalize_title(&rule_title(&n.path, text)) == norm
+                && norm.is_some()
+                && rule_title(text).map(|t| zam_store::normalize_title(&t)) == norm
         })
         .map(|(n, _)| Similar {
             node: n.id,
@@ -329,7 +341,11 @@ pub async fn similar_rules(
     ) else {
         return Ok(out);
     };
-    let text = format!("{}\n{content}", title.trim());
+    // как у дедупликации insight — заголовок и текст
+    let text = match &title {
+        Some(t) => format!("{}\n{content}", t.trim()),
+        None => content.to_string(),
+    };
     let e = match tokio::task::spawn_blocking(move || emb.embed_query(&text)).await {
         Ok(Ok(e)) => e,
         Ok(Err(e)) => {
@@ -497,19 +513,30 @@ pub fn instruction(lang: Lang) -> &'static str {
 }
 
 /// Пространства-источники вида в базе пользователя: Knowledge, затем решения (по id) — Human и
-/// Rules источниками не бывают.
-async fn source_spaces(db: &Db) -> Result<Vec<Id>, StoreError> {
-    let mut spaces: Vec<(u8, Id)> = zam_store::list_spaces(db)
+/// Rules источниками не бывают; с видом пространства (ловушки и приёмы — только из Knowledge).
+async fn source_spaces(db: &Db) -> Result<Vec<(Id, SpaceKind)>, StoreError> {
+    let mut spaces: Vec<(u8, Id, SpaceKind)> = zam_store::list_spaces(db)
         .await?
         .into_iter()
         .filter_map(|s| match s.kind {
-            SpaceKind::Knowledge => Some((0, s.id)),
-            SpaceKind::Solution => Some((1, s.id)),
+            SpaceKind::Knowledge => Some((0, s.id, s.kind)),
+            SpaceKind::Solution => Some((1, s.id, s.kind)),
             _ => None,
         })
         .collect();
-    spaces.sort();
-    Ok(spaces.into_iter().map(|(_, id)| id).collect())
+    spaces.sort_by_key(|(o, id, _)| (*o, *id));
+    Ok(spaces.into_iter().map(|(_, id, k)| (id, k)).collect())
+}
+
+/// Вид insight `ik` — источник кандидата в пространстве вида `space` (§6.7 п. 3): решение с
+/// `certainty = axiom` — из Knowledge и решений («решения владельца»), ловушка и приём — только
+/// из Knowledge (полезная ловушка решения — обычно факт проекта; ревью r1, Important 1).
+fn source_kind(ik: &str, axiom: bool, space: SpaceKind) -> bool {
+    match ik {
+        "decision" => axiom,
+        "gotcha" | "pattern" => space == SpaceKind::Knowledge,
+        _ => false,
+    }
 }
 
 /// Кандидаты вида `rules` пространства Rules `space` пользователя `user` (§6.7 п. 3, см.
@@ -531,11 +558,12 @@ pub async fn collect(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let kind = WorkKind::Rules;
-    let mut skip = store::excluded_refs(&db, kind).await?;
-    skip.extend(store::accepted_refs(&db, kind).await?);
+    // отсев принятых — строками `proposals` (ключ по источнику, отзыв автором не в счёт), а не
+    // `accepted_refs`: принятый элемент, чью строку закрытие не записало (предел, повтор), и
+    // отозванный автором источник снова кандидаты (ревью r1, Minor 5–6)
+    let skip = store::excluded_refs(&db, WorkKind::Rules).await?;
     let mut out = Vec::new();
-    for src in source_spaces(&db).await? {
+    for (src, src_kind) in source_spaces(&db).await? {
         if out.len() >= limit || ctx.stopping() {
             break;
         }
@@ -555,12 +583,8 @@ pub async fn collect(
                 continue;
             }
             let ik = x.data.get("kind").and_then(Value::as_str).unwrap_or("");
-            let keep = match ik {
-                "decision" => x.certainty == Some(zam_store::Certainty::Axiom),
-                "gotcha" | "pattern" => true,
-                _ => false,
-            };
-            if keep {
+            let axiom = x.certainty == Some(zam_store::Certainty::Axiom);
+            if source_kind(ik, axiom, src_kind) {
                 picked.push((e, ik.to_string()));
             }
         }
@@ -615,8 +639,13 @@ pub async fn collect(
     Ok(out)
 }
 
-/// Запись контекста пакета (`n="0"`): действующие заметки Rules — путь и L0 (маска — вид
-/// агента), до [`RULES_TITLES_MAX`]; заметок нет — `None`.
+/// L0 заметки в контексте пакета — не длиннее, символов (одна строка; путь — всегда целиком).
+pub const CONTEXT_L0_MAX_CHARS: usize = 160;
+
+/// Запись контекста пакета (`n="0"`): действующие заметки Rules — путь и L0 (до
+/// [`CONTEXT_L0_MAX_CHARS`] на заметку), до [`RULES_TITLES_MAX`] заметок; маска — на весь текст
+/// (вид агента), без обрезки записи до `ITEM_TEXT_MAX_CHARS`: пределы — число заметок и длина L0
+/// (ревью r1, Minor 4). Заметок нет — `None`.
 pub async fn context(db: &Db, rules: Id) -> Result<Option<Candidate>, StoreError> {
     let notes: Vec<zam_store::Node> = zam_store::list_children(db, rules, None, 16)
         .await?
@@ -629,19 +658,32 @@ pub async fn context(db: &Db, rules: Id) -> Result<Option<Candidate>, StoreError
     }
     let lines: Vec<String> = notes
         .iter()
-        .map(
-            |n| match n.l0.as_deref().map(str::trim).filter(|l| !l.is_empty()) {
-                Some(l0) => format!("- {} — {}", n.path, l0.replace('\n', " ")),
+        .map(|n| {
+            // маска — до обрезки (маска куска ≠ кусок маски)
+            let l0 =
+                n.l0.as_deref()
+                    .map(|l| crate::api::agent_view::mask(l).into_owned())
+                    .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .filter(|l| !l.is_empty());
+            match l0 {
+                Some(l0) => {
+                    let l0 = match l0.char_indices().nth(CONTEXT_L0_MAX_CHARS) {
+                        Some((i, _)) => format!("{}…", &l0[..i]),
+                        None => l0,
+                    };
+                    format!("- {} — {l0}", n.path)
+                }
                 None => format!("- {}", n.path),
-            },
-        )
+            }
+        })
         .collect();
     Ok(Some(Candidate {
         target: CONTEXT_REF.into(),
         rev: 0,
         kind: "rules".into(),
         title: "Действующие заметки Rules — не повторяй их (итога для этой записи нет)".into(),
-        text: agent_text(&lines.join("\n")),
+        // и на весь текст записи (путь заметки тоже может нести секрет)
+        text: crate::api::agent_view::mask(&lines.join("\n")).into_owned(),
         signals: Vec::new(),
     }))
 }
@@ -702,6 +744,27 @@ pub async fn accept(ctx: &ItemCtx<'_>, n: usize, item: &Value) -> Result<Vec<Ite
     )
     .await
     .map_err(|e| Reject::new(e.reason()))?;
+    // запись, которой не будет, — отказ с причиной уже здесь (ревью r1, Minor 6); гонка между
+    // проверкой и закрытием работы — предупреждение итога (`zam_store::works::finish_claimed`)
+    let store_failed = |e: StoreError| Reject::new(RuleError::from(e).reason());
+    if pr::counts(ctx.db).await.map_err(store_failed)?.rules >= pr::PROPOSALS_OPEN_MAX {
+        return Err(Reject::new(format!(
+            "открытых кандидатов в Rules — {}: новый не записывается, пока человек не решит по \
+             прежним",
+            pr::PROPOSALS_OPEN_MAX
+        )));
+    }
+    let key = pr::key_source(ProposalType::Rule, &it.target);
+    if !pr::existing_keys(ctx.db, ProposalType::Rule, std::slice::from_ref(&key))
+        .await
+        .map_err(store_failed)?
+        .is_empty()
+    {
+        return Err(Reject::new(format!(
+            "у источника {} уже есть предложение — повтор не записывается",
+            it.target
+        )));
+    }
     let (author_kind, author, session) = author_of(ctx.author);
     Ok(vec![ItemWrite::Rule {
         target: it.target.clone(),
@@ -802,8 +865,34 @@ mod tests {
         assert_eq!(compose("Имя", "Текст."), "# Имя\n\nТекст.");
         assert_eq!(compose("Имя", "# Свой\n\nТекст."), "# Свой\n\nТекст.");
         assert_eq!(compose("", "Текст."), "Текст.");
-        assert_eq!(rule_title("a/b", "Текст."), "b");
-        assert_eq!(rule_title("a/b", "# Ревью кода\n\nТекст."), "Ревью кода");
+        // имя заметки — не заголовок (ревью r1, Minor 2)
+        assert_eq!(rule_title("Текст."), None);
+        assert_eq!(
+            rule_title("# Ревью кода\n\nТекст.").as_deref(),
+            Some("Ревью кода")
+        );
+        assert_eq!(rule_title("# —\n\nТекст."), None);
+    }
+
+    /// Источники: аксиома-решение — из Knowledge и решений, ловушка и приём — только из Knowledge
+    /// (ревью r1, Important 1); решение без аксиомы и прочие виды — нет.
+    #[test]
+    fn source_kind_cases() {
+        let (k, s) = (SpaceKind::Knowledge, SpaceKind::Solution);
+        assert!(source_kind("decision", true, k) && source_kind("decision", true, s));
+        assert!(!source_kind("decision", false, k));
+        assert!(source_kind("gotcha", false, k) && source_kind("pattern", false, k));
+        assert!(!source_kind("gotcha", false, s) && !source_kind("pattern", true, s));
+        assert!(!source_kind("discovery", true, k));
+    }
+
+    /// Сбой хранилища при проверке — 500 у REST (не 422 «не повторяй»), у элемента работы —
+    /// причина «повторите позже» (ревью r1, Minor 3).
+    #[test]
+    fn store_failure_is_server_error() {
+        let e = RuleError::from(StoreError::Conflict("x".into()));
+        assert!(e.reason().contains("повторите позже"), "{}", e.reason());
+        assert!(matches!(ApiError::from(e), ApiError::Internal(_)));
     }
 
     /// Инструкции вида — в пределе 300 токенов.

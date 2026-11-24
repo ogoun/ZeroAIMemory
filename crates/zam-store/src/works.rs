@@ -515,8 +515,14 @@ pub enum ItemWrite {
 #[cfg(feature = "test-hooks")]
 pub const ECHO_PROPOSAL_TYPE: &str = "echo";
 
-/// Одна запись принятого элемента работы `w` (транзакция закрытия).
-fn apply_write(t: &rusqlite::Transaction<'_>, w: &Work, x: &ItemWrite) -> Result<(), StoreError> {
+/// Одна запись принятого элемента работы `w` (транзакция закрытия). `Some` — предупреждение:
+/// запись не сделана (у источника уже есть предложение, открытых кандидатов — предел), оно уходит
+/// в итог работы (`result.warnings`, ревью r1 задачи 7, Minor 6).
+fn apply_write(
+    t: &rusqlite::Transaction<'_>,
+    w: &Work,
+    x: &ItemWrite,
+) -> Result<Option<String>, StoreError> {
     let _ = (t, w);
     match *x {
         #[cfg(feature = "test-hooks")]
@@ -544,7 +550,7 @@ fn apply_write(t: &rusqlite::Transaction<'_>, w: &Work, x: &ItemWrite) -> Result
                     fmt_ts(now()),
                 ],
             )?;
-            Ok(())
+            Ok(None)
         }
         ItemWrite::Rule {
             ref target,
@@ -574,16 +580,22 @@ fn apply_write(t: &rusqlite::Transaction<'_>, w: &Work, x: &ItemWrite) -> Result
                 work_id: Some(w.id),
                 session_id: session.clone(),
             };
-            match pr::insert_tx(t, &p)? {
-                InsertOutcome::Inserted(_) => {}
+            Ok(match pr::insert_tx(t, &p)? {
+                InsertOutcome::Inserted(_) => None,
                 InsertOutcome::Existing(id) => {
                     tracing::warn!(work = %w.id, %target, proposal = %id, "кандидат в Rules: у источника уже есть предложение — не записан");
+                    Some(format!(
+                        "{target}: у источника уже есть предложение o:{id} — кандидат не записан"
+                    ))
                 }
                 InsertOutcome::Full => {
                     tracing::warn!(work = %w.id, %target, "кандидат в Rules: открытых кандидатов — предел, не записан");
+                    Some(format!(
+                        "{target}: открытых кандидатов в Rules — {} — кандидат не записан",
+                        pr::PROPOSALS_OPEN_MAX
+                    ))
                 }
-            }
-            Ok(())
+            })
         }
         ItemWrite::RuleSkip {
             ref target,
@@ -613,7 +625,7 @@ fn apply_write(t: &rusqlite::Transaction<'_>, w: &Work, x: &ItemWrite) -> Result
             };
             // повтор по ключу (та же ревизия) — без второй строки
             pr::insert_tx(t, &p)?;
-            Ok(())
+            Ok(None)
         }
     }
 }
@@ -621,8 +633,10 @@ fn apply_write(t: &rusqlite::Transaction<'_>, w: &Work, x: &ItemWrite) -> Result
 /// Исход [`finish_claimed`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Closed {
-    /// Работа закрыта итогом, записи принятого — в той же транзакции.
-    Closed,
+    /// Работа закрыта итогом, записи принятого — в той же транзакции; `warnings` — записи,
+    /// которые не сделаны (повтор предложения, предел открытых кандидатов), они же — в
+    /// `result.warnings` и `result.response.warnings`.
+    Closed { warnings: Vec<String> },
     /// Работа уже закрыта итогом с этим `Idempotency-Key`: прежний `result` (сверку тела и
     /// прежний ответ берёт вызывающий), ничего не записано.
     Replay(Value),
@@ -646,7 +660,7 @@ pub async fn finish_claimed(
 ) -> Result<Closed, StoreError> {
     let session = session.map(str::to_string);
     let key = key.map(str::to_string);
-    let result = result.to_string();
+    let mut result = result;
     db.write(move |t| {
         let Some(w) = get_tx(t, id)? else {
             return Ok(Closed::NotClaimed(None));
@@ -664,9 +678,20 @@ pub async fn finish_claimed(
         if !claimed {
             return Ok(Closed::NotClaimed(Some(Box::new(w))));
         }
+        let mut warnings = Vec::new();
         for x in &writes {
-            apply_write(t, &w, x)?;
+            warnings.extend(apply_write(t, &w, x)?);
         }
+        // несделанные записи — в итог и в копию ответа (повтор по ключу отдаст их же)
+        if !warnings.is_empty()
+            && let Value::Object(o) = &mut result
+        {
+            o.insert("warnings".into(), serde_json::json!(warnings));
+            if let Some(Value::Object(r)) = o.get_mut("response") {
+                r.insert("warnings".into(), serde_json::json!(warnings));
+            }
+        }
+        let result = result.to_string();
         let error_class = (state == WorkState::Cancelled).then_some(SKIPPED);
         t.execute(
             "UPDATE works SET state = ?2, result = ?3, result_key = ?4, error_class = ?5,
@@ -674,7 +699,7 @@ pub async fn finish_claimed(
              WHERE id = ?1",
             params![id, state.as_str(), result, key, error_class, fmt_ts(now())],
         )?;
-        Ok(Closed::Closed)
+        Ok(Closed::Closed { warnings })
     })
     .await
 }

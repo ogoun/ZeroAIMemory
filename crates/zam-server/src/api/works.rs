@@ -580,7 +580,13 @@ pub async fn result(
     )
     .await?;
     match closed {
-        store::Closed::Closed => Ok(Json(a.response)),
+        store::Closed::Closed { warnings } => {
+            let mut r = a.response;
+            if !warnings.is_empty() {
+                r["warnings"] = json!(warnings);
+            }
+            Ok(Json(r))
+        }
         store::Closed::Replay(prev) => replay(&prev, &hash),
         store::Closed::NotClaimed(Some(w)) => Err(not_claimed(&w)),
         store::Closed::NotClaimed(None) => Err(ApiError::NotFound),

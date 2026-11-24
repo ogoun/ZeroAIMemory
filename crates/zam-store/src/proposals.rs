@@ -12,8 +12,10 @@
 //! [`key_text`]; решение координатора 64): у предложения из работы — по ссылке источника (его
 //! отказ человеком — навсегда, в любой ревизии источника), у отказа исполнителя (`skipped`) — по
 //! ссылке и ревизии (изменённый источник оценивается заново), у спонтанного кандидата агента — по
-//! пути и тексту (тот же путь и текст — прежнее предложение, [`InsertOutcome::Existing`]). Любая
-//! строка с ключом — повтор, в каком бы статусе она ни была.
+//! пути и тексту (тот же путь и текст — прежнее предложение, [`InsertOutcome::Existing`]). Строка
+//! с ключом — повтор в любом статусе, **кроме `withdrawn`**: отзыв автором — не отказ человека
+//! (решение 64 «навсегда» — только у человека; ревью r1 задачи 7, Minor 5), отозванный источник
+//! снова кандидат, тот же текст — новое предложение.
 //!
 //! Статусы: `proposed → accepted | declined | withdrawn` ([`decide`]); `skipped` — исполнитель
 //! решил «правила здесь нет», человеку не показывается (только отсев повторов); `stale` —
@@ -168,7 +170,7 @@ pub struct NewProposal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertOutcome {
     Inserted(Id),
-    /// Строка с тем же `dedup_key` уже есть (в любом статусе) — новой нет.
+    /// Строка с тем же `dedup_key` уже есть (в любом статусе, кроме `withdrawn`) — новой нет.
     Existing(Id),
     /// Открытых предложений типа уже [`PROPOSALS_OPEN_MAX`] — новой нет.
     Full,
@@ -261,13 +263,14 @@ fn open_count(c: &Connection, ptype: ProposalType) -> Result<u32, StoreError> {
 
 /// [`insert`] в транзакции вызывающего (запись принятого элемента работы —
 /// `crate::works::finish_claimed`, одна транзакция с закрытием работы): сначала повтор по
-/// `dedup_key` (в любом статусе — [`InsertOutcome::Existing`]), затем предел открытых
-/// (`proposed`) — [`InsertOutcome::Full`]; у `skipped` предела нет.
+/// `dedup_key` (в любом статусе, кроме `withdrawn`, — [`InsertOutcome::Existing`]), затем предел
+/// открытых (`proposed`) — [`InsertOutcome::Full`]; у `skipped` предела нет.
 pub(crate) fn insert_tx(c: &Connection, p: &NewProposal) -> Result<InsertOutcome, StoreError> {
     if let Some(k) = &p.dedup_key {
         let prev: Option<Id> = c
             .query_row(
-                "SELECT id FROM proposals WHERE dedup_key = ?1 AND type = ?2
+                "SELECT id FROM proposals
+                 WHERE dedup_key = ?1 AND type = ?2 AND status != 'withdrawn'
                  ORDER BY created_at, id LIMIT 1",
                 params![k, p.ptype.as_str()],
                 |r| r.get(0),
@@ -449,7 +452,8 @@ pub async fn counts(db: &Db) -> Result<ProposalCounts, StoreError> {
     .await
 }
 
-/// Какие из ключей `keys` уже есть у предложений типа `ptype` (в любом статусе): сборщик вида
+/// Какие из ключей `keys` уже есть у предложений типа `ptype` (в любом статусе, кроме
+/// `withdrawn`): сборщик вида
 /// `rules` не берёт источник, у которого есть предложение ([`key_source`]) или отказ исполнителя
 /// в этой ревизии ([`key_source_rev`]).
 pub async fn existing_keys(
@@ -464,7 +468,8 @@ pub async fn existing_keys(
     db.read(move |c| {
         let mut st = c.prepare_cached(
             "SELECT DISTINCT dedup_key FROM proposals
-             WHERE type = ?1 AND dedup_key IN (SELECT value FROM json_each(?2))",
+             WHERE type = ?1 AND status != 'withdrawn'
+               AND dedup_key IN (SELECT value FROM json_each(?2))",
         )?;
         let rows = st.query_map(params![ptype.as_str(), list], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<Result<HashSet<_>, _>>()?)

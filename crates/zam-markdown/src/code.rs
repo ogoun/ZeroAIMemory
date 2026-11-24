@@ -17,15 +17,24 @@ pub(crate) use zam_secrets::code::{Line, code_spans, fence_of, fenced_lines, lin
 
 use crate::options::comrak_options;
 
-/// Есть ли в Markdown `src` блок кода — огороженный (```` ``` ````, `~~~`) или отступом
-/// (CommonMark: 4 пробела после пустой строки, вне элемента списка) на любой глубине (цитата,
-/// элемент списка); разбор — comrak с [`comrak_options`] (frontmatter — не блок). Инлайн-код
-/// `` `…` `` — не блок. [`crate::Doc`] из [`crate::parse`] блоков кода не отдаёт.
+/// Есть ли в Markdown `src` блок кода — огороженный (```` ``` ````, `~~~`), отступом
+/// (CommonMark: 4 пробела после пустой строки, вне элемента списка) или HTML-блок с `<pre>` /
+/// `<code>` — на любой глубине (цитата, элемент списка); разбор — comrak с [`comrak_options`]
+/// (frontmatter — не блок). Инлайн-код `` `…` `` и HTML внутри абзаца — не блок. [`crate::Doc`]
+/// из [`crate::parse`] блоков кода не отдаёт.
 pub fn has_code_block(src: &str) -> bool {
     let arena = Arena::new();
     let root = parse_document(&arena, src, &comrak_options());
-    root.descendants()
-        .any(|n| matches!(n.data().value, NodeValue::CodeBlock(_)))
+    root.descendants().any(|n| match &n.data().value {
+        NodeValue::CodeBlock(_) => true,
+        // HTML-блок с `<pre>`/`<code>` — тот же канал, что блок кода (M7.3, ревью r1 задачи 7);
+        // HTML внутри абзаца (`HtmlInline`) — как однострочный код, не блок
+        NodeValue::HtmlBlock(h) => {
+            let l = h.literal.to_ascii_lowercase();
+            l.contains("<pre") || l.contains("<code")
+        }
+        _ => false,
+    })
 }
 
 /// Проза `text` без кода (M6.6 §6.1): блоки в ограждениях (```` ``` ````, `~~~`, вместе со
@@ -176,6 +185,12 @@ mod tests {
             ("Используй ``a `b` c`` как есть.", false),
             ("---\ntags: [a]\n---\nПравило без кода.", false),
             ("", false),
+            // HTML-блок `<pre>`/`<code>` — тот же канал, что блок кода (ревью r1, Minor 8)
+            ("Текст.\n\n<pre>\nrm -rf /\n</pre>\n", true),
+            ("<PRE class=\"x\">код</PRE>", true),
+            ("<code>\nrm -rf /\n</code>\n", true),
+            ("<div>\nразметка без кода\n</div>\n", false),
+            ("Абзац с <code>x</code> внутри.", false),
         ] {
             assert_eq!(has_code_block(src), want, "{src:?}");
         }
