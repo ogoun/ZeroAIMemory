@@ -55,6 +55,10 @@
 //!   Касание сессии и отметка — одна
 //!   транзакция; сбой учёта — WARN (без id сессии и текста), ответ не портится. Некорректный
 //!   id сессии — 400. Учитывается только явная сессия (M6 §7.1) и её текущая эпоха (§7.2);
+//! - **открытие подсказки** (M7.3 §6.6 п. 2, [`super::opened`]): узел или запись, запрошенные по
+//!   токену явной сессией (текст любого уровня, секция, фокус, `unchanged`, `(budget)`; ошибка
+//!   элемента — нет) после показа этой цели подсказкой `/recall` той же сессии в той же эпохе, —
+//!   строка `usage_opened` в базе цели, одна на сессию и цель; сессия WebUI и вложения — нет;
 //! - **«уже выдавалось»** (M6 §7.3, решение владельца 7): полный текст L2 без `section` (или
 //!   часть вложения по `locator`), который сессия уже получила целиком в той же ревизии и эпохе
 //!   (все ключи элемента отмечены), отдаётся **полностью**, как раньше, но с пометкой
@@ -131,6 +135,7 @@ use super::doc_locator::Sheets;
 use super::json_body;
 use super::nodes::diff_blocking;
 use super::nodes::read::{Tier, l1, parse_tier, section_slice};
+use super::opened::ReadTarget;
 use super::read_focus::{
     FOCUS_NOT_INDEXED, FOCUS_SKIPPED, FocusCtx, FocusOut, FocusPart, FocusResult, FocusTarget,
     focus_read, leaves_within,
@@ -283,8 +288,9 @@ struct Fetched {
     omitted: usize,
     /// Пути устаревших ссылок цели на файлы (M4.5 §6.2); пусто — поля в ответе нет.
     stale_refs: Vec<String>,
-    /// Цель, чьи устаревшие ссылки нужны: база и ссылка (собираются одним запросом на базу).
-    stale_key: Option<(Id, zam_store::Db, TargetRef)>,
+    /// Узел или запись: владелец базы, база и ссылка — устаревшие ссылки цели (одним запросом на
+    /// базу) и открытие подсказки (M7 §6.6, [`super::opened`]); у вложения — нет.
+    target_key: Option<(Id, zam_store::Db, TargetRef)>,
     /// Вложение: файл, документ, блоб, `locator` (M5).
     att: Option<AttMeta>,
     /// Предупреждения элемента (`b:` с несколькими вложениями).
@@ -662,7 +668,7 @@ async fn fetch_node(
         content,
         omitted: 0,
         stale_refs: Vec::new(),
-        stale_key: Some((sc.owner, sc.db.clone(), target)),
+        target_key: Some((sc.owner, sc.db.clone(), target)),
         att: None,
         warnings,
         reread: false,
@@ -795,7 +801,7 @@ async fn fetch_entry(
         content,
         omitted: 0,
         stale_refs: Vec::new(),
-        stale_key: Some((sc.owner, sc.db.clone(), target)),
+        target_key: Some((sc.owner, sc.db.clone(), target)),
         att: None,
         warnings,
         reread: false,
@@ -906,7 +912,7 @@ async fn changes(
 async fn fill_stale_refs(fetched: &mut [Result<Fetched, (String, Fail)>]) -> Result<(), ApiError> {
     let mut by_db: HashMap<Id, (zam_store::Db, Vec<TargetRef>)> = HashMap::new();
     for f in fetched.iter().flatten() {
-        if let Some((owner, db, r)) = &f.stale_key {
+        if let Some((owner, db, r)) = &f.target_key {
             by_db
                 .entry(*owner)
                 .or_insert_with(|| (db.clone(), Vec::new()))
@@ -921,9 +927,9 @@ async fn fill_stale_refs(fetched: &mut [Result<Fetched, (String, Fail)>]) -> Res
         }
     }
     for f in fetched.iter_mut().flatten() {
-        if let Some((owner, _, r)) = f.stale_key.take() {
+        if let Some((owner, _, r)) = &f.target_key {
             // цель может повторяться в пачке (две секции одной заметки) — путь у каждого элемента
-            f.stale_refs = stale.get(&(owner, r)).cloned().unwrap_or_default();
+            f.stale_refs = stale.get(&(*owner, *r)).cloned().unwrap_or_default();
         }
     }
     Ok(())
@@ -1317,7 +1323,7 @@ async fn fetch_attachment(
         content,
         omitted,
         stale_refs: Vec::new(),
-        stale_key: None,
+        target_key: None,
         att: Some(AttMeta {
             file: doc.filename.clone(),
             attachment_id: doc.id,
@@ -1961,6 +1967,23 @@ pub async fn read(
         if let Err(e) = mark_seen_with_tokens(&s.db, &s.touch, &given, &counts).await {
             tracing::warn!(error = %e, "чтение: отметка выданного сессии не выполнена");
         }
+        // открытие подсказки (M7 §6.6 п. 2): цель прочитана — любой уровень, секция, фокус,
+        // `unchanged` и не влезшая в бюджет (агент её запросил); ошибка элемента — нет
+        let read: Vec<ReadTarget> = pieces
+            .iter()
+            .filter_map(|piece| match piece {
+                Piece::Text { f, .. } | Piece::Budget { f, .. } | Piece::Unchanged(f) => {
+                    f.target_key.as_ref()
+                }
+                Piece::Err { .. } => None,
+            })
+            .map(|(owner, db, target)| ReadTarget {
+                owner: *owner,
+                db: db.clone(),
+                target: *target,
+            })
+            .collect();
+        super::opened::record(&p, s, read).await;
     }
 
     // код `error` первого элемента с ошибкой — для клиентов, которым md не разобрать

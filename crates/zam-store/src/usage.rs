@@ -10,9 +10,10 @@
 //!
 //! «Агент открыл подсказку» (`usage_opened`, спецификация M7 §6.6, миграция 0027) — отдельная
 //! таблица в базе цели: одно событие на сессию и цель держит первичный ключ ([`record_opened`] —
-//! `INSERT OR IGNORE`), счётчики — [`opened_counts_many`], начало учёта — строка
-//! `meta.usage_opened_since` ([`usage_opened_since`]). Внешнего ключа на `sessions` нет: уборка
-//! сессий строки не трогает.
+//! `INSERT OR IGNORE`), счётчики — [`opened_counts_many`] и поле `opened` у [`UsageCounts`],
+//! начало учёта — строка `meta.usage_opened_since` ([`usage_opened_since`]), событие показа
+//! открытия — [`open_source`], «шумные» записи — [`noisy_ids`]. Внешнего ключа на `sessions` нет:
+//! уборка сессий строки не трогает.
 use std::collections::HashMap;
 
 use jiff::Timestamp;
@@ -76,6 +77,21 @@ impl UsageSource {
             UsageSource::Webui => "webui",
         }
     }
+
+    /// Источник по строке `usage.source` ([`UsageSource::as_str`]); неизвестная — `None`.
+    pub fn parse(s: &str) -> Option<UsageSource> {
+        [
+            UsageSource::SessionStart,
+            UsageSource::Prompt,
+            UsageSource::PreTool,
+            UsageSource::PostTool,
+            UsageSource::Brief,
+            UsageSource::Agent,
+            UsageSource::Webui,
+        ]
+        .into_iter()
+        .find(|u| u.as_str() == s)
+    }
 }
 
 /// Одно событие `usage`.
@@ -89,10 +105,13 @@ pub struct UsageEvent {
     pub source: Option<UsageSource>,
 }
 
-/// Счётчики цели: показы, «полезно», «бесполезно».
+/// Счётчики цели: показы, открытия, «полезно», «бесполезно».
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct UsageCounts {
     pub shown: i64,
+    /// Сессии, открывшие цель после её подсказки (`usage_opened`, спецификация M7 §6.6 п. 3;
+    /// признак сервера `usage_opened`).
+    pub opened: i64,
     pub useful: i64,
     pub useless: i64,
 }
@@ -103,6 +122,13 @@ pub async fn record_usage(db: &Db, u: &UsageEvent) -> Result<(), StoreError> {
 }
 
 /// Дописывает события одной транзакцией (показы подсказок `/recall` — пачкой).
+///
+/// **Инвариант порядка** (на него опирается окно «шумных» [`noisy_ids`], M7.3 §6.6): строки `usage`
+/// только дописываются, `ts` берётся внутри транзакции единственного писателя, поэтому `id` растёт
+/// вместе с `ts`, пока часы не идут назад. Будущая миграция или иной путь записи, который
+/// пересобирает `usage` с новыми `id`, переносит в неё строки не по порядку времени или пишет `ts`
+/// не «сейчас» (импорт, перенос задним числом), должен сохранить порядок `id` по `ts` (например,
+/// `INSERT … SELECT … ORDER BY ts`) или пересмотреть [`noisy_ids`].
 pub async fn record_usages(db: &Db, events: &[UsageEvent]) -> Result<(), StoreError> {
     if events.is_empty() {
         return Ok(());
@@ -193,8 +219,9 @@ pub async fn unattributed_tokens(
     .await
 }
 
-/// Счётчики событий многих целей одного вида одним запросом (столбец «показы / полезно /
-/// бесполезно» списка Insights WebUI, задача 13); цели без событий в ответе нет.
+/// Счётчики событий многих целей одного вида одним чтением (столбец «показы / полезно /
+/// бесполезно» списка Insights WebUI, задача 13; открытия — `usage_opened`, M7 §6.6 п. 3); цели
+/// без событий и открытий в ответе нет.
 pub async fn usage_counts_many(
     db: &Db,
     kind: TargetKind,
@@ -203,8 +230,7 @@ pub async fn usage_counts_many(
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let list =
-        serde_json::Value::from(ids.iter().map(Id::to_string).collect::<Vec<_>>()).to_string();
+    let list = id_list(ids);
     db.read(move |c| {
         let mut st = c.prepare_cached(
             "SELECT target_id, event, count(*) FROM usage
@@ -229,9 +255,17 @@ pub async fn usage_counts_many(
                 _ => {}
             }
         }
+        for (id, n) in opened_many_in(c, kind, &list)? {
+            out.entry(id).or_default().opened = n;
+        }
         Ok(out)
     })
     .await
+}
+
+/// Список id JSON-массивом строк (`json_each` запросов «многих целей»).
+fn id_list(ids: &[Id]) -> String {
+    serde_json::Value::from(ids.iter().map(Id::to_string).collect::<Vec<_>>()).to_string()
 }
 
 /// Ключ `meta` начала учёта открытий (миграция 0027, §6.6 п. 3).
@@ -285,18 +319,120 @@ pub async fn opened_counts_many(
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let list =
-        serde_json::Value::from(ids.iter().map(Id::to_string).collect::<Vec<_>>()).to_string();
+    let list = id_list(ids);
+    db.read(move |c| opened_many_in(c, kind, &list)).await
+}
+
+/// [`opened_counts_many`] на соединении `c`; `list` — [`id_list`].
+fn opened_many_in(
+    c: &rusqlite::Connection,
+    kind: TargetKind,
+    list: &str,
+) -> Result<HashMap<Id, i64>, StoreError> {
+    let mut st = c.prepare_cached(
+        "SELECT target_id, count(*) FROM usage_opened
+         WHERE target_kind = ?1 AND target_id IN (SELECT value FROM json_each(?2))
+         GROUP BY target_id",
+    )?;
+    let rows = st.query_map(params![kind_str(kind), list], |r| {
+        Ok((r.get::<_, Id>(0)?, r.get::<_, i64>(1)?))
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Событие показа, к которому относится открытие цели `target` сессией `session` (§6.6 п. 2):
+/// `source` последнего показа цели этой сессии (`usage.recall_shown`, индекс `usage_target`).
+/// `None` — открытие этой сессией уже записано (повтор не берёт запись базы) или показа этой
+/// сессии в `usage` нет (сбой учёта показа, неизвестный источник). Одно чтение.
+pub async fn open_source(
+    db: &Db,
+    session: &str,
+    target: TargetRef,
+) -> Result<Option<UsageSource>, StoreError> {
+    crate::sessions::check_session_id(session)?;
+    let session = session.to_string();
+    let (opened, source): (bool, Option<String>) = db
+        .read(move |c| {
+            Ok(c.prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM usage_opened
+                                WHERE session_id = ?1 AND target_kind = ?2 AND target_id = ?3),
+                        (SELECT source FROM usage
+                         WHERE target_kind = ?2 AND target_id = ?3 AND event = 'recall_shown'
+                           AND session_id = ?1
+                         ORDER BY id DESC LIMIT 1)",
+            )?
+            .query_row(params![session, kind_str(target.kind), target.id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?)
+        })
+        .await?;
+    if opened {
+        return Ok(None);
+    }
+    Ok(source.as_deref().and_then(UsageSource::parse))
+}
+
+/// Порог «шумной» записи: показов в окне не меньше (ТЗ §10.5, M7 §6.6 п. 3).
+pub const NOISY_MIN_SHOWN: i64 = 10;
+/// Окно «шумных», суток: события с `max(now − NOISY_WINDOW_DAYS, usage_opened_since)`.
+pub const NOISY_WINDOW_DAYS: i64 = 30;
+
+/// Нижняя граница окна в `usage`: `id` последней строки старше начала окна (`?1`). Обход — с конца
+/// по `rowid` до первой такой строки, то есть по строкам окна, а не по всей истории.
+const NOISY_LO_SQL: &str = "SELECT id FROM usage WHERE ts < ?1 ORDER BY id DESC LIMIT 1";
+
+/// Отбор «шумных» ([`noisy_ids`]): показы окна — диапазоном `rowid` (`id > ?3`; `+target_kind` не
+/// даёт планировщику уйти в `usage_target` и обойти все показы записей за всё время); `u.ts >= ?1`
+/// при выполненном условии порядка ([`noisy_ids`]) избыточна и ошибки границы не исправляет —
+/// оставлена как страховка смысла запроса; открытия — по окну (`usage_opened_target`), оценка
+/// `useful` — за всё время (`usage_target`).
+const NOISY_SQL: &str = "SELECT u.target_id FROM usage u
+     WHERE u.id > ?3 AND +u.target_kind = 'entry' AND u.event = 'recall_shown' AND u.ts >= ?1
+     GROUP BY u.target_id
+     HAVING count(*) >= ?2
+        AND NOT EXISTS (SELECT 1 FROM usage x
+                        WHERE x.target_kind = 'entry' AND x.target_id = u.target_id
+                          AND x.event = 'useful')
+        AND NOT EXISTS (SELECT 1 FROM usage_opened o
+                        WHERE o.target_kind = 'entry' AND o.target_id = u.target_id
+                          AND o.ts >= ?1)";
+
+/// «Шумные» записи журналов базы (M7 §6.6 п. 3, решение координатора 68 и круга правок 1 задачи
+/// 6): показов с `since` (включительно) не меньше [`NOISY_MIN_SHOWN`] и ни одного открытия с
+/// `since`, а оценки `useful` нет **за всё время** — любая «полезно», в том числе до начала учёта
+/// открытий и старше окна, запись исключает. Окно — только условие отбора: счётчики записей
+/// вызывающий берёт за всё время ([`usage_counts_many`]). Вид записи и пространство не
+/// проверяются — их ставит фильтр ленты.
+///
+/// Окно `usage` берётся по `id`, стоимость — по строкам окна, а не всей истории. **Условие
+/// корректности** (а не гарантия): порядок `id` совпадает с порядком `ts` (инвариант записи — у
+/// [`record_usages`]). Нарушается, когда системные часы идут назад относительно уже записанных
+/// строк: шаг NTP или ручной перевод назад, загрузка со сбитыми часами в прошлом и последующая
+/// коррекция, перенос базы на машину с отстающими часами, в тестах — `freeze_now` на прошлое
+/// время. Тогда граница `lo` (наибольший `id` строки старше окна) отбрасывает показы, записанные
+/// до строки с более старым временем: показов в окне насчитывается меньше, и «шумных» становится
+/// **меньше** — ложных «шумных» нет (оценка `useful` и открытия от границы не зависят, счётчики
+/// записей — за всё время). Ошибка проходит сама не позже чем через 30 суток: строки после сбоя
+/// становятся старше окна, и `lo` уходит за сбой.
+pub async fn noisy_ids(db: &Db, since: Timestamp) -> Result<Vec<Id>, StoreError> {
+    let since = fmt_ts(since);
     db.read(move |c| {
-        let mut st = c.prepare_cached(
-            "SELECT target_id, count(*) FROM usage_opened
-             WHERE target_kind = ?1 AND target_id IN (SELECT value FROM json_each(?2))
-             GROUP BY target_id",
-        )?;
-        let rows = st.query_map(params![kind_str(kind), list], |r| {
-            Ok((r.get::<_, Id>(0)?, r.get::<_, i64>(1)?))
+        let lo: i64 = c
+            .prepare_cached(NOISY_LO_SQL)?
+            .query_row([&since], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0);
+        let mut st = c.prepare_cached(NOISY_SQL)?;
+        let rows = st.query_map(params![since, NOISY_MIN_SHOWN, lo], |r| {
+            r.get::<_, String>(0)
         })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let mut out = Vec::new();
+        for id in rows {
+            if let Ok(id) = id?.parse::<Id>() {
+                out.push(id);
+            }
+        }
+        Ok(out)
     })
     .await
 }
@@ -317,7 +453,8 @@ pub async fn usage_opened_since(db: &Db) -> Result<Option<Timestamp>, StoreError
     raw.as_deref().map(crate::time::parse_ts).transpose()
 }
 
-/// Счётчики событий цели (по индексу `usage_target`).
+/// Счётчики событий цели (по индексу `usage_target`) и её открытия (`usage_opened_target`) —
+/// одним чтением.
 pub async fn usage_counts(db: &Db, target: TargetRef) -> Result<UsageCounts, StoreError> {
     db.read(move |c| {
         let mut st = c.prepare_cached(
@@ -337,7 +474,66 @@ pub async fn usage_counts(db: &Db, target: TargetRef) -> Result<UsageCounts, Sto
                 _ => {}
             }
         }
+        out.opened = c
+            .prepare_cached(
+                "SELECT count(*) FROM usage_opened WHERE target_kind = ?1 AND target_id = ?2",
+            )?
+            .query_row(params![kind_str(target.kind), target.id], |r| r.get(0))?;
         Ok(out)
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    use super::{NOISY_LO_SQL, NOISY_SQL};
+
+    fn schema() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        for m in crate::USER_MIGRATIONS {
+            c.execute_batch(m.sql).unwrap();
+        }
+        c
+    }
+
+    /// Строки `EXPLAIN QUERY PLAN` запроса с `n` параметрами-строками.
+    fn plan(c: &Connection, sql: &str, n: usize) -> Vec<String> {
+        let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let args = vec!["x"; n];
+        st.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// «Шумные» без миграций (круг правок 1 задачи 6, Minor 1): нижняя граница окна — обход
+    /// `usage` с конца по `rowid` без сортировки, показы окна — диапазоном `rowid`, а не через
+    /// `usage_target` по всей истории; оценка `useful` и открытия — по своим индексам.
+    #[test]
+    fn noisy_window_by_rowid() {
+        let c = schema();
+        let lo = plan(&c, NOISY_LO_SQL, 1);
+        assert!(
+            lo.iter().any(|l| l == "SCAN usage") && !lo.iter().any(|l| l.contains("B-TREE")),
+            "{lo:?}"
+        );
+        let main = plan(&c, NOISY_SQL, 3);
+        assert!(
+            main.iter()
+                .any(|l| l.starts_with("SEARCH u USING INTEGER PRIMARY KEY (rowid>?)")),
+            "{main:?}"
+        );
+        assert!(
+            main.iter().any(|l| l.starts_with("SEARCH x USING ")
+                && l.contains("usage_target (target_kind=? AND target_id=? AND event=?)")),
+            "{main:?}"
+        );
+        assert!(
+            main.iter()
+                .any(|l| l.starts_with("SEARCH o USING ") && l.contains("usage_opened_target")),
+            "{main:?}"
+        );
+    }
 }

@@ -495,13 +495,7 @@ pub fn show(ctx: &Ctx, id: &str) -> Result<(), CliError> {
         }
     }
     out.push_str(&trigger_lines(&e));
-    let u = &e["usage"];
-    if u.is_object() {
-        out.push_str(&format!(
-            "показы: {} · полезно: {} · бесполезно: {}\n",
-            u["shown"], u["useful"], u["useless"]
-        ));
-    }
+    out.push_str(&usage_line(&e["usage"]));
     let body = e["body"].as_str().unwrap_or("");
     if !body.is_empty() {
         out.push('\n');
@@ -509,6 +503,25 @@ pub fn show(ctx: &Ctx, id: &str) -> Result<(), CliError> {
         out.push('\n');
     }
     emit(out.as_bytes())
+}
+
+/// Строка счётчиков `show`: «показы · открыто · полезно · бесполезно» (M7.3 §6.6 п. 3); у сервера
+/// без признака `usage_opened` (0.0.15 и раньше — в `usage` нет `opened`) — прежняя строка без
+/// «открыто»; нет `usage` — пусто.
+fn usage_line(u: &Value) -> String {
+    if !u.is_object() {
+        return String::new();
+    }
+    match u.get("opened") {
+        Some(opened) => format!(
+            "показы: {} · открыто: {opened} · полезно: {} · бесполезно: {}\n",
+            u["shown"], u["useful"], u["useless"]
+        ),
+        None => format!(
+            "показы: {} · полезно: {} · бесполезно: {}\n",
+            u["shown"], u["useful"], u["useless"]
+        ),
+    }
 }
 
 /// Строки `триггер: <вид>:<шаблон>` записи (`show`, `triggers`).

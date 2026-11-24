@@ -568,11 +568,11 @@ fn insight_feedback_counts() {
     let j = json(&z(&["insight", "show", &id, "--json"]));
     assert_eq!(
         j["usage"],
-        serde_json::json!({"shown": 0, "useful": 2, "useless": 1})
+        serde_json::json!({"shown": 0, "opened": 0, "useful": 2, "useless": 1})
     );
     let text = ok(&z(&["insight", "show", &id]));
     assert!(
-        text.contains("показы: 0 · полезно: 2 · бесполезно: 1"),
+        text.contains("показы: 0 · открыто: 0 · полезно: 2 · бесполезно: 1"),
         "{text}"
     );
     // неизвестная оценка — отказ разбора аргументов, неизвестная запись — ошибка сервера
@@ -586,6 +586,85 @@ fn insight_feedback_counts() {
             .status
             .code(),
         Some(0)
+    );
+}
+
+/// M7.3 §6.6 п. 3: `zam insight show` — «показы · открыто · полезно · бесполезно»; «открыто» —
+/// сессии агента, прочитавшие запись после её подсказки в той же сессии (здесь сама `insight show`
+/// с `ZAM_SESSION` после показа `post_tool`). Сервер без `usage.opened` (0.0.15) — прежняя строка.
+#[test]
+fn insight_show_opened() {
+    let (url, tok) = start("opened");
+    let r = tmp("opened-repo");
+    let o = zam(
+        &url,
+        &tok,
+        &r,
+        &[
+            "log",
+            "insight",
+            "--kind",
+            "gotcha",
+            "--title",
+            "Квазар в сборке",
+            "--scope",
+            "global",
+            "--trigger",
+            "error_regex:quasar",
+        ],
+        "Квазар ломает сборку.\n".as_bytes(),
+    );
+    let id = id_of(&ok(&o));
+    let text = ok(&zam(&url, &tok, &r, &["insight", "show", &id], b""));
+    assert!(
+        text.contains("показы: 0 · открыто: 0 · полезно: 0 · бесполезно: 0"),
+        "{text}"
+    );
+    // подсказка к ошибке в сессии агента, затем `insight show` этой сессией
+    let a = ureq::Agent::new_with_config(ureq::Agent::config_builder().proxy(None).build());
+    let mut resp = a
+        .post(format!("{url}/api/v1/recall"))
+        .header("Authorization", format!("Bearer {tok}"))
+        .header("X-Zam-Session", "s-opened")
+        .content_type("application/json")
+        .send(serde_json::json!({"event": "post_tool", "error": "quasar"}).to_string())
+        .unwrap();
+    let hint = resp.body_mut().read_to_string().unwrap();
+    assert!(hint.contains(&id), "{hint}");
+    let in_session = |args: &[&str]| {
+        let mut c = common::zam_cmd();
+        c.env("ZAM_URL", &url)
+            .env("ZAM_TOKEN", &tok)
+            .env("ZAM_SESSION", "s-opened")
+            .env("HOME", &r)
+            .env("USERPROFILE", &r)
+            .current_dir(&r)
+            .args(args)
+            .write_stdin(Vec::new())
+            .output()
+            .unwrap()
+    };
+    let text = ok(&in_session(&["insight", "show", &id]));
+    assert!(
+        text.contains("показы: 1 · открыто: 1 · полезно: 0 · бесполезно: 0"),
+        "{text}"
+    );
+    let j = json(&in_session(&["insight", "show", &id, "--json"]));
+    assert_eq!(
+        j["usage"],
+        serde_json::json!({"shown": 1, "opened": 1, "useful": 0, "useless": 0})
+    );
+    // сервер 0.0.15: `usage` без `opened` — прежняя строка
+    let (old, _) = common::stub(
+        200,
+        r#"{"id":"01E","rev":3,"kind":"insight","status":"active","title":"Т","body":"",
+            "data":{"kind":"gotcha"},"usage":{"shown":4,"useful":1,"useless":0}}"#,
+        std::time::Duration::ZERO,
+    );
+    let text = ok(&zam(&old, "t", &r, &["insight", "show", "01E"], b""));
+    assert!(
+        text.contains("показы: 4 · полезно: 1 · бесполезно: 0") && !text.contains("открыто"),
+        "{text}"
     );
 }
 

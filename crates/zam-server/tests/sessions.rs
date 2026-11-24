@@ -415,7 +415,7 @@ async fn feedback_records_usage_in_owner_db() {
                 .json();
         assert_eq!(
             j["usage"],
-            json!({"shown": 0, "useful": 2, "useless": 1}),
+            json!({"shown": 0, "opened": 0, "useful": 2, "useless": 1}),
             "{j}"
         );
     }
@@ -437,7 +437,7 @@ async fn feedback_records_usage_in_owner_db() {
         .unwrap();
     assert_eq!(
         it["usage"],
-        json!({"shown": 0, "useful": 2, "useless": 1}),
+        json!({"shown": 0, "opened": 0, "useful": 2, "useless": 1}),
         "{l}"
     );
     let target = TargetRef {

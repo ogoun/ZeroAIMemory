@@ -123,6 +123,8 @@ fn health_features_documented() {
         "entries_trash",
         // внутренние работы: настройки, очередь, пакет и итог, журнал отправок (задача 3 M7.3)
         "works",
+        // «агент открыл подсказку»: `usage.opened`, лента `noisy=1` (задача 6 M7.3)
+        "usage_opened",
     ] {
         assert!(built.contains(f), "{f}");
     }
