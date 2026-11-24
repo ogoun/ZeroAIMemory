@@ -22,11 +22,15 @@
 //!   работа `cancelled` (`mode_changed`); пауза, стоп до следующей ночи (`quota`, `limit`,
 //!   `rate`, `unavailable`) и остановка (`aborted`, в том числе сбой хранилища) — работа снова
 //!   `queued`, запуск вида заканчивается; прочие классы — работа `failed`, запуск идёт дальше.
-//! - **Итог** ([`accept`], §6.3 п. 4): элемент — номер `n` пакета; маска секрета в любой строке
-//!   элемента — отказ; `{n, skip}` — явный отказ исполнителя (`result.skip`); проверка вида
-//!   ([`super::kinds::accept_item`]); элементы пакета без итога — `skipped`; элементы,
-//!   выброшенные вторым сканом, — отклонены с `secret_in_payload`. `skip` без элементов —
-//!   работа `cancelled`: сборщик поставит её снова следующей ночью.
+//! - **Итог** ([`accept`], §6.3 п. 4): элемент — номер `n` или ссылка `target` элемента пакета
+//!   (оба — должны совпасть); маска секрета в любой строке элемента — отказ; `{n, skip}` — явный
+//!   отказ исполнителя (`result.skip`); проверка вида ([`super::kinds::accept_item`]; повтор
+//!   номера — только у вида с несколькими элементами на запись, [`super::kinds::repeats`]);
+//!   элементы пакета без итога — `skipped`; элементы, выброшенные вторым сканом, — отклонены с
+//!   `secret_in_payload`. `skip` без элементов — работа `cancelled`: сборщик поставит её снова
+//!   следующей ночью.
+//! - **Предел записей вида** ([`super::kinds::room`]; у `probes` — остаток пределов проб):
+//!   постановка берёт кандидатов не больше остатка, исчерпан — запуск вида кончен.
 //!
 //! Правила [`NightCtx`] (задача 1): признак остановки — только `ctx.stopping()`; клон контекста в
 //! `tokio::spawn` не уносится — ручной запуск модели идёт через `NightRunner::spawn_tracked`.
@@ -221,7 +225,13 @@ pub async fn agent_batch(ctx: &NightCtx, db: &Db, plan: &Plan) -> Result<Vec<Wor
         if done_spaces.contains(&space) {
             continue;
         }
-        let cands = kinds::collect(plan.kind, ctx, plan.user, space, batch).await?;
+        // предел записей вида (у `probes` — остаток пределов проб): исчерпан — постановка кончена
+        let take = match kinds::room(plan.kind, ctx, db, plan.origin).await? {
+            Some(0) => break,
+            Some(r) => r.min(batch),
+            None => batch,
+        };
+        let cands = kinds::collect(plan.kind, ctx, plan.user, space, take).await?;
         if cands.is_empty() {
             continue;
         }
@@ -285,7 +295,14 @@ pub async fn run_model(ctx: &NightCtx, db: &Db, plan: &Plan) -> Result<(), Store
                 if packages_left(db, plan).await? == 0 {
                     return Ok(());
                 }
-                let cands = kinds::collect(plan.kind, ctx, plan.user, first, batch).await?;
+                // предел записей вида (у `probes` — остаток пределов проб): исчерпан — запуск
+                // вида кончен, обращений к модели больше нет
+                let take = match kinds::room(plan.kind, ctx, db, plan.origin).await? {
+                    Some(0) => return Ok(()),
+                    Some(r) => r.min(batch),
+                    None => batch,
+                };
+                let cands = kinds::collect(plan.kind, ctx, plan.user, first, take).await?;
                 if cands.is_empty() {
                     dropped.insert(first);
                     continue;
@@ -552,9 +569,9 @@ pub struct Accepted {
 }
 
 /// Общая проверка итога агента и модели (§6.3 пп. 4, 7) для работы `ctx.work`: `data` —
-/// `{items: [{n, …}], skip?}`; `dropped` — номера, выброшенные вторым сканом. `Err` — итог не по
-/// схеме (не объект, `items` не массив, `skip` не строка). Ничего не пишет: записи принятого —
-/// в [`Accepted::writes`].
+/// `{items: [{n | target, …}], skip?}`; `dropped` — номера, выброшенные вторым сканом. `Err` —
+/// итог не по схеме (не объект, `items` не массив, `skip` не строка). Ничего не пишет: записи
+/// принятого — в [`Accepted::writes`].
 pub async fn accept(
     ctx: &ItemCtx<'_>,
     data: &Value,
@@ -586,12 +603,24 @@ pub async fn accept(
     let mut writes: Vec<store::ItemWrite> = Vec::new();
     let mut seen: HashSet<usize> = HashSet::new();
     for item in items {
+        // элемент — номер `n` или ссылка `target` элемента пакета (задача 4: схема `probes`)
+        let target = item
+            .get("target")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
         let n = item
             .get("n")
             .and_then(Value::as_u64)
-            .and_then(|n| usize::try_from(n).ok());
+            .and_then(|n| usize::try_from(n).ok())
+            .or_else(|| target.and_then(|t| w.items.iter().find(|i| i.target == t).map(|i| i.n)));
         let Some(n) = n else {
-            rejected.push(reject(None, None, "нет n: номер элемента пакета"));
+            let why = if target.is_some() {
+                "target — не запись пакета: ref элемента"
+            } else {
+                "нет n или target: номер или ref элемента пакета"
+            };
+            rejected.push(reject(None, None, why));
             continue;
         };
         let Some(it) = w.item(n) else {
@@ -602,7 +631,15 @@ pub async fn accept(
             // элемент не уходил исполнителю — его итог не принимается
             continue;
         }
-        if !seen.insert(n) {
+        if target.is_some_and(|t| t != it.target) {
+            rejected.push(reject(
+                Some(n),
+                Some(it),
+                "target — не запись элемента n пакета",
+            ));
+            continue;
+        }
+        if !seen.insert(n) && !kinds::repeats(w.kind) {
             rejected.push(reject(Some(n), Some(it), "элемент n повторяется"));
             continue;
         }
@@ -619,7 +656,7 @@ pub async fn accept(
             }
             continue;
         }
-        match kinds::accept_item(w.kind, ctx, n, item).await {
+        match kinds::accept_item(w.kind, ctx, n, item, &writes).await {
             Ok(rows) => {
                 writes.extend(rows);
                 accepted.push(json!({"n": n, "target": it.target, "rev": it.rev, "item": item}));

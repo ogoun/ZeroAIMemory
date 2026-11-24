@@ -5703,14 +5703,14 @@ async fn mcp_log_data_schema_typed() {
 
 // ---------- внутренние работы (M7.3 §6.3) ----------
 
-/// Режим агента у администратора, insight в Knowledge и ночь сегодняшней даты: работа `echo` в
-/// очереди.
+/// Режим агента у администратора (настоящие виды — `off`: их сборщики ставили бы свои работы),
+/// insight в Knowledge и ночь сегодняшней даты: работа `echo` в очереди.
 async fn queued_work(a: &Api) {
     let r = a
         .adm(
             Method::PATCH,
             "/api/v1/auth/settings",
-            Some(json!({"works": {"mode": "agent"}})),
+            Some(json!({"works": {"mode": "agent", "kinds": {"probes": "off", "rules": "off"}}})),
             None,
         )
         .await;

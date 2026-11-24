@@ -469,10 +469,19 @@ pub async fn finish(
 
 /// Запись принятого элемента итога (пробы, кандидаты) — в **той же транзакции**, что закрытие
 /// работы ([`finish_claimed`]): работу сняли, она истекла или закрыта другим итогом — не
-/// записано ничего. Варианты добавляют виды работ (задачи 4 и 7 плана M7.3); без фичи
-/// `test-hooks` перечисление пока пусто.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// записано ничего. Варианты добавляют виды работ (задачи 4 и 7 плана M7.3).
+#[derive(Debug, Clone, PartialEq)]
 pub enum ItemWrite {
+    /// Проба вида `probe` (вид работы `probes`, §6.4 п. 2): пространство и работа пробы — этой
+    /// работы. При записи ещё раз, в транзакции, сверяются предел новых проб постановки работы
+    /// (`works.origin`) с момента `since` — не больше `cap` — и [`crate::probes::insert_probe`]
+    /// (повтор вопроса, предел активных): проверка элемента шла до транзакции, а итоги разных
+    /// работ пользователя принимаются параллельно. Не прошедшая сверку проба не пишется (WARN).
+    Probe {
+        probe: crate::probes::NewProbe,
+        since: Timestamp,
+        cap: u32,
+    },
     /// Тестовый вид `echo` (фича `test-hooks`): строка `proposals` типа [`ECHO_PROPOSAL_TYPE`]
     /// (читатели предложений пропускают неизвестный тип с WARN).
     #[cfg(feature = "test-hooks")]
@@ -494,6 +503,29 @@ pub const ECHO_PROPOSAL_TYPE: &str = "echo";
 fn apply_write(t: &rusqlite::Transaction<'_>, w: &Work, x: &ItemWrite) -> Result<(), StoreError> {
     let _ = (t, w);
     match *x {
+        ItemWrite::Probe {
+            ref probe,
+            since,
+            cap,
+        } => {
+            let made = crate::probes::new_since_tx(t, w.origin.as_str(), since)?;
+            if made >= cap {
+                tracing::warn!(work = %w.id, made, cap, "внутренние работы: предел новых проб исчерпан при записи — проба не записана");
+                return Ok(());
+            }
+            let p = crate::probes::NewProbe {
+                space: Some(w.space_id),
+                work_id: Some(w.id),
+                ..probe.clone()
+            };
+            match crate::probes::insert_tx(t, &p)? {
+                crate::probes::InsertOutcome::Inserted(_) => {}
+                o => {
+                    tracing::warn!(work = %w.id, outcome = ?o, "внутренние работы: проба не записана");
+                }
+            }
+            Ok(())
+        }
         #[cfg(feature = "test-hooks")]
         ItemWrite::Echo {
             ref target,

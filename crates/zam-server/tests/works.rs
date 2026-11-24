@@ -89,15 +89,21 @@ async fn patch(a: &Api, body: Value) -> Resp {
     a.adm(Method::PATCH, SETTINGS, Some(body), None).await
 }
 
-/// Общий режим исполнителя администратора.
+/// Общий режим исполнителя администратора; настоящие виды (`probes`, `rules`) — `off`: тесты
+/// файла — на виде `echo`, а сборщики настоящих видов ставили бы свои работы (задача 4).
 async fn set_mode(a: &Api, mode: &str) {
     ok(
-        &patch(a, json!({"works": {"mode": mode}})).await,
+        &patch(
+            a,
+            json!({"works": {"mode": mode, "kinds": {"probes": "off", "rules": "off"}}}),
+        )
+        .await,
         StatusCode::OK,
     );
 }
 
-/// Подключение к подставной модели (запись личного Vault) и режим `model`.
+/// Подключение к подставной модели (запись личного Vault) и режим `model` (настоящие виды —
+/// `off`, как у [`set_mode`]).
 async fn connect(a: &Api, m: &MockModel) {
     let r = a
         .t(
@@ -112,8 +118,9 @@ async fn connect(a: &Api, m: &MockModel) {
     ok(&r, StatusCode::CREATED);
     let r = patch(
         a,
-        json!({"works": {"mode": "model", "model": {"protocol": "openai", "vault": "llm",
-               "model": "mock-model", "max_tokens": 4000}}}),
+        json!({"works": {"mode": "model", "kinds": {"probes": "off", "rules": "off"},
+               "model": {"protocol": "openai", "vault": "llm", "model": "mock-model",
+                         "max_tokens": 4000}}}),
     )
     .await;
     ok(&r, StatusCode::OK);
@@ -1449,8 +1456,9 @@ async fn works_run_token_403() {
     assert!(echo_works(&a).await.is_empty());
 }
 
-/// Решение 76: `[works] enabled = false` — ручной запуск и проверка подключения — 409
-/// `/problems/works-disabled`, ни одного запроса к модели (`POST /check/run` — задача 5).
+/// Решение 76: `[works] enabled = false` — ручной запуск, проверка подключения и ручной прогон
+/// проверки памяти (`POST /check/run`, человеку и токену) — 409 `/problems/works-disabled`, ни
+/// одного запроса к модели.
 #[tokio::test]
 async fn works_disabled_manual_409() {
     let _g = SERIAL.lock().await;
@@ -1466,6 +1474,10 @@ async fn works_disabled_manual_409() {
     let r = a
         .adm(Method::POST, "/api/v1/works/model/test", None, None)
         .await;
+    problem(&r, StatusCode::CONFLICT, "works-disabled");
+    let r = a.adm(Method::POST, "/api/v1/check/run", None, None).await;
+    problem(&r, StatusCode::CONFLICT, "works-disabled");
+    let r = a.t(Method::POST, "/api/v1/check/run", None).await;
     problem(&r, StatusCode::CONFLICT, "works-disabled");
     assert_eq!(m.count(), 0);
 }
