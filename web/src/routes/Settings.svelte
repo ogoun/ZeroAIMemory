@@ -3,7 +3,13 @@
   // rw (агентам); «Шаблон инструкции» (§15.5) — правка блока для CLAUDE.md / AGENTS.md с
   // предпросмотром (`POST /admin/agent-setup/preview`), сбросом к умолчанию и номером версии.
   // Изменения записываются в аудит (settings.update).
-  import { untrack } from 'svelte';
+  //
+  // M7.3 (спецификация §6.14, правила А и Д): шаблон — поле на виду, правится на месте; набранное
+  // (в поле и в черновиках других агентов и языков) — в стеке проверок ухода: уход по адресу
+  // спрашивает один раз, закрытие вкладки — `beforeunload`. «Сбросить к умолчанию» необратим (свой
+  // текст шаблона уходит) — окно-подтверждение `danger`, фокус на «Отмена».
+  import { onMount, untrack } from 'svelte';
+  import Prompt, { type Ask } from '../components/Prompt.svelte';
   import {
     AGENT_KINDS,
     ApiError,
@@ -18,6 +24,7 @@
     type Settings,
     type TemplatePreview,
   } from '../lib/api';
+  import { guardLeave } from '../lib/leaveEdit';
 
   let { onexpired }: { onexpired: () => void } = $props();
 
@@ -76,6 +83,38 @@
 
   let current = $derived(settings?.agent_setup.templates[tplKey] ?? null);
   let dirty = $derived(!!current && draft !== current.text);
+  let ask = $state<Ask | null>(null);
+
+  /** Несохранённое шаблонов: текст в поле или черновик другого агента или языка. */
+  const unsavedTpl = (): boolean => dirty || Object.keys(drafts).length > 0;
+
+  // шаблон на виду — в стеке проверок ухода (§6.14 п. 4); согласие уйти — черновики отпущены
+  onMount(() =>
+    guardLeave(unsavedTpl, () => {
+      drafts = {};
+      if (current) draft = current.text;
+    }),
+  );
+
+  /** «Сбросить к умолчанию» — подтверждение: свой текст шаблона и несохранённая правка уходят. */
+  function askReset() {
+    const key = `${AGENT_TITLE[tplAgent]} · ${tplLang}`;
+    tplError = '';
+    tplSaved = '';
+    ask = {
+      title: 'Сбросить шаблон к умолчанию?',
+      message:
+        `Свой текст шаблона «${key}» заменится текстом по умолчанию${dirty ? ', несохранённая правка в поле пропадёт' : ''}; ` +
+        'версия блока вырастет, агенты получат напоминание обновить блок.',
+      confirm: 'Сбросить',
+      danger: true,
+      run: async () => {
+        await saveTpl(null);
+        if (tplError) throw new Error(tplError);
+      },
+      refocus: () => document.querySelector('[aria-label="Текст шаблона"]'),
+    };
+  }
 
   $effect(() => {
     // новый шаблон в поле: при первой загрузке и при смене агента или языка
@@ -186,7 +225,7 @@
     <textarea bind:value={draft} rows="12" spellcheck="false" aria-label="Текст шаблона"></textarea>
     <div class="row">
       <button class="primary" disabled={tplBusy || !dirty || !!previewError} onclick={() => saveTpl(draft)}>Сохранить</button>
-      <button disabled={tplBusy || !current?.custom} onclick={() => saveTpl(null)}>Сбросить к умолчанию</button>
+      <button disabled={tplBusy || !current?.custom} onclick={askReset}>Сбросить к умолчанию</button>
       {#if dirty}<span class="muted small">есть несохранённые изменения</span>{/if}
     </div>
     {#if tplError}<p class="error" role="alert">{tplError}</p>{/if}
@@ -203,6 +242,8 @@
     {/if}
   </section>
 {/if}
+
+<Prompt bind:ask />
 
 <style>
   .opt {

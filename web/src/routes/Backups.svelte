@@ -7,8 +7,12 @@
   // готовых копий каталога копий (дата, размер, баз, блобов, версия сервера, расхождения снимков)
   // с «Удалить» (подтверждение); на телефоне — карточками строк. Блок «Восстановление» — порядок
   // из руководства: восстановления и скачивания копии из WebUI нет (решение координатора 24).
-  import { Dialog } from 'bits-ui';
+  // Подтверждения «Снять копию сейчас» и «Удалить копию» — окна на общем каркасе `FormDialog`
+  // (M7.3, §6.14 п. 1): порядок кнопок, телефон, фокус («Удалить» — `danger`, фокус на «Отмена»),
+  // ошибка сервера — в окне, окно открыто; «копия уже идёт» (409) и «копии уже нет» (404) — итог
+  // строкой на странице, окно закрыто.
   import { onMount } from 'svelte';
+  import FormDialog from '../components/FormDialog.svelte';
   import { ApiError, deleteBackup, errorText, listBackups, startBackup, type BackupCopy, type Backups } from '../lib/api';
   import {
     BACKUP_POLL_MS,
@@ -89,6 +93,8 @@
     };
   });
 
+  /** «Снять копию»: ошибка — в окне (исключение), окно открыто; копия уже идёт (по расписанию или
+   * из другой вкладки) — окно закрыто, её ход виден ниже. */
   async function run() {
     sending = true;
     actionMsg = '';
@@ -97,16 +103,16 @@
       await startBackup();
     } catch (e) {
       if (expired(e)) return;
-      // копия уже идёт (по расписанию или из другой вкладки) — её ход виден ниже
-      if (e instanceof ApiError && e.status === 409) actionMsg = e.message;
-      else actionErr = errorText(e);
+      if (!(e instanceof ApiError && e.status === 409)) throw new Error(errorText(e));
+      actionMsg = e.message;
     } finally {
       sending = false;
-      confirmRun = false;
     }
+    confirmRun = false;
     await load();
   }
 
+  /** «Удалить» копию: ошибка — в окне, окно открыто; копии уже нет — окно закрыто, итог строкой. */
   async function remove() {
     const c = confirmDel;
     if (!c) return;
@@ -118,13 +124,17 @@
       actionMsg = `Копия ${c.name} удалена.`;
     } catch (e) {
       if (expired(e)) return;
-      actionErr = e instanceof ApiError && e.status === 404 ? `Копии ${c.name} уже нет в каталоге копий.` : errorText(e);
+      if (!(e instanceof ApiError && e.status === 404)) throw new Error(errorText(e));
+      actionMsg = `Копии ${c.name} уже нет в каталоге копий.`;
     } finally {
       sending = false;
-      confirmDel = null;
     }
+    confirmDel = null;
     await load();
   }
+
+  /** Итог действия на странице — фокус после закрытия окна (кнопка ушла или выключена). */
+  const actionStatus = () => document.querySelector('[data-testid="backup-action"]') ?? document.querySelector('[data-testid="backup-running"]');
 
   let phone = $derived(viewport.current === 'phone');
   let stale = $derived(st ? bannerText(st, now) : null);
@@ -189,7 +199,7 @@
         {/if}
       </p>
     {/if}
-    {#if actionMsg}<p class="small" role="status">{actionMsg}</p>{/if}
+    {#if actionMsg}<p class="small" role="status" tabindex="-1" data-testid="backup-action">{actionMsg}</p>{/if}
     {#if actionErr}<p class="error" role="alert">{actionErr}</p>{/if}
 
     <h3>Готовые копии</h3>
@@ -264,50 +274,37 @@
   {/if}
 </section>
 
-<Dialog.Root
+<!-- подтверждения — окна на общем каркасе (§6.14 п. 1): на телефоне — во всю ширину, не во весь экран -->
+<FormDialog
   open={confirmRun}
-  onOpenChange={(o) => {
-    if (!o && !sending) confirmRun = false;
-  }}
->
-  <Dialog.Portal>
-    <Dialog.Overlay class="overlay" />
-    <Dialog.Content class="panel dialog">
-      <Dialog.Title>Снять копию сейчас</Dialog.Title>
-      <Dialog.Description>
-        Сервер снимет полную копию каталога данных в каталог копий, не останавливаясь: запись и поиск работают. На
-        большой базе это займёт минуты и место на диске размером с базы и новые вложения.
-        {#if st?.schedule === 'daily'}Лишние копии сверх {st.keep} будут удалены, начиная с самых старых.{/if}
-      </Dialog.Description>
-      <div class="row" style="margin-top: 12px;">
-        <button type="button" class="primary" disabled={sending} onclick={run}>Снять копию</button>
-        <Dialog.Close disabled={sending}>Отмена</Dialog.Close>
-      </div>
-    </Dialog.Content>
-  </Dialog.Portal>
-</Dialog.Root>
+  confirm
+  title="Снять копию сейчас"
+  description={'Сервер снимет полную копию каталога данных в каталог копий, не останавливаясь: запись и поиск работают. ' +
+    'На большой базе это займёт минуты и место на диске размером с базы и новые вложения.' +
+    (st?.schedule === 'daily' ? ` Лишние копии сверх ${st.keep} будут удалены, начиная с самых старых.` : '')}
+  submit="Снять копию"
+  busy={sending}
+  refocus={actionStatus}
+  onsubmit={run}
+  onclose={() => (confirmRun = false)}
+/>
 
-<Dialog.Root
+<FormDialog
   open={confirmDel !== null}
-  onOpenChange={(o) => {
-    if (!o && !sending) confirmDel = null;
-  }}
+  confirm
+  danger
+  title="Удалить копию"
+  submit="Удалить"
+  busy={sending}
+  refocus={actionStatus}
+  onsubmit={remove}
+  onclose={() => (confirmDel = null)}
 >
-  <Dialog.Portal>
-    <Dialog.Overlay class="overlay" />
-    <Dialog.Content class="panel dialog">
-      <Dialog.Title>Удалить копию</Dialog.Title>
-      <Dialog.Description class="warn">
-        Копия {confirmDel ? dateTime(confirmDel.created_at) : ''} (<code>{confirmDel?.name}</code>) будет удалена с диска
-        сервера без возможности вернуть.
-      </Dialog.Description>
-      <div class="row" style="margin-top: 12px;">
-        <button type="button" class="danger-fill" disabled={sending} onclick={remove}>Удалить</button>
-        <Dialog.Close disabled={sending}>Отмена</Dialog.Close>
-      </div>
-    </Dialog.Content>
-  </Dialog.Portal>
-</Dialog.Root>
+  <p class="warn">
+    Копия {confirmDel ? dateTime(confirmDel.created_at) : ''} (<code>{confirmDel?.name}</code>) будет удалена с диска
+    сервера без возможности вернуть.
+  </p>
+</FormDialog>
 
 <style>
   h3 {

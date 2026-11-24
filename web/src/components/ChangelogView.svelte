@@ -4,18 +4,21 @@
   // спецификация §5.9): у записи — «Изменить» (`EntryEdit`: заголовок, текст, вид, теги, область;
   // 409 — запись перечитана) и «Удалить» (в корзину, с подтверждением); «Корзина» — удалённые
   // записи с «Восстановить» (`JournalTrash`). Форма и корзина — ленивые чанки.
-  // Форма привязана к записи: переход к другой (Ctrl+K, пункт журнала) её закрывает, а действия,
-  // которые закрыли бы её на месте (фильтры, «Корзина», «Изменить» другой записи), — тоже; при
-  // несохранённом и то и другое сначала спрашивает (`EntryEdit`: проверка ухода и `leave()`).
-  // Переход к записи выключает «Корзину» (запись показывается).
-  import { untrack } from 'svelte';
+  // Правка привязана к записи: переход к другой (Ctrl+K, пункт журнала) её закрывает, при
+  // несохранённом — сначала вопрос. Переход к записи выключает «Корзину» (запись показывается).
+  //
+  // M7.3 (спецификация §6.14 п. 3, решение 85): лента без карточки — «Изменить» открывает правку в
+  // широком окне формы (`EditPanel` с `dialog`): окно на виду при любой прокрутке ленты, вопрос о
+  // несохранённом задаёт окно, переход по адресу — стек проверок ухода. Запись из адреса — сверху
+  // («Открытая запись»), на виду и в фокусе её заголовка (п. 2).
+  import { tick, untrack } from 'svelte';
   import EditPanel from './EditPanel.svelte';
   import Notice from './Notice.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
   import TrashPanel from './TrashPanel.svelte';
   import { ApiError, errorText, getEntry, listEntries, type Entry } from '../lib/api';
   import { trashAsk } from '../lib/entryTrash';
-  import { focusSoon } from '../lib/focus';
+  import { focusNow, focusSoon } from '../lib/focus';
   import { AUTHOR_TEXT, CHANGELOG_KINDS, dataStr, fmtTime } from '../lib/journals';
 
   interface Props {
@@ -93,7 +96,13 @@
     if (!id) return;
     try {
       const e = await getEntry(u, id);
-      if (e.kind === 'changelog') focused = e;
+      if (e.kind !== 'changelog' || id !== entry) return;
+      focused = e;
+      // открытая запись — на виду и в фокусе заголовка (§6.14 п. 2)
+      await tick();
+      const el = root?.querySelector<HTMLElement>('.focused');
+      el?.scrollIntoView({ block: 'start' });
+      focusNow(el?.querySelector('h3'));
     } catch (e) {
       fail(e);
     }
@@ -128,32 +137,16 @@
     }
   }
 
+  // фильтры и «Корзина» под открытым окном правки недоступны (окно модальное): спрашивать нечего
   function applyArea(e: SubmitEvent) {
     e.preventDefault();
-    if (!leaveEdit()) return;
     appliedArea = area.trim();
     load(user, space, true);
   }
 
   function changeKind() {
-    if (!leaveEdit()) {
-      kind = appliedKind;
-      return;
-    }
     appliedKind = kind;
     load(user, space, true);
-  }
-
-  /** Открытая форма правки (`EditPanel`): её несохранённое — в `leaveEdit`. */
-  let editor = $state<{ leave: () => boolean; release: () => void } | null>(null);
-
-  /** Действие закроет открытую форму: при несохранённом — сначала вопрос; `false` — остаться. */
-  function leaveEdit(): boolean {
-    if (!editing) return true;
-    if (editor && !editor.leave()) return false;
-    editor?.release();
-    editing = '';
-    return true;
   }
 
   /** Запись `e` в ленте и в открытой — новой ревизией (после правки или перечитывания). */
@@ -163,7 +156,6 @@
   }
 
   function startEdit(e: Entry) {
-    if (editing !== e.id && !leaveEdit()) return;
     editing = e.id;
     cardError[e.id] = '';
     notice = '';
@@ -171,11 +163,16 @@
 
   let root = $state<HTMLElement | null>(null);
 
-  /** Форма закрыта (сохранено или «Отмена»): фокус — на «Изменить» той записи (у открытой сверху —
-   * она первая в документе). */
+  /** Запись с открытым окном правки (открытая сверху или из ленты; после 409 — новой ревизией). */
+  let editingEntry = $derived(editing ? (focused?.id === editing ? focused : (items.find((x) => x.id === editing) ?? null)) : null);
+
+  /** «Изменить» записи `id` (у открытой сверху — она первая в документе). */
+  const editButton = (id: string) => root?.querySelector(`[data-entry="${CSS.escape(id)}"] .actions button`);
+
+  /** Окно закрыто (сохранено или «Отмена»): фокус — на «Изменить» той записи. */
   function closeEdit(id: string) {
     editing = '';
-    focusSoon(() => root?.querySelector(`[data-entry="${CSS.escape(id)}"] .actions button`));
+    focusSoon(() => editButton(id));
   }
 
   function saved(e: Entry) {
@@ -211,7 +208,6 @@
   }
 
   function toggleTrash() {
-    if (!leaveEdit()) return;
     trash = !trash;
     notice = '';
     // назад к ленте: восстановленные из корзины — в ней
@@ -234,8 +230,6 @@
 </script>
 
 {#snippet card(e: Entry, hl: boolean)}
-  <!-- открытая сверху и та же в ленте — одна форма правки: у открытой -->
-  {@const edit = editing === e.id && (hl || focused?.id !== e.id)}
   <article class="entry" class:focus={hl} data-entry={e.id}>
     <header>
       <span class="kind k-{dataStr(e.data, 'kind') || 'other'}">{dataStr(e.data, 'kind') || 'other'}</span>
@@ -252,14 +246,10 @@
         {#each v as x, i (i)}<code>{x}</code>{/each}
       </div>
     {/each}
-    {#if edit}
-      <EditPanel bind:this={editor} {user} entry={e} onsaved={saved} oncancel={() => closeEdit(e.id)} onreread={replace} {onexpired} />
-    {:else}
-      <div class="row actions">
-        <button type="button" class="small-btn" aria-label="Изменить «{e.title}»" onclick={() => startEdit(e)}>Изменить</button>
-        <button type="button" class="small-btn danger" aria-label="Удалить «{e.title}»" onclick={() => askDelete(e)}>Удалить</button>
-      </div>
-    {/if}
+    <div class="row actions">
+      <button type="button" class="small-btn" aria-label="Изменить «{e.title}»" onclick={() => startEdit(e)}>Изменить</button>
+      <button type="button" class="small-btn danger" aria-label="Удалить «{e.title}»" onclick={() => askDelete(e)}>Удалить</button>
+    </div>
     {#if cardError[e.id]}<p class="error" role="alert">{cardError[e.id]}</p>{/if}
   </article>
 {/snippet}
@@ -314,6 +304,14 @@
 
 <Prompt bind:ask />
 
+<!-- «Изменить» — правка в широком окне формы (лента без карточки, правило В) -->
+{#if editingEntry}
+  {@const e = editingEntry}
+  {#key e.id}
+    <EditPanel dialog {user} entry={e} onsaved={saved} oncancel={() => closeEdit(e.id)} onreread={replace} {onexpired} refocus={() => editButton(e.id)} />
+  {/key}
+{/if}
+
 <style>
   .filters {
     margin-bottom: 16px;
@@ -326,6 +324,7 @@
     gap: 10px;
   }
   .entry {
+    scroll-margin-top: calc(var(--header-h) + 8px);
     padding: 10px 14px;
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -390,8 +389,10 @@
   .refs code {
     min-width: 0;
   }
+  /* открытая запись из адреса прокручивается к началу — под шапку приложения */
   .focused {
     margin-bottom: 16px;
+    scroll-margin-top: calc(var(--header-h) + 8px);
   }
   .actions {
     margin-top: 6px;

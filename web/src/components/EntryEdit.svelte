@@ -82,9 +82,14 @@
   // в окне проверку ухода ставит окно (`FormDialog`)
   onMount(() => (inDialog ? undefined : guardLeave(dirty, release)));
 
-  /** Фокус на первом поле при открытии формы (в окне — фокус ставит окно). */
+  /** Фокус на первом поле при открытии формы. В окне фокус ставит окно (`[data-autofocus]`), но
+   * чанк формы приходит позже открытия окна (`Lazy`): если фокус ещё не в поле этого окна (на его
+   * кнопке, на странице под окном) — первое поле (§6.14 п. 1). */
   function focusOnOpen(node: HTMLElement) {
-    if (!inDialog) node.focus();
+    if (!inDialog) return node.focus();
+    const a = document.activeElement;
+    const dlg = node.closest('[data-form-dialog]');
+    if (!(a && dlg?.contains(a) && a.matches('input, select, textarea'))) node.focus();
   }
 
   function onsubmitForm(e: SubmitEvent) {

@@ -576,9 +576,10 @@ test('changelog_edit_and_trash_restore', async ({ page }) => {
   const num = page.getByRole('navigation', { name: 'Журналы пространства' }).locator('[data-count="changelog"]');
   await expect(num).toHaveText('2');
 
-  // «Изменить»: заголовок и вид — одним PATCH с ревизией карточки, только изменённое
+  // «Изменить»: заголовок и вид — одним PATCH с ревизией карточки, только изменённое; M7.3 (§6.14
+  // п. 3, решение 85): лента без карточки — правка в широком окне формы, а не в элементе ленты
   await card.getByRole('button', { name: 'Изменить «Запись для правки»' }).click();
-  const form = card.getByRole('form', { name: 'Правка записи' });
+  const form = page.getByRole('dialog', { name: 'Правка записи' });
   await expect(form.getByLabel('Заголовок')).toBeFocused();
   await expect(form.getByLabel('Вид')).toHaveValue('fix');
   await form.getByLabel('Заголовок').fill('Запись после правки');
@@ -657,7 +658,8 @@ test('entry_edit_stale_rev_rereads', async ({ page }) => {
   await page.goto(`${base()}#/u/${c.user}/s/${guid}/j/changelog`);
   const card = page.getByRole('feed', { name: 'Лента changelog' }).locator(`[data-entry="${e.id}"]`);
   await card.getByRole('button', { name: 'Изменить «Запись под правкой»' }).click();
-  const form = card.getByRole('form', { name: 'Правка записи' });
+  // правка — в окне формы (M7.3, §6.14 п. 3)
+  const form = page.getByRole('dialog', { name: 'Правка записи' });
   await expect(form.getByLabel('Текст')).toHaveValue('Исходный текст.');
   // пока форма открыта, запись правит агент (другая сессия): текст и вид
   const other = await agentApi<Rec>('PATCH', `entries/${e.id}`, { body: 'Текст агента.', data: { kind: 'docs' } }, {
@@ -733,22 +735,26 @@ test('releases_edit_and_trash_restore', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Релиз 1.1.0' })).toBeVisible();
   const compare = page.locator('.compare');
   await compare.getByRole('button', { name: 'Изменить', exact: true }).click();
-  const form = compare.getByRole('form', { name: 'Правка релиза' });
+  // M7.3 (§6.14 п. 3, решение 85): правка релиза — в широком окне формы; выбор другого релиза и
+  // «Корзина» под модальным окном недоступны — несохранённое спрашивает окно (Esc) и переход по
+  // адресу (один вопрос стека проверок ухода); «Отмена» вопроса — релиз и набранное на месте
+  const form = page.getByRole('dialog', { name: 'Правка релиза' });
   await expect(form.getByLabel('Заголовок')).toBeFocused();
   await form.getByLabel('Заголовок').fill('Релиз 1.1.0 «Осень»');
   await form.getByLabel('Текст').fill('Второй, с правкой.');
-  // выбор другого релиза и «Корзина» при несохранённом — сначала вопрос; «Отмена» вопроса —
-  // релиз и форма с набранным на месте
   const list = page.getByRole('list', { name: 'Релизы' });
-  for (const leave of [list.getByRole('button', { name: /1\.0\.0/ }), trashToggle(page)]) {
-    page.once('dialog', (d) => {
-      expect([d.type(), d.message()]).toEqual(['confirm', LEAVE_EDIT]);
-      void d.dismiss();
-    });
-    await leave.click();
-    await expect(page.getByRole('heading', { name: 'Релиз 1.1.0' })).toBeVisible();
-    await expect(form.getByLabel('Заголовок')).toHaveValue('Релиз 1.1.0 «Осень»');
-  }
+  await page.keyboard.press('Escape');
+  await expect(form.getByTestId('fd-ask')).toContainText(LEAVE_EDIT);
+  await form.getByRole('button', { name: 'Продолжить правку' }).click();
+  page.once('dialog', (d) => {
+    expect([d.type(), d.message()]).toEqual(['confirm', LEAVE_EDIT]);
+    void d.dismiss();
+  });
+
+  await page.evaluate((h) => (location.hash = h), `#/u/${c.user}/s/${guid}/j/releases`);
+  await expect(page).toHaveURL(new RegExp(`/j/releases/${r2.id}$`));
+  await expect(page.getByRole('heading', { name: 'Релиз 1.1.0' })).toBeVisible();
+  await expect(form.getByLabel('Заголовок')).toHaveValue('Релиз 1.1.0 «Осень»');
   await expect(trashToggle(page)).toHaveAttribute('aria-pressed', 'false');
   const saved = page.waitForResponse((r) => r.request().method() === 'PATCH' && r.url().endsWith(`/entries/${r2.id}`));
   await form.getByRole('button', { name: 'Сохранить' }).click();
@@ -848,7 +854,8 @@ test('changelog_edit_follows_entry', async ({ page }) => {
   await page.goto(`${base()}${at(x.id)}`);
   await expect(opened.getByRole('heading')).toHaveText('Запись X');
   await opened.getByRole('button', { name: 'Изменить «Запись X»' }).click();
-  await expect(opened.getByRole('form', { name: 'Правка записи' })).toBeVisible();
+  // M7.3 (§6.14 п. 3): правка — в окне формы
+  await expect(page.getByRole('dialog', { name: 'Правка записи' })).toBeVisible();
 
   // без набранного: переход закрывает форму сразу, без вопроса; кнопки журнала доступны
   page.on('dialog', (d) => {
@@ -857,7 +864,7 @@ test('changelog_edit_follows_entry', async ({ page }) => {
   });
   await go(at(y.id));
   await expect(opened.getByRole('heading')).toHaveText('Запись Y');
-  await expect(page.getByRole('form', { name: 'Правка записи' })).toHaveCount(0);
+  await expect(page.getByRole('dialog', { name: 'Правка записи' })).toHaveCount(0);
   for (const b of [
     opened.getByRole('button', { name: 'Изменить «Запись Y»' }),
     page.getByRole('feed', { name: 'Лента changelog' }).getByRole('button', { name: 'Изменить «Запись X»' }),
@@ -870,7 +877,7 @@ test('changelog_edit_follows_entry', async ({ page }) => {
   // с набранным: переход спрашивает; «Отмена» — адрес и форма с текстом на месте; согласие — форма
   // закрыта, запись X открыта
   await opened.getByRole('button', { name: 'Изменить «Запись Y»' }).click();
-  const form = opened.getByRole('form', { name: 'Правка записи' });
+  const form = page.getByRole('dialog', { name: 'Правка записи' });
   await form.getByLabel('Заголовок').fill('Y с правкой');
   const place = () => page.evaluate(() => (history.state as { zamIdx?: number } | null)?.zamIdx);
   const yIdx = await place();
@@ -892,7 +899,7 @@ test('changelog_edit_follows_entry', async ({ page }) => {
   page.once('dialog', (d) => void d.accept());
   await go(at(x.id));
   await expect(opened.getByRole('heading')).toHaveText('Запись X');
-  await expect(page.getByRole('form', { name: 'Правка записи' })).toHaveCount(0);
+  await expect(page.getByRole('dialog', { name: 'Правка записи' })).toHaveCount(0);
   await expect(opened.getByRole('button', { name: 'Изменить «Запись X»' })).toBeEnabled();
   expect((await agentApi<Rec>('GET', `entries/${y.id}`)).title).toBe('Запись Y');
 

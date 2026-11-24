@@ -1,14 +1,16 @@
 <script lang="ts" module>
   /** Последняя нажатая кнопка или ссылка (не в окне формы): при касании и в Safari нажатая кнопка
    * фокус не получает, а вернуть его при закрытии окна нужно на неё (как `activated` у
-   * `JournalSplit`). Нажатие старше трёх секунд (чанк окна мог грузиться) — не то, что открыло окно. */
+   * `JournalSplit`). Нажатие старше трёх секунд (чанк окна мог грузиться) — не то, что открыло окно.
+   * Пункт меню (`role="menuitem"`) уходит вместе с меню — открывшим окно считается элемент, куда меню
+   * вернуло фокус (кнопка «⋯»). */
   let pressed: { el: HTMLElement; at: number } | null = null;
   if (typeof document !== 'undefined') {
     document.addEventListener(
       'click',
       (e) => {
         const t = e.target instanceof Element ? e.target.closest<HTMLElement>('button, a[href], [role="button"]') : null;
-        if (t && !t.closest('[data-form-dialog]')) pressed = { el: t, at: Date.now() };
+        if (t && !t.closest('[data-form-dialog]') && !t.closest('[role="menu"]')) pressed = { el: t, at: Date.now() };
       },
       true,
     );
@@ -156,7 +158,11 @@
 
   let offGuard: (() => void) | null = null;
 
+  /** Окно на экране (между `opened` и `closed`; снятое вместе с владельцем — нет). */
+  let shown = false;
+
   function opened() {
+    shown = true;
     asking = false;
     pending = false;
     thrown = '';
@@ -170,6 +176,7 @@
   }
 
   function closed() {
+    shown = false;
     offGuard?.();
     offGuard = null;
     layer?.drop();
@@ -181,13 +188,27 @@
     // после перерисовки владельца: элемент, открывший окно, мог уйти вместе с записью
     const back = opener;
     opener = null;
-    setTimeout(() => restoreFocus(back, bySubmit), 0);
+    const box = content;
+    setTimeout(() => restoreAfter(back, bySubmit, box, 0), 0);
   }
 
-  function restoreFocus(back: HTMLElement | null, bySubmit: boolean) {
+  /** Вернуть фокус, когда содержимое окна уже снято: bits-ui снимает его не сразу (присутствие —
+   * после кадра), и пока оно в документе, фокус в нём ещё «жив», а ловушка фокуса окна вернула бы
+   * его обратно; после снятия он падал на `body` — место терялось (нестабильный
+   * `forms_open_focus_trap_esc task-create phone`, задача 10b по сообщению координатора). */
+  function restoreAfter(back: HTMLElement | null, bySubmit: boolean, box: HTMLElement | null, frames: number) {
+    if (box?.isConnected && frames < 30) {
+      requestAnimationFrame(() => restoreAfter(back, bySubmit, box, frames + 1));
+      return;
+    }
+    restoreFocus(back, bySubmit, box);
+  }
+
+  function restoreFocus(back: HTMLElement | null, bySubmit: boolean, box: HTMLElement | null) {
     const a = document.activeElement;
-    // фокус ушёл сам (заголовок карточки созданной записи) — не трогать
-    if (a && a !== document.body && a.isConnected) return;
+    // фокус ушёл сам (заголовок карточки созданной записи) — не трогать; фокус ещё в снятом окне —
+    // не в счёт
+    if (a && a !== document.body && a.isConnected && !box?.contains(a)) return;
     const r = bySubmit ? refocus?.() : null;
     if (r && focusNow(r)) return;
     // отправка открыла другую запись: фокус переведёт её карточка, а не кнопка под окном
@@ -201,7 +222,14 @@
     layer = null;
     if (!open) return;
     if (unsaved()) void ask();
-    else onclose();
+    else {
+      onclose();
+      // владелец окно не закрыл (свой вопрос — «Прервать отправку?» импорта): запись слоя
+      // возвращается, следующая «Назад» снова придёт к окну, а не уведёт со страницы
+      void tick().then(() => {
+        if (shown && open && full && !layer) layer = pushLayer(fromBack);
+      });
+    }
   }
 
   async function ask() {
@@ -269,7 +297,8 @@
     if (!c) return;
     let t: HTMLElement | null = null;
     if (confirm) t = c.querySelector<HTMLElement>(danger ? '[data-fd="cancel"]' : '[data-fd="submit"]');
-    else t = firstField() ?? c.querySelector<HTMLElement>('[data-fd="submit"]:not([hidden])');
+    // полей ещё нет (чанк формы в пути) — видимая основная кнопка: на телефоне — в шапке
+    else t = firstField() ?? [...c.querySelectorAll<HTMLElement>('button[type="submit"]')].find((b) => b.getClientRects().length > 0) ?? null;
     t?.focus();
     if (t instanceof HTMLInputElement && t.hasAttribute('data-select')) t.select();
   }

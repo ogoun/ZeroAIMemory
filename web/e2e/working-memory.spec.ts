@@ -96,24 +96,27 @@ test('glossary_create_alias_conflict', async ({ page }) => {
   await expect(card).toContainText('summary-wm');
   await expect(card).toContainText('digest_wm');
 
-  // новый термин с занятым псевдонимом: 409 и ссылка на занявший термин
+  // новый термин с занятым псевдонимом: 409 и ссылка на занявший термин; M7.3 (§6.14, правило Б) —
+  // «Новый термин» — окно формы с «Добавить», а не форма в карточке
   await page.getByRole('button', { name: 'Новый термин' }).click();
-  const form = page.getByRole('form', { name: 'Новый термин' });
+  const form = page.getByRole('dialog', { name: 'Новый термин' });
   await form.getByLabel('Имя').fill('Сводка WM');
   await form.getByLabel('Определение').fill('То же, но другое имя');
   await form.getByLabel(/Псевдонимы/).fill('summary-wm');
-  await form.getByRole('button', { name: 'Сохранить' }).click();
+  await form.getByRole('button', { name: 'Добавить' }).click();
   const conflict = form.getByTestId('term-conflicts');
   await expect(conflict).toContainText('summary-wm');
   await expect(conflict.getByRole('link', { name: '«Выжимка WM»' })).toBeVisible();
 
-  // другой псевдоним — сохраняется, термин появляется в алфавитном списке
+  // другой псевдоним — сохраняется, окно закрыто, открыта карточка созданного (§6.14 п. 6), термин —
+  // в алфавитном списке
   await form.getByLabel(/Псевдонимы/).fill('digest-wm-2');
-  await form.getByRole('button', { name: 'Сохранить' }).click();
+  await form.getByRole('button', { name: 'Добавить' }).click();
+  await expect(form).toHaveCount(0);
   await expect(list).toContainText('Сводка WM');
   await expect(page.getByRole('article', { name: 'Карточка термина' })).toContainText('digest-wm-2');
 
-  // правка с If-Match: определение меняется, ревизия растёт
+  // правка с If-Match (в карточке на месте, правило В): определение меняется, ревизия растёт
   await page.getByRole('button', { name: 'Править' }).click();
   const edit = page.getByRole('form', { name: 'Правка термина' });
   await edit.getByLabel('Определение').fill('Новое определение сводки');

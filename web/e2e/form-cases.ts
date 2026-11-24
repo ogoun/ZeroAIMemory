@@ -5,12 +5,11 @@
 // несохранённое спрашивает внутри окна, ошибка сервера (ответ 422 на `route`) — в окне, поля целы,
 // после «Добавить» (`after: 'card'`) — карточка созданного на виду и в фокусе.
 //
-// Строки задачи 10a — Задачи, Insights, Идеи (ядро). Задачи 10b и 8 дописывают свои строки — перед
-// последним элементом массива (не в хвост: параллельные задачи иначе правят одну строку). Данные
-// строк — `E2E_FORMS_*` (наполнение — `seedForms` в `forms.spec.ts`) и `E2E_*` global-setup.
-//
-// `SNAP_ONLY` — места перечня вне ядра (задача 10b) для снимков «до» (`E2E_FORMS_SNAP=before`):
-// только как открыть форму на 0.0.15, без проверок; 10b заменяет их полными строками.
+// Строки задачи 10a — Задачи, Insights, Идеи (ядро); задачи 10b — Словарь, Вопросы, ленты Changelog
+// и Releases, окна дерева, вложений, истории, отчётов и кэша, администрирование, импорт, копии и
+// индекс. Задачи дописывают свои строки — перед последним элементом массива (не в хвост:
+// параллельные задачи иначе правят одну строку). Данные строк — `E2E_FORMS_*` (наполнение —
+// `seedForms` в `forms.spec.ts`) и `E2E_*` global-setup.
 import { expect, type Locator, type Page } from '@playwright/test';
 import { IDEAS_GUID } from './seed';
 import type { PageCtx } from './mobile-pages';
@@ -21,7 +20,7 @@ export interface FormCase {
   /** Форма перечня §6.14 (по-русски). */
   name: string;
   /** Имя окна для чтения с экрана (`getByRole('dialog', {name})`); по умолчанию — `name`. */
-  dialog?: string;
+  dialog?: string | RegExp;
   /** Адрес, где открывается форма. */
   page: (c: PageCtx) => string;
   /** Открыть форму (кнопкой страницы или карточки). */
@@ -47,10 +46,23 @@ export interface FormCase {
    * где искать поля и ошибку (`scope`), чем отправить (`submit`); `focus` — фокус на `first` при
    * открытии (поле на виду открытия нет — фокус не переводится). */
   inline?: { scope: (p: Page) => Locator; submit: string; focus: boolean };
+  /** До открытия страницы (подмена ответа `page.route`, где состояние сервера трогать нельзя). */
+  prepare?: (p: Page) => Promise<void>;
+  /** Подтверждение необратимого: после Enter на «Отмена» — ничего не изменилось (кроме общей
+   * проверки «запроса `route` не было»; без `kept` у адреса журнала — запись адреса цела). */
+  kept?: (p: Page) => Promise<void>;
+}
+
+/** GET REST сессией администратора (cookie состояния браузера). */
+export async function sessionGet<T>(p: Page, path: string): Promise<T> {
+  const r = await p.request.get(`${process.env.E2E_BASE_URL}api/v1/${path}`);
+  expect(r.ok(), `GET ${path}: HTTP ${r.status()}`).toBe(true);
+  return (await r.json()) as T;
 }
 
 /** Окно формы по имени. */
-export const dialogOf = (p: Page, name: string): Locator => p.getByRole('dialog', { name, exact: true });
+export const dialogOf = (p: Page, name: string | RegExp): Locator =>
+  typeof name === 'string' ? p.getByRole('dialog', { name, exact: true }) : p.getByRole('dialog', { name });
 
 /** Карточка записи журнала (`article` с `aria-label`). */
 const card = (p: Page, label: string) => p.getByRole('article', { name: label });
@@ -89,6 +101,18 @@ const PATCH_ENTRY = { method: 'PATCH', url: /\/api\/v1\/entries\/[^/?]+$/ };
 const DECIDE = { method: 'POST', url: /\/api\/v1\/entries\/[^/?]+\/decide$/ };
 const DELETE_ENTRY = { method: 'DELETE', url: /\/api\/v1\/entries\/[^/?]+$/ };
 const CREATE_ENTRY = { method: 'POST', url: /\/api\/v1\/spaces\/[^/?]+\/entries$/ };
+const ANSWER = { method: 'POST', url: /\/api\/v1\/entries\/[^/?]+\/answer$/ };
+const NODE_CREATE = { method: 'POST', url: /\/api\/v1\/nodes$/ };
+const SETTINGS_PATCH = { method: 'PATCH', url: /\/api\/v1\/admin\/settings$/ };
+const REINDEX = { method: 'POST', url: /\/api\/v1\/admin\/reindex$/ };
+
+const TERM = 'Карточка термина';
+/** Вопрос ленты по id из `E2E_*`. */
+const question = (p: Page, k: string) => p.locator(`[data-question="${process.env[k]}"]`);
+/** Запись ленты Changelog из адреса (открытая сверху — первая). */
+const changelogEntry = (p: Page) => p.locator(`article[data-entry="${process.env.E2E_FORMS_CHANGELOG}"]`).first();
+/** Строка пользователя форм в таблице «Пользователи». */
+const userRow = (p: Page) => p.locator(`tr[data-user="${process.env.E2E_FORMS_USER}"]`);
 
 export const FORM_CASES: FormCase[] = [
   // ---- Задачи (задача 10a) ----
@@ -344,6 +368,414 @@ export const FORM_CASES: FormCase[] = [
     after: 'notice',
     inline: { scope: (p) => p.getByRole('form', { name: 'Правка идеи' }), submit: 'Сохранить', focus: true },
   },
+  // ---- Словарь (задача 10b): «Новый термин» и «Отозвать» — окна, правка — в карточке ----
+  {
+    id: 'term-new',
+    name: 'Новый термин',
+    page: (c) => journal(c, 'glossary'),
+    open: (p) => press(p, 'Новый термин'),
+    first: 'Имя',
+    fill: async (p) => {
+      await type(p, 'Новый термин', 'Имя', `Термин E2E ${stamp()}`);
+      await type(p, 'Новый термин', 'Определение', 'Определение из окна формы.');
+    },
+    route: CREATE_ENTRY,
+    after: 'card',
+    legacy: 'Новый термин',
+  },
+  {
+    id: 'term-retract',
+    name: 'Отозвать термин',
+    page: (c) => journal(c, 'glossary', c.env('E2E_FORMS_TERM')),
+    open: (p) => pressIn(p, TERM, 'Отозвать'),
+    first: 'Причина',
+    fill: (p) => type(p, 'Отозвать термин', 'Причина', 'термин больше не нужен'),
+    route: { method: 'POST', url: /\/api\/v1\/entries\/[^/?]+\/retract$/ },
+    after: 'notice',
+    legacy: 'Отзыв термина',
+  },
+  {
+    id: 'term-edit',
+    name: 'Править термин (в карточке)',
+    page: (c) => journal(c, 'glossary', c.env('E2E_FORMS_TERM')),
+    open: (p) => pressIn(p, TERM, 'Править'),
+    first: 'Имя',
+    fill: (p) => p.getByRole('form', { name: 'Правка термина' }).getByLabel('Определение').fill(`Определение, правка ${stamp()}`),
+    route: PATCH_ENTRY,
+    after: 'notice',
+    legacy: 'Правка термина',
+    inline: { scope: (p) => p.getByRole('form', { name: 'Правка термина' }), submit: 'Сохранить', focus: true },
+  },
+  // ---- Вопросы (задача 10b): лента без карточки — правка в окне, «отложить» и «начать» — окна ----
+  {
+    id: 'question-edit',
+    name: 'Правка вопроса',
+    page: (c) => journal(c, 'questions', c.env('E2E_FORMS_QUESTION')),
+    open: (p) => question(p, 'E2E_FORMS_QUESTION').getByRole('button', { name: /^Изменить «/ }).click(),
+    first: 'Заголовок',
+    fill: (p) => type(p, 'Правка вопроса', 'Заголовок', `Вопрос форм E2E: правка ${stamp()}`),
+    route: PATCH_ENTRY,
+    after: 'notice',
+    legacy: 'Правка вопроса',
+  },
+  {
+    id: 'question-obsolete',
+    name: 'Вопрос неактуален',
+    dialog: 'Вопрос неактуален?',
+    page: (c) => journal(c, 'questions', c.env('E2E_FORMS_QUESTION')),
+    open: (p) => question(p, 'E2E_FORMS_QUESTION').getByRole('button', { name: /^Неактуален «/ }).click(),
+    first: 'Причина',
+    fill: (p) => type(p, 'Вопрос неактуален?', 'Причина', 'решили без вопроса'),
+    route: PATCH_ENTRY,
+    after: 'notice',
+  },
+  {
+    id: 'question-defer',
+    name: 'Отложить до (вопрос-предложение)',
+    dialog: 'Отложить',
+    page: (c) => `#/u/${c.user}/s/knowledge/j/questions/${c.env('E2E_FORMS_QUESTION_SHARED')}`,
+    open: (p) => question(p, 'E2E_FORMS_QUESTION_SHARED').getByRole('button', { name: 'отложить', exact: true }).click(),
+    first: 'Отложить до',
+    fill: (p) => type(p, 'Отложить', 'Отложить до', utcDay(45)),
+    route: ANSWER,
+    after: 'notice',
+    legacy: 'Отложить идею',
+  },
+  {
+    id: 'question-start',
+    name: 'Начать идею в общем решении',
+    dialog: 'Начать идею в общем решении?',
+    page: (c) => `#/u/${c.user}/s/knowledge/j/questions/${c.env('E2E_FORMS_QUESTION_SHARED')}`,
+    open: (p) => question(p, 'E2E_FORMS_QUESTION_SHARED').getByRole('button', { name: 'начать', exact: true }).click(),
+    route: ANSWER,
+    after: 'notice',
+    confirm: true,
+    legacy: 'Подтверждение «начать»',
+  },
+  {
+    id: 'question-answer',
+    name: 'Ответ текстом (поле на виду)',
+    page: (c) => journal(c, 'questions', c.env('E2E_FORMS_QUESTION')),
+    open: async (p) => {
+      await expect(question(p, 'E2E_FORMS_QUESTION').getByLabel('Ответ на вопрос')).toBeVisible();
+    },
+    first: 'Ответ на вопрос',
+    fill: (p) => question(p, 'E2E_FORMS_QUESTION').getByLabel('Ответ на вопрос').fill(`свой ответ ${stamp()}`),
+    route: ANSWER,
+    after: 'notice',
+    legacy: 'Ответ текстом',
+    inline: { scope: (p) => question(p, 'E2E_FORMS_QUESTION'), submit: 'Ответить', focus: false },
+  },
+  // ---- ленты Changelog и Releases (задача 10b): правка — в широком окне ----
+  {
+    id: 'changelog-edit',
+    name: 'Правка записи Changelog',
+    dialog: 'Правка записи',
+    page: (c) => journal(c, 'changelog', c.env('E2E_FORMS_CHANGELOG')),
+    open: (p) => changelogEntry(p).getByRole('button', { name: /^Изменить «/ }).click(),
+    first: 'Заголовок',
+    fill: (p) => type(p, 'Правка записи', 'Заголовок', `Запись форм E2E: правка ${stamp()}`),
+    route: PATCH_ENTRY,
+    after: 'notice',
+    legacy: 'Правка записи',
+  },
+  {
+    id: 'changelog-delete',
+    name: 'Удалить запись журнала',
+    dialog: 'Удалить запись?',
+    page: (c) => journal(c, 'changelog', c.env('E2E_FORMS_CHANGELOG')),
+    open: (p) => changelogEntry(p).getByRole('button', { name: /^Удалить «/ }).click(),
+    route: DELETE_ENTRY,
+    after: 'none',
+    confirm: true,
+    danger: true,
+  },
+  {
+    id: 'release-edit',
+    name: 'Правка релиза',
+    page: (c) => journal(c, 'releases', c.env('E2E_FORMS_RELEASE')),
+    open: (p) => p.locator('.compare').getByRole('button', { name: 'Изменить', exact: true }).click(),
+    first: 'Заголовок',
+    fill: (p) => type(p, 'Правка релиза', 'Заголовок', `Релиз форм E2E: правка ${stamp()}`),
+    route: PATCH_ENTRY,
+    after: 'notice',
+    legacy: 'Правка релиза',
+  },
+  // ---- окна `Prompt` дерева, вложений, истории, отчёта и кэша (каркас — задача 10a; строки — 10b) ----
+  {
+    id: 'note-new',
+    name: 'Новая заметка',
+    page: (c) => `#/u/${c.user}`,
+    open: (p) => treeMenu(p, 'Knowledge', 'Новая заметка'),
+    first: 'Имя',
+    fill: (p) => type(p, 'Новая заметка', 'Имя', `Заметка форм ${stamp()}`),
+    route: NODE_CREATE,
+    after: 'none',
+  },
+  {
+    id: 'folder-new',
+    name: 'Новая папка',
+    page: (c) => `#/u/${c.user}`,
+    open: (p) => treeMenu(p, 'Knowledge', 'Новая папка'),
+    first: 'Имя',
+    fill: (p) => type(p, 'Новая папка', 'Имя', `Папка форм ${stamp()}`),
+    route: NODE_CREATE,
+    after: 'none',
+  },
+  {
+    id: 'note-move',
+    name: 'Переименовать или переместить',
+    page: (c) => `#/u/${c.user}/s/knowledge/n/${c.env('E2E_NOTE_MEDIA')}`,
+    open: (p) => treeMenu(p, 'Медиа-заметка', 'Переименовать/переместить'),
+    first: 'Путь',
+    fill: (p) => type(p, 'Переименовать или переместить', 'Путь', `Формы/Перенос ${stamp()}`),
+    route: { method: 'POST', url: /\/api\/v1\/nodes\/[^/?]+\/move$/ },
+    after: 'none',
+  },
+  {
+    id: 'note-delete',
+    name: 'Удалить заметку',
+    dialog: 'Удалить?',
+    page: (c) => `#/u/${c.user}/s/knowledge/n/${c.env('E2E_NOTE_MEDIA')}`,
+    open: (p) => treeMenu(p, 'Медиа-заметка', 'Удалить'),
+    route: { method: 'DELETE', url: /\/api\/v1\/nodes\/[^/?]+$/ },
+    after: 'none',
+    confirm: true,
+    danger: true,
+    kept: async (p) => {
+      await sessionGet(p, `nodes/${process.env.E2E_NOTE_MEDIA}`);
+    },
+  },
+  {
+    id: 'attachment-detach',
+    name: 'Открепить вложение',
+    dialog: 'Открепить вложение?',
+    page: (c) => `#/u/${c.user}/s/knowledge/n/${c.env('E2E_NOTE_DOCS')}`,
+    open: async (p) => {
+      await p.getByRole('tab', { name: 'Вложения' }).click();
+      await p.getByRole('button', { name: /^Открепить / }).first().click();
+    },
+    route: { method: 'DELETE', url: /\/api\/v1\/nodes\/[^/?]+\/attachments\// },
+    after: 'none',
+    confirm: true,
+    danger: true,
+    kept: async (p) => {
+      await expect(p.getByRole('button', { name: /^Открепить / }).first()).toBeVisible();
+    },
+  },
+  {
+    id: 'history-revert',
+    name: 'Восстановить ревизию',
+    dialog: /^Откатить к ревизии \d+\?$/,
+    page: (c) => `#/u/${c.user}/s/knowledge/n/${c.env('E2E_NOTE_MEDIA')}`,
+    open: async (p) => {
+      await p.getByRole('tab', { name: 'История' }).click();
+      await p.getByRole('button', { name: 'Откатить к этой' }).first().click();
+    },
+    route: { method: 'POST', url: /\/api\/v1\/nodes\/[^/?]+\/revert$/ },
+    after: 'none',
+    confirm: true,
+    danger: true,
+    kept: async (p) => {
+      await expect(p.getByRole('button', { name: 'Откатить к этой' }).first()).toBeVisible();
+    },
+  },
+  {
+    id: 'report-delete',
+    name: 'Удалить отчёт',
+    dialog: 'Удалить отчёт?',
+    page: (c) => journal(c, 'reports', c.env('E2E_REPORT_PRINT'), c.solution),
+    open: (p) => press(p, 'Удалить'),
+    route: DELETE_ENTRY,
+    after: 'none',
+    confirm: true,
+    danger: true,
+    // отчёт на месте: адрес прежний, страница отчёта с «Удалить» (запроса `DELETE` не было — общая
+    // проверка сценария)
+    kept: async (p) => {
+      await expect(p).toHaveURL(/\/j\/reports\/[^/?#]+$/);
+      await expect(p.getByRole('button', { name: 'Удалить', exact: true }).first()).toBeVisible();
+    },
+  },
+  {
+    id: 'cache-note',
+    name: 'Превратить выжимку в заметку',
+    dialog: 'Превратить в заметку',
+    page: () => '#/cache',
+    open: (p) => p.locator(`tr[data-cache="${process.env.E2E_FORMS_CACHE_QUERY}"]`).getByRole('button', { name: 'Превратить в заметку' }).click(),
+    first: 'Путь заметки',
+    fill: (p) => type(p, 'Превратить в заметку', 'Путь заметки', `Формы/Выжимка ${stamp()}`),
+    route: { method: 'POST', url: /\/api\/v1\/cache\/[^/?]+\/promote$/ },
+    after: 'none',
+  },
+  {
+    id: 'cache-delete',
+    name: 'Удалить выжимку',
+    page: () => '#/cache',
+    open: (p) => p.locator(`tr[data-cache="${process.env.E2E_FORMS_CACHE_QUERY}"]`).getByRole('button', { name: 'Удалить', exact: true }).click(),
+    route: { method: 'DELETE', url: /\/api\/v1\/cache\/[^/?]+$/ },
+    after: 'none',
+    confirm: true,
+    danger: true,
+    kept: async (p) => {
+      await expect(p.locator(`tr[data-cache="${process.env.E2E_FORMS_CACHE_QUERY}"]`)).toHaveCount(1);
+    },
+  },
+  // ---- администрирование и аккаунт (задача 10b): необратимое — подтверждение `danger` ----
+  {
+    id: 'user-password',
+    name: 'Пароль пользователя',
+    get dialog() {
+      return `Пароль пользователя «${process.env.E2E_FORMS_USER}»`;
+    },
+    page: () => '#/admin',
+    open: (p) => userRow(p).getByRole('button', { name: 'Сменить пароль' }).click(),
+    first: 'Пароль',
+    fill: (p) => type(p, `Пароль пользователя «${process.env.E2E_FORMS_USER}»`, 'Пароль', ['forms', 'e2e', 'pass', '2'].join('-')),
+    route: { method: 'POST', url: /\/api\/v1\/admin\/users\/[^/?]+\/password$/ },
+    after: 'notice',
+  },
+  {
+    id: 'user-close',
+    name: 'Закрыть вход пользователя',
+    get dialog() {
+      return `Закрыть вход «${process.env.E2E_FORMS_USER}» в WebUI`;
+    },
+    page: () => '#/admin',
+    open: (p) => userRow(p).getByRole('button', { name: 'Закрыть вход' }).click(),
+    route: { method: 'DELETE', url: /\/api\/v1\/admin\/users\/[^/?]+\/password$/ },
+    after: 'notice',
+    confirm: true,
+    danger: true,
+    kept: async (p) => {
+      const users = await sessionGet<{ name: string; has_password: boolean }[]>(p, 'admin/users');
+      expect(users.find((u) => u.name === process.env.E2E_FORMS_USER)?.has_password).toBe(true);
+    },
+  },
+  {
+    id: 'user-revoke',
+    name: 'Отозвать токен пользователя',
+    dialog: 'Отозвать токен?',
+    page: () => '#/admin',
+    open: async (p) => {
+      await userRow(p).getByRole('button', { name: 'Токены' }).click();
+      await p.getByRole('row', { name: new RegExp(`^${process.env.E2E_FORMS_USER_TOKEN} `) }).getByRole('button', { name: 'Отозвать' }).click();
+    },
+    route: { method: 'DELETE', url: /\/api\/v1\/admin\/tokens\/[^/?]+$/ },
+    after: 'notice',
+    confirm: true,
+    danger: true,
+    kept: async (p) => {
+      const tokens = await sessionGet<{ name: string; revoked_at: string | null }[]>(p, `admin/users/${process.env.E2E_FORMS_USER_ID}/tokens`);
+      expect(tokens.find((t) => t.name === process.env.E2E_FORMS_USER_TOKEN)?.revoked_at).toBeNull();
+    },
+  },
+  {
+    id: 'account-revoke',
+    name: 'Отозвать свой токен',
+    dialog: 'Отозвать токен?',
+    page: () => '#/account',
+    open: (p) => p.locator(`tr[data-token="${process.env.E2E_FORMS_OWN_TOKEN}"]`).getByRole('button', { name: 'Отозвать' }).click(),
+    route: { method: 'DELETE', url: /\/api\/v1\/auth\/tokens\/[^/?]+$/ },
+    after: 'notice',
+    confirm: true,
+    danger: true,
+    kept: async (p) => {
+      const tokens = await sessionGet<{ name: string; revoked_at: string | null }[]>(p, 'auth/tokens');
+      expect(tokens.find((t) => t.name === process.env.E2E_FORMS_OWN_TOKEN)?.revoked_at).toBeNull();
+    },
+  },
+  {
+    id: 'access-revoke',
+    name: 'Отозвать доступ участника',
+    dialog: 'Отозвать доступ?',
+    page: () => '#/admin/solutions',
+    open: async (p) => {
+      await p.locator(`tr[data-solution="${process.env.E2E_FORMS_ACCESS_SOL}"]`).getByRole('button', { name: 'Доступ' }).click();
+      await p.locator(`tr[data-member="${process.env.E2E_FORMS_USER}"]`).getByRole('button', { name: 'Отозвать' }).click();
+    },
+    route: { method: 'POST', url: /\/api\/v1\/solutions\/[^/?]+\/access\/[^/?]+\/revoke$/ },
+    after: 'notice',
+    confirm: true,
+    danger: true,
+    kept: async (p) => {
+      const r = await sessionGet<{ members: { user_name: string; state: string }[] }>(p, `solutions/${process.env.E2E_FORMS_ACCESS_SOL}/access`);
+      expect(r.members.find((m) => m.user_name === process.env.E2E_FORMS_USER)?.state).toBe('approved');
+    },
+  },
+  {
+    id: 'template-reset',
+    name: 'Сбросить шаблон к умолчанию',
+    dialog: 'Сбросить шаблон к умолчанию?',
+    page: () => '#/admin/settings',
+    // свой шаблон — подменой ответа настроек: общий шаблон сервера сценарии форм не меняют
+    prepare: (p) => customTemplate(p),
+    open: (p) => p.getByRole('button', { name: 'Сбросить к умолчанию' }).click(),
+    route: SETTINGS_PATCH,
+    after: 'notice',
+    confirm: true,
+    danger: true,
+    kept: async (p) => {
+      await expect(p.getByRole('region', { name: 'Шаблон инструкции' })).toContainText('свой шаблон');
+    },
+  },
+  {
+    id: 'template-edit',
+    name: 'Шаблон инструкции (поле на виду)',
+    page: () => '#/admin/settings',
+    open: async (p) => {
+      const area = p.getByLabel('Текст шаблона');
+      await expect(area).toBeVisible();
+      // поле на странице ниже первого экрана — к нему прокручивает человек: здесь — в середину окна
+      await area.evaluate((e) => e.scrollIntoView({ block: 'center' }));
+    },
+    first: 'Текст шаблона',
+    fill: (p) => p.getByLabel('Текст шаблона').fill(`## Шаблон форм E2E ${stamp()}\nАдрес: {url}\nРешение: {solution}. {rules}`),
+    route: SETTINGS_PATCH,
+    after: 'notice',
+    legacy: 'Шаблон инструкции',
+    inline: { scope: (p) => p.getByRole('region', { name: 'Шаблон инструкции' }), submit: 'Сохранить', focus: false },
+  },
+  // ---- импорт, копии, индекс (задача 10b): свои окна — на каркасе `FormDialog` ----
+  {
+    id: 'import',
+    name: 'Импорт архива',
+    page: (c) => `#/u/${c.user}`,
+    open: (p) => treeMenu(p, 'Knowledge', 'Импорт (.zip)…'),
+    first: 'Архив (.zip)',
+    after: 'none',
+  },
+  {
+    id: 'backup-run',
+    name: 'Снять копию сейчас',
+    page: () => '#/admin/backups',
+    open: (p) => press(p, 'Снять копию сейчас'),
+    route: { method: 'POST', url: /\/api\/v1\/admin\/backups$/ },
+    after: 'notice',
+    confirm: true,
+  },
+  {
+    id: 'reindex',
+    name: 'Переиндексация из embeddings',
+    page: () => '#/admin/index',
+    open: (p) => press(p, 'Переиндексировать из embeddings'),
+    route: REINDEX,
+    after: 'notice',
+    confirm: true,
+  },
+  {
+    id: 'reindex-full',
+    name: 'Полная переиндексация',
+    page: () => '#/admin/index',
+    open: (p) => press(p, 'Полная переиндексация'),
+    route: REINDEX,
+    after: 'notice',
+    confirm: true,
+    danger: true,
+    kept: async (p) => {
+      await expect(p.getByTestId('reindex-status')).toHaveCount(0);
+    },
+  },
   {
     id: 'idea-delete',
     name: 'Удалить идею',
@@ -357,17 +789,6 @@ export const FORM_CASES: FormCase[] = [
   },
 ];
 
-/** Место перечня вне ядра для снимков «до» (задача 10b заменит полными строками). */
-export interface SnapCase {
-  id: string;
-  name: string;
-  page: (c: PageCtx) => string;
-  open: (p: Page) => Promise<void>;
-  /** `aria-label` формы в карточке или ленте (не окно). */
-  legacy?: string;
-  as?: 'admin' | 'user';
-}
-
 /** Дерево заметок: на узком экране — в выдвижной панели. */
 async function treeMenu(p: Page, target: string, item: string): Promise<void> {
   const tree = p.locator('nav[aria-label="Дерево заметок"]');
@@ -377,108 +798,14 @@ async function treeMenu(p: Page, target: string, item: string): Promise<void> {
   await p.getByRole('menuitem', { name: item }).click();
 }
 
-export const SNAP_ONLY: SnapCase[] = [
-  {
-    id: 'term-new',
-    name: 'Новый термин',
-    page: (c) => journal(c, 'glossary'),
-    open: (p) => press(p, 'Новый термин'),
-    legacy: 'Новый термин',
-  },
-  {
-    id: 'term-edit',
-    name: 'Правка термина',
-    page: (c) => journal(c, 'glossary', c.env('E2E_FORMS_TERM')),
-    open: (p) => pressIn(p, 'Карточка термина', 'Править'),
-    legacy: 'Правка термина',
-  },
-  {
-    id: 'term-retract',
-    name: 'Отозвать термин',
-    page: (c) => journal(c, 'glossary', c.env('E2E_FORMS_TERM')),
-    open: (p) => pressIn(p, 'Карточка термина', 'Отозвать'),
-    legacy: 'Отзыв термина',
-  },
-  {
-    id: 'question-edit',
-    name: 'Правка вопроса',
-    page: (c) => journal(c, 'questions', c.env('E2E_FORMS_QUESTION')),
-    open: (p) => p.locator(`[data-question="${process.env.E2E_FORMS_QUESTION}"]`).getByRole('button', { name: /^Изменить «/ }).click(),
-    legacy: 'Правка вопроса',
-  },
-  {
-    id: 'question-obsolete',
-    name: 'Вопрос неактуален',
-    page: (c) => journal(c, 'questions', c.env('E2E_FORMS_QUESTION')),
-    open: (p) => p.locator(`[data-question="${process.env.E2E_FORMS_QUESTION}"]`).getByRole('button', { name: /^Неактуален «/ }).click(),
-  },
-  {
-    id: 'question-defer',
-    name: 'Отложить до (вопрос-предложение)',
-    page: (c) => journal(c, 'questions', c.env('E2E_IDEA_QUESTION'), IDEAS_GUID),
-    open: (p) => p.getByRole('button', { name: /^отложить/i }).first().click(),
-    legacy: 'Отложить идею',
-  },
-  {
-    id: 'changelog-edit',
-    name: 'Правка записи Changelog',
-    page: (c) => journal(c, 'changelog', c.env('E2E_FORMS_CHANGELOG')),
-    open: (p) => p.locator(`article[data-entry="${process.env.E2E_FORMS_CHANGELOG}"]`).first().getByRole('button', { name: /^Изменить «/ }).click(),
-    legacy: 'Правка записи',
-  },
-  {
-    id: 'changelog-delete',
-    name: 'Удалить запись журнала',
-    page: (c) => journal(c, 'changelog', c.env('E2E_FORMS_CHANGELOG')),
-    open: (p) => p.locator(`article[data-entry="${process.env.E2E_FORMS_CHANGELOG}"]`).first().getByRole('button', { name: /^Удалить «/ }).click(),
-  },
-  {
-    id: 'release-edit',
-    name: 'Правка релиза',
-    page: (c) => journal(c, 'releases', c.env('E2E_FORMS_RELEASE')),
-    open: (p) => press(p, 'Изменить'),
-    legacy: 'Правка релиза',
-  },
-  { id: 'note-new', name: 'Новая заметка', page: (c) => `#/u/${c.user}`, open: (p) => treeMenu(p, 'Knowledge', 'Новая заметка') },
-  { id: 'folder-new', name: 'Новая папка', page: (c) => `#/u/${c.user}`, open: (p) => treeMenu(p, 'Knowledge', 'Новая папка') },
-  { id: 'import', name: 'Импорт архива', page: (c) => `#/u/${c.user}`, open: (p) => treeMenu(p, 'Knowledge', 'Импорт (.zip)…') },
-  {
-    id: 'note-delete',
-    name: 'Удалить заметку',
-    page: (c) => `#/u/${c.user}/s/knowledge/n/${c.env('E2E_NOTE_MEDIA')}`,
-    open: (p) => treeMenu(p, 'Медиа-заметка', 'Удалить'),
-  },
-  {
-    id: 'note-move',
-    name: 'Переименовать или переместить',
-    page: (c) => `#/u/${c.user}/s/knowledge/n/${c.env('E2E_NOTE_MEDIA')}`,
-    open: (p) => treeMenu(p, 'Медиа-заметка', 'Переименовать/переместить'),
-  },
-  {
-    id: 'attachment-detach',
-    name: 'Открепить вложение',
-    page: (c) => `#/u/${c.user}/s/knowledge/n/${c.env('E2E_NOTE_DOCS')}`,
-    open: async (p) => {
-      await p.getByRole('tab', { name: 'Вложения' }).click();
-      await p.getByRole('button', { name: /^Открепить / }).first().click();
-    },
-  },
-  {
-    id: 'history-revert',
-    name: 'Восстановить ревизию',
-    page: (c) => `#/u/${c.user}/s/knowledge/n/${c.env('E2E_NOTE_MEDIA')}`,
-    open: async (p) => {
-      await p.getByRole('tab', { name: 'История' }).click();
-      await p.getByRole('button', { name: 'Откатить к этой' }).first().click();
-    },
-  },
-  {
-    id: 'report-delete',
-    name: 'Удалить отчёт',
-    page: (c) => journal(c, 'reports', c.env('E2E_REPORT_PRINT'), c.solution),
-    open: (p) => press(p, 'Удалить'),
-  },
-  { id: 'user-password', name: 'Пароль пользователя', page: () => '#/admin', open: (p) => p.getByRole('button', { name: /^(Сменить|Задать) пароль$/ }).first().click() },
-  { id: 'backup-run', name: 'Снять копию сейчас', page: () => '#/admin/backups', open: (p) => press(p, 'Снять копию сейчас') },
-  { id: 'reindex', name: 'Переиндексация', page: () => '#/admin/index', open: (p) => press(p, 'Переиндексировать из embeddings') },
-];
+/** Ответ `GET /admin/settings` — с «своим» шаблоном Claude Code · ru (кнопка «Сбросить к умолчанию»
+ * доступна), запросы прочих методов — дальше по цепочке подмен. */
+export async function customTemplate(p: Page): Promise<void> {
+  await p.route(/\/api\/v1\/admin\/settings$/, async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback();
+    const r = await route.fetch();
+    const j = (await r.json()) as { agent_setup: { templates: Record<string, { text: string; custom: boolean }> } };
+    j.agent_setup.templates['claude.ru'].custom = true;
+    await route.fulfill({ response: r, json: j });
+  });
+}

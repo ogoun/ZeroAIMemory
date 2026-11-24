@@ -2,7 +2,10 @@
   // Администрирование → «Решения» (§11.6): реестр решений с владельцами, участники и запросы
   // доступа — одобрить (rw или ro), отклонить с причиной, отозвать. Решения о доступе
   // действуют на следующем же запросе участника (кэша нет). `mine` — «Мои решения»
-  // пользователя (§15.1): только свои решения, те же REST, что у CLI.
+  // пользователя (§15.1): только свои решения, те же REST, что у CLI. M7.3 (§6.14, правило Д):
+  // «Одобрить ro/rw» — сразу; «Отклонить запрос» — окно `Prompt` с причиной на общем каркасе;
+  // «Отозвать» доступ участника необратим (участник сразу теряет доступ, вернуть — только новым
+  // запросом) — окно-подтверждение `danger`, фокус на «Отмена».
   import Prompt, { type Ask } from '../components/Prompt.svelte';
   import {
     ApiError,
@@ -90,7 +93,28 @@
 
   const approve = (guid: string, m: AccessEntry, access: Access) =>
     run(guid, () => approveAccess(guid, m.user_id, access));
-  const revoke = (guid: string, m: AccessEntry) => run(guid, () => revokeAccess(guid, m.user_id));
+  /** «Отозвать» доступ — подтверждение; ошибка — в окне, окно открыто. */
+  function revoke(s: SolutionItem, m: AccessEntry) {
+    const guid = s.agent_solution_id;
+    ask = {
+      title: 'Отозвать доступ?',
+      message: `Пользователь «${m.user_name}» сразу потеряет доступ к решению «${s.name}» (${m.access}): следующий же его запрос получит отказ. Вернуть доступ — только новым запросом участника и одобрением.`,
+      confirm: 'Отозвать',
+      danger: true,
+      run: async () => {
+        delete rowErrors[guid];
+        try {
+          await revokeAccess(guid, m.user_id);
+          await refresh(guid);
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 401) return onexpired();
+          throw new Error(errorText(e));
+        }
+      },
+      // кнопка «Отозвать» ушла вместе с отзывом — фокус на строку участника (состояние «отозван»)
+      refocus: () => document.querySelector(`tr[data-member="${CSS.escape(m.user_name)}"] td`),
+    };
+  }
 
   function reject(guid: string, m: AccessEntry) {
     ask = {
@@ -179,7 +203,7 @@
                               <button type="button" onclick={() => approve(guid, m, 'ro')}>Одобрить ro</button>
                               <button type="button" class="danger" onclick={() => reject(guid, m)}>Отклонить</button>
                             {:else if m.state === 'approved'}
-                              <button type="button" class="danger" onclick={() => revoke(guid, m)}>Отозвать</button>
+                              <button type="button" class="danger" onclick={() => revoke(s, m)}>Отозвать</button>
                             {/if}
                           </td>
                         </tr>
