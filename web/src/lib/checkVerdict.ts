@@ -288,6 +288,21 @@ export const regressionOpen = (nightly: CheckRun | null | undefined): boolean =>
 export const acceptRun = (nightly: CheckRun | null | undefined): string | null =>
   regressionOpen(nightly) ? nightly!.run : null;
 
+/**
+ * Строка у «Принять как норму», когда последний прогон — не этот ночной (ручной поверх эпизода):
+ * принимается ночной прогон. Вердикт на странице тот же, что у ночного, — без повтора вердикта
+ * (ревью r2 задачи 8, N3); другой или его нет — с вердиктом ночного. Регрессия не открыта или
+ * последний прогон и есть ночной — `null`.
+ */
+export function openRegressionNote(last: CheckRun | null, nightly: CheckRun | null | undefined): string | null {
+  if (!nightly?.verdict || !regressionOpen(nightly) || last?.run === nightly.run) return null;
+  const night = nightly.night ?? '';
+  const shown = shownVerdict(last, nightly);
+  const nightlyText = verdictText(nightly.verdict);
+  if (shown && verdictText(shown) === nightlyText) return `«Принять как норму» относится к ночному прогону ${night}.`;
+  return `Открыта регрессия ночного прогона ${night}: ${nightlyText}. «Принять как норму» относится к нему.`;
+}
+
 /** Строка метрики к медиане базы. */
 export interface MetricRow {
   label: string;

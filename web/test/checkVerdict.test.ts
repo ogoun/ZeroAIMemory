@@ -8,6 +8,7 @@ import {
   flagText,
   foundText,
   metricRows,
+  openRegressionNote,
   ppText,
   regressionOpen,
   runStatusText,
@@ -125,6 +126,28 @@ test('verdict_accept_target_latest_nightly', () => {
   // ночных прогонов нет
   assert.equal(regressionOpen(null), false);
   assert.equal(acceptRun(null), null);
+});
+
+test('verdict_open_regression_note', () => {
+  // строка у «Принять как норму» — только когда последний прогон не этот ночной
+  const nightly = run({ run: 'N1', night: '2026-11-23' });
+  assert.equal(openRegressionNote(nightly, nightly), null);
+  // ручной прогон дал тот же вердикт — без повтора вердикта (ревью r2 задачи 8, N3)
+  const same = run({ run: 'M1', trigger: 'manual', night: null });
+  assert.equal(openRegressionNote(same, nightly), '«Принять как норму» относится к ночному прогону 2026-11-23.');
+  // вердикт на странице другой — строка называет вердикт ночного
+  const ok = run({ run: 'M2', trigger: 'manual', night: null, verdict: v({ kind: 'ok' }) });
+  assert.equal(
+    openRegressionNote(ok, nightly),
+    'Открыта регрессия ночного прогона 2026-11-23: ухудшение: поиск −12 п. п. (62 % → 50 %). «Принять как норму» относится к нему.',
+  );
+  // последний прогон без вердикта (предел времени) — тоже с вердиктом ночного
+  const timeout = run({ run: 'M3', trigger: 'manual', night: null, verdict: null, status: 'timeout' });
+  assert.match(openRegressionNote(timeout, nightly) ?? '', /^Открыта регрессия ночного прогона 2026-11-23: ухудшение/);
+  // регрессия не открыта — строки нет
+  assert.equal(openRegressionNote(ok, run({ verdict: v({ kind: 'ok' }) })), null);
+  assert.equal(openRegressionNote(ok, run({ accepted_at: '2026-11-23T08:00:00.000000Z' })), null);
+  assert.equal(openRegressionNote(ok, null), null);
 });
 
 test('verdict_run_status_and_failing', () => {

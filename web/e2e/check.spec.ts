@@ -134,8 +134,9 @@ test('check_accept_new_norm', async ({ page }) => {
   await page.keyboard.press('Escape');
   await expect(page.getByTestId('check-verdict')).toContainText('Вердикт: ухудшение: поиск −12 п. п. (62 % → 50 %)');
   await expect(page.getByTestId('check-verdict')).toContainText('ручной прогон');
-  // последний прогон — ручной: у кнопки — строка об открытой регрессии ночного (ревью r1, Minor 6)
-  await expect(page.getByTestId('check-open-regression')).toContainText('Открыта регрессия ночного прогона 2026-11-23');
+  // последний прогон — ручной: у кнопки — строка о ночном прогоне (ревью r1, Minor 6); вердикт тот
+  // же — без его повтора (ревью r2, N3)
+  await expect(page.getByTestId('check-open-regression')).toHaveText('«Принять как норму» относится к ночному прогону 2026-11-23.');
   // «Принять как норму» — окно-подтверждение (правило Б), фокус — на основной кнопке
   await page.getByRole('button', { name: 'Принять как норму', exact: true }).click();
   const d = page.getByRole('dialog', { name: 'Принять как норму?', exact: true });

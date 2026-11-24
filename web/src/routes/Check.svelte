@@ -17,6 +17,7 @@
     acceptRun,
     foundText,
     metricRows,
+    openRegressionNote,
     regressionOpen,
     runStatusText,
     shownVerdict,
@@ -148,6 +149,8 @@
 
   let last = $derived(st?.last ?? null);
   let verdict = $derived(shownVerdict(last, nightly));
+  /** Строка у «Принять как норму»: последний прогон — не этот ночной (ревью r1 M6, r2 N3). */
+  let openNote = $derived(openRegressionNote(last, nightly));
   let rows = $derived(last ? metricRows(last.metrics, last.compared_with ?? last.verdict?.compared_with ?? null) : []);
   const kindClass = (k: string | undefined) => (k ? `v-${k}` : '');
   /** «i:01KQ…E2EI1» — ссылка записи коротко (id — 26 знаков). */
@@ -196,11 +199,9 @@
         <button type="button" class="primary" onclick={() => (acceptOpen = true)}>Принять как норму</button>
       {/if}
     </div>
-    {#if target && nightly?.verdict && last?.run !== nightly.run}
-      <!-- последний прогон — не этот ночной (ручной поверх эпизода): регрессия открыта по ночному -->
-      <p class="warn small" data-testid="check-open-regression">
-        {`Открыта регрессия ночного прогона ${nightly.night ?? ''}: ${verdictText(nightly.verdict)}. «Принять как норму» относится к нему.`}
-      </p>
+    {#if openNote}
+      <!-- последний прогон — не этот ночной (ручной поверх эпизода): принимается ночной -->
+      <p class="warn small" data-testid="check-open-regression">{openNote}</p>
     {/if}
     <div bind:this={noticeBox}><Notice text={notice} /></div>
     {#if actionError}<p class="error" role="alert">{actionError}</p>{/if}

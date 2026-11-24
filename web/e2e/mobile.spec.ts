@@ -931,6 +931,25 @@ test('header_sections_fit', async ({ browser }) => {
         };
       });
       expect(m, `${at}: полоса разделов`).toEqual({ over: false, underSearch: false, cut: [] });
+      // в «Ещё» не уходит раздел, который помещается (ревью r2, N4): свободного места справа от
+      // «Ещё» не хватает первому скрытому разделу и зазору — с учётом того, что «Ещё» после переноса
+      // станет уже (признаки оставшихся) или исчезнет (раздел был последним скрытым)
+      const roomy = await nav.evaluate((n) => {
+        const btn = n.querySelector('.nav-more-btn');
+        if (!btn) return null;
+        const m = document.querySelector('header.topbar .nav-measure .topnav')!;
+        const width = (e: Element | null) => (e ? e.getBoundingClientRect().width : 0);
+        const gap = parseFloat(getComputedStyle(n).columnGap) || 0;
+        const items = [...m.querySelectorAll<HTMLElement>('[data-short]')];
+        const shown = n.querySelectorAll(':scope > a').length;
+        const rest = items.slice(shown + 1).map((e) => e.dataset.key);
+        const after = rest.length
+          ? width(m.querySelector(`[data-more="${rest.includes('check') ? 1 : 0}${rest.includes('proposals') ? 1 : 0}"]`))
+          : -gap;
+        const free = n.getBoundingClientRect().right - btn.getBoundingClientRect().right;
+        return { key: items[shown].dataset.key, fits: free + width(btn) - after >= width(items[shown]) + gap + 1 };
+      });
+      if (roomy) expect(roomy.fits, `${at}: «${roomy.key}» помещается, но ушёл в «Ещё»`).toBe(false);
       const shown = await nav.locator(':scope > a').evaluateAll(linkNames);
       let hidden: string[] = [];
       const more = moreButton(page);

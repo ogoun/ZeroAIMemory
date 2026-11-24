@@ -30,16 +30,14 @@ test.describe.configure({ mode: 'serial' });
 // LAN на паузе «адрес изменён» — пауза подставлена в ответ настроек) и Insights с фильтром «Шумные»
 pageSnapshots('works', () => '#/works', { prepare: (p) => resetWorks(p) });
 pageSnapshots('works-external', () => '#/works', {
+  // настоящая пауза (ревью r2, N1): подключение в LAN, адрес записи сменён на внешний, проверка
+  // подключения ставит паузу `vault_changed` (409 — ожидаемо)
   prepare: async (p) => {
+    await setMoveUrl(`${mock()}/v1`);
     await resetWorks(p);
-    await connect(p, env('E2E_VAULT_EXT'));
-    await p.route(/\/api\/v1\/auth\/settings$/, async (r) => {
-      if (r.request().method() !== 'GET') return r.continue();
-      const resp = await r.fetch();
-      const j = (await resp.json()) as { works: Record<string, unknown> };
-      j.works.pause = { class: 'vault_changed', since: new Date().toISOString(), from: 'https://203.0.113.10/v1', to: 'https://203.0.113.10/v2' };
-      return r.fulfill({ response: resp, json: j });
-    });
+    await connect(p, env('E2E_VAULT_MOVE'));
+    await setMoveUrl(EXT_URL);
+    await human(p, 'POST', 'works/model/test').catch(() => undefined);
   },
 });
 pageSnapshots('insights-noisy', (c) => `#/u/${c.user}/s/${SOLUTION_GUID}/j/insights`, {
@@ -87,6 +85,13 @@ const connect = (page: Page, vault: string, mode = 'model') =>
   }).then(() => human(page, 'PATCH', 'auth/settings', { works: { mode } }));
 
 const dialog = (page: Page, name: string) => page.getByRole('dialog', { name, exact: true });
+
+/** Внешний адрес (TEST-NET-3): классификация без DNS и соединения. */
+const EXT_URL = 'https://203.0.113.10/v1';
+
+/** Адрес записи Vault «смена адреса» — правкой агента по токену (как смена `data.url` вне WebUI). */
+const setMoveUrl = (url: string) =>
+  agent('PATCH', `vault/${env('E2E_VAULT_MOVE')}`, { data: { type: 'token', url, description: 'e2e: подключённая модель' } });
 
 test('works_settings_and_connection_test', async ({ page }) => {
   const problems = watch(page);
@@ -215,9 +220,57 @@ test('works_external_banner_testnet', async ({ page }) => {
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
+test('works_external_banner_real_pause', async ({ page }) => {
+  // ревью r2 задачи 8 (N1): настоящая пауза `vault_changed` на внешний адрес при выбранном режиме
+  // «модель» (действующий на паузе — «выкл»): плашка — «уйдут на <адрес> сразу после «Подтвердить
+  // адрес»», и после перезагрузки; после подтверждения — «уходят»
+  const problems = watch(page, (path, st) => st === 409 && (path.endsWith('/auth/settings') || path.endsWith('/works/model/test')));
+  await setMoveUrl(`${mock()}/v1`);
+  await resetWorks(page);
+  await connect(page, env('E2E_VAULT_MOVE'));
+  try {
+    await setMoveUrl(EXT_URL);
+    await open(page);
+    // закреплён адрес в LAN — плашки нет
+    await expect(page.getByTestId('works-external')).toHaveCount(0);
+    await page.getByRole('button', { name: 'Проверить подключение', exact: true }).click();
+    await expect(page.getByRole('alert').filter({ hasText: 'Адрес подключения изменён' })).toBeVisible();
+    const banner = page.getByTestId('works-external');
+    const pending = `Данные памяти уйдут за пределы локальной сети на ${EXT_URL} сразу после «Подтвердить адрес»`;
+    await expect(banner).toContainText(pending);
+    await expect(page.getByTestId('works-effective-probes')).toContainText('действует: выкл');
+    await page.reload();
+    await expect(page.getByTestId('works-external')).toContainText(pending);
+    // подтверждение — данные уходят на новый адрес
+    await page.getByRole('button', { name: 'Подтвердить адрес', exact: true }).click();
+    const d = dialog(page, 'Подтвердить новый адрес подключения?');
+    await expect(d.getByTestId('works-confirm-now')).toHaveText(EXT_URL);
+    await d.getByRole('button', { name: 'Подтвердить адрес', exact: true }).click();
+    await expect(d).toBeHidden();
+    await expect(page.getByTestId('works-external')).toContainText('Данные памяти уходят за пределы локальной сети: 203.0.113.10');
+    await expect(page.getByTestId('works-effective-probes')).toHaveText('действует: модель');
+  } finally {
+    await setMoveUrl(`${mock()}/v1`);
+    await resetWorks(page);
+  }
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
 test('works_send_journal_no_text', async ({ page }) => {
   test.setTimeout(120_000);
   const problems = watch(page);
+  // свои источники проб (термины Knowledge): кандидаты пакета не зависят от сценариев раньше —
+  // пробы агента в `check.spec` разбирают записи прогона, и при выборочном запуске модели может
+  // быть нечего спросить (запуск кончается без обращения)
+  const stamp = Date.now().toString(36);
+  for (const i of [1, 2]) {
+    await agent('POST', 'spaces/knowledge/entries', {
+      kind: 'term',
+      title: `Журнал отправок ${i} ${stamp}`,
+      body: '',
+      data: { definition: `Определение для пробы подключённой модели номер ${i}.`, aliases: [], code: [] },
+    });
+  }
   await connect(page, env('E2E_VAULT_LAN'));
   await human(page, 'POST', 'works/model/test');
   await open(page);

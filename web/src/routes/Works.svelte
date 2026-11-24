@@ -472,8 +472,17 @@
   let pause = $derived(settings?.pause ?? null);
   /** Хост подключения вне LAN — только по полю сервера (`external`, без DNS при чтении). */
   let external = $derived(settings?.model?.external ? settings.model.host || 'адрес подключения' : null);
-  /** Какой-нибудь вид работает в режиме «модель» — данные уходят сейчас, иначе — уйдут при выборе. */
+  /** Какой-нибудь вид работает в режиме «модель» сейчас (действующий режим) — данные уходят. */
   let modelActive = $derived(Object.values(settings?.effective ?? {}).some((e) => e.mode === 'model'));
+  /** Режим «модель» выбран человеком (общий или у вида) — на паузе действующий режим «выкл», но
+   * данные уйдут, как только пауза снимется (ревью r2 задачи 8, N1). */
+  let modelChosen = $derived(
+    settings?.mode === 'model' || Object.values(settings?.kinds ?? {}).some((m) => m === 'model'),
+  );
+  /** Почему выбранная «модель» сейчас не действует (не пауза): причина первого вида. */
+  let modelOffReason = $derived(
+    Object.values(settings?.effective ?? {}).find((e) => e.mode === 'off' && e.reason && e.reason !== 'paused')?.reason ?? null,
+  );
   let modelVault = $derived(settings?.model ? vault.find((v) => `v:${v.id}` === settings!.model!.vault) ?? null : null);
   /** Итог последней ночи по видам. */
   let lastNight = $derived.by(() => {
@@ -494,13 +503,23 @@
 
   {#if external}
     <div class="alert ext" role="note" aria-label="Данные вне локальной сети" data-testid="works-external">
+      <!-- текст — по выбранному режиму и паузе: действующий режим на паузе «выкл» (ревью r2, N1) -->
       {#if modelActive}
         <p class="alert-title">Данные памяти уходят за пределы локальной сети: {external}</p>
-        <p>Подключённая модель — вне локальной сети: ей уходит маскированный пакет работ (без Human, Vault и записей участников).</p>
+      {:else if modelChosen && pause?.class === 'vault_changed'}
+        <p class="alert-title">
+          Данные памяти уйдут за пределы локальной сети на <code>{pause.to ?? external}</code> сразу после «Подтвердить адрес»
+        </p>
+      {:else if modelChosen && pause}
+        <p class="alert-title">Данные памяти уйдут за пределы локальной сети, как только пауза снимется: {external}</p>
+      {:else if modelChosen && modelOffReason}
+        <p class="alert-title">Подключённая модель — вне локальной сети: {external}</p>
+        <p>Сейчас данные не уходят: {reasonText(modelOffReason)}.</p>
       {:else}
         <p class="alert-title">Подключённая модель — вне локальной сети: {external}</p>
-        <p>Данные памяти уйдут за пределы локальной сети, когда вид работ будет в режиме «модель»: ей уходит маскированный пакет работ (без Human, Vault и записей участников).</p>
+        <p>Данные памяти уйдут за пределы локальной сети, когда вид работ будет в режиме «модель».</p>
       {/if}
+      <p>Модели вне локальной сети уходит маскированный пакет работ (без Human, Vault и записей участников).</p>
     </div>
   {/if}
   {#if pause}
@@ -795,7 +814,8 @@
   </label>
   <label>
     Поле предела
-    <span class="field-note muted" id="works-field-note">авто — max_completion_tokens у api.openai.com, max_tokens у прочих</span>
+    <!-- пояснение — только описание поля (`aria-describedby`), не часть его имени (ревью r2, N2) -->
+    <span class="field-note muted" id="works-field-note" aria-hidden="true">авто — max_completion_tokens у api.openai.com, max_tokens у прочих</span>
     <select bind:value={fField} aria-describedby="works-field-note">
       <option value="auto">авто</option>
       <option value="max_tokens">max_tokens</option>

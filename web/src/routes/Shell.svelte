@@ -320,18 +320,36 @@
   /** Разделов в полосе; остальные — в «Ещё». */
   let fit = $state(Infinity);
 
+  /** Виды кнопки «Ещё» в копии для замера: [точка, число]. */
+  const MORE_VARIANTS: [boolean, boolean][] = [
+    [false, false],
+    [true, false],
+    [false, true],
+    [true, true],
+  ];
+
   /** Замер: ширины пунктов скрытой копии (полные и короткие подписи, кнопка «Ещё») против ширины
-   * полосы. Запас 1 px — на дробные ширины. */
+   * полосы; ширина «Ещё» — с признаками только тех разделов, что уходят в меню. Запас 1 px — на
+   * дробные ширины. */
   function fitSections() {
     const nav = navEl;
     const m = measureEl;
     if (!nav || !m) return;
     const avail = nav.clientWidth - 1;
     const gap = parseFloat(getComputedStyle(nav).columnGap) || 0;
-    const widths = (sel: string) => [...m.querySelectorAll<HTMLElement>(sel)].map((e) => e.getBoundingClientRect().width);
+    const width = (e: Element | null) => e?.getBoundingClientRect().width ?? 0;
+    const widths = (sel: string) => [...m.querySelectorAll<HTMLElement>(sel)].map(width);
     const full = widths('[data-full]');
-    const short = widths('[data-short]');
-    const more = m.querySelector<HTMLElement>('[data-more]')?.getBoundingClientRect().width ?? 0;
+    const shortEls = [...m.querySelectorAll<HTMLElement>('[data-short]')];
+    const short = shortEls.map(width);
+    const keys = shortEls.map((e) => e.dataset.key ?? '');
+    /** «Ещё» для разделов с `k`-го: точка — если среди них «Проверка», число — «Кандидаты». */
+    const more = (k: number) => {
+      const hidden = keys.slice(k);
+      const dot = hidden.includes('check') ? 1 : 0;
+      const num = hidden.includes('proposals') ? 1 : 0;
+      return width(m.querySelector(`[data-more="${dot}${num}"]`));
+    };
     const total = (ws: number[]) => ws.reduce((a, b) => a + b, 0) + gap * Math.max(0, ws.length - 1);
     if (total(full) <= avail) {
       shortLabels = false;
@@ -343,9 +361,10 @@
       fit = Infinity;
       return;
     }
-    let w = more;
-    let k = 0;
-    while (k < short.length && w + gap + short[k] <= avail) w += gap + short[k++];
+    // больше всего разделов в полосе: `k` пунктов, `k` зазоров (последний — перед «Ещё») и «Ещё»
+    // с признаками оставшихся
+    let k = short.length - 1;
+    while (k > 0 && total(short.slice(0, k)) + gap + more(k) > avail) k--;
     fit = k;
   }
 
@@ -420,17 +439,22 @@
     {#if candidates}<span id="nav-candidates" hidden>кандидатов в Rules ждут решения: {formatCount(candidates)}</span>{/if}
   </nav>
   {#if !rows}
-    <!-- скрытая копия для замера: все разделы полными и короткими подписями и кнопка «Ещё» со всеми
-         признаками (запас) — те же правила стиля, что у полосы -->
+    <!-- скрытая копия для замера: все разделы полными и короткими подписями и кнопка «Ещё» в четырёх
+         видах — без признаков, с точкой, с числом, с обоими (ширина — по признакам тех разделов,
+         что уходят в меню; ревью r2, N4) — те же правила стиля, что у полосы -->
     <div class="nav-measure" aria-hidden="true" inert>
       <div class="topnav" bind:this={measureEl}>
         {#each sectionList as x (x.key)}<span class="item" data-full>{x.label}{@render sectionBadges(x.key, true)}</span>{/each}
-        {#each sectionList as x (x.key)}<span class="item short-item" data-short>{x.short ?? x.label}{@render sectionBadges(x.key, true)}</span>{/each}
-        <span class="item nav-more-btn" data-more
-          >Ещё<span class="caret">▾</span>{#if attention.regression}<span class="dot"></span>{/if}{#if candidates}<span class="nav-num"
-              >{formatCount(candidates)}</span
-            >{/if}</span
-        >
+        {#each sectionList as x (x.key)}<span class="item short-item" data-short data-key={x.key}
+            >{x.short ?? x.label}{@render sectionBadges(x.key, true)}</span
+          >{/each}
+        {#each MORE_VARIANTS as [dot, num] (`${dot}${num}`)}
+          <span class="item nav-more-btn" data-more="{+dot}{+num}"
+            >Ещё<span class="caret">▾</span>{#if dot && attention.regression}<span class="dot"></span>{/if}{#if num && candidates}<span
+                class="nav-num">{formatCount(candidates)}</span
+              >{/if}</span
+          >
+        {/each}
       </div>
     </div>
   {/if}
