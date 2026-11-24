@@ -469,7 +469,9 @@ pub async fn finish(
 
 /// Запись принятого элемента итога (пробы, кандидаты) — в **той же транзакции**, что закрытие
 /// работы ([`finish_claimed`]): работу сняли, она истекла или закрыта другим итогом — не
-/// записано ничего. Варианты добавляют виды работ (задачи 4 и 7 плана M7.3).
+/// записано ничего. Варианты добавляют виды работ (задачи 4 и 7 плана M7.3): пробы —
+/// [`ItemWrite::Probe`], кандидаты в Rules — [`ItemWrite::Rule`] и отказ исполнителя
+/// [`ItemWrite::RuleSkip`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum ItemWrite {
     /// Проба вида `probe` (вид работы `probes`, §6.4 п. 2): пространство и работа пробы — этой
@@ -493,14 +495,45 @@ pub enum ItemWrite {
         author: String,
         session: Option<String>,
     },
+    /// Кандидат в Rules — принятый элемент работы вида `rules` (§6.7 п. 3, задача 7 плана):
+    /// строка `proposals` типа `rule` (`proposed`, `payload {path, content}`, `targets` —
+    /// источник, ключ отсева — по ссылке источника, [`crate::proposals::key_source`]). Повтор по
+    /// ключу или предел открытых кандидатов к моменту записи — строки нет (WARN).
+    Rule {
+        target: String,
+        rev: i64,
+        path: String,
+        content: String,
+        reason: String,
+        author_kind: crate::proposals::ProposalAuthor,
+        author: String,
+        session: Option<String>,
+    },
+    /// Отказ исполнителя от элемента работы вида `rules` (`{n, skip: "почему"}`): строка
+    /// `skipped` с ключом по ссылке и ревизии ([`crate::proposals::key_source_rev`]) — источник
+    /// предлагается снова только в новой ревизии; человеку не показывается.
+    RuleSkip {
+        target: String,
+        rev: i64,
+        why: String,
+        author_kind: crate::proposals::ProposalAuthor,
+        author: String,
+        session: Option<String>,
+    },
 }
 
 /// `proposals.type` записей тестового вида `echo`.
 #[cfg(feature = "test-hooks")]
 pub const ECHO_PROPOSAL_TYPE: &str = "echo";
 
-/// Одна запись принятого элемента работы `w` (транзакция закрытия).
-fn apply_write(t: &rusqlite::Transaction<'_>, w: &Work, x: &ItemWrite) -> Result<(), StoreError> {
+/// Одна запись принятого элемента работы `w` (транзакция закрытия). `Some` — предупреждение:
+/// запись не сделана (у источника уже есть предложение, открытых кандидатов — предел), оно уходит
+/// в итог работы (`result.warnings`, ревью r1 задачи 7, Minor 6).
+fn apply_write(
+    t: &rusqlite::Transaction<'_>,
+    w: &Work,
+    x: &ItemWrite,
+) -> Result<Option<String>, StoreError> {
     let _ = (t, w);
     match *x {
         ItemWrite::Probe {
@@ -511,7 +544,7 @@ fn apply_write(t: &rusqlite::Transaction<'_>, w: &Work, x: &ItemWrite) -> Result
             let made = crate::probes::new_since_tx(t, w.origin.as_str(), since)?;
             if made >= cap {
                 tracing::warn!(work = %w.id, made, cap, "внутренние работы: предел новых проб исчерпан при записи — проба не записана");
-                return Ok(());
+                return Ok(None);
             }
             let p = crate::probes::NewProbe {
                 space: Some(w.space_id),
@@ -524,7 +557,7 @@ fn apply_write(t: &rusqlite::Transaction<'_>, w: &Work, x: &ItemWrite) -> Result
                     tracing::warn!(work = %w.id, outcome = ?o, "внутренние работы: проба не записана");
                 }
             }
-            Ok(())
+            Ok(None)
         }
         #[cfg(feature = "test-hooks")]
         ItemWrite::Echo {
@@ -551,7 +584,82 @@ fn apply_write(t: &rusqlite::Transaction<'_>, w: &Work, x: &ItemWrite) -> Result
                     fmt_ts(now()),
                 ],
             )?;
-            Ok(())
+            Ok(None)
+        }
+        ItemWrite::Rule {
+            ref target,
+            rev,
+            ref path,
+            ref content,
+            ref reason,
+            author_kind,
+            ref author,
+            ref session,
+        } => {
+            use crate::proposals::{self as pr, InsertOutcome, NewProposal, ProposalStatus};
+            let p = NewProposal {
+                space: w.space_id,
+                ptype: ProposalType::Rule,
+                status: ProposalStatus::Proposed,
+                targets: vec![pr::SourceRef {
+                    target: target.clone(),
+                    rev,
+                }],
+                payload: serde_json::json!({"path": path, "content": content}),
+                reason: Some(reason.clone()),
+                basis: vec![target.clone()],
+                dedup_key: Some(pr::key_source(ProposalType::Rule, target)),
+                author_kind,
+                author: Some(author.clone()),
+                work_id: Some(w.id),
+                session_id: session.clone(),
+            };
+            Ok(match pr::insert_tx(t, &p)? {
+                InsertOutcome::Inserted(_) => None,
+                InsertOutcome::Existing(id) => {
+                    tracing::warn!(work = %w.id, %target, proposal = %id, "кандидат в Rules: у источника уже есть предложение — не записан");
+                    Some(format!(
+                        "{target}: у источника уже есть предложение o:{id} — кандидат не записан"
+                    ))
+                }
+                InsertOutcome::Full => {
+                    tracing::warn!(work = %w.id, %target, "кандидат в Rules: открытых кандидатов — предел, не записан");
+                    Some(format!(
+                        "{target}: открытых кандидатов в Rules — {} — кандидат не записан",
+                        pr::PROPOSALS_OPEN_MAX
+                    ))
+                }
+            })
+        }
+        ItemWrite::RuleSkip {
+            ref target,
+            rev,
+            ref why,
+            author_kind,
+            ref author,
+            ref session,
+        } => {
+            use crate::proposals::{self as pr, NewProposal, ProposalStatus};
+            let p = NewProposal {
+                space: w.space_id,
+                ptype: ProposalType::Rule,
+                status: ProposalStatus::Skipped,
+                targets: vec![pr::SourceRef {
+                    target: target.clone(),
+                    rev,
+                }],
+                payload: serde_json::json!({}),
+                reason: Some(why.clone()),
+                basis: Vec::new(),
+                dedup_key: Some(pr::key_source_rev(ProposalType::Rule, target, rev)),
+                author_kind,
+                author: Some(author.clone()),
+                work_id: Some(w.id),
+                session_id: session.clone(),
+            };
+            // повтор по ключу (та же ревизия) — без второй строки
+            pr::insert_tx(t, &p)?;
+            Ok(None)
         }
     }
 }
@@ -559,8 +667,10 @@ fn apply_write(t: &rusqlite::Transaction<'_>, w: &Work, x: &ItemWrite) -> Result
 /// Исход [`finish_claimed`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum Closed {
-    /// Работа закрыта итогом, записи принятого — в той же транзакции.
-    Closed,
+    /// Работа закрыта итогом, записи принятого — в той же транзакции; `warnings` — записи,
+    /// которые не сделаны (повтор предложения, предел открытых кандидатов), они же — в
+    /// `result.warnings` и `result.response.warnings`.
+    Closed { warnings: Vec<String> },
     /// Работа уже закрыта итогом с этим `Idempotency-Key`: прежний `result` (сверку тела и
     /// прежний ответ берёт вызывающий), ничего не записано.
     Replay(Value),
@@ -584,7 +694,7 @@ pub async fn finish_claimed(
 ) -> Result<Closed, StoreError> {
     let session = session.map(str::to_string);
     let key = key.map(str::to_string);
-    let result = result.to_string();
+    let mut result = result;
     db.write(move |t| {
         let Some(w) = get_tx(t, id)? else {
             return Ok(Closed::NotClaimed(None));
@@ -602,9 +712,20 @@ pub async fn finish_claimed(
         if !claimed {
             return Ok(Closed::NotClaimed(Some(Box::new(w))));
         }
+        let mut warnings = Vec::new();
         for x in &writes {
-            apply_write(t, &w, x)?;
+            warnings.extend(apply_write(t, &w, x)?);
         }
+        // несделанные записи — в итог и в копию ответа (повтор по ключу отдаст их же)
+        if !warnings.is_empty()
+            && let Value::Object(o) = &mut result
+        {
+            o.insert("warnings".into(), serde_json::json!(warnings));
+            if let Some(Value::Object(r)) = o.get_mut("response") {
+                r.insert("warnings".into(), serde_json::json!(warnings));
+            }
+        }
+        let result = result.to_string();
         let error_class = (state == WorkState::Cancelled).then_some(SKIPPED);
         t.execute(
             "UPDATE works SET state = ?2, result = ?3, result_key = ?4, error_class = ?5,
@@ -612,7 +733,7 @@ pub async fn finish_claimed(
              WHERE id = ?1",
             params![id, state.as_str(), result, key, error_class, fmt_ts(now())],
         )?;
-        Ok(Closed::Closed)
+        Ok(Closed::Closed { warnings })
     })
     .await
 }

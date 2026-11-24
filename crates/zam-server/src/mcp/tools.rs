@@ -110,10 +110,10 @@ impl ToolName {
                  с префиксом пространства (rules:/a), depth 1–5."
             }
             ToolName::Write => {
-                "Запись заметки по пути [<пространство>:/]<путь>: без base_rev — создать (content); \
-                 с base_rev — заменить content или применить ops к секциям. Ревизия устарела — \
-                 ошибка 409 с диффом: перечитать и повторить. Ссылки на файлы — refs: [пути] во \
-                 frontmatter."
+                "Заметка по пути [<пространство>:/]<путь>: без base_rev — создать (content), с \
+                 base_rev — заменить content или ops к секциям; 409 с диффом — перечитать и \
+                 повторить. Файлы — refs: [пути] во frontmatter. rules:/<путь> с candidate \
+                 {reason} — кандидат в Rules (решает человек)."
             }
             ToolName::Log => {
                 "Запись журнала: kind changelog|release, insight (data.kind, triggers, scope, \
@@ -266,6 +266,14 @@ impl ToolName {
                     "l0": {"type": "string"},
                     "idempotency_key": {"type": "string", "description":
                         "повтор с тем же ключом не пишет второй раз (сбой связи); другое тело — 422"},
+                    // кандидат в Rules (M7.3 §6.7 п. 2, решение координатора 52)
+                    "candidate": {"type": "object", "description":
+                        "кандидат в Rules вместо записи (path rules:/<путь>, content до 200 токенов, без URL и блоков кода): reason — почему правило для всех проектов (20–2000 символов), basis — ссылки; принимает человек",
+                        "properties": {
+                            "reason": {"type": "string"},
+                            "basis": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["reason"]},
                     "format": fmt,
                 }),
                 &["path"],
@@ -1220,6 +1228,9 @@ async fn node_id(rest: &Rest, space: &str, path: &str) -> Result<String, Fail> {
 }
 
 async fn write(rest: &Rest, args: &JsonObject) -> Res {
+    if let Some(c) = args.get("candidate").filter(|v| !v.is_null()) {
+        return candidate(rest, args, c).await;
+    }
     let f = fmt(args)?;
     let (space, path) = split_path(rest, req_str(args, "path")?)?;
     let content = opt_str(args, "content")?;
@@ -1299,6 +1310,53 @@ async fn write(rest: &Rest, args: &JsonObject) -> Res {
             v["current_rev"],
             warnings_md(v)
         )
+    })
+}
+
+/// Кандидат в Rules `memory_write {path: "rules:/<путь>", content, candidate: {reason, basis?}}`
+/// → `POST /proposals {type: "rule", path, content, reason, basis}` (M7.3 §6.7 п. 2): путь —
+/// только Rules, без `base_rev`, `ops` и `l0`; решает человек в WebUI.
+async fn candidate(rest: &Rest, args: &JsonObject, c: &Value) -> Res {
+    let f = fmt(args)?;
+    let (space, path) = split_path(rest, req_str(args, "path")?)?;
+    if space != "rules" {
+        return Err(Fail::Invalid(
+            "candidate — только для пути rules:/<путь>: кандидат бывает только в Rules".into(),
+        ));
+    }
+    for k in ["ops", "base_rev", "l0"] {
+        if args.get(k).is_some_and(|v| !v.is_null()) {
+            return Err(Fail::Invalid(format!(
+                "{k} и candidate вместе не передаются: кандидат — новый текст правила (content)"
+            )));
+        }
+    }
+    let content = opt_str(args, "content")?
+        .ok_or_else(|| Fail::Invalid("candidate: нужен content — текст правила".into()))?;
+    let c = c
+        .as_object()
+        .ok_or_else(|| Fail::Invalid("candidate: {reason, basis?}".into()))?;
+    let reason = c.get("reason").and_then(Value::as_str).ok_or_else(|| {
+        Fail::Invalid("candidate.reason: почему это правило для всех проектов".into())
+    })?;
+    let mut body = json!({"type": "rule", "path": path, "content": content, "reason": reason});
+    if let Some(b) = c.get("basis").filter(|v| !v.is_null()) {
+        body["basis"] = b.clone();
+    }
+    let r = call_rest(rest, Method::POST, "/api/v1/proposals", Some(&body), &[]).await?;
+    done(f, &r, |v| {
+        let o = v["proposal"].as_str().unwrap_or("?");
+        if v["existing"] == true {
+            format!(
+                "Кандидат уже есть: {o} rules:/{path} ({}) — тот же путь и текст",
+                v["status"].as_str().unwrap_or("?")
+            )
+        } else {
+            format!(
+                "Кандидат в Rules {o} rules:/{path} — решает человек (WebUI «Кандидаты в \
+                 Rules»); свои — GET /proposals?author=me"
+            )
+        }
     })
 }
 
@@ -1535,6 +1593,10 @@ fn work_result_md(v: &Value) -> String {
             r["target"].as_str().unwrap_or(""),
             r["reason"].as_str().unwrap_or("")
         ));
+    }
+    // записи принятого, которые не сделаны при закрытии (кандидат в Rules: повтор, предел)
+    for w in v["warnings"].as_array().into_iter().flatten() {
+        s.push_str(&format!("\n- предупреждение: {}", w.as_str().unwrap_or("")));
     }
     s
 }

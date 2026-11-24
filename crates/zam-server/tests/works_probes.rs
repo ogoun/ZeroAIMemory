@@ -1555,7 +1555,12 @@ async fn probes_write_rechecks_in_transaction() {
     )
     .await
     .unwrap();
-    assert_eq!(closed, store::Closed::Closed);
+    assert_eq!(
+        closed,
+        store::Closed::Closed {
+            warnings: Vec::new()
+        }
+    );
     let same: Vec<Probe> = probes_of(&dbx)
         .await
         .into_iter()
@@ -1582,7 +1587,12 @@ async fn probes_write_rechecks_in_transaction() {
     )
     .await
     .unwrap();
-    assert_eq!(closed, store::Closed::Closed);
+    assert_eq!(
+        closed,
+        store::Closed::Closed {
+            warnings: Vec::new()
+        }
+    );
     let ps = probes_of(&dbx).await;
     assert!(ps.iter().all(|p| p.question != q2), "{ps:?}");
     assert!(ps.iter().all(|p| p.targets[0].target != r), "{ps:?}");

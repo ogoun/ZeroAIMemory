@@ -25,7 +25,7 @@ pub use chunk::{
     ApproxCounter, ChunkDraft, ChunkLevel, ChunkParams, ESTIMATE_C, ESTIMATE_M, EstimateCounter,
     TokenCounter, chunk_note, split_plain,
 };
-pub use code::{prose_mask, prose_mask_prefix};
+pub use code::{has_code_block, prose_mask, prose_mask_prefix};
 pub use doc::{
     Doc, Frontmatter, Heading, Link, LinkKind, OutlineItem, Section, SectionLookup,
     first_paragraph, first_paragraph_masked, outline, parse, resolve_section, section_by_path,

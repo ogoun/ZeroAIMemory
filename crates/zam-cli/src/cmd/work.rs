@@ -175,6 +175,10 @@ fn result_text(v: &Value) -> String {
             r["reason"].as_str().unwrap_or("")
         ));
     }
+    // записи принятого, которые не сделаны при закрытии (кандидат в Rules: повтор, предел)
+    for w in v["warnings"].as_array().into_iter().flatten() {
+        s.push_str(&format!("  предупреждение: {}\n", w.as_str().unwrap_or("")));
+    }
     s
 }
 
@@ -244,8 +248,13 @@ mod tests {
     #[test]
     fn result_text_lists_rejects() {
         let v = json!({"work": "j:1", "state": "done", "accepted": [1], "skip": [],
-                       "skipped": [3], "rejected": [{"n": 2, "target": "i:x", "reason": "нет"}]});
+                       "skipped": [3], "rejected": [{"n": 2, "target": "i:x", "reason": "нет"}],
+                       "warnings": ["i:y: кандидат не записан"]});
         let t = result_text(&v);
+        assert!(
+            t.contains("предупреждение: i:y: кандидат не записан"),
+            "{t}"
+        );
         assert!(
             t.starts_with("j:1: done — принято 1, отклонено 1, отказ 0, без итога 1"),
             "{t}"

@@ -5915,3 +5915,79 @@ async fn mcp_digest_works_line_once() {
     .await;
     assert!(!o.text.contains("Внутренние работы"), "{}", o.text);
 }
+
+/// M7.3 §6.7 п. 2 (решение 52): `memory_write {path: "rules:/…", content, candidate: {reason}}` —
+/// кандидат в Rules (`POST /proposals`, автор — сессия подключения); повтор — прежнее
+/// предложение; без `candidate` запись в Rules — ошибка 403 с подсказкой `candidate`;
+/// `candidate` не у Rules и вместе с `base_rev` — ошибка аргумента; поле — в схеме инструмента.
+#[tokio::test]
+async fn mcp_write_candidate() {
+    let a = api("mcp-write-candidate", |_| {}).await;
+    let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
+    let write = list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "memory_write")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        write["inputSchema"]["properties"]["candidate"]["required"],
+        json!(["reason"]),
+        "{write}"
+    );
+    assert!(
+        write["description"].as_str().unwrap().contains("candidate"),
+        "{write}"
+    );
+    let args = json!({"path": "rules:/process/summary",
+                      "content": "Пиши итог задачи в память перед ответом человеку.",
+                      "candidate": {"reason": "Правило поведения агента во всех проектах"}});
+    let o = ok(&a, &a.token, &sess(), "memory_write", args.clone()).await;
+    assert!(
+        o.text.starts_with("Кандидат в Rules o:") && o.text.contains("решает человек"),
+        "{}",
+        o.text
+    );
+    let id = o.text.split_whitespace().nth(3).unwrap().to_string();
+    let o = ok(&a, &a.token, &sess(), "memory_write", args).await;
+    assert!(
+        o.text.contains(&format!("Кандидат уже есть: {id}")),
+        "{}",
+        o.text
+    );
+    let r = a
+        .tok(&a.token, Method::GET, "/api/v1/proposals?author=me", None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.json()["proposals"][0]["id"], id.as_str());
+    assert_eq!(r.json()["proposals"][0]["session"], SESSION);
+    // без candidate — 403 с подсказкой
+    let o = tool(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_write",
+        json!({"path": "rules:/process/x", "content": "текст"}),
+    )
+    .await;
+    assert!(
+        o.is_error && o.text.contains("403") && o.text.contains("candidate"),
+        "{}",
+        o.text
+    );
+    for bad in [
+        json!({"path": "knowledge:/x", "content": "т",
+               "candidate": {"reason": "Правило поведения агента во всех проектах"}}),
+        json!({"path": "rules:/x", "content": "т", "base_rev": 1,
+               "candidate": {"reason": "Правило поведения агента во всех проектах"}}),
+        json!({"path": "rules:/x", "content": "т", "candidate": {}}),
+    ] {
+        let o = tool(&a, &a.token, &[], "memory_write", bad.clone()).await;
+        assert!(
+            o.is_error && o.text.contains("candidate"),
+            "{bad}: {}",
+            o.text
+        );
+    }
+}

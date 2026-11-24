@@ -6,8 +6,9 @@
 //!
 //! - `probes` (задача 4 плана) — пробные вопросы ночной проверки ([`super::probes`]): сборщик
 //!   по слоям, инструкция, схема и проверка вопроса, пределы проб;
-//! - `rules` (задача 7) — заготовка: сборщик пуст (работ вида нет), инструкция и схема —
-//!   короткие, элемент отклоняется; ветку заменит задача 7;
+//! - `rules` (задача 7) — кандидаты в Rules ([`super::rules`]): сборщик, инструкция, схема,
+//!   проверка элемента (общая со спонтанным кандидатом агента), отказ исполнителя — строка
+//!   `skipped`, контекст пакета — действующие заметки Rules (запись `n="0"`);
 //! - `echo` (только фича `test-hooks`, решение 73) — тестовый вид: кандидаты — записи журнала
 //!   пространства, итог элемента — `{n, target?, text}` без записи в память (тесты очереди,
 //!   пакета, итога и режима модели).
@@ -159,8 +160,7 @@ pub async fn collect(
     let _ = (ctx, user, space, limit, exclude);
     match kind {
         WorkKind::Probes => super::probes::collect(ctx, user, space, limit, exclude).await,
-        // заготовка: сборщик вида — задача 7 плана
-        WorkKind::Rules => Ok(Vec::new()),
+        WorkKind::Rules => super::rules::collect(ctx, user, space, limit, exclude).await,
         #[cfg(feature = "test-hooks")]
         WorkKind::Echo => echo::collect(ctx, user, space, limit, exclude).await,
     }
@@ -172,11 +172,7 @@ pub fn instruction(kind: WorkKind, lang: Lang) -> &'static str {
     match (kind, lang) {
         (WorkKind::Probes, Lang::Ru) => super::probes::INSTRUCTION_RU,
         (WorkKind::Probes, Lang::En) => super::probes::INSTRUCTION_EN,
-        // заготовка: тексты вида — задача 7 плана
-        (WorkKind::Rules, Lang::Ru) => {
-            "Найди в записях правило для Rules (вид появится в задаче 7)."
-        }
-        (WorkKind::Rules, Lang::En) => "Find a rule for Rules in the records (task 7).",
+        (WorkKind::Rules, lang) => super::rules::instruction(lang),
         #[cfg(feature = "test-hooks")]
         (WorkKind::Echo, Lang::Ru) => {
             "Тестовый вид echo: для каждой записи верни элемент {n, text} — text: заголовок \
@@ -195,9 +191,7 @@ pub fn instruction(kind: WorkKind, lang: Lang) -> &'static str {
 pub fn schema(kind: WorkKind) -> &'static str {
     match kind {
         WorkKind::Probes => super::probes::SCHEMA,
-        WorkKind::Rules => {
-            r#"{"items": [{"n": 1, "path": "…", "content": "…", "reason": "…"}], "skip": "<причина>"?}"#
-        }
+        WorkKind::Rules => super::rules::SCHEMA,
         #[cfg(feature = "test-hooks")]
         WorkKind::Echo => r#"{"items": [{"n": 1, "text": "…"}], "skip": "<причина>"?}"#,
     }
@@ -220,12 +214,44 @@ pub async fn accept_item(
     let _ = (ctx, n, item, prior);
     match kind {
         WorkKind::Probes => super::probes::accept(ctx, n, item, prior).await,
-        // заготовка: проверка вида — задача 7 плана
-        WorkKind::Rules => Err(Reject::new(
-            "вид ещё не принимает итог: обновите zam-server",
-        )),
+        WorkKind::Rules => super::rules::accept(ctx, n, item, prior).await,
         #[cfg(feature = "test-hooks")]
         WorkKind::Echo => echo::accept(ctx, n, item).await,
+    }
+}
+
+/// Записи отказа исполнителя от элемента `{n, skip: "почему"}` (§6.3 п. 4): у `rules` — строка
+/// `proposals` со статусом `skipped` (отсев до новой ревизии источника, §6.7 п. 3); у прочих
+/// видов отказ остаётся только в итоге работы (`result.skip`). Пишет закрытие работы в той же
+/// транзакции, что принятые элементы.
+pub fn skip_writes(
+    kind: WorkKind,
+    ctx: &ItemCtx<'_>,
+    item: &zam_store::works::WorkItem,
+    why: &str,
+) -> Vec<ItemWrite> {
+    match kind {
+        WorkKind::Rules => super::rules::skip(ctx, item, why),
+        WorkKind::Probes => Vec::new(),
+        #[cfg(feature = "test-hooks")]
+        WorkKind::Echo => Vec::new(),
+    }
+}
+
+/// Контекст пакета вида — запись `n="0"` перед элементами (данные, итога для неё нет): у `rules`
+/// — действующие заметки Rules (§6.7 п. 3), чтобы исполнитель их не повторял; у прочих видов —
+/// нет. `space` — пространство работы, `budget` — бюджет пакета (контекст — его часть).
+pub async fn context(
+    kind: WorkKind,
+    db: &Db,
+    space: Id,
+    budget: usize,
+) -> Result<Option<Candidate>, StoreError> {
+    match kind {
+        WorkKind::Rules => super::rules::context(db, space, budget).await,
+        WorkKind::Probes => Ok(None),
+        #[cfg(feature = "test-hooks")]
+        WorkKind::Echo => Ok(None),
     }
 }
 

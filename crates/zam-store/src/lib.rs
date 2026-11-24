@@ -10,7 +10,8 @@
 //! M5.6), журнал идей (вид записи `idea`; M5.7), эпохи выданного сессии, учёт без сессии и
 //! снимки сессий (`session_snapshots`; M6), виды внутренних работ и открытия подсказок
 //! (`works`, `usage_opened`; M7.3), журнал отправок подключённой модели (`work_calls`; M7.3), пробы
-//! ночной проверки памяти, её прогоны и результаты (`probes`, `check_runs`, `check_results`; M7.3).
+//! ночной проверки памяти, её прогоны и результаты (`probes`, `check_runs`, `check_results`; M7.3),
+//! предложения человеку — кандидаты в Rules (`proposals`; M7.3).
 
 pub mod access;
 pub mod archive;
@@ -38,6 +39,7 @@ pub mod migrate;
 pub mod nodes;
 pub mod paths;
 pub mod probes;
+pub mod proposals;
 pub mod questions;
 mod schema_repair;
 pub mod search;

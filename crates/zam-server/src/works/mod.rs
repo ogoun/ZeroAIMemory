@@ -12,6 +12,8 @@
 //!   построитель пакета с общей проверкой текста итога (задача 3).
 //! - [`probes`] — вид `probes`: сборщик кандидатов по слоям, инструкция, проверка пробного
 //!   вопроса и пределы проб (задача 4).
+//! - [`rules`] — вид `rules` и проверка кандидата в Rules, общая со спонтанным кандидатом агента
+//!   (задача 7).
 
 pub mod conn;
 pub mod egress;
@@ -23,6 +25,7 @@ pub mod package;
 pub mod pause;
 pub mod probes;
 pub mod queue;
+pub mod rules;
 pub mod schedule;
 pub mod settings;
 

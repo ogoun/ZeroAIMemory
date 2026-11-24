@@ -215,9 +215,21 @@ If a session broke off (a limit, a closed window) and the task's `next_step` was
 - **Only the human accepts a new norm** (WebUI “Проверка памяти” → “Принять как норму”); with a token — 403: do not hide a regression.
 - A manual run — `zam check run` (runs outside the night window too), the latest verdict — `zam check status`. Probe references `x:` are not for `memory_read`.
 
+## Rules candidates
+
+The human writes Rules; you **propose** a rule, and the human accepts or declines it in WebUI (“Кандидаты в Rules”, Rules candidates). A proposal (reference `o:`) changes nothing by itself: the human creates the Rules note by accepting it.
+
+- **When.** You noticed a rule for **all** of your projects — a behaviour, not a fact of one project (an owner's decision, a gotcha you hit again and again) — and Rules does not have it.
+- **How** — `memory_write {path: "rules:/<path>", content, candidate: {reason, basis?}}`; CLI — `zam rules candidate <path> --file F --reason R [--basis ID]…`; REST — `POST /proposals {type: "rule", path, content, reason, basis?}`. The reply is `o:<id>`; the same path and text — the earlier proposal.
+- **The rule**: imperative, up to 200 tokens, without project paths, URLs and code blocks (one-line `code` is fine), without the mask `‹secret›`; the Rules path is free (taken — 409 with advice to pick another path), not a near-duplicate of a Rules note (409 with a reference to it). `reason` — why it is a rule for all projects, 20–2000 characters; `basis` — references (`i:`, `n:` …) it rests on.
+- **Limits**: at most 50 open candidates (409 `/problems/proposals-full` — wait for the human's decision); an `ro` token — 403.
+- **Writing to Rules without the right** (`rules.agent_write` off, the default) — 403 with a hint to propose a candidate; with the right you write to Rules directly, and `candidate` works then too.
+- **Your candidates** — `GET /proposals?author=me` (CLI `zam rules candidates`); withdraw your own — `POST /proposals/{id}/withdraw`. Only the human can accept (`accept`) and decline (`decline`) — with a token 403; the digest has no candidate lines. `o:` references are not for `memory_read`.
+- At night an internal work of kind `rules` may look for candidates too (section “Internal works”): the same check; a source declined by the human is not proposed again.
+
 ## Spaces
 
-- Solution (GUID from `solution.toml`) — project memory; Knowledge — the user's general knowledge; Rules — rules read at the start of every session (agent writes only if the administrator allowed them); Human — the person's notes, not available to agents.
+- Solution (GUID from `solution.toml`) — project memory; Knowledge — the user's general knowledge; Rules — rules read at the start of every session (the human writes them; the agent — only if the administrator allowed it, otherwise it proposes a candidate — section “Rules candidates”); Human — the person's notes, not available to agents.
 - Someone else's solution GUID — an access request to its owner; until approved, writes get 403.
 
 ## Instruction block
