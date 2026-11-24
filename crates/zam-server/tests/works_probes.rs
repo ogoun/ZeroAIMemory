@@ -261,6 +261,11 @@ async fn night_in_window(a: &Api) {
     queue::night(&ctx(a), d, until).await.unwrap();
 }
 
+/// Пустой отсев «уже предложено в этом запуске» (сборщик вне постановки).
+fn none() -> HashSet<(String, i64)> {
+    HashSet::new()
+}
+
 fn day(n: i8) -> civil::Date {
     civil::date(2026, 11, n)
 }
@@ -317,6 +322,18 @@ async fn put_result(a: &Api, session: &str, work: &str, body: Value) -> Resp {
         &format!("{WORKS}/{work}/result"),
         Some(body),
         &[("x-zam-session", session)],
+    )
+    .await
+}
+
+/// Итог работы `work` сессии `session` с `Idempotency-Key` `key`.
+async fn put_result_key(a: &Api, session: &str, work: &str, body: Value, key: &str) -> Resp {
+    a.tok_h(
+        &a.token,
+        Method::POST,
+        &format!("{WORKS}/{work}/result"),
+        Some(body),
+        &[("x-zam-session", session), ("idempotency-key", key)],
     )
     .await
 }
@@ -482,17 +499,23 @@ async fn probes_sample_stratified_deterministic() {
     let user = a.st.admin_id;
     let g1 = solution(&a, G1).await;
     let c = ctx(&a);
-    let first = probes::collect_on(&c, user, g1, day(23), 100)
+    let first = probes::collect_on(&c, user, g1, day(23), 100, &none())
         .await
         .unwrap();
     assert_eq!(first.len(), 20, "{first:?}");
-    let order: Vec<&str> = ["insight:decision", "insight:gotcha", "note", "term"].into();
+    // круг слоёв: первые четыре — все четыре слоя (порядок слоёв — ночи), дальше круг повторяется
+    let round: Vec<&str> = first[..4].iter().map(|c| layer[&c.target]).collect();
+    assert_eq!(
+        round.iter().copied().collect::<HashSet<_>>(),
+        HashSet::from(["insight:decision", "insight:gotcha", "note", "term"]),
+        "{round:?}"
+    );
     for (i, cand) in first.iter().enumerate() {
         assert!(!other.contains(&cand.target), "{cand:?}");
-        assert_eq!(layer[&cand.target], order[i % 4], "{i}: по кругу слоёв");
+        assert_eq!(layer[&cand.target], round[i % 4], "{i}: по кругу слоёв");
     }
     let targets = |v: &[kinds::Candidate]| v.iter().map(|c| c.target.clone()).collect::<Vec<_>>();
-    let again = probes::collect_on(&c, user, g1, day(23), 100)
+    let again = probes::collect_on(&c, user, g1, day(23), 100, &none())
         .await
         .unwrap();
     assert_eq!(
@@ -500,7 +523,7 @@ async fn probes_sample_stratified_deterministic() {
         targets(&first),
         "та же ночь — тот же порядок"
     );
-    let next = probes::collect_on(&c, user, g1, day(24), 100)
+    let next = probes::collect_on(&c, user, g1, day(24), 100, &none())
         .await
         .unwrap();
     assert_ne!(
@@ -510,18 +533,34 @@ async fn probes_sample_stratified_deterministic() {
     );
     let set = |v: &[kinds::Candidate]| targets(v).into_iter().collect::<HashSet<_>>();
     assert_eq!(set(&next), set(&first));
-    let six = probes::collect_on(&c, user, g1, day(23), 6).await.unwrap();
+    let six = probes::collect_on(&c, user, g1, day(23), 6, &none())
+        .await
+        .unwrap();
     assert_eq!(targets(&six), targets(&first)[..6]);
-    let r = probes::collect_on(&c, user, space(&a, SpaceKind::Rules).await, day(23), 100)
-        .await
-        .unwrap();
+    let r = probes::collect_on(
+        &c,
+        user,
+        space(&a, SpaceKind::Rules).await,
+        day(23),
+        100,
+        &none(),
+    )
+    .await
+    .unwrap();
     assert_eq!(set(&r), rules);
-    let h = probes::collect_on(&c, user, space(&a, SpaceKind::Human).await, day(23), 100)
-        .await
-        .unwrap();
+    let h = probes::collect_on(
+        &c,
+        user,
+        space(&a, SpaceKind::Human).await,
+        day(23),
+        100,
+        &none(),
+    )
+    .await
+    .unwrap();
     assert!(h.is_empty(), "{h:?}");
     // диспетчер вида и ночь: работы решения и Rules, Human — нет
-    let d = kinds::collect(WorkKind::Probes, &c, user, g1, 100)
+    let d = kinds::collect(WorkKind::Probes, &c, user, g1, 100, &none())
         .await
         .unwrap();
     assert_eq!(set(&d), set(&first));
@@ -542,16 +581,73 @@ async fn probes_sample_stratified_deterministic() {
     assert_eq!(w.items.len(), 10, "batch_records по умолчанию");
 }
 
+/// Ревью r1, M2: начало круга слоёв — свой порядок слоёв каждой ночи: при `limit` меньше числа
+/// слоёв (малый `batch_records`, хвост предела) поздние по имени слои не голодают — за несколько
+/// ночей в выборку попадает каждый, и выборки ночей различаются.
+#[tokio::test]
+async fn probes_layer_round_start_varies() {
+    let _g = SERIAL.lock().await;
+    let a = server("layers", |_| {}).await;
+    let mut layer: HashMap<String, &str> = HashMap::new();
+    for i in 0..2 {
+        let r = insight_k(&a, "knowledge", &format!("Ловушка {i}"), "текст", "gotcha").await;
+        layer.insert(r, "insight:gotcha");
+        let r = insight_k(
+            &a,
+            "knowledge",
+            &format!("Решение {i}"),
+            "текст",
+            "decision",
+        )
+        .await;
+        layer.insert(r, "insight:decision");
+        let r = note_by(
+            &a,
+            Some(&a.token),
+            "knowledge",
+            &format!("kb/n{i}.md"),
+            "# Заметка\n\nтекст\n",
+        )
+        .await;
+        layer.insert(r, "note");
+        let r = term(&a, "knowledge", &format!("Понятие{i}")).await;
+        layer.insert(r, "term");
+    }
+    let kn = space(&a, SpaceKind::Knowledge).await;
+    let c = ctx(&a);
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut nights: HashSet<Vec<&str>> = HashSet::new();
+    for n in 1..=12 {
+        let got = probes::collect_on(&c, a.st.admin_id, kn, day(n), 3, &none())
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 3);
+        let mut layers: Vec<&str> = got.iter().map(|c| layer[&c.target]).collect();
+        assert_eq!(
+            layers.iter().collect::<HashSet<_>>().len(),
+            3,
+            "круг: три разных слоя"
+        );
+        seen.extend(layers.iter().copied());
+        layers.sort_unstable();
+        nights.insert(layers);
+    }
+    assert_eq!(seen.len(), 4, "каждый слой попадает в выборку: {seen:?}");
+    assert!(nights.len() > 1, "выборки ночей различаются: {nights:?}");
+}
+
 // ---------------- проверка итога ----------------
 
-/// §6.4 п. 2: проверка пробного вопроса — 7 и 26 слов, 301 символ, путь, ссылка, дата, URL,
-/// обратные кавычки — отказ; `overlap` 4 из 8 (0,5) — принят, 13 из 25 (0,52) — «пересказ
-/// заголовка»; повтор (у активной пробы пространства и в том же итоге) — отказ; маска секрета —
-/// отказ. Принятая проба агента — автор `agent`, сессия, `overlap` пробы.
+/// §6.4 п. 2: проверка пробного вопроса — 7 и 26 слов, 301 символ, путь (и Windows), ссылка,
+/// дата, URL (и `www.`), обратные кавычки — отказ; 25 слов и 300 символов — приняты; `overlap` 4
+/// из 8 (0,5) — принят, 13 из 25 (0,52) — «пересказ заголовка»; повтор (у активной пробы
+/// пространства и в том же итоге) — отказ; маска секрета (`‹secret›`, `‹secret-1›`) — отказ;
+/// ссылка не из пакета — отказ с присланной ссылкой. Принятая проба агента — автор `agent`,
+/// сессия, `overlap` пробы.
 #[tokio::test]
 async fn probes_validator_cases() {
     let _g = SERIAL.lock().await;
-    let a = server("validator", |c| c.works.batch_records = 20).await;
+    let a = server("validator", |c| c.works.batch_records = 30).await;
     agent_mode(&a).await;
     let kn = space(&a, SpaceKind::Knowledge).await;
     let dup_db = "Какой порядок действий при восстановлении базы памяти из копии сервера?";
@@ -581,6 +677,15 @@ async fn probes_validator_cases() {
     chars301.push(' ');
     chars301.push_str(&"щ".repeat(22));
     assert_eq!(chars301.chars().count(), 301);
+    // границы, которые принимаются (ревью r1, M7): ровно 25 слов и ровно 300 символов
+    let words25 = (0..25)
+        .map(|i| format!("слово{i}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut chars300 = vec!["ш".repeat(30); 9].join(" ");
+    chars300.push(' ');
+    chars300.push_str(&"щ".repeat(21));
+    assert_eq!(chars300.chars().count(), 300);
     let q1 = "Почему ночная проверка памяти пропускает базу без проб с целью?";
     // (заголовок записи, вопрос, ожидание: None — принят, Some(часть причины) — отказ)
     let cases: Vec<(String, String, Option<&str>)> = vec![
@@ -646,6 +751,23 @@ async fn probes_validator_cases() {
             "Где хранится ‹secret› для подключения подставной модели к серверу памяти?".into(),
             Some(MASK_LITERAL_REASON),
         ),
+        ("Тема номер 13".into(), words25, None),
+        ("Тема номер 14".into(), chars300, None),
+        (
+            "Тема номер 15".into(),
+            "Где хранится ‹secret-1› для подключения подставной модели к серверу памяти?".into(),
+            Some(MASK_LITERAL_REASON),
+        ),
+        (
+            "Тема номер 16".into(),
+            "Что хранит файл C:\\data\\zam\\config.toml на сервере памяти сейчас?".into(),
+            Some("путь"),
+        ),
+        (
+            "Тема номер 17".into(),
+            "Где описана настройка модели на сайте www.example.com для сервера памяти?".into(),
+            Some("URL"),
+        ),
     ];
     let mut refs = Vec::new();
     for (title, _, _) in &cases {
@@ -658,15 +780,23 @@ async fn probes_validator_cases() {
     assert!(text.contains(INSTRUCTION_RU), "{text}");
     assert!(text.contains(SCHEMA), "{text}");
     let work = r.json()["work"].as_str().unwrap().to_string();
-    let items: Vec<Value> = cases
+    let mut items: Vec<Value> = cases
         .iter()
         .zip(&refs)
         .map(|((_, q, _), t)| json!({"target": t, "question": q}))
         .collect();
+    // ссылка не из пакета (ревью r1, M6): в отказе — присланная строка
+    let stranger = format!("i:{}", Id::new());
+    items.push(json!({"target": stranger, "question": q1}));
     let resp = put_result(&a, S1, &work, json!({"items": items})).await;
     ok(&resp, StatusCode::OK);
     let resp = resp.json();
     let why = reasons(&resp);
+    assert!(
+        why.get(&stranger)
+            .is_some_and(|r| r.contains("не запись пакета")),
+        "{resp}"
+    );
     let mut accepted = Vec::new();
     for ((title, _, want), t) in cases.iter().zip(&refs) {
         match want {
@@ -682,10 +812,10 @@ async fn probes_validator_cases() {
             }
         }
     }
-    assert_eq!(resp["accepted"].as_array().unwrap().len(), 2, "{resp}");
+    assert_eq!(resp["accepted"].as_array().unwrap().len(), 4, "{resp}");
     let ps = probes_of(&db(&a).await).await;
     let mine: Vec<&Probe> = ps.iter().filter(|p| p.work_id.is_some()).collect();
-    assert_eq!(mine.len(), 2, "{ps:?}");
+    assert_eq!(mine.len(), 4, "{ps:?}");
     for p in &mine {
         assert!(accepted.contains(&p.targets[0].target), "{p:?}");
         assert_eq!(p.author_kind, ProbeAuthor::Agent);
@@ -756,8 +886,9 @@ async fn probes_two_for_long_record() {
 // ---------------- пределы ----------------
 
 /// §6.3 п. 2, §6.4 п. 1: 40 новых проб за ночь — на пользователя, сколько бы ни было решений:
-/// две работы агента ночи (25 + 25 записей) — принято 25 и 15, отказ «предел» — 10; следующая
-/// ночь того же окна работ не ставит; у модели ночь останавливается на пределе (обращений — 2).
+/// постановка агента — 25 + 15 записей (остаток предела за вычетом поставленного); итог сам
+/// сверяет предел (проба другого итога пришла раньше — отказ «предел»); исчерпанный предел —
+/// следующая ночь работ не ставит; у модели ночь останавливается на пределе (обращений — 2).
 #[tokio::test]
 async fn probes_limits_per_user() {
     let _g = SERIAL.lock().await;
@@ -774,40 +905,51 @@ async fn probes_limits_per_user() {
         }
     }
     night_in_window(&a).await;
-    let ws = probe_works(&a).await;
+    let mut ws = probe_works(&a).await;
+    ws.reverse();
     assert_eq!(ws.len(), 2, "{ws:?}");
-    assert!(
-        ws.iter()
-            .all(|w| w.items.len() == 25 && w.origin == Origin::Nightly)
+    assert!(ws.iter().all(|w| w.origin == Origin::Nightly));
+    // постановка вычитает поставленное в этом же проходе (ревью r1, M3): 25 + 15, не 25 + 25
+    assert_eq!(
+        ws.iter().map(|w| w.items.len()).collect::<Vec<_>>(),
+        vec![25, 15]
     );
-    let mut accepted = Vec::new();
-    for (p, (s, g)) in [("probes-limit-1", G1), ("probes-limit-2", G2)]
-        .into_iter()
-        .enumerate()
-    {
-        let items: Vec<Value> = (1..=25)
-            .map(|n| json!({"n": n, "question": good_q(p, n)}))
-            .collect();
-        let resp = answer_in(&a, s, Some(g), json!(items)).await;
-        accepted.push(resp["accepted"].as_array().unwrap().len());
-        if p == 1 {
-            let rej = resp["rejected"].as_array().unwrap();
-            assert_eq!(rej.len(), 10, "{resp}");
-            assert!(
-                rej.iter().all(|r| r["reason"]
-                    .as_str()
-                    .unwrap()
-                    .contains(&format!("предел новых проб за ночь — {PROBES_PER_NIGHT}"))),
-                "{resp}"
-            );
-        }
-    }
-    assert_eq!(accepted, vec![25, 15]);
+    let g1 = solution(&a, G1).await;
+    let guid = |w: &store::Work| if w.space_id == g1 { G1 } else { G2 };
+    let all = |p: usize, k: usize| -> Value {
+        json!(
+            (1..=k)
+                .map(|n| json!({"n": n, "question": good_q(p, n)}))
+                .collect::<Vec<_>>()
+        )
+    };
+    let first = answer_in(&a, "probes-limit-1", Some(guid(&ws[0])), all(0, 25)).await;
+    assert_eq!(first["accepted"].as_array().unwrap().len(), 25, "{first}");
+    // итог проверяет предел сам: проба другого итога пришла раньше — последняя из 15 — отказ
+    seed(
+        &a,
+        space(&a, SpaceKind::Knowledge).await,
+        Origin::Nightly,
+        1,
+    )
+    .await;
+    let second = answer_in(&a, "probes-limit-2", Some(guid(&ws[1])), all(1, 15)).await;
+    assert_eq!(second["accepted"].as_array().unwrap().len(), 14, "{second}");
+    let rej = second["rejected"].as_array().unwrap();
+    assert_eq!(rej.len(), 1, "{second}");
+    assert!(
+        rej[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("предел новых проб за ночь — {PROBES_PER_NIGHT}")),
+        "{second}"
+    );
     assert_eq!(made(&a, Origin::Nightly).await, PROBES_PER_NIGHT);
     // предел исчерпан — ночь работ вида не ставит (другая дата: постановка пространства за эту
-    // ночь — не повод; записей без проб — 10)
+    // ночь — не повод; записей без проб — 11)
+    let before = probe_works(&a).await.len();
     night_of(&a, day(25)).await;
-    assert_eq!(probe_works(&a).await.len(), 2);
+    assert_eq!(probe_works(&a).await.len(), before);
     // режим модели: ночь останавливается на пределе — второй пакет только до него
     let m = MockModel::start();
     let b = server("limits-model", |c| {
@@ -932,12 +1074,13 @@ async fn probes_skip_member_records() {
         .await;
     ok(&r, StatusCode::OK);
     let g1 = solution(&a, G1).await;
-    let got: HashSet<String> = probes::collect_on(&ctx(&a), a.st.admin_id, g1, day(23), 100)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|c| c.target)
-        .collect();
+    let got: HashSet<String> =
+        probes::collect_on(&ctx(&a), a.st.admin_id, g1, day(23), 100, &none())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.target)
+            .collect();
     assert_eq!(got, HashSet::from([own_i.clone(), own_n.clone()]));
     for t in [&mixed_i, &mixed_n, &member_i, &member_n] {
         assert!(!got.contains(t), "{t}");
@@ -1039,7 +1182,7 @@ async fn probes_secret_dropped_not_reoffered_until_new_rev() {
     assert_eq!(rej[0]["reason"], store::SECRET_IN_PAYLOAD);
     // следующая ночь: чистая запись опробована, запись с ключом — до новой ревизии вне пакетов
     let c = ctx(&a);
-    let got = probes::collect_on(&c, a.st.admin_id, kn, day(24), 100)
+    let got = probes::collect_on(&c, a.st.admin_id, kn, day(24), 100, &none())
         .await
         .unwrap();
     assert!(got.is_empty(), "{got:?}");
@@ -1048,7 +1191,7 @@ async fn probes_secret_dropped_not_reoffered_until_new_rev() {
     assert_eq!(ws.len(), 1, "{ws:?}");
     assert_eq!(m.count(), 1);
     revise(&a, &a.token, &leaky, "новый текст без ключа").await;
-    let got = probes::collect_on(&c, a.st.admin_id, kn, day(24), 100)
+    let got = probes::collect_on(&c, a.st.admin_id, kn, day(24), 100, &none())
         .await
         .unwrap();
     assert_eq!(
@@ -1110,6 +1253,315 @@ async fn probes_skip_not_reoffered_until_new_rev() {
             .collect::<Vec<_>>(),
         vec![(r2, 2)]
     );
+}
+
+// ---------------- круг правок 1 (ревью r1) ----------------
+
+/// Ревью r1, I1 (решение координатора): записи, уже отправленные в пакете этой ночью, — с любым
+/// исходом (без итога, отклонённые проверкой) — той же ночью снова не предлагаются: вторая
+/// постановка той же ночи — ни одного обращения к подставной модели; другой ночью — снова
+/// кандидаты.
+#[tokio::test]
+async fn probes_offered_not_reoffered_same_night() {
+    let _g = SERIAL.lock().await;
+    let m = MockModel::start();
+    m.set_default(MockReply::chat("{\"items\": []}"));
+    let a = server("offered", night_now).await;
+    let r1 = insight(&a, "knowledge", "Первая запись", "текст").await;
+    let r2 = insight(&a, "knowledge", "Вторая запись", "текст").await;
+    model_mode(&a, &m, &a.token, None).await;
+    night_in_window(&a).await;
+    assert_eq!(m.count(), 1);
+    let w = probe_works(&a).await.remove(0);
+    assert_eq!(w.state, WorkState::Done, "{w:?}");
+    let skipped: HashSet<String> = w.result.as_ref().unwrap()["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["target"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(skipped, HashSet::from([r1.clone(), r2.clone()]));
+    // та же ночь: молчание модели — не повод отправить те же записи снова
+    night_in_window(&a).await;
+    assert_eq!(m.count(), 1);
+    assert_eq!(probe_works(&a).await.len(), 1);
+    // отказ проверки (пересказ заголовка) — та же ночь без повторного пакета
+    let r3 = insight(&a, "knowledge", "Резервная копия сервера памяти", "текст").await;
+    m.push(reply(1..=1, |_| {
+        "Где лежит резервная копия сервера памяти и как часто она делается?".into()
+    }));
+    night_in_window(&a).await;
+    assert_eq!(m.count(), 2);
+    let w = probe_works(&a).await.remove(0);
+    assert_eq!(
+        w.items.iter().map(|i| i.target.clone()).collect::<Vec<_>>(),
+        vec![r3.clone()]
+    );
+    assert_eq!(
+        w.result.as_ref().unwrap()["rejected"][0]["reason"],
+        REASON_RETELL
+    );
+    night_in_window(&a).await;
+    assert_eq!(
+        m.count(),
+        2,
+        "отклонённая проверкой — той же ночью снова не идёт"
+    );
+    // отсев — по ночи: этой ночью предложены все три, другой ночью — снова кандидаты
+    let wc = &a.st.cfg.works;
+    let (d, start, _) = zam_server::schedule::night_window(
+        zam_store::time::now(),
+        wc.at_hm(),
+        &wc.time_zone(),
+        wc.window_min,
+    )
+    .unwrap();
+    let dbx = db(&a).await;
+    let tonight = store::offered_refs(&dbx, WorkKind::Probes, Origin::Nightly, Some(d), start)
+        .await
+        .unwrap();
+    let all: HashSet<(String, i64)> = [&r1, &r2, &r3].iter().map(|t| ((*t).clone(), 1)).collect();
+    assert_eq!(tonight, all);
+    let other = d.tomorrow().unwrap();
+    let later = store::offered_refs(&dbx, WorkKind::Probes, Origin::Nightly, Some(other), start)
+        .await
+        .unwrap();
+    assert!(later.is_empty(), "{later:?}");
+    let kn = space(&a, SpaceKind::Knowledge).await;
+    let c = ctx(&a);
+    let got = kinds::collect(WorkKind::Probes, &c, a.st.admin_id, kn, 10, &later)
+        .await
+        .unwrap();
+    assert_eq!(
+        got.into_iter()
+            .map(|c| (c.target, c.rev))
+            .collect::<HashSet<_>>(),
+        all
+    );
+    let none_left = kinds::collect(WorkKind::Probes, &c, a.st.admin_id, kn, 10, &tonight)
+        .await
+        .unwrap();
+    assert!(none_left.is_empty(), "{none_left:?}");
+}
+
+/// Ревью r1, M5: заголовок заметки для пакета и проверки — её первый H1 и путь: пересказ H1
+/// отклоняется «пересказ заголовка».
+#[tokio::test]
+async fn probes_note_title_includes_heading() {
+    let _g = SERIAL.lock().await;
+    let a = server("note-title", |_| {}).await;
+    agent_mode(&a).await;
+    let n = note_by(
+        &a,
+        Some(&a.token),
+        "knowledge",
+        "kb/backup.md",
+        "---\ntags: [ops]\n---\n# Восстановление базы из резервной копии сервера\n\nШаги и проверка.\n",
+    )
+    .await;
+    night_of(&a, day(23)).await;
+    let w = probe_works(&a).await.remove(0);
+    assert_eq!(
+        w.items[0].title,
+        "Восстановление базы из резервной копии сервера (kb/backup.md)"
+    );
+    let resp = answer(
+        &a,
+        S1,
+        json!([{"target": n,
+                "question": "Как выполнить восстановление базы из резервной копии сервера?"}]),
+    )
+    .await;
+    assert_eq!(resp["rejected"][0]["reason"], REASON_RETELL, "{resp}");
+}
+
+/// ⚠️ ревью r1: граница «пересказа заголовка» на кириллице — нормализация как у слов подсказок
+/// (§6.4 п. 2): словоформы по основам, регистр, `ё` = `е`, служебные слова не считаются; ровно
+/// 0,5 (4 из 8) — принят, 5 из 9 — отказ.
+#[test]
+fn probes_overlap_cyrillic_boundary() {
+    let title = "Резервная копия сервера: учёт памяти";
+    let half = "Как ночная проверка РЕЗЕРВНОЙ копии серверу для учета занимает время?";
+    let ov = zam_search::eval::overlap(half, title);
+    assert!((ov - 0.5).abs() < 1e-9, "{ov}");
+    let got = probes::check_question(half, title).unwrap();
+    assert!((got - 0.5).abs() < 1e-9, "{got}");
+    let above = "Как ночная проверка РЕЗЕРВНОЙ копии серверу для учёта ПАМЯТИ занимает время?";
+    let ov = zam_search::eval::overlap(above, title);
+    assert!((ov - 5.0 / 9.0).abs() < 1e-9, "{ov}");
+    assert_eq!(
+        probes::check_question(above, title).unwrap_err().reason,
+        REASON_RETELL
+    );
+}
+
+/// ⚠️ ревью r1, M1: запись принятых проб — в транзакции закрытия работы, у одного писателя базы:
+/// тот же вопрос, записанный другим путём до закрытия, не дублируется; предел ночи, исчерпанный к
+/// закрытию, — проба не пишется; запись, чья проба не записалась, следующей ночью — снова кандидат.
+#[tokio::test]
+async fn probes_write_rechecks_in_transaction() {
+    let _g = SERIAL.lock().await;
+    let a = server("recheck", |_| {}).await;
+    let r = insight(&a, "knowledge", "Запись", "текст").await;
+    let kn = space(&a, SpaceKind::Knowledge).await;
+    let dbx = db(&a).await;
+    let probe = |q: &str, target: &str| NewProbe {
+        space: Some(kn),
+        question: q.into(),
+        kind: ProbeKind::Probe,
+        targets: vec![ProbeTarget {
+            target: target.into(),
+            rev: 1,
+        }],
+        split: zam_search::eval::probe_split(target),
+        overlap: Some(0.0),
+        author_kind: ProbeAuthor::Model,
+        author: Some("model:mock-model".into()),
+        work_id: None,
+    };
+    let (since, cap) = probes::quota(Origin::Nightly, zam_store::time::now(), &a.st.cfg.works);
+    let result = json!({"accepted": [{"n": 1, "target": r, "rev": 1}], "rejected": [],
+                        "skip": [], "skipped": []});
+    let start = |dbx: zam_store::Db, r: String| async move {
+        let w = store::enqueue(
+            &dbx,
+            NewWork {
+                kind: WorkKind::Probes,
+                space: kn,
+                mode: WorkMode::Model,
+                origin: Origin::Nightly,
+                night: Some(day(23)),
+                items: vec![WorkItem {
+                    n: 1,
+                    target: r,
+                    rev: 1,
+                    kind: "insight".into(),
+                    title: "Запись".into(),
+                    text: "текст".into(),
+                    signals: Vec::new(),
+                }],
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(store::start_model(&dbx, w.id).await.unwrap());
+        w.id
+    };
+    // 1. тот же вопрос записан другим путём, пока шла работа: закрытие его не дублирует
+    let q = good_q(1, 1);
+    let w1 = start(dbx.clone(), r.clone()).await;
+    let fake = format!("i:{}", Id::new());
+    zam_store::probes::insert_probe(&dbx, probe(&q, &fake))
+        .await
+        .unwrap();
+    let closed = store::finish_claimed(
+        &dbx,
+        w1,
+        None,
+        WorkState::Done,
+        result.clone(),
+        None,
+        vec![store::ItemWrite::Probe {
+            probe: probe(&q, &r),
+            since,
+            cap,
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed, store::Closed::Closed);
+    let same: Vec<Probe> = probes_of(&dbx)
+        .await
+        .into_iter()
+        .filter(|p| p.question == q)
+        .collect();
+    assert_eq!(same.len(), 1, "{same:?}");
+    assert_eq!(same[0].targets[0].target, fake);
+    // 2. предел ночи исчерпан к закрытию: проба не пишется
+    seed(&a, kn, Origin::Nightly, PROBES_PER_NIGHT as usize).await;
+    let w2 = start(dbx.clone(), r.clone()).await;
+    let q2 = good_q(2, 1);
+    let closed = store::finish_claimed(
+        &dbx,
+        w2,
+        None,
+        WorkState::Done,
+        result.clone(),
+        None,
+        vec![store::ItemWrite::Probe {
+            probe: probe(&q2, &r),
+            since,
+            cap,
+        }],
+    )
+    .await
+    .unwrap();
+    assert_eq!(closed, store::Closed::Closed);
+    let ps = probes_of(&dbx).await;
+    assert!(ps.iter().all(|p| p.question != q2), "{ps:?}");
+    assert!(ps.iter().all(|p| p.targets[0].target != r), "{ps:?}");
+    // 3. проба записи не записалась — следующей ночью запись снова кандидат (принятый элемент
+    // итога её не держит)
+    let got = probes::collect_on(&ctx(&a), a.st.admin_id, kn, day(24), 10, &none())
+        .await
+        .unwrap();
+    assert_eq!(
+        got.iter().map(|c| c.target.clone()).collect::<Vec<_>>(),
+        vec![r]
+    );
+}
+
+/// ⚠️ ревью r1: параллельный повтор итога с тем же `Idempotency-Key` — один итог и одна запись
+/// проб (замок работы, один писатель); параллельные итоги двух работ у предела ночи — проб не
+/// больше 40.
+#[tokio::test]
+async fn probes_parallel_results_once() {
+    let _g = SERIAL.lock().await;
+    let a = server("parallel", |c| c.works.batch_records = 25).await;
+    agent_mode(&a).await;
+    let r1 = insight(&a, "knowledge", "Первая запись", "текст").await;
+    let r2 = insight(&a, "knowledge", "Вторая запись", "текст").await;
+    night_of(&a, day(23)).await;
+    let r = package(&a, S1).await;
+    let work = r.json()["work"].as_str().unwrap().to_string();
+    let body = json!({"items": [{"target": r1, "question": good_q(1, 1)},
+                                {"target": r2, "question": good_q(1, 2)}]});
+    let (x, y) = tokio::join!(
+        put_result_key(&a, S1, &work, body.clone(), "probes-parallel"),
+        put_result_key(&a, S1, &work, body.clone(), "probes-parallel"),
+    );
+    ok(&x, StatusCode::OK);
+    ok(&y, StatusCode::OK);
+    assert_eq!(x.json(), y.json());
+    let mine = probes_of(&db(&a).await)
+        .await
+        .into_iter()
+        .filter(|p| p.work_id.is_some())
+        .count();
+    assert_eq!(mine, 2);
+    // две работы у предела: 38 готовых + 2 принятых = 40, ещё по вопросу в каждой — параллельно
+    for g in [G1, G2] {
+        ok(&register(&a, &a.token, g).await, StatusCode::CREATED);
+        insight(&a, g, &format!("Запись {g}"), "текст").await;
+    }
+    night_of(&a, day(24)).await;
+    let open: Vec<store::Work> = probe_works(&a)
+        .await
+        .into_iter()
+        .filter(|w| w.state == WorkState::Queued)
+        .collect();
+    assert_eq!(open.len(), 2, "{open:?}");
+    seed(&a, space(&a, SpaceKind::Rules).await, Origin::Nightly, 37).await;
+    assert_eq!(made(&a, Origin::Nightly).await, PROBES_PER_NIGHT - 1);
+    let item = |p: usize| json!([{"n": 1, "question": good_q(p, 1)}]);
+    let (x, y) = tokio::join!(
+        answer_in(&a, "probes-parallel-1", Some(G1), item(3)),
+        answer_in(&a, "probes-parallel-2", Some(G2), item(4)),
+    );
+    let took = |v: &Value| v["accepted"].as_array().unwrap().len();
+    assert!(took(&x) + took(&y) >= 1, "{x} {y}");
+    assert_eq!(made(&a, Origin::Nightly).await, PROBES_PER_NIGHT);
 }
 
 // ---------------- порядок ночи ----------------

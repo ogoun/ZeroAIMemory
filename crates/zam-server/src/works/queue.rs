@@ -29,8 +29,13 @@
 //!   элементы пакета без итога — `skipped`; элементы, выброшенные вторым сканом, — отклонены с
 //!   `secret_in_payload`. `skip` без элементов — работа `cancelled`: сборщик поставит её снова
 //!   следующей ночью.
-//! - **Предел записей вида** ([`super::kinds::room`]; у `probes` — остаток пределов проб):
-//!   постановка берёт кандидатов не больше остатка, исчерпан — запуск вида кончен.
+//! - **Предел записей вида** ([`super::kinds::room`]; у `probes` — остаток пределов проб, у
+//!   агента — за вычетом поставленного в этом проходе): постановка берёт кандидатов не больше
+//!   остатка, исчерпан — запуск вида кончен.
+//! - **Отправленное в этом запуске** (`zam_store::works::offered_refs`, решение координатора по
+//!   ревью r1 задачи 4): записи, уже бывшие в пакетах вида этой ночи (у ручного запуска — этих
+//!   суток UTC) с любым исходом — без итога, отклонённые проверкой, `failed`, — сборщик той же
+//!   ночью не берёт (отсев до предела `limit`); следующей ночью они снова кандидаты.
 //!
 //! Правила [`NightCtx`] (задача 1): признак остановки — только `ctx.stopping()`; клон контекста в
 //! `tokio::spawn` не уносится — ручной запуск модели идёт через `NightRunner::spawn_tracked`.
@@ -218,6 +223,8 @@ pub async fn agent_batch(ctx: &NightCtx, db: &Db, plan: &Plan) -> Result<Vec<Wor
     };
     let batch = ctx.st().cfg.works.batch_records as usize;
     let mut out = Vec::new();
+    // кандидатов, поставленных в этом проходе: их итогов ещё нет, предел их не видит (ревью r1, M3)
+    let mut queued = 0usize;
     for space in kind_spaces(db, plan.kind, plan.only).await? {
         if left == 0 || ctx.stopping() {
             break;
@@ -225,13 +232,15 @@ pub async fn agent_batch(ctx: &NightCtx, db: &Db, plan: &Plan) -> Result<Vec<Wor
         if done_spaces.contains(&space) {
             continue;
         }
-        // предел записей вида (у `probes` — остаток пределов проб): исчерпан — постановка кончена
+        // предел записей вида (у `probes` — остаток пределов проб за вычетом поставленного):
+        // исчерпан — постановка кончена
         let take = match kinds::room(plan.kind, ctx, db, plan.origin).await? {
-            Some(0) => break,
-            Some(r) => r.min(batch),
+            Some(r) if r.saturating_sub(queued) == 0 => break,
+            Some(r) => r.saturating_sub(queued).min(batch),
             None => batch,
         };
-        let cands = kinds::collect(plan.kind, ctx, plan.user, space, take).await?;
+        let offered = offered(db, plan).await?;
+        let cands = kinds::collect(plan.kind, ctx, plan.user, space, take, &offered).await?;
         if cands.is_empty() {
             continue;
         }
@@ -248,11 +257,20 @@ pub async fn agent_batch(ctx: &NightCtx, db: &Db, plan: &Plan) -> Result<Vec<Wor
         )
         .await?;
         if let Some(w) = w {
+            queued += w.items.len();
             out.push(w);
             left -= 1;
         }
     }
     Ok(out)
+}
+
+/// Пары «ссылка, ревизия», уже отправленные в пакетах вида в этом запуске `plan` — ночью этой
+/// ночи, у ручного запуска — с начала суток UTC (`zam_store::works::offered_refs`, ревью r1
+/// задачи 4, I1): той же ночью сборщик их не берёт.
+async fn offered(db: &Db, plan: &Plan) -> Result<HashSet<(String, i64)>, StoreError> {
+    let night = plan.night.filter(|_| plan.origin == Origin::Nightly);
+    store::offered_refs(db, plan.kind, plan.origin, night, plan.since).await
 }
 
 /// Ход запуска модели после работы.
@@ -302,7 +320,10 @@ pub async fn run_model(ctx: &NightCtx, db: &Db, plan: &Plan) -> Result<(), Store
                     Some(r) => r.min(batch),
                     None => batch,
                 };
-                let cands = kinds::collect(plan.kind, ctx, plan.user, first, take).await?;
+                // отправленные этой ночью (с любым исходом) — той же ночью снова не идут
+                let offered = offered(db, plan).await?;
+                let cands =
+                    kinds::collect(plan.kind, ctx, plan.user, first, take, &offered).await?;
                 if cands.is_empty() {
                     dropped.insert(first);
                     continue;
@@ -615,12 +636,21 @@ pub async fn accept(
             .and_then(|n| usize::try_from(n).ok())
             .or_else(|| target.and_then(|t| w.items.iter().find(|i| i.target == t).map(|i| i.n)));
         let Some(n) = n else {
-            let why = if target.is_some() {
-                "target — не запись пакета: ref элемента"
-            } else {
-                "нет n или target: номер или ref элемента пакета"
-            };
-            rejected.push(reject(None, None, why));
+            match target {
+                // присланная ссылка — в отказе (ревью r1, M6): какой элемент отклонён, видно и
+                // при нескольких таких
+                Some(t) => rejected.push(json!({
+                    "n": null,
+                    "target": t,
+                    "rev": null,
+                    "reason": "target — не запись пакета: ref элемента",
+                })),
+                None => rejected.push(reject(
+                    None,
+                    None,
+                    "нет n или target: номер или ref элемента пакета",
+                )),
+            }
             continue;
         };
         let Some(it) = w.item(n) else {

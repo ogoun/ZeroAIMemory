@@ -19,6 +19,8 @@
 //! кандидата — **вид агента**: маска `‹secret›` на весь текст записи, затем обрезка до
 //! [`super::package::ITEM_TEXT_MAX_CHARS`] (маска куска ≠ кусок маски).
 
+use std::collections::HashSet;
+
 use serde_json::Value;
 use zam_core::Id;
 use zam_store::works::{ItemWrite, Origin, WorkKind};
@@ -143,21 +145,24 @@ pub fn label(kind: WorkKind, lang: Lang) -> &'static str {
 }
 
 /// Кандидаты вида в пространстве `space` пользователя `user` — детерминированно, до `limit`
-/// (§6.3 п. 2). Пусто — работы нет.
+/// (§6.3 п. 2), без пар «ссылка, ревизия» `exclude` — уже отправленных в пакетах этого запуска
+/// (ночь, сутки ручных запусков; [`zam_store::works::offered_refs`]): они отсеиваются **до**
+/// `limit`, той же ночью запись в пакет снова не идёт (ревью r1 задачи 4, I1). Пусто — работы нет.
 pub async fn collect(
     kind: WorkKind,
     ctx: &NightCtx,
     user: Id,
     space: Id,
     limit: usize,
+    exclude: &HashSet<(String, i64)>,
 ) -> Result<Vec<Candidate>, StoreError> {
-    let _ = (ctx, user, space, limit);
+    let _ = (ctx, user, space, limit, exclude);
     match kind {
-        WorkKind::Probes => super::probes::collect(ctx, user, space, limit).await,
+        WorkKind::Probes => super::probes::collect(ctx, user, space, limit, exclude).await,
         // заготовка: сборщик вида — задача 7 плана
         WorkKind::Rules => Ok(Vec::new()),
         #[cfg(feature = "test-hooks")]
-        WorkKind::Echo => echo::collect(ctx, user, space, limit).await,
+        WorkKind::Echo => echo::collect(ctx, user, space, limit, exclude).await,
     }
 }
 
@@ -260,18 +265,20 @@ mod echo {
     use super::{Candidate, ItemCtx, ItemWrite, NightCtx, Reject};
     use crate::works::package::{ITEM_TEXT_MAX_CHARS, agent_text};
 
-    /// Кандидаты — живые insight пространства владельца, кроме принятых в той же ревизии и
-    /// отсеянных ([`zam_store::works::excluded_refs`]).
+    /// Кандидаты — живые insight пространства владельца, кроме принятых в той же ревизии,
+    /// отсеянных ([`zam_store::works::excluded_refs`]) и отправленных в этом запуске (`exclude`).
     pub(super) async fn collect(
         ctx: &NightCtx,
         user: Id,
         space: Id,
         limit: usize,
+        exclude: &std::collections::HashSet<(String, i64)>,
     ) -> Result<Vec<Candidate>, StoreError> {
         let db = ctx.st().users.get(user).await?;
         let kind = zam_store::works::WorkKind::Echo;
         let mut skip = zam_store::works::excluded_refs(&db, kind).await?;
         skip.extend(zam_store::works::accepted_refs(&db, kind).await?);
+        skip.extend(exclude.iter().cloned());
         let rows =
             zam_store::works::owner_entries(&db, user, space, &["insight"], &skip, limit).await?;
         Ok(rows

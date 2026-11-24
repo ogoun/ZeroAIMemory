@@ -450,8 +450,9 @@ pub struct ProbeSource {
     pub layer: String,
 }
 
-/// Заголовок (у записи — `title`, у заметки — путь) и текст источника пробы: у insight — тело,
-/// у термина — определение и тело, у заметки — текст текущей ревизии без frontmatter.
+/// Заголовок (у записи — `title`, у заметки — «первый H1 (путь)», без H1 — путь) и текст
+/// источника пробы: у insight — тело, у термина — определение и тело, у заметки — текст текущей
+/// ревизии без frontmatter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceText {
     pub title: String,
@@ -505,14 +506,17 @@ pub async fn probe_sources(db: &Db, owner: Id, space: Id) -> Result<Vec<ProbeSou
             })?;
             for row in rows {
                 let (id, kind, rev, data_kind) = row?;
-                let (letter, layer) = if kind == "term" {
-                    ("t", "term".to_string())
+                // буква ссылки — по виду записи, как у `owner_entries` (ревью r1, M8)
+                let Some(letter) = EntryKind::parse(&kind).map(EntryKind::ref_letter) else {
+                    continue;
+                };
+                let layer = if kind == "term" {
+                    "term".to_string()
                 } else {
-                    let layer = match data_kind.as_deref().map(str::trim) {
+                    match data_kind.as_deref().map(str::trim) {
                         Some(k) if !k.is_empty() => format!("insight:{k}"),
                         _ => "insight".to_string(),
-                    };
-                    ("i", layer)
+                    }
                 };
                 let target = format!("{letter}:{id}");
                 if probed.contains(&target) {
@@ -576,8 +580,31 @@ fn strip_frontmatter(src: &str) -> &str {
     s
 }
 
+/// Первый заголовок первого уровня (`# …`) текста заметки вне блоков кода; нет — `None`.
+fn first_h1(text: &str) -> Option<&str> {
+    let mut fence = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            fence = !fence;
+            continue;
+        }
+        if fence {
+            continue;
+        }
+        if let Some(h) = t.strip_prefix("# ") {
+            let h = h.trim().trim_end_matches('#').trim();
+            if !h.is_empty() {
+                return Some(h);
+            }
+        }
+    }
+    None
+}
+
 /// Заголовок и текст источника `src` в его ревизии; запись удалена или исправлена (ревизия
-/// другая) — `None`.
+/// другая) — `None`. Заголовок заметки — её первый H1 и путь («H1 (путь)»; без H1 — путь):
+/// человеческий заголовок заметки — H1, и пересказ его проверка пробы ловит (ревью r1, M5).
 pub async fn source_text(db: &Db, src: &ProbeSource) -> Result<Option<SourceText>, StoreError> {
     let src = src.clone();
     db.read(move |c| {
@@ -591,9 +618,16 @@ pub async fn source_text(db: &Db, src: &ProbeSource) -> Result<Option<SourceText
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            return Ok(row.map(|(path, content)| SourceText {
-                title: path,
-                text: strip_frontmatter(&content).trim().to_string(),
+            return Ok(row.map(|(path, content)| {
+                let text = strip_frontmatter(&content).trim();
+                let title = match first_h1(text) {
+                    Some(h) => format!("{h} ({path})"),
+                    None => path,
+                };
+                SourceText {
+                    title,
+                    text: text.to_string(),
+                }
             }));
         }
         let row: Option<(String, String, Option<String>)> = c

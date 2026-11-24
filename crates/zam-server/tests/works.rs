@@ -1196,7 +1196,11 @@ async fn manual_limits_separate_from_night() {
         c.works.batch_records = 1;
     })
     .await;
-    insight(&a, "knowledge", "Пределы", "текст").await;
+    // по записи на пакет: отправленная этой ночью (сутками ручных) запись в тот же запуск снова
+    // не идёт (ревью r1 задачи 4, I1)
+    for i in 0..4 {
+        insight(&a, "knowledge", &format!("Пределы {i}"), "текст").await;
+    }
     connect(&a, &m).await;
     night_in_window(&a).await;
     assert_eq!(m.count(), 4);
@@ -1408,7 +1412,13 @@ async fn secret_dropped_stays_excluded_after_skip() {
             space,
             mode: WorkMode::Model,
             origin: Origin::Nightly,
-            night: Some(zam_store::time::utc_today()),
+            // работа прошлой ночи: отправленное этой ночью той же ночью снова не идёт (ревью r1
+            // задачи 4, I1), а тест — о следующей постановке
+            night: Some(
+                zam_store::time::utc_today()
+                    .checked_sub(jiff::Span::new().days(2))
+                    .unwrap(),
+            ),
             items: vec![
                 item(1, &clean, "текст".into()),
                 item(2, &leaky, format!("токен деплоя {s} в CI")),

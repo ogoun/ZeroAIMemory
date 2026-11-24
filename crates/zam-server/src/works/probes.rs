@@ -6,13 +6,16 @@
 //!   базы, без замещённых, отозванных и исключённых из индекса; задачи, вопросы, идеи, changelog,
 //!   выпуски и отчёты не берутся никогда — они быстро устаревают, и агент не ищет их как знание).
 //!   Слои — insight по `data.kind` (`insight:<вид>`), заметки (в Rules — заметки Rules), термины;
-//!   по кругу слоёв, внутри слоя — порядок `blake3("probes" ‖ ночь ‖ id)` ([`order`]):
-//!   детерминированно и каждую ночь иначе. Пары «ссылка, ревизия» из итогов прежних работ
-//!   (`secret_in_payload` второго скана, явный `skip` исполнителя, принятые) до новой ревизии
-//!   записи не предлагаются (решение 72). Ночь — дата последнего слота `[works] at`/`tz` не
-//!   позже «сейчас» ([`current_night`]): ночью — дата ночи, днём (ручной запуск) — прошедшей.
-//! - **Элемент пакета** — заголовок (у заметки — путь), текст вида агента (маска, до 1500
-//!   символов); запись длиннее [`LONG_RECORD_CHARS`] символов — сигнал `вопросов: 2`.
+//!   по кругу слоёв, порядок слоёв в круге — `blake3("probes" ‖ ночь ‖ "layer:" ‖ слой)`, внутри
+//!   слоя — `blake3("probes" ‖ ночь ‖ id)` ([`order`]): детерминированно и каждую ночь иначе, при
+//!   малом пределе ни один слой не голодает. Пары «ссылка, ревизия» из итогов прежних работ
+//!   (`secret_in_payload` второго скана, явный `skip` исполнителя) до новой ревизии записи не
+//!   предлагаются (решение 72); отправленные в пакетах этого запуска (ночь, сутки ручных) — до
+//!   следующего (`exclude`, [`zam_store::works::offered_refs`]). Ночь — дата последнего слота
+//!   `[works] at`/`tz` не позже «сейчас» ([`current_night`]): ночью — дата ночи, днём (ручной
+//!   запуск) — прошедшей.
+//! - **Элемент пакета** — заголовок (у заметки — первый H1 и путь), текст вида агента (маска, до
+//!   1500 символов); запись длиннее [`LONG_RECORD_CHARS`] символов — сигнал `вопросов: 2`.
 //! - **Итог** — `{"items": [{"target": "<ref из пакета>", "question": "…"} | {"target": "…",
 //!   "skip": "…"}]}` ([`SCHEMA`]; номер `n` вместо `target` тоже принимается). Проверка элемента
 //!   ([`accept`], [`check_question`]): 8–25 слов и не больше 300 символов; нет пути (`/` или `\`
@@ -31,7 +34,7 @@
 //!   часть — [`zam_search::eval::probe_split`] по цели, `overlap`, автор — сессия агента или
 //!   `model:<имя модели>`, работа. Знания не меняются.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::RangeInclusive;
 
 use jiff::{Timestamp, civil};
@@ -133,17 +136,33 @@ fn order_key(night: civil::Date, id: Id) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-/// Порядок источников ночи `night`: по кругу слоёв (слои — по имени: `insight…`, `note`,
-/// `term`), внутри слоя — по [`order_key`].
+/// Ключ места слоя `layer` в круге ночи `night`: `blake3("probes" ‖ ночь ‖ "layer:" ‖ слой)`
+/// (ревью r1, M2: круг не начинается всегда с первого по имени слоя).
+fn layer_key(night: civil::Date, layer: &str) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(ORDER_SALT.as_bytes());
+    h.update(night.to_string().as_bytes());
+    h.update(b"layer:");
+    h.update(layer.as_bytes());
+    *h.finalize().as_bytes()
+}
+
+/// Источник с ключом порядка внутри слоя.
+type Keyed = ([u8; 32], ProbeSource);
+
+/// Порядок источников ночи `night`: по кругу слоёв (порядок слоёв в круге — [`layer_key`]),
+/// внутри слоя — по [`order_key`].
 pub fn order(night: civil::Date, sources: Vec<ProbeSource>) -> Vec<ProbeSource> {
-    let mut layers: BTreeMap<String, Vec<([u8; 32], ProbeSource)>> = BTreeMap::new();
+    let mut layers: BTreeMap<String, Vec<Keyed>> = BTreeMap::new();
     for s in sources {
         let key = order_key(night, s.id);
         layers.entry(s.layer.clone()).or_default().push((key, s));
     }
-    let mut queues: Vec<std::vec::IntoIter<([u8; 32], ProbeSource)>> = layers
-        .into_values()
-        .map(|mut v| {
+    let mut layers: Vec<(String, Vec<Keyed>)> = layers.into_iter().collect();
+    layers.sort_by_cached_key(|(name, _)| (layer_key(night, name), name.clone()));
+    let mut queues: Vec<std::vec::IntoIter<Keyed>> = layers
+        .into_iter()
+        .map(|(_, mut v)| {
             v.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.id.cmp(&b.1.id)));
             v.into_iter()
         })
@@ -163,25 +182,29 @@ pub fn order(night: civil::Date, sources: Vec<ProbeSource>) -> Vec<ProbeSource> 
 }
 
 /// Кандидаты вида `probes` пространства `space` пользователя `user` в текущую ночь
-/// ([`current_night`]), до `limit`.
+/// ([`current_night`]), до `limit`, без пар `exclude` (отправленные в этом запуске).
 pub async fn collect(
     ctx: &NightCtx,
     user: Id,
     space: Id,
     limit: usize,
+    exclude: &HashSet<(String, i64)>,
 ) -> Result<Vec<Candidate>, StoreError> {
     let (night, _) = current_night(zam_store::time::now(), &ctx.st().cfg.works);
-    collect_on(ctx, user, space, night, limit).await
+    collect_on(ctx, user, space, night, limit, exclude).await
 }
 
 /// Кандидаты вида `probes` ночи `night` (см. модуль): пространство не вида работы (Human) —
-/// пусто.
+/// пусто; пары `exclude` отсеиваются до `limit`. Принятые элементы прежних итогов отдельно не
+/// отсеиваются (ревью r1, M1): запись с активной пробой и так не источник, а запись, чья проба
+/// не записалась (сверка в транзакции закрытия), должна вернуться в кандидаты.
 pub async fn collect_on(
     ctx: &NightCtx,
     user: Id,
     space: Id,
     night: civil::Date,
     limit: usize,
+    exclude: &HashSet<(String, i64)>,
 ) -> Result<Vec<Candidate>, StoreError> {
     let db = ctx.st().users.get(user).await?;
     let allowed = space_kinds(WorkKind::Probes);
@@ -192,12 +215,14 @@ pub async fn collect_on(
     if !ok_space || limit == 0 {
         return Ok(Vec::new());
     }
-    let mut skip = zam_store::works::excluded_refs(&db, WorkKind::Probes).await?;
-    skip.extend(zam_store::works::accepted_refs(&db, WorkKind::Probes).await?);
+    let skip = zam_store::works::excluded_refs(&db, WorkKind::Probes).await?;
     let sources: Vec<ProbeSource> = probe_sources(&db, user, space)
         .await?
         .into_iter()
-        .filter(|s| !skip.contains(&(s.target.clone(), s.rev)))
+        .filter(|s| {
+            let pair = (s.target.clone(), s.rev);
+            !skip.contains(&pair) && !exclude.contains(&pair)
+        })
         .collect();
     let mut out = Vec::new();
     for s in order(night, sources) {
@@ -380,10 +405,16 @@ pub async fn room(st: &AppState, db: &Db, origin: Origin) -> Result<usize, Store
         .min(PROBES_MAX.saturating_sub(active)) as usize)
 }
 
-/// Сбой хранилища при проверке элемента — отказ элемента (повторить итог).
+/// Причина отказа элемента при сбое хранилища во время проверки: работа закрывается с прочими
+/// элементами (второй итог — 409), а отклонённая запись в отсев не попадает — вернётся в одну из
+/// следующих работ (ревью r1, M4).
+pub const REASON_STORE: &str =
+    "временный сбой хранилища при проверке — запись вернётся в одну из следующих работ";
+
+/// Сбой хранилища при проверке элемента — отказ элемента ([`REASON_STORE`]).
 fn store_reject(e: StoreError) -> Reject {
     tracing::warn!(error = %e, "внутренние работы: проверка пробы не дочитала базу");
-    Reject::new("временный сбой хранилища при проверке — повторите итог позже")
+    Reject::new(REASON_STORE)
 }
 
 /// Проба из записи итога (только `ItemWrite::Probe`).
