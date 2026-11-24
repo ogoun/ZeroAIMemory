@@ -241,10 +241,15 @@ pub fn skip_writes(
 
 /// Контекст пакета вида — запись `n="0"` перед элементами (данные, итога для неё нет): у `rules`
 /// — действующие заметки Rules (§6.7 п. 3), чтобы исполнитель их не повторял; у прочих видов —
-/// нет. `space` — пространство работы.
-pub async fn context(kind: WorkKind, db: &Db, space: Id) -> Result<Option<Candidate>, StoreError> {
+/// нет. `space` — пространство работы, `budget` — бюджет пакета (контекст — его часть).
+pub async fn context(
+    kind: WorkKind,
+    db: &Db,
+    space: Id,
+    budget: usize,
+) -> Result<Option<Candidate>, StoreError> {
     match kind {
-        WorkKind::Rules => super::rules::context(db, space).await,
+        WorkKind::Rules => super::rules::context(db, space, budget).await,
         WorkKind::Probes => Ok(None),
         #[cfg(feature = "test-hooks")]
         WorkKind::Echo => Ok(None),

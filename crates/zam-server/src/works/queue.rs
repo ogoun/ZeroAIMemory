@@ -344,7 +344,7 @@ pub async fn prepare(db: &Db, mut w: Work, budget: usize) -> Result<Option<Prepa
     }
     // контекст вида (у `rules` — действующие заметки Rules) — запись `n="0"` перед элементами:
     // данные, итога для неё нет (элемента `n = 0` в работе нет)
-    let mut cands: Vec<(usize, Candidate)> = kinds::context(w.kind, db, w.space_id)
+    let mut cands: Vec<(usize, Candidate)> = kinds::context(w.kind, db, w.space_id, budget)
         .await?
         .map(|c| (0, c))
         .into_iter()

@@ -24,7 +24,8 @@
 //! ревизии (`zam_store::proposals::existing_keys`, решение 64). Сколько кандидатов — не больше
 //! свободных мест до [`zam_store::proposals::PROPOSALS_OPEN_MAX`] открытых. Пакет получает ещё
 //! запись `n="0"` — действующие заметки Rules (до [`RULES_TITLES_MAX`], путь и L0 до
-//! [`CONTEXT_L0_MAX_CHARS`], [`context`]), чтобы исполнитель их не повторял; итога для неё нет.
+//! [`CONTEXT_L0_MAX_CHARS`], вся запись — не больше четверти бюджета пакета и
+//! [`CONTEXT_MAX_TOKENS`], [`context`]), чтобы исполнитель их не повторял; итога для неё нет.
 //! Элемент, которому нет места или у источника которого уже есть предложение, отклоняется
 //! проверкой ([`accept`]); то же, случившееся между проверкой и закрытием работы, — предупреждение
 //! итога (`warnings`).
@@ -642,11 +643,19 @@ pub async fn collect(
 /// L0 заметки в контексте пакета — не длиннее, символов (одна строка; путь — всегда целиком).
 pub const CONTEXT_L0_MAX_CHARS: usize = 160;
 
-/// Запись контекста пакета (`n="0"`): действующие заметки Rules — путь и L0 (до
-/// [`CONTEXT_L0_MAX_CHARS`] на заметку), до [`RULES_TITLES_MAX`] заметок; маска — на весь текст
-/// (вид агента), без обрезки записи до `ITEM_TEXT_MAX_CHARS`: пределы — число заметок и длина L0
-/// (ревью r1, Minor 4). Заметок нет — `None`.
-pub async fn context(db: &Db, rules: Id) -> Result<Option<Candidate>, StoreError> {
+/// Контекст пакета — не больше этой доли бюджета пакета (`budget_tokens / 4`; ревью r2, Minor 1).
+pub const CONTEXT_BUDGET_SHARE: usize = 4;
+/// Контекст пакета — не больше, токенов счётчика выдачи (при бюджете по умолчанию 6000 — четверть).
+pub const CONTEXT_MAX_TOKENS: usize = 1500;
+
+/// Запись контекста пакета (`n="0"`): действующие заметки Rules (до [`RULES_TITLES_MAX`]) в пределе
+/// `min(budget / CONTEXT_BUDGET_SHARE, CONTEXT_MAX_TOKENS)` токенов **всей записи** (ревью r2,
+/// Minor 1: запрошенный бюджет пакета контекст не съедает): сначала пути — пока помещаются, хвост —
+/// строкой «ещё заметок Rules: N»; затем L0 (до [`CONTEXT_L0_MAX_CHARS`]) — пока помещаются.
+/// Маска — до обрезки L0 и на весь текст (вид агента). Заметок нет или не помещается даже
+/// заголовок — `None`.
+pub async fn context(db: &Db, rules: Id, budget: usize) -> Result<Option<Candidate>, StoreError> {
+    use crate::api::agent_view::mask;
     let notes: Vec<zam_store::Node> = zam_store::list_children(db, rules, None, 16)
         .await?
         .into_iter()
@@ -656,36 +665,72 @@ pub async fn context(db: &Db, rules: Id) -> Result<Option<Candidate>, StoreError
     if notes.is_empty() {
         return Ok(None);
     }
-    let lines: Vec<String> = notes
+    let cap = (budget / CONTEXT_BUDGET_SHARE).min(CONTEXT_MAX_TOKENS);
+    // (строка пути, строка с L0)
+    let lines: Vec<(String, Option<String>)> = notes
         .iter()
         .map(|n| {
+            let path = format!("- {}", mask(&n.path));
             // маска — до обрезки (маска куска ≠ кусок маски)
             let l0 =
                 n.l0.as_deref()
-                    .map(|l| crate::api::agent_view::mask(l).into_owned())
+                    .map(|l| mask(l).into_owned())
                     .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
-                    .filter(|l| !l.is_empty());
-            match l0 {
-                Some(l0) => {
-                    let l0 = match l0.char_indices().nth(CONTEXT_L0_MAX_CHARS) {
-                        Some((i, _)) => format!("{}…", &l0[..i]),
-                        None => l0,
-                    };
-                    format!("- {} — {l0}", n.path)
-                }
-                None => format!("- {}", n.path),
-            }
+                    .filter(|l| !l.is_empty())
+                    .map(|l0| match l0.char_indices().nth(CONTEXT_L0_MAX_CHARS) {
+                        Some((i, _)) => format!("{path} — {}…", &l0[..i]),
+                        None => format!("{path} — {l0}"),
+                    });
+            (path, l0)
         })
         .collect();
-    Ok(Some(Candidate {
+    let candidate = |text: String| Candidate {
         target: CONTEXT_REF.into(),
         rev: 0,
         kind: "rules".into(),
         title: "Действующие заметки Rules — не повторяй их (итога для этой записи нет)".into(),
-        // и на весь текст записи (путь заметки тоже может нести секрет)
-        text: crate::api::agent_view::mask(&lines.join("\n")).into_owned(),
+        text,
         signals: Vec::new(),
-    }))
+    };
+    // токены записи целиком (как она уйдёт в пакет); `shown` — строк, `full` — с L0
+    let size = |shown: usize, full: &[bool]| {
+        let mut text: Vec<&str> = lines[..shown]
+            .iter()
+            .zip(full)
+            .map(|((p, l), f)| {
+                if *f {
+                    l.as_deref().unwrap_or(p)
+                } else {
+                    p.as_str()
+                }
+            })
+            .collect();
+        let tail =
+            (shown < lines.len()).then(|| format!("- ещё заметок Rules: {}", lines.len() - shown));
+        if let Some(t) = &tail {
+            text.push(t);
+        }
+        let text = text.join("\n");
+        let tokens = zam_store::count_tokens(&super::package::record(0, &candidate(text.clone())));
+        (tokens, text)
+    };
+    let mut shown = 0;
+    let mut full = vec![false; lines.len()];
+    while shown < lines.len() && size(shown + 1, &full).0 <= cap {
+        shown += 1;
+    }
+    if shown == 0 && size(0, &full).0 > cap {
+        return Ok(None);
+    }
+    let with_l0: Vec<usize> = (0..shown).filter(|&i| lines[i].1.is_some()).collect();
+    for i in with_l0 {
+        full[i] = true;
+        if size(shown, &full).0 > cap {
+            full[i] = false;
+            break;
+        }
+    }
+    Ok(Some(candidate(size(shown, &full).1)))
 }
 
 /// Строка поля `key` объекта `v` (нет или не строка — пусто).

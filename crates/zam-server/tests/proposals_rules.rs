@@ -1178,6 +1178,158 @@ async fn rules_context_lists_50_notes() {
     assert!(!ctx.contains('…'), "контекст обрезан: {ctx}");
 }
 
+/// Ревью r2, Minor 1: контекст `n="0"` — в пределах части бюджета пакета (`budget_tokens / 4`, не
+/// больше 1500 токенов): при малом бюджете пути — пока помещаются, хвост — строкой «ещё N заметок
+/// Rules»; запрошенный бюджет контекст не съедает.
+#[tokio::test]
+async fn rules_context_fits_small_budget() {
+    let _g = SERIAL.lock().await;
+    let a = server("context-budget", |_| {}).await;
+    set_mode(&a, "agent").await;
+    for i in 0..51 {
+        rule_note(
+            &a,
+            &format!("r{i:02}/rule"),
+            &format!("Правило номер {i}: подробное описание поведения агента во всех проектах."),
+        )
+        .await;
+    }
+    insight(&a, "knowledge", "decision", Some("axiom"), "Аксиома").await;
+    night(&a, 0).await;
+    let budget = 800;
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            RECALL,
+            Some(json!({"event": "work", "kind": "rules", "budget_tokens": budget})),
+            &[("x-zam-session", S1)],
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    let text = r.json()["text"].as_str().unwrap().to_string();
+    let ctx = text
+        .split("<record n=\"0\"")
+        .nth(1)
+        .and_then(|s| s.split("</record>").next())
+        .unwrap_or_else(|| panic!("нет записи n=0: {text}"));
+    let t = zam_store::count_tokens(ctx);
+    assert!(
+        t <= budget / 4,
+        "контекст {t} токенов при бюджете {budget}: {ctx}"
+    );
+    assert!(ctx.contains("r00/rule"), "{ctx}");
+    assert!(
+        ctx.contains("ещё") && ctx.contains("заметок Rules"),
+        "{ctx}"
+    );
+    // элемент работы в пакете остался
+    assert!(text.contains("<record n=\"1\""), "{text}");
+}
+
+/// Ревью r2, Minor 3: у источника уже есть предложение (из прежней работы) — элемент с ним
+/// отклоняется проверкой с причиной; появилось между проверкой и закрытием работы — строки нет,
+/// предупреждение `warnings` с `o:<id>` прежнего предложения.
+#[tokio::test]
+async fn rules_item_existing_source_reported() {
+    let _g = SERIAL.lock().await;
+    let a = server("item-existing", |_| {}).await;
+    set_mode(&a, "agent").await;
+    let axiom = insight(&a, "knowledge", "decision", Some("axiom"), "Аксиома").await;
+    night(&a, 0).await;
+    do_work(
+        &a,
+        json!([rule_item(1, "e/first", "Держись решения владельца.")]),
+    )
+    .await;
+    let r = a.t(Method::GET, PROPOSALS, None).await;
+    let o = r.json()["proposals"][0]["id"].as_str().unwrap().to_string();
+    // сборщик источник с предложением не берёт — работа с ним ставится вручную
+    let db = db(&a).await;
+    let rules = space_id(&a, zam_store::SpaceKind::Rules).await;
+    let item = || WorkItem {
+        n: 1,
+        target: axiom.clone(),
+        rev: 1,
+        kind: "insight".into(),
+        title: "Аксиома".into(),
+        text: "текст".into(),
+        signals: Vec::new(),
+    };
+    let enqueue = || {
+        store::enqueue(
+            &db,
+            NewWork {
+                kind: WorkKind::Rules,
+                space: rules,
+                mode: WorkMode::Agent,
+                origin: Origin::Manual,
+                night: None,
+                items: vec![item()],
+            },
+        )
+    };
+    enqueue().await.unwrap().unwrap();
+    let v = do_work(
+        &a,
+        json!([rule_item(
+            1,
+            "e/second",
+            "Держись решения владельца всегда."
+        )]),
+    )
+    .await;
+    assert_eq!(v["accepted"], json!([]), "{v}");
+    let why = v["rejected"][0]["reason"].as_str().unwrap();
+    assert!(
+        why.contains(&axiom) && why.contains("уже есть предложение"),
+        "{v}"
+    );
+    // гонка: предложение появилось после проверки — закрытие пишет предупреждение, а не строку
+    let w = enqueue().await.unwrap().unwrap();
+    store::claim_next(&db, &[rules], None, S1, SignedDuration::from_hours(2))
+        .await
+        .unwrap()
+        .unwrap();
+    let write = store::ItemWrite::Rule {
+        target: axiom.clone(),
+        rev: 1,
+        path: "e/race".into(),
+        content: "Правило гонки.".into(),
+        reason: REASON.into(),
+        author_kind: zam_store::proposals::ProposalAuthor::Agent,
+        author: S1.into(),
+        session: Some(S1.into()),
+    };
+    let closed = store::finish_claimed(
+        &db,
+        w.id,
+        Some(S1),
+        WorkState::Done,
+        json!({"accepted": [], "response": {"work": format!("j:{}", w.id)}}),
+        None,
+        vec![write],
+    )
+    .await
+    .unwrap();
+    let store::Closed::Closed { warnings } = closed else {
+        panic!("{closed:?}")
+    };
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains(&axiom) && warnings[0].contains(&o),
+        "{warnings:?}"
+    );
+    let res = store::get(&db, w.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(res["warnings"], json!(warnings), "{res}");
+    assert_eq!(counts(&a).await, json!({"rules": 1}));
+}
+
 /// Ревью r1, Minor 6: элемент `rules`, которому нет места (открытых кандидатов 50) или у
 /// источника которого уже есть предложение, — отказ с причиной при проверке; если место кончилось
 /// между проверкой и закрытием работы — предупреждение в итоге (`warnings`), строки нет.
@@ -1560,6 +1712,32 @@ async fn guide_rules_candidates_section() {
     }
 }
 
+/// Лучший dense-косинус текста `text` (как запрос проверки почти-дубля: заголовок и текст) с
+/// точками заметки `node` в Rules администратора — тот же фильтр, что у `works::rules`.
+async fn dense_score(a: &Api, text: &str, node: Id) -> f64 {
+    let emb = a.st.index.embedder.clone().expect("модель");
+    let vector = a.st.index.vector.clone().expect("векторный канал");
+    let t = text.to_string();
+    let e = tokio::task::spawn_blocking(move || emb.embed_query(&t))
+        .await
+        .unwrap()
+        .unwrap();
+    let rules = space_id(a, zam_store::SpaceKind::Rules).await;
+    let filter = zam_index::VectorFilter {
+        scopes: vec![zam_index::VectorScope {
+            user_id: a.st.admin_id,
+            space_ids: vec![rules],
+        }],
+        kinds: vec!["note".into()],
+        ..zam_index::VectorFilter::default()
+    };
+    let hits = vector.nearest_dense(&e.dense, &filter, 20).await.unwrap();
+    hits.iter()
+        .filter(|h| h.target.id == node)
+        .map(|h| f64::from(h.score))
+        .fold(0.0, f64::max)
+}
+
 /// §6.7 п. 3, ревью r1, Important 3 (модель и Qdrant; без них — пропуск, в CI — падение):
 /// почти-дубль по dense-косинусу — тот же смысл под другим заголовком и путём — 409
 /// `rule_duplicate` с `reason: vector` и баллом не ниже `insights.dedup_threshold`; другое правило
@@ -1612,11 +1790,34 @@ async fn rules_near_duplicate_by_vector() {
     assert_eq!(s["reason"], "vector", "{v}");
     let threshold = f64::from(a.st.cfg.insights.dedup_threshold);
     assert!(s["score"].as_f64().unwrap() >= threshold, "{v}");
+    eprintln!("копия под другим заголовком: dense-косинус {}", s["score"]);
+    // пересказ: тот же смысл другими словами (ревью r2, Minor 2)
+    let (title, content) = (
+        "Use Unix newlines in shell scripts",
+        "Scripts written on Windows keep carriage-return newlines and then break on Linux with an \
+         interpreter error; save them with plain LF newlines before you run them.",
+    );
+    let score = dense_score(&a, &format!("{title}\n# {title}\n\n{content}"), nid).await;
+    eprintln!("пересказ: dense-косинус {score:.3}, порог {threshold:.2}");
+    // фактическое поведение (MiniLM int8, модель тестов): пересказ другими словами порог insight
+    // 0,90 не проходит (замер круга правок 2 — 0,734 при 0,933 у копии под другим заголовком),
+    // кандидат принимается: векторный канал ловит почти-копию, а пересказ остаётся человеку
+    // (решение записано в отчёте и журнале задачи 7). Изменится модель или порог — тест
+    // скажет об этом
+    assert!(score < threshold, "пересказ: {score:.3} ≥ {threshold:.2}");
+    proposed(&a, "scripts/newlines", &format!("# {title}\n\n{content}")).await;
+    let other = (
+        "Keep Windows batch files in CRLF",
+        "Windows .bat and .cmd files must keep CRLF line endings: do not convert them to LF.",
+    );
+    eprintln!(
+        "соседняя тема: dense-косинус {:.3}",
+        dense_score(&a, &format!("{0}\n# {0}\n\n{1}", other.0, other.1), nid).await
+    );
     proposed(
         &a,
         "windows/batch",
-        "# Keep Windows batch files in CRLF\n\nWindows .bat and .cmd files must keep CRLF line \
-         endings: do not convert them to LF.",
+        &format!("# {}\n\n{}", other.0, other.1),
     )
     .await;
 }
