@@ -20,3 +20,21 @@ export function focusNow(el: Element | null | undefined): boolean {
   if (r.bottom <= 0 || r.top >= window.innerHeight) el.scrollIntoView({ block: 'nearest' });
   return true;
 }
+
+/** Начало элемента — на виду (правка карточки на месте, §6.14 п. 3): у прокручиваемого предка
+ * (панель доски, карточка рядом со списком) начало элемента, ушедшее выше его края, возвращается;
+ * в документе — если начало под шапкой или у нижнего края окна (поправка — `scroll-margin-top`). */
+export function revealTop(el: Element | null | undefined): void {
+  if (!(el instanceof HTMLElement)) return;
+  for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
+    const o = getComputedStyle(p).overflowY;
+    if ((o === 'auto' || o === 'scroll') && p.scrollHeight > p.clientHeight) {
+      const above = p.getBoundingClientRect().top - el.getBoundingClientRect().top;
+      if (above > 0) p.scrollTop -= above;
+      break;
+    }
+  }
+  const r = el.getBoundingClientRect();
+  const margin = parseFloat(getComputedStyle(el).scrollMarginTop) || 0;
+  if (r.top < margin || r.top > window.innerHeight - 80) el.scrollIntoView({ block: 'start' });
+}

@@ -139,7 +139,8 @@ test('пользователь: вход, обязательная смена п
   await table.getByRole('button', { name: 'Вывод агента пользователя' }).click();
   const card = page.getByRole('article', { name: 'Карточка insight' });
   await card.getByRole('button', { name: 'Заменить' }).click();
-  const form = card.getByRole('form', { name: 'Замена insight' });
+  // формы карточки — окна (M7.3, §6.14 правило Б)
+  const form = page.getByRole('dialog', { name: 'Заменить запись' });
   await expect(form.getByLabel('Надёжность новой записи')).toHaveValue('');
   await form.getByLabel('Заголовок').fill('Вывод человека');
   await form.getByRole('button', { name: 'Заменить' }).click();
@@ -148,7 +149,7 @@ test('пользователь: вход, обязательная смена п
 
   // смена статуса без причины: человеку причина и доказательство необязательны
   await card.getByRole('button', { name: 'Сменить статус надёжности' }).click();
-  const cf = card.getByRole('form', { name: 'Статус надёжности' });
+  const cf = page.getByRole('dialog', { name: 'Статус надёжности' });
   await cf.getByLabel('theorem').check();
   await cf.getByRole('button', { name: 'Сохранить' }).click();
   await expect(card.getByRole('status')).toHaveText('Статус надёжности изменён.');

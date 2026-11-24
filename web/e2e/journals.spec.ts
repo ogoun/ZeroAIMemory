@@ -143,7 +143,8 @@ test('Insights: замена записи и повышение до theorem с 
   const card = page.getByRole('article', { name: 'Карточка insight' });
   await expect(card.getByRole('heading', { name: 'Старый вывод о Qdrant' })).toBeVisible();
   await card.getByRole('button', { name: 'Заменить' }).click();
-  const form = card.getByRole('form', { name: 'Замена insight' });
+  // формы карточки — окна (M7.3, §6.14 правило Б)
+  const form = page.getByRole('dialog', { name: 'Заменить запись' });
   // новая запись человека — без статуса по умолчанию (аксиому человек ставит явно)
   await expect(form.getByLabel('Надёжность новой записи')).toHaveValue('');
   await form.getByLabel('Заголовок').fill('Новый вывод о Qdrant');
@@ -162,7 +163,7 @@ test('Insights: замена записи и повышение до theorem с 
   await table.getByRole('button', { name: 'Кэш эмбеддингов ускоряет переиндексацию' }).click();
   await expect(page).toHaveURL(new RegExp(`/j/insights/${env('E2E_INSIGHT_HYP')}$`));
   await card.getByRole('button', { name: 'Сменить статус надёжности' }).click();
-  const cf = card.getByRole('form', { name: 'Статус надёжности' });
+  const cf = page.getByRole('dialog', { name: 'Статус надёжности' });
   await cf.getByLabel('theorem').check();
   await cf.getByRole('button', { name: 'Сохранить' }).click();
   await expect(card.getByRole('status')).toHaveText('Статус надёжности изменён.');
@@ -202,7 +203,7 @@ test('Insights: замена записи и повышение до theorem с 
 
   // Триггеры: добавить, сохранить, удалить
   await card.getByRole('button', { name: 'Триггеры' }).click();
-  const tr = card.getByLabel('Триггеры', { exact: true });
+  const tr = page.getByRole('dialog', { name: 'Триггеры' });
   await tr.getByLabel('Тип триггера').selectOption('file_glob');
   await tr.getByLabel('Шаблон триггера').fill('**/qdrant/*.rs');
   await tr.getByLabel('Инструменты').fill('Write, Edit');
@@ -225,7 +226,7 @@ test('Insights: замена записи и повышение до theorem с 
   await table.getByRole('button', { name: 'Новый вывод о Qdrant' }).click();
   await expect(card.getByRole('heading', { name: 'Новый вывод о Qdrant' })).toBeVisible();
   await card.getByRole('button', { name: 'Отозвать' }).click();
-  const rf = card.getByRole('form', { name: 'Отзыв insight' });
+  const rf = page.getByRole('dialog', { name: 'Отозвать запись' });
   await rf.getByRole('button', { name: 'Отозвать' }).click();
   await expect(rf.getByRole('alert')).toHaveText('Укажите причину отзыва.');
   await rf.getByLabel('Причина').fill('Qdrant заменён в задаче 4');
@@ -501,7 +502,8 @@ test('tree_and_tabs_show_counts', async ({ page }) => {
 
     // новая идея из WebUI — «Идеи» +1 в дереве и в полосе без перезагрузки
     await page.getByRole('button', { name: 'Новая идея' }).click();
-    const form = page.getByRole('form', { name: 'Новая идея' });
+    // «Новая идея» — окно (M7.3, §6.14 правило Б), после «Записать» — карточка созданной
+    const form = page.getByRole('dialog', { name: 'Новая идея' });
     await form.getByLabel('Заголовок').fill('Идея E2E: число раздела');
     await form.getByLabel('Замысел').fill('Проверка числа записей раздела.');
     const created = page.waitForResponse((r) => r.request().method() === 'POST' && r.url().endsWith(`/spaces/${SOLUTION_GUID}/entries`));
@@ -668,7 +670,8 @@ test('entry_edit_stale_rev_rereads', async ({ page }) => {
   expect((await stale).status()).toBe(409);
   // запись перечитана: ошибка видна, карточка — новой ревизии, нетронутые поля формы — агента,
   // набранный заголовок — человека
-  await expect(form.getByRole('alert')).toContainText(`Запись изменили в другом месте (сейчас ревизия ${other.rev})`);
+  // текст 409 — один у всех форм с ревизией (M7.3, §6.14 п. 5)
+  await expect(form.getByRole('alert')).toContainText(`Запись изменилась, пока вы правили (сейчас ревизия ${other.rev})`);
   await expect(card).toContainText(`ревизия ${other.rev}`);
   await expect(card).toContainText('Текст агента.');
   await expect(form.getByLabel('Текст')).toHaveValue('Текст агента.');

@@ -1199,6 +1199,48 @@ export const createEntry = async (user: string, space: string, body: Record<stri
     await request('POST', `spaces/${q(space)}/entries`, { body, user })
   ).json()) as Entry & { warnings?: string[] };
 
+/** Новый insight человека из WebUI (M7.3, §6.14 п. 7): как у агента, автор — человек сессии.
+ * Дубль — 409 `/problems/possible-duplicate` с кандидатами (`duplicateCandidates`); `force` —
+ * «Записать всё равно». Надёжность по умолчанию не указана. */
+export interface NewInsight {
+  title: string;
+  body: string;
+  /** `data.kind`: `gotcha`, `failure`, `discovery`, `decision`, `experiment`, `pattern`. */
+  kind: string;
+  area?: string;
+  certainty?: Certainty;
+  force?: boolean;
+}
+
+export const createInsight = (user: string, space: string, n: NewInsight) =>
+  createEntry(user, space, {
+    kind: 'insight',
+    title: n.title,
+    body: n.body,
+    data: { kind: n.kind },
+    ...(n.area ? { area: n.area } : {}),
+    ...(n.certainty ? { certainty: n.certainty } : {}),
+    ...(n.force ? { force: true } : {}),
+  });
+
+/** Кандидат-дубль 409 `/problems/possible-duplicate` (`DedupCandidate` сервера): `reason` —
+ * `title` (тот же заголовок) или `vector` (близкий текст, `score` — косинус). */
+export interface DuplicateCandidate {
+  id: string;
+  title: string;
+  status: EntryStatus;
+  certainty: Certainty | null;
+  reason: string;
+  score?: number | null;
+}
+
+/** Кандидаты-дубли из 409 `/problems/possible-duplicate`; иначе — `null` (не дубль). */
+export function duplicateCandidates(e: unknown): DuplicateCandidate[] | null {
+  if (!(e instanceof ApiError) || e.status !== 409 || e.problem?.type !== '/problems/possible-duplicate') return null;
+  const c = e.problem.candidates;
+  return Array.isArray(c) ? (c as DuplicateCandidate[]) : [];
+}
+
 // ---- отчёты (M5.5): только чтение, удаление и восстановление — владельцу решения ----
 
 /** Файл отчёта (`entry_attachments`); `url` — адрес для `<img>` и «Скачать» (собирает сервер). */

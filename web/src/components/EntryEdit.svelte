@@ -15,11 +15,16 @@
   // закрывает форму на переходе, а действия, которые закрыли бы её на месте (фильтр, «Корзина»,
   // другая запись), спрашивают через `leave()`. `release()` — журнал уже спросил сам (вопрос панели
   // доски) или закрывает форму.
+  //
+  // Вариант «в окне» (`bare`, M7.3 §6.14 п. 3 — ленты без карточки): только поля и ошибка, кнопки и
+  // вопрос о несохранённом — у окна `FormDialog` (`EditPanel` с `dialog`), отправка — `submit()`;
+  // `leave()` не спрашивает и своей проверки ухода форма не ставит — их задаёт окно.
   import { onMount, untrack } from 'svelte';
-  import { ApiError, errorText, getEntry, isStaleEntry, patchEntry, type Entry, type EntryKind } from '../lib/api';
-  import { ESTIMATE_MAX, FIELD_TEXT, fieldsOf, isDirty, patchOf, rebase } from '../lib/entryEdit';
+  import { ApiError, errorText, getEntry, isStaleEntry, patchEntry, type Entry } from '../lib/api';
+  import { ESTIMATE_MAX, FIELD_TEXT, fieldsOf, isDirty, patchOf, rebase, type EditFields } from '../lib/entryEdit';
+  import { rebaseText } from '../lib/formDraft';
   import { LEAVE_EDIT, guardLeave } from '../lib/leaveEdit';
-  import { CHANGELOG_KINDS, PRIORITIES, PRIORITY_TEXT } from '../lib/journals';
+  import { CHANGELOG_KINDS, EDIT_TITLE, PRIORITIES, PRIORITY_TEXT } from '../lib/journals';
 
   interface Props {
     user: string;
@@ -33,16 +38,12 @@
     onreread?: (e: Entry) => void;
     /** 401: сессия кончилась. */
     onexpired?: () => void;
+    /** Поля — в окне формы (`EditPanel` с `dialog`): без своих кнопок, заголовка и вопросов. */
+    bare?: boolean;
   }
 
-  let { user, entry, onsaved, oncancel, onreread, onexpired }: Props = $props();
+  let { user, entry, onsaved, oncancel, onreread, onexpired, bare = false }: Props = $props();
 
-  const TITLE: Partial<Record<EntryKind, string>> = {
-    changelog: 'Правка записи',
-    release: 'Правка релиза',
-    task: 'Правка задачи',
-    question: 'Правка вопроса',
-  };
   const OWNER_TEXT: Record<string, string> = { agent: 'агент', human: 'человек' };
 
   /** Запись, против которой считается правка: на открытии, после 409 — перечитанная. */
@@ -52,19 +53,25 @@
   let f = $state(untrack(() => fieldsOf(entry)));
   let busy = $state(false);
   let error = $state('');
-  const title = untrack(() => TITLE[entry.kind] ?? 'Правка записи');
+  /** Поля, изменённые и здесь, и в другом месте (409): помечены в форме (§6.14 п. 5). */
+  let clash = $state<(keyof EditFields)[]>([]);
+  const title = untrack(() => EDIT_TITLE[entry.kind] ?? 'Правка записи');
+  const inDialog = untrack(() => bare);
 
-  /** В форме есть несохранённое (для вопроса «Закрыть без сохранения?» панели журнала). */
-  export function dirty(): boolean {
-    return isDirty(f, base);
-  }
-
-  /** Журнал уже решил закрыть форму (спросил сам или несохранённого нет): переход не спрашивает. */
+  /** Журнал уже решил закрыть форму (спросил сам, несохранённого нет или сохранено): переход не
+   * спрашивает. */
   let released = false;
 
-  /** Можно ли закрыть форму: несохранённого нет или человек согласился его оставить. */
+  /** В форме есть несохранённое (для вопроса «Закрыть без сохранения?» панели журнала или окна);
+   * отпущенная форма (закрывается, сохранена) — нет. */
+  export function dirty(): boolean {
+    return !released && isDirty(f, base);
+  }
+
+  /** Можно ли закрыть форму: несохранённого нет или человек согласился его оставить. В окне — не
+   * спрашивает (вопрос задаёт окно). */
   export function leave(): boolean {
-    return released || !dirty() || window.confirm(LEAVE_EDIT);
+    return released || inDialog || !dirty() || window.confirm(LEAVE_EDIT);
   }
 
   /** Форма закрывается по решению журнала: проверка ухода больше не спрашивает. */
@@ -72,15 +79,21 @@
     released = true;
   }
 
-  onMount(() => guardLeave(() => !released && dirty()));
+  // в окне проверку ухода ставит окно (`FormDialog`)
+  onMount(() => (inDialog ? undefined : guardLeave(dirty, release)));
 
-  /** Фокус на первом поле при открытии формы. */
+  /** Фокус на первом поле при открытии формы (в окне — фокус ставит окно). */
   function focusOnOpen(node: HTMLElement) {
-    node.focus();
+    if (!inDialog) node.focus();
   }
 
-  async function submit(e: SubmitEvent) {
+  function onsubmitForm(e: SubmitEvent) {
     e.preventDefault();
+    void submit();
+  }
+
+  /** Сохранить: `PATCH` только изменённого; 409 — черновик поверх свежей записи, ошибка видна. */
+  export async function submit(): Promise<void> {
     if (busy) return;
     const r = patchOf(cur, f);
     if ('error' in r) {
@@ -117,58 +130,78 @@
     f = r.fields;
     base = next;
     cur = fresh;
-    const clash = r.clash.length
-      ? ` Изменено и здесь, и в другом месте: ${r.clash.map((k) => FIELD_TEXT[k]).join(', ')} — сверьте перед сохранением.`
-      : '';
-    error = `Запись изменили в другом месте (сейчас ревизия ${fresh.rev}): форма обновлена, ваши правки остались — проверьте и сохраните снова.${clash}`;
+    clash = r.clash;
+    // один текст 409 у всех форм с ревизией (`formDraft.rebaseText`)
+    error = rebaseText(
+      r.clash.map((k) => FIELD_TEXT[k]),
+      fresh.rev,
+    );
     onreread?.(fresh);
   }
 </script>
 
-<form class="form" onsubmit={submit} aria-label={title}>
-  <h3>{title}</h3>
-  <label>Заголовок <input bind:value={f.title} required maxlength="500" use:focusOnOpen /></label>
-  <label>Текст <textarea bind:value={f.body} rows="4"></textarea></label>
+{#if inDialog}
+  {@render fields()}
+  {#if error}<p class="error" role="alert">{error}</p>{/if}
+{:else}
+  <form class="form" onsubmit={onsubmitForm} aria-label={title}>
+    <h3>{title}</h3>
+    {@render fields()}
+    {#if error}<p class="error" role="alert">{error}</p>{/if}
+    <div class="row end">
+      <button type="submit" class="primary" disabled={busy}>Сохранить</button>
+      <button type="button" onclick={() => ((released = true), oncancel())}>Отмена</button>
+    </div>
+  </form>
+{/if}
+
+<!-- пометка поля-расхождения 409 в подписи (её читает и программа чтения с экрана) -->
+{#snippet note(k: keyof EditFields)}
+  {#if clash.includes(k)}<span class="clash-note">изменено и здесь, и в другом месте</span>{/if}
+{/snippet}
+
+{#snippet fields()}
+  <label class:clash={clash.includes('title')}>Заголовок {@render note('title')}<input bind:value={f.title} required maxlength="500" use:focusOnOpen data-autofocus /></label>
+  <label class:clash={clash.includes('body')}>Текст {@render note('body')}<textarea bind:value={f.body} rows="4"></textarea></label>
   {#if cur.kind === 'changelog'}
-    <label>
-      Вид
+    <label class:clash={clash.includes('kind')}>
+      Вид {@render note('kind')}
       <select bind:value={f.kind}>
         {#each CHANGELOG_KINDS as k (k)}<option value={k}>{k}</option>{/each}
       </select>
     </label>
   {:else if cur.kind === 'task'}
     <div class="row">
-      <label>
-        Приоритет
+      <label class:clash={clash.includes('priority')}>
+        Приоритет {@render note('priority')}
         <select bind:value={f.priority}>
           <option value="">без приоритета</option>
           {#each PRIORITIES as p (p)}<option value={p}>{PRIORITY_TEXT[p]}</option>{/each}
         </select>
       </label>
-      <label>
-        Кто ведёт
+      <label class:clash={clash.includes('owner')}>
+        Кто ведёт {@render note('owner')}
         <select bind:value={f.owner}>
           <option value="">не задано</option>
           {#each Object.entries(OWNER_TEXT) as [k, t] (k)}<option value={k}>{t}</option>{/each}
         </select>
       </label>
-      <label>
-        Оценка, минут
+      <label class:clash={clash.includes('estimate')}>
+        Оценка, минут {@render note('estimate')}
         <input bind:value={f.estimate} inputmode="numeric" pattern="[0-9]*" maxlength="6" title="от 1 до {ESTIMATE_MAX}" />
       </label>
     </div>
-    <label>Ссылки <span class="muted small">(по одной в строке)</span> <textarea bind:value={f.links} rows="2"></textarea></label>
+    <label class:clash={clash.includes('links')}
+      >Ссылки <span class="muted small">(по одной в строке)</span> {@render note('links')}<textarea bind:value={f.links} rows="2"></textarea></label
+    >
   {/if}
   <div class="row">
-    <label class="grow">Теги <span class="muted small">(через запятую)</span> <input bind:value={f.tags} /></label>
-    <label class="grow">Область <input bind:value={f.area} maxlength="200" /></label>
+    <label class="grow" class:clash={clash.includes('tags')}
+      >Теги <span class="muted small">(через запятую)</span> {@render note('tags')}<input bind:value={f.tags} /></label
+    >
+    <label class="grow" class:clash={clash.includes('area')}>Область {@render note('area')}<input bind:value={f.area} maxlength="200" /></label>
   </div>
-  {#if error}<p class="error" role="alert">{error}</p>{/if}
-  <div class="row end">
-    <button type="submit" class="primary" disabled={busy}>Сохранить</button>
-    <button type="button" onclick={() => ((released = true), oncancel())}>Отмена</button>
-  </div>
-</form>
+{/snippet}
 
 <style>
   .form {
@@ -187,7 +220,8 @@
     display: grid;
     gap: 4px;
   }
-  .form .row {
+  .form .row,
+  .row:has(> .grow) {
     align-items: start;
   }
   .grow {

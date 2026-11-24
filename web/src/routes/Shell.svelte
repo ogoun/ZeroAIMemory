@@ -15,12 +15,7 @@
   import LazyFail from '../components/LazyFail.svelte';
   import Search from '../components/Search.svelte';
   import Tree, { type Reveal, type TreeChange } from '../components/Tree.svelte';
-  import ChangelogView from '../components/ChangelogView.svelte';
-  import InsightsView from '../components/InsightsView.svelte';
-  import GlossaryView from '../components/GlossaryView.svelte';
   import TasksView from '../components/TasksView.svelte';
-  import QuestionsView from '../components/QuestionsView.svelte';
-  import ReleasesView from '../components/ReleasesView.svelte';
   import VaultView from '../components/VaultView.svelte';
   import RechunkBanner from '../components/RechunkBanner.svelte';
   import BackupBanner from '../components/BackupBanner.svelte';
@@ -450,9 +445,23 @@
             Knowledge (Insights, Словарь, Задачи, Идеи, Вопросы, Vault).
           </p>
         {:else if r.journal === 'changelog'}
-          <ChangelogView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+          <!-- журналы — ленивыми чанками (M7.3, ревью r2 задачи 10a, N2): стартовая загрузка их не несёт -->
+          {#await import('../components/ChangelogView.svelte')}
+            <p class="muted">Загрузка…</p>
+          {:then { default: ChangelogView }}
+            <ChangelogView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+          {:catch e}
+            <LazyFail error={e} />
+          {/await}
         {:else if r.journal === 'releases'}
-          <ReleasesView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+          <!-- Releases — ленивым чанком -->
+          {#await import('../components/ReleasesView.svelte')}
+            <p class="muted">Загрузка…</p>
+          {:then { default: ReleasesView }}
+            <ReleasesView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+          {:catch e}
+            <LazyFail error={e} />
+          {/await}
         {:else if r.journal === 'reports'}
           <!-- отчёты — ленивым чанком (страница, лента, корзина); удаляет только владелец решения -->
           {#await import('../components/ReportsView.svelte')}
@@ -485,9 +494,22 @@
             <LazyFail error={e} />
           {/await}
         {:else if r.journal === 'insights'}
-          <InsightsView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+          {#await import('../components/InsightsView.svelte')}
+            <p class="muted">Загрузка…</p>
+          {:then { default: InsightsView }}
+            <InsightsView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+          {:catch e}
+            <LazyFail error={e} />
+          {/await}
         {:else if r.journal === 'glossary'}
-          <GlossaryView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+          <!-- Словарь — ленивым чанком -->
+          {#await import('../components/GlossaryView.svelte')}
+            <p class="muted">Загрузка…</p>
+          {:then { default: GlossaryView }}
+            <GlossaryView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+          {:catch e}
+            <LazyFail error={e} />
+          {/await}
         {:else if r.journal === 'tasks'}
           <TasksView user={r.user} space={r.space} entry={r.entry} {onexpired} />
         {:else if r.journal === 'ideas'}
@@ -500,7 +522,14 @@
             <LazyFail error={e} />
           {/await}
         {:else if r.journal === 'questions'}
-          <QuestionsView user={r.user} space={r.space} entry={r.entry} spaces={journalSpaces?.spaces ?? []} {onexpired} />
+          <!-- Вопросы — ленивым чанком -->
+          {#await import('../components/QuestionsView.svelte')}
+            <p class="muted">Загрузка…</p>
+          {:then { default: QuestionsView }}
+            <QuestionsView user={r.user} space={r.space} entry={r.entry} spaces={journalSpaces?.spaces ?? []} {onexpired} />
+          {:catch e}
+            <LazyFail error={e} />
+          {/await}
         {:else}
           <VaultView user={r.user} space={r.space} {onexpired} />
         {/if}

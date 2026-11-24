@@ -606,7 +606,7 @@ test.describe('телефон, сенсорный ввод', () => {
   // финальное ревью M7.2, I1: несохранённое в формах Insights, «Идей» и «Словаря» молча не теряется
   // ни по «←», ни при уходе по адресу — как у доски задач и формы правки записи
   test('insights_unsaved_back_asks_phone', async ({ page }) => {
-    // форма отзыва в карточке; без набранного «← Insights» уводит сразу
+    // окно отзыва (M7.3: окно формы, а не форма в карточке); без набранного «Назад» закрывает окно
     const problems = watch(page);
     const guid = await newSolution('insights и несохранённое');
     const e = await api<{ id: string }>('POST', `spaces/${guid}/entries`, {
@@ -621,23 +621,42 @@ test.describe('телефон, сенсорный ввод', () => {
     const table = page.getByRole('table', { name: 'Insights' });
     const row = table.locator(`tr[data-entry="${e.id}"]`).getByRole('button').first();
     const card = page.getByRole('article', { name: 'Карточка insight' });
-    const form = card.getByRole('form', { name: 'Отзыв insight' });
+    // M7.3 (§6.14 п. 1, решение 93): «Отозвать» — окно формы во весь экран, а не форма в карточке;
+    // системная «Назад» с набранным спрашивает в окне, уход по адресу — один вопрос роутера, без
+    // набранного «Назад» закрывает окно (адрес прежний), «← Insights» — к таблице
+    const here = new RegExp(`/j/insights/${e.id}$`);
+    const dlg = page.getByRole('dialog', { name: 'Отозвать запись' });
+    const field = dlg.getByLabel('Причина');
+    const ask = dlg.getByTestId('fd-ask');
     await row.tap();
     await card.getByRole('button', { name: 'Отозвать', exact: true }).tap();
-    await unsavedAsksPhone(page, {
-      label: 'Insights',
-      field: form.getByLabel('Причина'),
-      typed: 'Опровергнуто замером',
-      here: new RegExp(`/j/insights/${e.id}$`),
-      away: `#/u/${c.user}/s/${guid}/j/glossary`,
-      list: table,
+    await field.fill('Опровергнуто замером');
+    await page.goBack({ waitUntil: 'commit' });
+    await expect(ask).toBeVisible();
+    await expect(page).toHaveURL(here);
+    await ask.getByRole('button', { name: 'Продолжить правку' }).tap();
+    await expect(ask).toHaveCount(0);
+    await expect(field).toHaveValue('Опровергнуто замером');
+    let asked = '';
+    page.once('dialog', (d) => {
+      asked = `${d.type()}: ${d.message()}`;
+      void d.dismiss();
     });
-    await expect(page).toHaveURL(/\/j\/insights$/);
-    await row.tap();
+    await page.evaluate((h) => (location.hash = h), `#/u/${c.user}/s/${guid}/j/glossary`);
+    await expect.poll(() => asked).toBe(`confirm: ${LEAVE_EDIT}`);
+    await expect(page).toHaveURL(here);
+    await expect(field).toHaveValue('Опровергнуто замером');
+    await dlg.getByRole('button', { name: 'Закрыть', exact: true }).tap();
+    await ask.getByRole('button', { name: 'Закрыть без сохранения' }).tap();
+    await expect(dlg).toHaveCount(0);
     await card.getByRole('button', { name: 'Отозвать', exact: true }).tap();
-    await expect(form).toBeVisible();
+    await expect(field).toHaveValue('');
+    await page.goBack({ waitUntil: 'commit' });
+    await expect(dlg).toHaveCount(0);
+    await expect(page).toHaveURL(here);
     await page.getByRole('link', { name: '← Insights' }).tap();
     await expect(table).toBeVisible();
+    await expect(page).toHaveURL(/\/j\/insights$/);
     await expect(page.getByRole('alertdialog')).toHaveCount(0);
     expect((await api<{ status: string }>('GET', `entries/${e.id}`)).status).toBe('active');
     expect(problems, problems.join('\n')).toEqual([]);

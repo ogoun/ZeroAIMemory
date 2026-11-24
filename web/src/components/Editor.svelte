@@ -23,7 +23,7 @@
   import type { EditorHandle } from '../lib/editor/codemirror';
   import { codeOf, flashButton } from '../lib/hydrate/dom';
   import { hydrateRendered } from '../lib/hydrate/render';
-  import { anchorId, href, parse, setGuard } from '../lib/router';
+  import { anchorId, href, parse, pushGuard } from '../lib/router';
   import { onTabKey } from '../lib/tabs';
   import { viewport } from '../lib/viewport.svelte';
 
@@ -132,21 +132,16 @@
       }
     })();
 
-    // уход по адресу (дерево, ссылка, назад) — подтверждение; внутри заметки — свободно
-    const offGuard = setGuard(
-      (next) =>
-        (next.name === 'node' && next.user === user && next.node === node) ||
-        !isDirty() ||
-        window.confirm(LEAVE_QUESTION),
-    );
-    const onbeforeunload = (e: BeforeUnloadEvent) => {
-      if (isDirty()) e.preventDefault();
-    };
-    window.addEventListener('beforeunload', onbeforeunload);
+    // уход по адресу (дерево, ссылка, назад) — подтверждение своим вопросом; внутри заметки —
+    // свободно. Проверка — в стеке проверок ухода (M7.3, §6.14 п. 4): с окном формы поверх
+    // редактора вопрос один; закрытие вкладки — `beforeunload` роутера
+    const offGuard = pushGuard({
+      dirty: (next) => !(next && next.name === 'node' && next.user === user && next.node === node) && isDirty(),
+      question: LEAVE_QUESTION,
+    });
     return () => {
       alive = false;
       offGuard();
-      window.removeEventListener('beforeunload', onbeforeunload);
       clearTimeout(previewTimer);
       previewSeq++;
       cm?.destroy();

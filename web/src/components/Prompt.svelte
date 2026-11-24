@@ -21,108 +21,69 @@
 </script>
 
 <script lang="ts">
-  import { Dialog } from 'bits-ui';
-  import { focusNow } from '../lib/focus';
+  // Подтверждение или ввод строки (дерево заметок, корзина, сброс пароля, решения, кэш, история) —
+  // обёртка над окном формы `FormDialog` (M7.3, §6.14 п. 1): интерфейс `Ask` прежний, каркас общий —
+  // шапка, порядок кнопок, телефон (окно с полем — во весь экран, подтверждение — нет), вопрос о
+  // несохранённом (набранное в поле против начального значения), фокус: поле с выделенным текстом;
+  // у подтверждения `danger` — «Отмена».
+  import FormDialog from './FormDialog.svelte';
 
   let { ask = $bindable() }: { ask: Ask | null } = $props();
 
   let value = $state('');
-  let error = $state('');
-  let busy = $state(false);
-  let field = $state<HTMLInputElement | null>(null);
+  /** Окно, для которого взято значение поля (новое окно — новое значение). */
+  let shownFor: Ask | null = null;
   /** Куда перевести фокус при закрытии окна после удавшегося действия (`Ask.refocus`). */
-  let refocus: Ask['refocus'] = undefined;
+  let after: Ask['refocus'] = undefined;
 
-  // Новое окно — новое значение поля.
-  $effect(() => {
-    if (ask) {
-      value = ask.value ?? '';
-      error = '';
-      busy = false;
-    }
+  $effect.pre(() => {
+    const a = ask;
+    if (a && a !== shownFor) {
+      shownFor = a;
+      value = a.value ?? '';
+      after = undefined;
+    } else if (!a) shownFor = null;
   });
 
-  async function submit(e: SubmitEvent) {
-    e.preventDefault();
-    if (!ask || busy) return;
-    const v = ask.secret ? value : value.trim();
-    if (ask.label && !v) return;
-    busy = true;
-    error = '';
-    try {
-      await ask.run(v);
-      refocus = ask?.refocus;
+  async function run() {
+    const a = ask;
+    if (!a) return;
+    const v = a.secret ? value : value.trim();
+    if (a.label && !v) return;
+    // исключение — в окне (`FormDialog`), окно открыто
+    await a.run(v);
+    // действие могло открыть новое окно (`ask` сменился) — его не закрывать
+    if (ask === a) {
+      after = a.refocus;
       ask = null;
-    } catch (err) {
-      error = err instanceof Error ? err.message : 'Ошибка';
-    } finally {
-      busy = false;
     }
   }
 </script>
 
-<Dialog.Root
+<FormDialog
   open={ask !== null}
-  onOpenChange={(o) => {
-    if (!o) ask = null;
+  title={ask?.title ?? ''}
+  description={ask?.message}
+  submit={ask?.confirm ?? ''}
+  danger={ask?.danger}
+  confirm={!ask?.label}
+  dirty={() => !!ask?.label && value !== (ask.value ?? '')}
+  refocus={() => {
+    const r = after;
+    after = undefined;
+    return r?.() ?? null;
   }}
+  onsubmit={run}
+  onclose={() => (ask = null)}
 >
-  <Dialog.Portal>
-    <Dialog.Overlay class="overlay" />
-    <Dialog.Content
-      class="panel dialog"
-      onOpenAutoFocus={(e) => {
-        refocus = undefined;
-        if (field) {
-          e.preventDefault();
-          field.focus();
-          field.select();
-        }
-      }}
-      onCloseAutoFocus={(e) => {
-        const r = refocus;
-        refocus = undefined;
-        if (r && focusNow(r())) e.preventDefault();
-      }}
-    >
-      {#if ask}
-        <form onsubmit={submit}>
-          <Dialog.Title>{ask.title}</Dialog.Title>
-          {#if ask.message}<Dialog.Description class="muted">{ask.message}</Dialog.Description>{/if}
-          {#if ask.label}
-            <label class="field">
-              {ask.label}
-              {#if ask.secret}
-                <input bind:this={field} bind:value type="password" autocomplete="new-password" required />
-              {:else}
-                <input bind:this={field} bind:value placeholder={ask.placeholder} required />
-              {/if}
-            </label>
-          {/if}
-          {#if error}<p class="error" role="alert">{error}</p>{/if}
-          <div class="row actions">
-            <button type="submit" class={ask.danger ? 'danger-fill' : 'primary'} disabled={busy}>
-              {ask.confirm}
-            </button>
-            <Dialog.Close type="button">Отмена</Dialog.Close>
-          </div>
-        </form>
+  {#if ask?.label}
+    <label>
+      {ask.label}
+      {#if ask.secret}
+        <input bind:value type="password" autocomplete="new-password" required data-autofocus />
+      {:else}
+        <input bind:value placeholder={ask.placeholder} required data-autofocus data-select />
       {/if}
-    </Dialog.Content>
-  </Dialog.Portal>
-</Dialog.Root>
-
-<style>
-  .field {
-    display: grid;
-    gap: 4px;
-    margin-top: 12px;
-  }
-  .field input {
-    width: 100%;
-  }
-  .actions {
-    margin-top: 16px;
-    justify-content: flex-end;
-  }
-</style>
+    </label>
+  {/if}
+</FormDialog>

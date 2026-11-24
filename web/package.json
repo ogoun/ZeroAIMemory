@@ -11,7 +11,7 @@
     "build": "vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "size": "size-limit",
-    "test:build": "node --experimental-strip-types --test build/license-policy.test.ts test/time.test.ts test/codeRef.test.ts test/reportLinks.test.ts test/ideaButtons.test.ts test/indexing.test.ts test/adrData.test.ts test/layout.test.ts test/sessionTree.test.ts test/plural.test.ts test/counts.test.ts test/taskBoard.test.ts test/tabs.test.ts test/taskProgress.test.ts test/backups.test.ts test/apiError.test.ts test/graphLayout.test.ts test/entryEdit.test.ts",
+    "test:build": "node --experimental-strip-types --test build/license-policy.test.ts build/start-budget.test.ts test/time.test.ts test/codeRef.test.ts test/reportLinks.test.ts test/ideaButtons.test.ts test/indexing.test.ts test/adrData.test.ts test/layout.test.ts test/sessionTree.test.ts test/plural.test.ts test/counts.test.ts test/taskBoard.test.ts test/tabs.test.ts test/taskProgress.test.ts test/backups.test.ts test/apiError.test.ts test/graphLayout.test.ts test/entryEdit.test.ts test/guards.test.ts test/formDraft.test.ts",
     "e2e": "node e2e/run.mjs"
   },
   "devDependencies": {

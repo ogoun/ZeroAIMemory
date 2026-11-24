@@ -151,9 +151,12 @@ test('tasks_board_claim_shown', async ({ page }) => {
   await card.getByLabel('Следующий шаг').fill('написать тест');
   await card.getByRole('button', { name: 'Сохранить шаг' }).click();
   await expect(col('открыт')).toContainText('Дальше: написать тест');
+  // «→ заблокирован» — окно «Что мешает» (M7.3, §6.14 решение 84), а не форма внизу карточки
   await card.getByRole('button', { name: '→ заблокирован' }).click();
-  await card.getByLabel('Что мешает').fill('ждём ответа владельца');
-  await card.getByRole('button', { name: 'Применить' }).click();
+  const blocked = page.getByRole('dialog', { name: 'Задача заблокирована' });
+  await blocked.getByLabel('Что мешает').fill('ждём ответа владельца');
+  await blocked.getByRole('button', { name: 'Заблокировать' }).click();
+  await expect(blocked).toHaveCount(0);
   await expect(col('заблокирован')).toContainText('Блокер: ждём ответа владельца');
 
   // снятие захвата человеком; карточка — панель 480 px поверх доски (M7.2, §5.2 п. 1): она
@@ -170,9 +173,12 @@ test('tasks_board_claim_shown', async ({ page }) => {
   await page.keyboard.press('Escape');
   await expect(card).toHaveCount(0);
   await col('выполнен').getByRole('button', { name: 'Задача WM выполнена' }).click();
+  // переоткрытие — окно с обязательной причиной (M7.3, §6.14)
   await card.getByRole('button', { name: 'Переоткрыть' }).click();
-  await card.getByLabel('Причина переоткрытия').fill('тесты красные');
-  await card.getByRole('button', { name: 'Применить' }).click();
+  const reopen = page.getByRole('dialog', { name: 'Переоткрыть задачу' });
+  await reopen.getByLabel('Причина переоткрытия').fill('тесты красные');
+  await reopen.getByRole('button', { name: 'Переоткрыть' }).click();
+  await expect(reopen).toHaveCount(0);
   await expect(col('открыт')).toContainText('Задача WM выполнена');
   expect(problems, problems.join('\n')).toEqual([]);
 });
@@ -292,7 +298,8 @@ test('decision_adr_fields', async ({ page }) => {
 
   // правка ADR на месте: If-Match, новая ревизия
   await card.getByRole('button', { name: 'Править ADR' }).click();
-  const form = card.getByRole('form', { name: 'Поля ADR' });
+  // поля ADR — окно (M7.3, §6.14 правило Б); запись правится на месте, новой ревизией
+  const form = page.getByRole('dialog', { name: 'Поля ADR' });
   await form.getByLabel('Выбрано').fill('PostgreSQL');
   const saved = page.waitForResponse((r) => r.request().method() === 'PATCH' && r.url().includes(`/entries/${human.id}`));
   await form.getByRole('button', { name: 'Сохранить' }).click();

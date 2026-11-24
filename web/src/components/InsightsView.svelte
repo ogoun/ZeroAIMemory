@@ -12,13 +12,18 @@
   // Корзина (M7.2, спецификация §5.9 пп. 2–3): «Удалить» карточки — в корзину, с подтверждением
   // (отзыв оставляет запись в истории, удаление убирает её из журнала и поиска); «Корзина» — вместо
   // таблицы удалённые записи с «Восстановить» (`JournalTrash`, ленивый чанк).
-  // Несохранённое (финальное ревью M7.2, I1): поля открытой формы карточки (замещение, ADR, отзыв,
-  // надёжность, триггеры) против их значений при открытии — `unsaved()`; «← Insights» сначала
-  // спрашивает «Закрыть без сохранения?» (`JournalSplit`), уход по адресу и действия карточки,
-  // которые закрыли бы форму (другая форма, «Пересмотреть»), — `LEAVE_EDIT` (`lib/leaveEdit.ts`).
+  // Карточка и формы (M7.3, спецификация §6.14, решения 80–87): ряд действий — сразу под шапкой
+  // карточки, до текста, полей ADR, файлов, цепочки и связей (правило Г); «Заменить», «Отозвать»,
+  // «Сменить статус надёжности», «Триггеры» и «Поля ADR» — окна формы (`FormDialog`, правило Б):
+  // несохранённое спрашивает окно (поля против их значений при открытии), уход по адресу — один
+  // вопрос стека проверок ухода; 409 — запись перечитана, набранное остаётся, нетронутое поле — из
+  // свежей записи (`rebase`, `formDraft.ts`), расхождения помечены, окно открыто. «Новый insight» —
+  // окно `InsightNew` (ленивый чанк): кандидаты-дубли сервера — ссылками, «Записать всё равно»;
+  // после записи — карточка созданной. «Полезно» / «Бесполезно» и «Пересмотреть» — сразу (Д).
   import { onMount, tick, untrack } from 'svelte';
   import CertaintyBadge from './CertaintyBadge.svelte';
   import FileRefs from './FileRefs.svelte';
+  import FormDialog from './FormDialog.svelte';
   import JournalSplit from './JournalSplit.svelte';
   import Links from './Links.svelte';
   import Notice from './Notice.svelte';
@@ -63,8 +68,8 @@
     fmtTime,
     type Adr,
   } from '../lib/journals';
+  import { isDirty, rebase, rebaseText } from '../lib/formDraft';
   import { BP_TABLET } from '../lib/layout';
-  import { LEAVE_EDIT, guardLeave } from '../lib/leaveEdit';
   import { go, href } from '../lib/router';
   import { observeWidth } from '../lib/viewport.svelte';
   import { supersedeData } from '../lib/adrData';
@@ -118,6 +123,12 @@
   /** Итог действия, закрывшего карточку (удаление), — над таблицей. */
   let listNotice = $state('');
   let ask = $state<Ask | null>(null);
+  /** Окно «Новый insight» (ленивый чанк `InsightNew`). */
+  let newOpen = $state(false);
+  /** Ошибка открытого окна формы (сервер, проверка, 409). */
+  let dlgError = $state('');
+  /** Поля, изменённые и в окне, и в другом месте (409): помечены в окне. */
+  let clash = $state<string[]>([]);
 
   // формы
   let sTitle = $state('');
@@ -139,55 +150,139 @@
   let tPattern = $state('');
   let tTools = $state('');
 
-  /** Поля открытой формы (без выбора типа нового триггера — он не уходит при сохранении). */
-  function formState(): string {
-    switch (mode) {
+  /** Поля формы окна — простые значения и структуры (сравнение `formDraft.ts`). */
+  type Fields = Record<string, unknown>;
+
+  /** Поля открытой формы `m` (без выбора типа нового триггера — он не уходит при сохранении). */
+  function fieldsNow(m: Mode): Fields {
+    switch (m) {
       case 'supersede':
-        return JSON.stringify([sTitle, sBody, sKind, sCertainty, adr, adrOptions]);
+        return { title: sTitle, body: sBody, kind: sKind, certainty: sCertainty, adr: { ...adr }, options: adrOptions };
       case 'adr':
-        return JSON.stringify([adr, adrOptions]);
+        return { adr: { ...adr }, options: adrOptions };
       case 'retract':
-        return rReason;
+        return { reason: rReason };
       case 'certainty':
-        return JSON.stringify([cTo, cReason, evChecked, evMethod, evResult]);
+        return { to: cTo, reason: cReason, checked: evChecked, method: evMethod, result: evResult };
       case 'triggers':
-        return JSON.stringify([tDraft, tPattern, tTools]);
+        return { triggers: tDraft.map((t) => ({ ...t })), pattern: tPattern, tools: tTools };
       default:
-        return '';
+        return {};
     }
   }
-  /** Поля формы при её открытии (из записи карточки). */
-  let pristine = '';
 
-  /** Открыть форму `m`: поля уже взяты из записи — их снимок для `unsaved()`. */
-  function openForm(m: Mode) {
-    mode = m;
-    pristine = formState();
+  /** ADR формы из `data.decision` записи; у нового решения «кто решил» — человек. */
+  function adrForm(data: Record<string, unknown>): Adr {
+    const a = adrOf(data);
+    return { ...a, decided_by: a.decided_by || 'human' };
   }
 
-  /** В открытой форме карточки есть несохранённое. Карточка закрыта (удаление) — нет. */
-  const unsaved = (): boolean => mode !== 'none' && cur !== null && formState() !== pristine;
+  /** Поля формы `m` из записи `e`: при открытии окна и из свежей записи при 409. Новая запись
+   * замены — без статуса надёжности (аксиому человек ставит явно, §7.5); причины — пустые. */
+  function fieldsOf(m: Mode, e: Entry): Fields {
+    const ev = evidenceOf(e);
+    const evStr = (k: string) => (typeof ev?.[k] === 'string' ? (ev[k] as string) : '');
+    switch (m) {
+      case 'supersede':
+        return {
+          title: e.title,
+          body: e.body,
+          kind: dataStr(e.data, 'kind') || 'discovery',
+          certainty: '',
+          adr: adrForm(e.data),
+          options: adrOf(e.data).options.join('\n'),
+        };
+      case 'adr':
+        return { adr: adrForm(e.data), options: adrOf(e.data).options.join('\n') };
+      case 'retract':
+        return { reason: '' };
+      case 'certainty':
+        return { to: e.certainty ?? '', reason: '', checked: evStr('checked'), method: evStr('method'), result: evStr('result') };
+      case 'triggers':
+        return { triggers: (e.triggers ?? []).map((t) => ({ type: t.type, pattern: t.pattern, tools: t.tools })), pattern: '', tools: '' };
+      default:
+        return {};
+    }
+  }
 
-  /** Действие закроет открытую форму: при несохранённом — сначала вопрос; `false` — остаться. */
-  const leaveForm = (): boolean => !unsaved() || window.confirm(LEAVE_EDIT);
+  /** Поля `f` — в форму `m`. */
+  function setFields(m: Mode, f: Fields) {
+    const str = (k: string) => (typeof f[k] === 'string' ? (f[k] as string) : '');
+    if (m === 'supersede' || m === 'adr') {
+      adr = { ...(f.adr as Adr) };
+      adrOptions = str('options');
+    }
+    if (m === 'supersede') {
+      sTitle = str('title');
+      sBody = str('body');
+      sKind = str('kind');
+      sCertainty = str('certainty') as Certainty | '';
+    } else if (m === 'retract') rReason = str('reason');
+    else if (m === 'certainty') {
+      cTo = str('to') as Certainty | '';
+      cReason = str('reason');
+      evChecked = str('checked');
+      evMethod = str('method');
+      evResult = str('result');
+    } else if (m === 'triggers') {
+      tDraft = (f.triggers as NewTrigger[]).map((t) => ({ ...t }));
+      tPattern = str('pattern');
+      tTools = str('tools');
+    }
+  }
 
-  onMount(() => guardLeave(unsaved));
+  /** Поля формы при открытии (или из свежей записи после 409) — с ними сравнивается набранное. */
+  let base: Fields = {};
 
-  /** «← Insights»: форма закрывается здесь (несохранённое `JournalSplit` уже спросил). */
-  function closeDetail() {
+  /** Подписи полей в тексте 409 (`clash`). */
+  const FIELD_LABEL: Record<string, string> = {
+    title: 'заголовок',
+    body: 'текст',
+    kind: 'вид',
+    certainty: 'надёжность',
+    adr: 'поля ADR',
+    options: 'варианты',
+    reason: 'причина',
+    to: 'статус надёжности',
+    checked: 'проверено',
+    method: 'метод',
+    result: 'результат',
+    triggers: 'триггеры',
+    pattern: 'шаблон',
+    tools: 'инструменты',
+  };
+
+  /** Открыть окно формы `m`: поля — из записи карточки. */
+  function openForm(m: Exclude<Mode, 'none'>) {
+    const c = cur;
+    if (!c) return;
+    base = fieldsOf(m, c);
+    setFields(m, base);
+    if (m === 'triggers') tType = 'keyword';
+    dlgError = '';
+    clash = [];
+    actionError = '';
+    mode = m;
+  }
+
+  /** В открытом окне есть несохранённое (вопрос окна и проверка ухода). */
+  const unsaved = (): boolean => mode !== 'none' && cur !== null && isDirty(fieldsNow(mode), base);
+
+  /** Окно формы закрыли (кнопкой, Esc, фоном; несохранённое окно уже спросило). */
+  function closeForm() {
     mode = 'none';
+    dlgError = '';
+    clash = [];
+  }
+
+  /** «← Insights»: окно формы закрывается вместе с карточкой. */
+  function closeDetail() {
+    closeForm();
     actionError = '';
   }
 
   function emptyAdr(): Adr {
     return { context: '', options: [], chosen: '', rationale: '', consequences: '', decided_by: 'human', revisit_if: '' };
-  }
-
-  /** Форма ADR из `data.decision` записи; у нового решения «кто решил» — человек. */
-  function loadAdr(data: Record<string, unknown>) {
-    const a = adrOf(data);
-    adr = { ...a, decided_by: a.decided_by || 'human' };
-    adrOptions = a.options.join('\n');
   }
 
   /** `data.decision` формы; пустой ADR (одно лишь «кто решил») не отправляется. */
@@ -289,6 +384,8 @@
   async function open(u: string, id: string | null) {
     const my = ++eseq;
     mode = 'none';
+    // другая запись (переход по адресу уже спросил о набранном): окно «Новый insight» закрывается
+    if (id !== (cur?.id ?? null)) newOpen = false;
     actionError = '';
     curError = '';
     chain = [];
@@ -398,7 +495,6 @@
     notice = '';
     try {
       const target = (await fn()) ?? cur?.id ?? null;
-      mode = 'none';
       await reloadList();
       reloadRefs();
       if (target && target !== entry) {
@@ -422,30 +518,60 @@
     }
   }
 
-  function startSupersede() {
-    if (!cur || !leaveForm()) return;
-    sTitle = cur.title;
-    sBody = cur.body;
-    sKind = dataStr(cur.data, 'kind') || 'discovery';
-    sCertainty = '';
-    loadAdr(cur.data);
-    openForm('supersede');
+  /** Отправка окна формы: успех — окно закрыто, таблица перечитана, карточка — та же или новая
+   * запись (замена), итог строкой; ошибка — в окне; 409 — набранное перенесено на свежую запись
+   * (`staleForm`), окно открыто. */
+  async function submitForm(fn: () => Promise<string | void>, done: string) {
+    dlgError = '';
+    let target: string | null;
+    try {
+      target = (await fn()) ?? cur?.id ?? null;
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) return onexpired();
+      if (isStaleEntry(e) && cur) return staleForm(cur.id);
+      dlgError = errorText(e);
+      return;
+    }
+    closeForm();
+    const other = !!target && target !== entry;
+    // к новой записи — сразу: на телефоне запись слоя окна становится её записью
+    if (other) select(target!);
+    notice = done;
+    busy = true;
+    try {
+      await reloadList();
+      reloadRefs();
+      if (!other) await open(user, target);
+    } finally {
+      busy = false;
+    }
   }
 
-  function startAdr() {
-    if (!cur || !leaveForm()) return;
-    loadAdr(cur.data);
-    openForm('adr');
+  /** 409 окна: запись перечитана, нетронутые поля — из неё, набранное остаётся, расхождения
+   * помечены (`rebase`); окно открыто, карточка под ним — свежая ревизия. */
+  async function staleForm(id: string) {
+    const m = mode;
+    let fresh: Entry;
+    try {
+      fresh = await getEntry(user, id);
+    } catch (e) {
+      dlgError = errorText(e);
+      return;
+    }
+    if (m === 'none' || mode !== m) return;
+    const next = fieldsOf(m, fresh);
+    const r = rebase(fieldsNow(m), base, next);
+    setFields(m, r.fields);
+    base = next;
+    cur = fresh;
+    clash = r.clash.map(String);
+    dlgError = rebaseText(clash.map((k) => FIELD_LABEL[k] ?? k), fresh.rev);
   }
 
-  function startRetract() {
-    if (!leaveForm()) return;
-    rReason = '';
-    openForm('retract');
-  }
+  /** Поле — расхождение 409: помечено. */
+  const clashed = (k: string) => clash.includes(k) || undefined;
 
-  function submitAdr(e: SubmitEvent) {
-    e.preventDefault();
+  function submitAdr() {
     const c = cur;
     if (!c) return;
     const decision = adrPayload();
@@ -453,16 +579,15 @@
     const data: Record<string, unknown> = { ...c.data };
     if (decision) data.decision = decision;
     else delete data.decision;
-    act(async () => {
+    return submitForm(async () => {
       await patchEntry(user, c.id, c.rev, { data });
     }, 'Поля ADR сохранены.');
   }
 
-  function submitSupersede(e: SubmitEvent) {
-    e.preventDefault();
+  function submitSupersede() {
     const c = cur;
     if (!c) return;
-    act(async () => {
+    return submitForm(async () => {
       // у решения ключи ADR верхнего уровня прежней записи не копируются (422 сервера)
       const data = supersedeData(c.data, sKind, sKind === 'decision' ? adrPayload() : null);
       const r = await supersedeEntry(user, c.id, {
@@ -477,23 +602,22 @@
     }, 'Запись заменена: прежняя помечена superseded.');
   }
 
-  function submitRetract(e: SubmitEvent) {
-    e.preventDefault();
+  function submitRetract() {
     const c = cur;
     if (!c) return;
     const reason = rReason.trim();
     if (!reason) {
-      actionError = 'Укажите причину отзыва.';
+      dlgError = 'Укажите причину отзыва.';
       return;
     }
-    act(async () => {
+    return submitForm(async () => {
       await retractEntry(user, c.id, reason, c.rev);
     }, 'Запись отозвана.');
   }
 
   function toggleRevisit() {
     const c = cur;
-    if (!c || !leaveForm()) return;
+    if (!c) return;
     const to = c.status === 'revisit' ? 'active' : 'revisit';
     act(
       async () => {
@@ -503,19 +627,7 @@
     );
   }
 
-  function startCertainty() {
-    if (!cur || !leaveForm()) return;
-    cTo = cur.certainty ?? '';
-    cReason = '';
-    const ev = cur.data.evidence as Record<string, unknown> | undefined;
-    evChecked = typeof ev?.checked === 'string' ? ev.checked : '';
-    evMethod = typeof ev?.method === 'string' ? ev.method : '';
-    evResult = typeof ev?.result === 'string' ? ev.result : '';
-    openForm('certainty');
-  }
-
-  function submitCertainty(e: SubmitEvent) {
-    e.preventDefault();
+  function submitCertainty() {
     const c = cur;
     if (!c) return;
     // человеку причина необязательна (§7.5)
@@ -528,7 +640,7 @@
       const ev = { checked: evChecked.trim(), method: evMethod.trim(), result: evResult.trim() };
       if (ev.checked || ev.method || ev.result) data = { ...c.data, evidence: ev };
     }
-    act(async () => {
+    return submitForm(async () => {
       await patchEntry(user, c.id, c.rev, {
         certainty: to,
         ...(reason ? { reason } : {}),
@@ -537,16 +649,8 @@
     }, 'Статус надёжности изменён.');
   }
 
-  function startTriggers() {
-    if (!cur || !leaveForm()) return;
-    tDraft = (cur.triggers ?? []).map((t) => ({ type: t.type, pattern: t.pattern, tools: t.tools }));
-    tPattern = '';
-    tTools = '';
-    openForm('triggers');
-  }
-
-  function addTrigger(e: SubmitEvent) {
-    e.preventDefault();
+  /** «Добавить» триггер в черновик окна (кнопка и Enter в поле шаблона — не отправка окна). */
+  function addTrigger() {
     const pattern = tPattern.trim();
     if (!pattern) return;
     const tools = tTools
@@ -562,9 +666,61 @@
     const c = cur;
     if (!c) return;
     const triggers = tDraft;
-    act(async () => {
+    return submitForm(async () => {
       await patchEntry(user, c.id, c.rev, { triggers });
     }, 'Триггеры сохранены.');
+  }
+
+  /** Окна форм карточки: заголовок, пояснение, кнопка, ширина и отправка. */
+  const FORMS: Record<Exclude<Mode, 'none'>, { title: string; hint?: string; submit: string; wide?: boolean; danger?: boolean; send: () => unknown }> = {
+    supersede: {
+      title: 'Заменить запись',
+      hint: 'Новая запись займёт место этой; прежняя останется в истории как superseded.',
+      submit: 'Заменить',
+      wide: true,
+      send: () => submitSupersede(),
+    },
+    adr: {
+      title: 'Поля ADR',
+      hint: 'Контекст, варианты, выбор, обоснование, последствия: запись правится на месте, новой ревизией.',
+      submit: 'Сохранить',
+      wide: true,
+      send: () => submitAdr(),
+    },
+    retract: {
+      title: 'Отозвать запись',
+      hint: 'Отзыв ничего не удаляет: запись остаётся в истории со статусом retracted.',
+      submit: 'Отозвать',
+      danger: true,
+      send: () => submitRetract(),
+    },
+    certainty: {
+      title: 'Статус надёжности',
+      hint: 'Вы действуете как человек: доступны все статусы, в том числе axiom; причина необязательна.',
+      submit: 'Сохранить',
+      send: () => submitCertainty(),
+    },
+    triggers: { title: 'Триггеры', submit: 'Сохранить триггеры', wide: true, send: () => saveTriggers() },
+  };
+  let form = $derived(mode === 'none' ? null : FORMS[mode]);
+
+  /** Итог действия в карточке (`Notice`): фокус после закрытия окна. */
+  const cardNotice = () => document.querySelector<HTMLElement>('article[aria-label="Карточка insight"] .card-notice [role="status"]');
+
+  // чанк окна «Новый insight» — заранее, когда журнал открыт: первое нажатие открывает окно сразу
+  onMount(() => {
+    const t = setTimeout(() => void import('./InsightNew.svelte').catch(() => {}), 1500);
+    return () => clearTimeout(t);
+  });
+
+  /** «Новый insight» записан: окно закрыто, карточка созданной — на виду и в фокусе (§6.14 п. 6). */
+  async function created(e: Entry) {
+    newOpen = false;
+    listNotice = '';
+    select(e.id);
+    notice = 'Insight записан.';
+    await reloadList();
+    reloadRefs();
   }
 
   /** «Удалить» карточки: в корзину; карточка закрывается, итог — над таблицей. */
@@ -593,6 +749,7 @@
   function toggleTrash() {
     trash = !trash;
     listNotice = '';
+    newOpen = false;
     // назад к таблице: восстановленные из корзины — в ней
     if (!trash) reloadList();
   }
@@ -613,7 +770,6 @@
     open={detailOpen}
     back={{ href: href({ name: 'journal', user, space, journal: 'insights', entry: null }), label: JOURNAL_TITLE.insights }}
     onclose={closeDetail}
-    dirty={unsaved}
     {entry}
   >
     {#snippet list()}
@@ -627,13 +783,42 @@
 
 <Prompt bind:ask />
 
+{#if newOpen}
+  <!-- «Новый insight» — окно (§6.14 п. 7), ленивый чанк (загружен заранее, `onMount`); пока чанк
+       идёт и если не пришёл — окно с тем же заголовком: «Загрузка…» или ошибка и «Обновить страницу» -->
+  {#await import('./InsightNew.svelte')}
+    <!-- заглушка — того же вида, что окно (на телефоне сразу во весь экран, без скачка) -->
+    <FormDialog open title="Новый insight" submit="Записать" busy onsubmit={() => {}} onclose={() => (newOpen = false)}>
+      <p class="muted" aria-busy="true">Загрузка…</p>
+    </FormDialog>
+  {:then { default: InsightNew }}
+    <InsightNew {user} {space} oncreated={created} onclose={() => (newOpen = false)} {onexpired} />
+  {:catch e}
+    <FormDialog
+      open
+      confirm
+      title="Новый insight"
+      submit="Обновить страницу"
+      onsubmit={() => location.reload()}
+      onclose={() => (newOpen = false)}
+    >
+      <p class="error" role="alert">Окно не загрузилось: {errorText(e)} — обновите страницу</p>
+    </FormDialog>
+  {/await}
+{/if}
+
 {#snippet table()}
-  <!-- фильтры — у живой таблицы; «Корзина» — одна кнопка в обоих видах (фокус переживает
-       переключение) -->
-  <form class="filters row" onsubmit={applyText}>
-    {#if !trash}{@render filters()}{/if}
+  <!-- «Новый insight» и «Корзина» — одной полосой, как у Задач и Идей; «Корзина» — одна кнопка в
+       обоих видах (фокус переживает переключение); фильтры — у живой таблицы -->
+  <div class="row bar">
+    {#if !trash}<button type="button" class="primary" onclick={() => (newOpen = true)}>Новый insight</button>{/if}
     <button type="button" class="toggle" aria-pressed={trash} onclick={toggleTrash}>Корзина</button>
-  </form>
+  </div>
+  {#if !trash}
+    <form class="filters row" onsubmit={applyText} aria-label="Фильтры insights">
+      {@render filters()}
+    </form>
+  {/if}
   {#if trash}
     <TrashPanel {user} {space} kind="insight" {onexpired} />
   {:else}
@@ -739,7 +924,37 @@
             {AUTHOR_TEXT[c.author.kind] ?? c.author.kind} · ревизия {c.rev} · {fmtTime(c.updated_at)}
           </span>
         </div>
+        {#if c.retract_reason}<p class="warn">Отозвано: {c.retract_reason}</p>{/if}
       </header>
+
+      <!-- ряд действий и оценка — сразу под шапкой, до длинных разделов (правило Г) -->
+      <div class="row actions" role="group" aria-label="Действия с записью">
+        {#if live(c)}
+          <button type="button" onclick={() => openForm('supersede')} disabled={busy}>Заменить</button>
+          <button type="button" onclick={toggleRevisit} disabled={busy}>
+            {c.status === 'revisit' ? 'Вернуть в действующие' : 'Пересмотреть'}
+          </button>
+          <button type="button" onclick={() => openForm('certainty')} disabled={busy}>Сменить статус надёжности</button>
+          <button type="button" onclick={() => openForm('triggers')} disabled={busy}>Триггеры</button>
+          {#if dataStr(c.data, 'kind') === 'decision'}
+            <button type="button" onclick={() => openForm('adr')} disabled={busy}>Править ADR</button>
+          {/if}
+        {/if}
+        {#if c.status !== 'retracted'}
+          <button type="button" class="danger" onclick={() => openForm('retract')} disabled={busy}>Отозвать</button>
+        {/if}
+        <button type="button" class="danger" onclick={() => askDelete(c)} disabled={busy}>Удалить</button>
+      </div>
+      <div class="row rate" role="group" aria-label="Оценка полезности">
+        <span class="muted small" data-testid="usage">
+          показы {c.usage?.shown ?? 0} · полезно {c.usage?.useful ?? 0} · бесполезно {c.usage?.useless ?? 0}
+        </span>
+        <button type="button" onclick={() => rate('useful')} disabled={busy}>Полезно</button>
+        <button type="button" onclick={() => rate('useless')} disabled={busy}>Бесполезно</button>
+      </div>
+      <div class="card-notice"><Notice text={notice} /></div>
+      {#if actionError}<p class="error" role="alert">{actionError}</p>{/if}
+
       {#if c.body}<p class="body">{c.body}</p>{/if}
       {#if evidenceOf(c)}
         {@const ev = evidenceOf(c)!}
@@ -769,14 +984,6 @@
         <p class="warn" data-testid="stale-note">{staleText(staleOf(refs.get(entryRef('insight', c.id))))}</p>
       {/if}
       <FileRefs refs={refs.get(entryRef('insight', c.id)) ?? []} />
-      {#if c.retract_reason}<p class="warn">Отозвано: {c.retract_reason}</p>{/if}
-      <div class="row rate" role="group" aria-label="Оценка полезности">
-        <span class="muted small" data-testid="usage">
-          показы {c.usage?.shown ?? 0} · полезно {c.usage?.useful ?? 0} · бесполезно {c.usage?.useless ?? 0}
-        </span>
-        <button type="button" onclick={() => rate('useful')} disabled={busy}>Полезно</button>
-        <button type="button" onclick={() => rate('useless')} disabled={busy}>Бесполезно</button>
-      </div>
 
       {#if chain.length > 1}
         <div class="chain">
@@ -798,113 +1005,6 @@
         </div>
       {/if}
 
-      <div class="row actions">
-        {#if live(c)}
-          <button type="button" onclick={startSupersede}>Заменить</button>
-          <button type="button" onclick={toggleRevisit} disabled={busy}>
-            {c.status === 'revisit' ? 'Вернуть в действующие' : 'Пересмотреть'}
-          </button>
-          <button type="button" onclick={startCertainty}>Сменить статус надёжности</button>
-          <button type="button" onclick={startTriggers}>Триггеры</button>
-          {#if dataStr(c.data, 'kind') === 'decision'}
-            <button type="button" onclick={startAdr}>Править ADR</button>
-          {/if}
-        {/if}
-        {#if c.status !== 'retracted'}
-          <button type="button" class="danger" onclick={startRetract}>Отозвать</button>
-        {/if}
-        <button type="button" class="danger" onclick={() => askDelete(c)} disabled={busy}>Удалить</button>
-      </div>
-      <Notice text={notice} />
-
-      {#if mode === 'supersede'}
-        <form class="form" onsubmit={submitSupersede} aria-label="Замена insight">
-          <h3>Заменить запись</h3>
-          <p class="muted small">Новая запись займёт место этой; прежняя останется в истории как superseded.</p>
-          <label>Заголовок <input bind:value={sTitle} required /></label>
-          <label>Текст <textarea bind:value={sBody} rows="5"></textarea></label>
-          <div class="row">
-            <label class="row">Вид
-              <select bind:value={sKind}>{#each INSIGHT_KINDS as k (k)}<option value={k}>{k}</option>{/each}</select>
-            </label>
-            <label class="row">Надёжность
-              <select bind:value={sCertainty} aria-label="Надёжность новой записи">
-                <option value="">без статуса</option>
-                {#each CERTAINTIES as x (x)}<option value={x}>{x}</option>{/each}
-              </select>
-            </label>
-          </div>
-          {#if sKind === 'decision'}{@render adrFields()}{/if}
-          {@render formEnd('Заменить')}
-        </form>
-      {:else if mode === 'adr'}
-        <form class="form" onsubmit={submitAdr} aria-label="Поля ADR">
-          <h3>Поля ADR</h3>
-          <p class="muted small">Контекст, варианты, выбор, обоснование, последствия: запись правится на месте, новой ревизией.</p>
-          {@render adrFields()}
-          {@render formEnd('Сохранить')}
-        </form>
-      {:else if mode === 'retract'}
-        <form class="form" onsubmit={submitRetract} aria-label="Отзыв insight">
-          <h3>Отозвать запись</h3>
-          <p class="muted small">Отзыв ничего не удаляет: запись остаётся в истории со статусом retracted.</p>
-          <label>Причина <textarea bind:value={rReason} rows="2"></textarea></label>
-          {@render formEnd('Отозвать')}
-        </form>
-      {:else if mode === 'certainty'}
-        <form class="form" onsubmit={submitCertainty} aria-label="Статус надёжности">
-          <h3>Статус надёжности</h3>
-          <p class="muted small">Вы действуете как человек: доступны все статусы, в том числе axiom; причина необязательна.</p>
-          <fieldset class="row">
-            <legend class="sr">Новый статус</legend>
-            {#each CERTAINTIES as x (x)}
-              <label class="opt" title={CERTAINTY_TEXT[x]}><input type="radio" bind:group={cTo} value={x} /> {x}</label>
-            {/each}
-            <label class="opt"><input type="radio" bind:group={cTo} value="" /> без статуса</label>
-          </fieldset>
-          {#if cTo === 'theorem'}
-            <div class="ev">
-              <p class="muted small">Доказательство (data.evidence) <span class="muted small">(необязательно)</span>: что проверено, как и с каким результатом.</p>
-              <label>Проверено <input bind:value={evChecked} /></label>
-              <label>Метод <input bind:value={evMethod} /></label>
-              <label>Результат <input bind:value={evResult} /></label>
-            </div>
-          {/if}
-          <label>Причина <span class="muted small">(необязательно)</span> <textarea bind:value={cReason} rows="2"></textarea></label>
-          {@render formEnd('Сохранить')}
-        </form>
-      {:else if mode === 'triggers'}
-        <div class="form" role="group" aria-label="Триггеры">
-          <h3>Триггеры</h3>
-          {#if tDraft.length === 0}<p class="muted">Триггеров нет.</p>{/if}
-          <ul class="triggers">
-            {#each tDraft as t, i (i)}
-              <li>
-                <span class="chip">{TRIGGER_TEXT[t.type]}</span> <code>{t.pattern}</code>
-                {#if t.tools?.length}<span class="muted small">({t.tools.join(', ')})</span>{/if}
-                <button type="button" class="danger small-btn" aria-label="Удалить триггер {t.pattern}"
-                  onclick={() => (tDraft = tDraft.filter((_, j) => j !== i))}>×</button>
-              </li>
-            {/each}
-          </ul>
-          <form class="row" onsubmit={addTrigger}>
-            <select bind:value={tType} aria-label="Тип триггера">
-              {#each TRIGGER_TYPES as x (x)}<option value={x}>{TRIGGER_TEXT[x]}</option>{/each}
-            </select>
-            <input bind:value={tPattern} placeholder="шаблон" aria-label="Шаблон триггера" />
-            <input bind:value={tTools} placeholder="инструменты: Write, Bash" aria-label="Инструменты" />
-            <button type="submit">Добавить</button>
-          </form>
-          {#if actionError}<p class="error" role="alert">{actionError}</p>{/if}
-          <div class="row end">
-            <button type="button" class="primary" disabled={busy} onclick={saveTriggers}>Сохранить триггеры</button>
-            <button type="button" onclick={() => ((mode = 'none'), (actionError = ''))}>Отмена</button>
-          </div>
-        </div>
-      {:else if actionError}
-        <p class="error" role="alert">{actionError}</p>
-      {/if}
-
       <div class="links">
         <h3>Связи</h3>
         <Links {user} kind="entry" id={c.id} {onexpired} />
@@ -913,9 +1013,109 @@
   {/if}
 {/snippet}
 
+<!-- формы карточки — окна (§6.14, правило Б): замена, поля ADR, отзыв, надёжность, триггеры -->
+<FormDialog
+  open={form !== null && cur !== null}
+  title={form?.title ?? ''}
+  subject={cur?.title}
+  description={form?.hint}
+  submit={form?.submit ?? ''}
+  wide={form?.wide}
+  danger={form?.danger}
+  error={dlgError}
+  dirty={unsaved}
+  refocus={cardNotice}
+  onsubmit={async () => {
+    await form?.send();
+  }}
+  onclose={closeForm}
+>
+  {#if mode === 'supersede'}
+    <label class:clash={clashed('title')}>Заголовок {@render clashNote('title')}<input bind:value={sTitle} required data-autofocus /></label>
+    <label class:clash={clashed('body')}>Текст {@render clashNote('body')}<textarea bind:value={sBody} rows="6"></textarea></label>
+    <div class="row fd-pair">
+      <label class:clash={clashed('kind')}>Вид {@render clashNote('kind')}
+        <select bind:value={sKind}>{#each INSIGHT_KINDS as k (k)}<option value={k}>{k}</option>{/each}</select>
+      </label>
+      <label>Надёжность
+        <select bind:value={sCertainty} aria-label="Надёжность новой записи">
+          <option value="">без статуса</option>
+          {#each CERTAINTIES as x (x)}<option value={x}>{x}</option>{/each}
+        </select>
+      </label>
+    </div>
+    {#if sKind === 'decision'}{@render adrFields()}{/if}
+  {:else if mode === 'adr'}
+    {@render adrFields()}
+  {:else if mode === 'retract'}
+    <label>Причина <textarea bind:value={rReason} rows="3" data-autofocus></textarea></label>
+  {:else if mode === 'certainty'}
+    <!-- главный выбор окна — статус: фокус при открытии — на выбранном -->
+    <fieldset class="row opts" class:clash={clashed('to')}>
+      <legend class="sr">Новый статус{clashed('to') ? ' — изменено и здесь, и в другом месте' : ''}</legend>
+      {#each CERTAINTIES as x (x)}
+        <label class="inline opt" title={CERTAINTY_TEXT[x]}
+          ><input type="radio" bind:group={cTo} value={x} data-autofocus={cTo === x ? '' : undefined} /> {x}</label
+        >
+      {/each}
+      <label class="inline opt"><input type="radio" bind:group={cTo} value="" data-autofocus={cTo === '' ? '' : undefined} /> без статуса</label>
+    </fieldset>
+    {#if clashed('to')}<p class="clash-note" aria-hidden="true">статус изменён и здесь, и в другом месте</p>{/if}
+    {#if cTo === 'theorem'}
+      <div class="ev">
+        <p class="muted small">Доказательство (data.evidence) <span class="muted small">(необязательно)</span>: что проверено, как и с каким результатом.</p>
+        <label class:clash={clashed('checked')}>Проверено {@render clashNote('checked')}<input bind:value={evChecked} /></label>
+        <label class:clash={clashed('method')}>Метод {@render clashNote('method')}<input bind:value={evMethod} /></label>
+        <label class:clash={clashed('result')}>Результат {@render clashNote('result')}<input bind:value={evResult} /></label>
+      </div>
+    {/if}
+    <label>Причина <span class="muted small">(необязательно)</span> <textarea bind:value={cReason} rows="2"></textarea></label>
+  {:else if mode === 'triggers'}
+    {#if tDraft.length === 0}<p class="muted">Триггеров нет.</p>{/if}
+    {#if clashed('triggers')}<p class="clash-note">триггеры изменены и здесь, и в другом месте</p>{/if}
+    {#if tDraft.length}
+    <ul class="triggers" class:clash={clashed('triggers')}>
+      {#each tDraft as t, i (i)}
+        <li>
+          <span class="chip">{TRIGGER_TEXT[t.type]}</span> <code>{t.pattern}</code>
+          {#if t.tools?.length}<span class="muted small">({t.tools.join(', ')})</span>{/if}
+          <button type="button" class="danger small-btn" aria-label="Удалить триггер {t.pattern}"
+            onclick={() => (tDraft = tDraft.filter((_, j) => j !== i))}>×</button>
+        </li>
+      {/each}
+    </ul>
+    {/if}
+    <div class="row add-trigger" role="group" aria-label="Новый триггер">
+      <select bind:value={tType} aria-label="Тип триггера">
+        {#each TRIGGER_TYPES as x (x)}<option value={x}>{TRIGGER_TEXT[x]}</option>{/each}
+      </select>
+      <input
+        bind:value={tPattern}
+        placeholder="шаблон"
+        aria-label="Шаблон триггера"
+        data-autofocus
+        onkeydown={(e) => {
+          // Enter в шаблоне — добавить триггер в черновик, а не сохранить окно
+          if (e.key === 'Enter' && !e.ctrlKey && !e.metaKey) {
+            e.preventDefault();
+            addTrigger();
+          }
+        }}
+      />
+      <input bind:value={tTools} placeholder="инструменты: Write, Bash" aria-label="Инструменты" />
+      <button type="button" onclick={addTrigger}>Добавить</button>
+    </div>
+  {/if}
+</FormDialog>
+
+<!-- пометка поля-расхождения 409 в подписи (её читает и программа чтения с экрана) -->
+{#snippet clashNote(k: string)}
+  {#if clashed(k)}<span class="clash-note">изменено и здесь, и в другом месте</span>{/if}
+{/snippet}
+
 {#snippet adrFields()}
-  <fieldset class="adr-form">
-    <legend class="muted small">Решение (ADR)</legend>
+  <fieldset class="adr-form" class:clash={clashed('adr') || clashed('options')}>
+    <legend class="muted small">Решение (ADR){#if clashed('adr') || clashed('options')}<span class="clash-note">изменено и здесь, и в другом месте</span>{/if}</legend>
     <label>{ADR_TEXT.context} <textarea bind:value={adr.context} rows="2"></textarea></label>
     <label>{ADR_TEXT.options} <span class="muted small">(по одному в строке)</span> <textarea bind:value={adrOptions} rows="3"></textarea></label>
     <label>{ADR_TEXT.chosen} <input bind:value={adr.chosen} /></label>
@@ -931,18 +1131,14 @@
   </fieldset>
 {/snippet}
 
-{#snippet formEnd(label: string)}
-  {#if actionError}<p class="error" role="alert">{actionError}</p>{/if}
-  <div class="row end">
-    <button type="submit" class="primary" disabled={busy}>{label}</button>
-    <button type="button" onclick={() => ((mode = 'none'), (actionError = ''))}>Отмена</button>
-  </div>
-{/snippet}
 
 <style>
   .more[aria-disabled='true'] {
     opacity: 0.5;
     cursor: default;
+  }
+  .bar {
+    margin-bottom: 8px;
   }
   .filters {
     margin-bottom: 12px;
@@ -1080,28 +1276,28 @@
   .actions {
     margin-top: 12px;
   }
-  .form {
-    display: grid;
-    gap: 8px;
-    margin-top: 12px;
-    padding: 12px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
+  header .warn {
+    margin: 8px 0 0;
   }
-  .form h3 {
-    margin: 0;
+  .card-notice :global(.notice:not(:empty)) {
+    margin: 8px 0 0;
   }
-  .form label:not(.opt):not(.row) {
-    display: grid;
-    gap: 4px;
+  /* окна форм: вид и надёжность — рядом, варианты статуса — в ряд */
+  .fd-pair {
+    align-items: start;
   }
-  .form textarea {
-    font: inherit;
-    padding: 6px 10px;
-    color: var(--text);
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 6px;
+  .fd-pair > label {
+    flex: 1 1 180px;
+  }
+  .opt {
+    display: inline-flex;
+    gap: 6px;
+    align-items: center;
+  }
+  .add-trigger input {
+    flex: 1 1 160px;
+    width: auto !important;
+    min-width: 0;
   }
   fieldset {
     border: 0;
@@ -1120,9 +1316,6 @@
     gap: 6px;
     padding: 8px;
     border-left: 3px solid var(--callout-tip);
-  }
-  .end {
-    justify-content: flex-end;
   }
   .triggers {
     margin: 0;

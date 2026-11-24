@@ -1,10 +1,10 @@
 // Правка записи журнала (M7.2, спецификация §5.9 п. 1, форма `EntryEdit.svelte`): поля формы из
 // записи, `PATCH` только из изменённых полей и перенос черновика на перечитанную запись после 409.
-// Без runtime-импортов: модуль проверяет `node --test` (`test/entryEdit.test.ts`).
+// Без runtime-импортов, кроме `.ts`: модуль проверяет `node --test` (`test/entryEdit.test.ts`).
 import type { Entry, EntryPatch } from './api';
 
 /** Поля формы — строки, как в элементах ввода. */
-export interface EditFields {
+export type EditFields = {
   title: string;
   /** Простым текстом, как у задач и идей. */
   body: string;
@@ -21,7 +21,7 @@ export interface EditFields {
   estimate: string;
   /** Задача: `data.links`, по одной в строке. */
   links: string;
-}
+};
 
 /** Предел оценки задачи, минут (`ESTIMATE_MAX_MIN`, `crates/zam-store/src/tasks.rs`). */
 export const ESTIMATE_MAX = 525_600;
@@ -104,26 +104,6 @@ export function patchOf(e: Entry, f: EditFields): EditResult {
   return Object.keys(p).length ? { patch: p } : { none: true };
 }
 
-/** В черновике `draft` есть изменения против `base` (полей записи на открытии формы). */
-export const isDirty = (draft: EditFields, base: EditFields): boolean =>
-  (Object.keys(base) as (keyof EditFields)[]).some((k) => draft[k] !== base[k]);
-
-/**
- * Черновик поверх перечитанной записи (409: запись изменили, пока открыта форма). Поле, которое
- * пользователь не трогал (`draft` = `base` — значение на открытии), берётся из `fresh`: иначе
- * следующее сохранение откатило бы чужую правку; тронутое остаётся его. `clash` — поля, изменённые
- * и им, и в другом месте (по-разному): их надо сверить перед повтором.
- */
-export function rebase(
-  draft: EditFields,
-  base: EditFields,
-  fresh: EditFields,
-): { fields: EditFields; clash: (keyof EditFields)[] } {
-  const fields = { ...draft };
-  const clash: (keyof EditFields)[] = [];
-  for (const k of Object.keys(base) as (keyof EditFields)[]) {
-    if (draft[k] === base[k]) fields[k] = fresh[k];
-    else if (fresh[k] !== base[k] && fresh[k] !== draft[k]) clash.push(k);
-  }
-  return { fields, clash };
-}
+// `isDirty` и `rebase` (409: черновик поверх перечитанной записи) — общее правило форм с ревизией
+// (M7.3, §6.14 п. 5): `formDraft.ts`; здесь — реэкспорт для формы правки записей.
+export { isDirty, rebase } from './formDraft.ts';

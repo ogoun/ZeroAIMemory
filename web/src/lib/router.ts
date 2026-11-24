@@ -21,6 +21,7 @@
 //   `questions`, `vault`), необязательно — открытая запись (у `reports` — страница отчёта, у `code` —
 //   карточка символа: `путь#qual` в percent-encoding, M5.6).
 // Пустой или неизвестный адрес — `home` без пользователя (Shell выбирает своего).
+import { createGuards, type Guard } from './guards';
 
 /** Журналы пространства: у решения — все, у Knowledge — без Changelog, Releases, Отчётов и
  * Кода (`code` — страница карты кода решения, M5.6). */
@@ -186,13 +187,21 @@ export function href(r: Route): string {
 
 export const current = (): Route => parse(location.hash);
 
-/**
- * Проверка ухода с текущего адреса (несохранённая правка): `false` — остаться.
- * Синхронная: вызывается из `hashchange`, где переход уже случился и откатывается.
- */
-export type Guard = (next: Route) => boolean;
+// ---- проверки ухода (M7.3, спецификация §6.14 п. 4) ----
+//
+// Стек проверок (`guards.ts`): каждая форма с набранным ставит свою (`pushGuard`), переход по
+// адресу спрашивает один раз — синхронным `window.confirm` текстом верхней грязной (решение 92:
+// роутер решает переход сразу; асинхронный вопрос — отдельная задача); согласие отпускает все.
+// Вызывается из `go` и из `hashchange`, где переход уже случился и откатывается. Закрытие и
+// перезагрузка вкладки — один `beforeunload` на весь стек.
 
-let guard: Guard | null = null;
+const guards = createGuards<Route>((q) => window.confirm(q));
+
+/** Поставить проверку ухода (`dirty(next)` — `next`: адрес, куда уходят); возвращает её снятие. */
+export function pushGuard(g: Guard<Route>): () => void {
+  return guards.push(g);
+}
+
 /** Адрес, на котором стоит приложение (для отката запрещённого перехода). */
 let shown = location.hash;
 
@@ -308,23 +317,130 @@ export function onCancel(cb: () => void): () => void {
   return () => cancelled.delete(cb);
 }
 
-/** Ставит проверку ухода; возвращает снятие. */
-export function setGuard(g: Guard): () => void {
-  guard = g;
-  return () => {
-    if (guard === g) guard = null;
+const allowed = (r: Route): boolean => guards.allow(r);
+
+// ---- слои истории (M7.3, спецификация §6.14 п. 1, решение 93) ----
+//
+// Окно формы на телефоне — во весь экран и выглядит как страница: системную «Назад» человек ждёт как
+// «закрыть». Окно при открытии кладёт запись истории с тем же адресом и меткой слоя
+// (`history.state.zamLayer`, `pushLayer`); она становится показанной записью роутера (откат
+// запрещённого перехода возвращает на неё). «Назад» с неё — `popstate` без смены адреса: роутер
+// вызывает `close` слоя (окно закрывается или спрашивает о несохранённом и тогда кладёт слой
+// заново), а не переход. Закрытие кнопками снимает запись (`drop`: `history.back()`, которое роутер
+// поглощает); переход, пока слой на вершине (`go` — после «Добавить» к карточке созданного, запись из
+// Ctrl+K), заменяет запись слоя адресом перехода (`history.replaceState` и разбор маршрута), а не
+// делает `back()` и `go()`: иначе «Назад» снял бы не тот шаг. Переход, пока `back()` снятия ещё в
+// пути, и новый слой — после него (порядок шагов истории). Окна планшета и компьютера и
+// окна-подтверждения слоёв не кладут.
+
+/** Запись слоя: `on` — на вершине истории, `dropping` — снимается (`back()` в пути), `gone` — снята,
+ * заменена переходом или ушли с неё «Назад»; `pending` — ждёт снятия прежнего слоя. */
+interface Layer {
+  id: number;
+  close: () => void;
+  state: 'pending' | 'on' | 'dropping' | 'gone';
+}
+
+/** Запись слоя окна. Закрытие с переходом (после «Добавить» — к карточке созданного) отдельного
+ * вызова не требует: любой `go`, пока слой на вершине, заменяет его запись адресом перехода. */
+export interface LayerHandle {
+  /** Снять запись слоя (окно закрыто кнопкой): `history.back()` без перехода роутера. Слой уже снят,
+   * заменён или ушли с него — ничего. */
+  drop: () => void;
+}
+
+const layers: Layer[] = [];
+let layerSeq = 0;
+/** Действия, ждущие снятия слоя (`back()` ещё в пути): переходы и новые слои — по порядку. */
+let afterDrop: (() => void)[] = [];
+
+const layerOf = (s: unknown): number | null => {
+  const v = (s as { zamLayer?: unknown } | null)?.zamLayer;
+  return typeof v === 'number' ? v : null;
+};
+const dropping = () => layers.some((l) => l.state === 'dropping');
+/** Слой `l` — верхний и текущая запись истории — его. */
+const onTop = (l: Layer) => l.state === 'on' && layers[layers.length - 1] === l && layerOf(history.state) === l.id;
+
+function forget(l: Layer) {
+  l.state = 'gone';
+  const i = layers.indexOf(l);
+  if (i >= 0) layers.splice(i, 1);
+}
+
+/** Снятие слоёв закончилось: отложенные действия — по порядку. */
+function flushAfterDrop() {
+  if (dropping()) return;
+  const q = afterDrop;
+  afterDrop = [];
+  for (const f of q) f();
+}
+
+/** Снять запись верхнего слоя `l`: `history.back()`, его `popstate` роутер поглощает. */
+function startDrop(l: Layer) {
+  l.state = 'dropping';
+  history.back();
+  // «назад» не пришёл (история обрезана): слой снят, отложенное — дальше
+  setTimeout(() => {
+    if (l.state !== 'dropping') return;
+    forget(l);
+    flushAfterDrop();
+  }, RESTORE_MS);
+}
+
+/** Запись слоя окна во весь экран: `popstate` с неё вызывает `close` (а не переход). */
+export function pushLayer(close: () => void): LayerHandle {
+  const me: Layer = { id: ++layerSeq, close, state: 'pending' };
+  const put = () => {
+    if (me.state !== 'pending') return;
+    me.state = 'on';
+    layers.push(me);
+    idx += 1;
+    history.pushState({ zamIdx: idx, zamLayer: me.id }, '', location.href);
+    // показанная запись — слой: откат запрещённого перехода возвращает на него
+    shownKey = navKey() ?? shownKey;
+  };
+  if (dropping()) afterDrop.push(put);
+  else put();
+  return {
+    drop() {
+      if (me.state === 'pending') me.state = 'gone';
+      if (me.state !== 'on') return;
+      if (!onTop(me)) return forget(me);
+      startDrop(me);
+    },
   };
 }
 
-const allowed = (r: Route): boolean => !guard || guard(r);
-
 /**
  * Переход. `replace` — без новой записи истории; `silent` — только адрес,
- * без события маршрута и без проверки ухода.
+ * без события маршрута и без проверки ухода. Слой окна на вершине истории — его запись заменяется
+ * адресом перехода; снятие слоя ещё в пути — переход после него.
  */
 export function go(r: Route, opts: { replace?: boolean; silent?: boolean } = {}): void {
-  const target = href(r);
   if (!opts.silent && !allowed(r)) return;
+  if (dropping()) {
+    afterDrop.push(() => navigate(r, opts));
+    return;
+  }
+  navigate(r, opts);
+}
+
+/** Переход после проверки ухода (`go`). */
+function navigate(r: Route, opts: { replace?: boolean; silent?: boolean }): void {
+  const target = href(r);
+  const top = layers[layers.length - 1];
+  if (top && onTop(top)) {
+    if (target === location.hash && !opts.silent) {
+      // тот же адрес: запись слоя снимается (иначе «Назад» дал бы пустой шаг), событие — после
+      startDrop(top);
+      afterDrop.push(emit);
+      return;
+    }
+    // переход с окна во весь экран: запись слоя становится записью адреса (номер — её)
+    forget(top);
+    opts = { ...opts, replace: true };
+  }
   if (opts.replace || opts.silent) {
     // replaceState не порождает hashchange: событие — вручную; номер записи сохраняется
     history.replaceState({ zamIdx: idx }, '', target);
@@ -408,9 +524,26 @@ function onHashChange(e: HashChangeEvent) {
  * (удаление из карточки: `go(список, {replace})` после перехода со списка; возврат после `lost`):
  * `hashchange` нет, но показанная запись — другая; без этого следующий откат шагал бы не туда. */
 function onPopState() {
-  if (restoring !== null || location.hash !== shown) return;
+  if (restoring !== null || location.hash !== shown) {
+    // другой адрес (новая запись по ссылке или `location.hash =` — у неё тоже `popstate`, шаг по
+    // истории на другой адрес): решает `hashchange` — с проверкой ухода; слой окна не трогается
+    // (отменённый переход возвращает на его запись)
+    flushAfterDrop();
+    return;
+  }
+  // тот же адрес — ушли с записи слоя («Назад» или его снятие `drop`): слои выше текущей записи
+  // сняты; «Назад» закрывает окно слоя, снятие — нет (окно уже закрыто)
+  const at = layerOf(history.state);
+  const closes: (() => void)[] = [];
+  while (layers.length && layers[layers.length - 1].id !== at) {
+    const l = layers.pop()!;
+    if (l.state === 'on') closes.push(l.close);
+    l.state = 'gone';
+  }
   idx = numbered() ?? idx;
   shownKey = navKey() ?? shownKey;
+  for (const c of closes) c();
+  flushAfterDrop();
 }
 
 // Подписка на окно — при загрузке модуля (финальное ревью M7.2, M2), а не в `listen`: оболочка
@@ -420,6 +553,10 @@ function onPopState() {
 // раньше, и `stopImmediatePropagation` отменённого перехода его не остановил бы.
 window.addEventListener('hashchange', onHashChange);
 window.addEventListener('popstate', onPopState);
+// закрытие и перезагрузка вкладки при набранном в любой форме стека
+window.addEventListener('beforeunload', (e) => {
+  if (guards.anyDirty()) e.preventDefault();
+});
 
 /** Подписка на смену маршрута; возвращает отписку. */
 export function listen(cb: (r: Route) => void): () => void {
