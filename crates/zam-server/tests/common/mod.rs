@@ -56,6 +56,38 @@ pub fn files_containing(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
     out
 }
 
+/// Семь таблиц миграции 0027 базы пользователя (M7.3): только новые, прежние не меняются.
+pub const TABLES_0027: [&str; 7] = [
+    "check_results",
+    "check_runs",
+    "probes",
+    "proposals",
+    "usage_opened",
+    "work_calls",
+    "works",
+];
+
+/// Объекты 0027 базы `db` — `(тип, имя)` таблиц миграции и их индексов (тесты миграций старых
+/// баз сверяют прежние объекты схемы без них; эталон 0027 —
+/// `zam-store/tests/migrate_rebuild.rs::objects_0027`).
+pub async fn objects_0027(db: &zam_store::Db) -> Vec<(String, String)> {
+    db.read(|c| {
+        let mut st = c.prepare(
+            "SELECT type, name FROM sqlite_master WHERE tbl_name IN
+               (SELECT value FROM json_each(?1)) ORDER BY type, name",
+        )?;
+        let list = serde_json::to_string(&TABLES_0027).unwrap();
+        let rows = st
+            .query_map([list], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    })
+    .await
+    .unwrap()
+}
+
 /// Несуществующая ссылка того же вида, что `r`: префикс до `:` тот же, каждая цифра — другая
 /// цифра, буква — другая буква того же регистра (Crockford у id, `a`–`f` у hex). Оценка токенов
 /// без модели (M6, задача 5: подсерии по смене вида символа) у неё та же, что у `r`, и `~N tok`

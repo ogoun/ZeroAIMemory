@@ -1318,36 +1318,6 @@ const RELATED_ROWS: &str = "
     FROM spaces
     ORDER BY 1";
 
-/// Семь таблиц миграции 0027 (M7.3): только новые, прежние не меняются.
-const TABLES_0027: [&str; 7] = [
-    "check_results",
-    "check_runs",
-    "probes",
-    "proposals",
-    "usage_opened",
-    "work_calls",
-    "works",
-];
-
-/// Объекты 0027 базы `db` — `(тип, имя)` таблиц миграции и их индексов.
-async fn objects_0027(db: &zam_store::Db) -> Vec<(String, String)> {
-    db.read(|c| {
-        let mut st = c.prepare(
-            "SELECT type, name, tbl_name FROM sqlite_master WHERE tbl_name IN
-               (SELECT value FROM json_each(?1)) ORDER BY type, name",
-        )?;
-        let list = serde_json::to_string(&TABLES_0027).unwrap();
-        let rows = st
-            .query_map([list], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?
-            .collect::<Result<_, _>>()?;
-        Ok(rows)
-    })
-    .await
-    .unwrap()
-}
-
 fn schema_and_rows(c: &rusqlite::Connection) -> rusqlite::Result<Snapshot> {
     let mut st =
         c.prepare("SELECT type, name, coalesce(sql, '') FROM sqlite_master ORDER BY type, name")?;
@@ -1601,7 +1571,7 @@ async fn acceptance_migration_0026() {
     );
     let is_entries = |o: &&Obj| o.0 == "table" && o.1 == "entries";
     // объекты 0027 (M7.3) — семь новых таблиц и их индексы — в сравнение с базой 0025 не входят
-    let new_0027 = objects_0027(&db).await;
+    let new_0027 = common::objects_0027(&db).await;
     assert_eq!(
         new_0027.iter().filter(|o| o.0 == "table").count(),
         7,
