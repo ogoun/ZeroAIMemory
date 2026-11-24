@@ -470,6 +470,16 @@
   </section>
 </section>
 
+<!-- M7.3 (§6.9 п. 1): ссылка на исполнителя внутренних работ -->
+<section class="panel" style="margin-top: 16px;" aria-labelledby="setup-works-h">
+  <h2 id="setup-works-h">Внутренние работы</h2>
+  <p class="muted small">
+    Пробные вопросы ночной проверки и кандидаты в Rules может делать агент в своей сессии (строка дайджеста
+    предложит <code>memory_recall event=work</code>) или подключённая модель; по умолчанию — выкл. Режим, подключение
+    модели, очередь и журнал отправок — на странице <a href={'#/works'}>Внутренние работы</a>.
+  </p>
+</section>
+
 <TokenShown bind:shown />
 
 <style>

@@ -59,6 +59,7 @@ fn conn() -> ModelConn {
         token_field: TokenField::Auto,
         body_extra: serde_json::Map::new(),
         pinned: None,
+        external: None,
     }
 }
 
@@ -885,6 +886,75 @@ async fn lan_check_cases() {
         "empty.example.com",
     ] {
         test_hooks::clear_host(h);
+    }
+}
+
+/// Задача 8, ревью r1 (I1, решение координатора): `GET /auth/settings` отдаёт у `works.model`
+/// `external` и `host` — по закреплённому адресу и классу, сохранённому при закреплении, без DNS
+/// при чтении: литерал LAN — нет, литерал TEST-NET-3 — да, имя, закреплённое во внешний адрес, —
+/// да (и когда резолвер имени больше не знает), имя в LAN — нет; на паузе `vault_changed` — по
+/// «стал». Поля показа в `PATCH` не принимаются (вход строгий).
+#[tokio::test]
+async fn model_external_field_in_settings() {
+    let a = server("ext-field", |c| c.works.allow_loopback = false).await;
+    let view = || async {
+        let r = a.adm(Method::GET, SETTINGS, None, None).await;
+        ok(&r, StatusCode::OK);
+        let m = r.json()["works"]["model"].clone();
+        (m["host"].clone(), m["external"].clone())
+    };
+    // литерал LAN
+    let r = patch_url(&a, "lan-lit", "http://192.168.1.20:8080/v1").await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(
+        r.json()["works"]["model"]["external"],
+        json!(false),
+        "{}",
+        r.text()
+    );
+    assert_eq!(view().await, (json!("192.168.1.20:8080"), json!(false)));
+    // литерал вне LAN (TEST-NET-3): ответ `PATCH` и чтение — одно
+    let r = patch_url(&a, "ext-lit", "https://203.0.113.10/v1").await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(
+        r.json()["works"]["model"]["external"],
+        json!(true),
+        "{}",
+        r.text()
+    );
+    assert_eq!(view().await, (json!("203.0.113.10"), json!(true)));
+    // имя, закреплённое во внешний адрес: класс — с закрепления, резолвер при чтении не нужен
+    test_hooks::set_host("ext-field.example.com", &[ip("203.0.113.10")]);
+    let r = patch_url(&a, "ext-name", "https://ext-field.example.com/v1").await;
+    ok(&r, StatusCode::OK);
+    test_hooks::clear_host("ext-field.example.com");
+    assert_eq!(view().await, (json!("ext-field.example.com"), json!(true)));
+    // имя в LAN — нет
+    test_hooks::set_host("lan-field.example.com", &[ip("10.203.113.7")]);
+    let r = patch_url(&a, "lan-name", "http://lan-field.example.com:8080/v1").await;
+    ok(&r, StatusCode::OK);
+    test_hooks::clear_host("lan-field.example.com");
+    assert_eq!(
+        view().await,
+        (json!("lan-field.example.com:8080"), json!(false))
+    );
+    // пауза `vault_changed` — по «стал»
+    set_pause(
+        &a,
+        "vault_changed",
+        Some((
+            "http://lan-field.example.com:8080/v1",
+            "https://203.0.113.10/v2",
+        )),
+    )
+    .await;
+    assert_eq!(view().await, (json!("203.0.113.10"), json!(true)));
+    // поля показа — только в ответе: в `PATCH` — 400
+    for (k, v) in [("external", json!(false)), ("host", json!("203.0.113.10"))] {
+        let mut input = conn_input("lan-name");
+        input[k] = v;
+        let r = patch(&a, json!({"works": {"model": input}})).await;
+        ok(&r, StatusCode::BAD_REQUEST);
     }
 }
 

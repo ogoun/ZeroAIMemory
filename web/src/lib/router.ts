@@ -10,6 +10,8 @@
 // - `#/agent-setup` — «Подключение агента» (§15.5); `#/cache` — «Кэш выжимок» (§15.4);
 // - `#/sessions[/<id сессии>]` — «Сессии»: сессии агентов и выданное им по событию (M6 §8),
 //   необязательно — открытая сессия (M7.2: на узкой области карточка вместо списка);
+// - `#/works` — «Внутренние работы», `#/check` — «Проверка памяти», `#/proposals[/<o:id>]` —
+//   «Кандидаты в Rules», необязательно — открытый кандидат (M7.3 §6.9);
 // - `#/u/<user_id>` — пространства пользователя;
 // - `#/u/<user_id>/s/<space_ref>/n/<node_id>[#<якорь>]` — документ, якорь — `id`
 //   элемента в percent-encoding (как в href вики-ссылок сервера: `#/n/<id>#h-<slug>`);
@@ -62,6 +64,9 @@ export type Route =
   | { name: 'agentsetup' }
   | { name: 'cache' }
   | { name: 'sessions'; session?: string | null }
+  | { name: 'works' }
+  | { name: 'check' }
+  | { name: 'proposals'; proposal: string | null }
   | { name: 'journal'; user: string; space: string; journal: Journal; entry: string | null }
   | { name: 'home'; user: string | null }
   | { name: 'node'; user: string; space: string; node: string; anchor: string | null }
@@ -101,6 +106,11 @@ export function parse(hash: string): Route {
   if (parts.length === 1 && parts[0] === 'cache') return { name: 'cache' };
   if ((parts.length === 1 || parts.length === 2) && parts[0] === 'sessions') {
     return { name: 'sessions', session: parts[1] ? dec(parts[1]) : null };
+  }
+  if (parts.length === 1 && parts[0] === 'works') return { name: 'works' };
+  if (parts.length === 1 && parts[0] === 'check') return { name: 'check' };
+  if ((parts.length === 1 || parts.length === 2) && parts[0] === 'proposals') {
+    return { name: 'proposals', proposal: parts[1] ? dec(parts[1]) : null };
   }
   if (parts.length === 2 && parts[0] === 'my' && parts[1] === 'solutions') return { name: 'mysolutions' };
   if (parts.length === 2 && parts[0] === 'admin') {
@@ -167,6 +177,12 @@ export function href(r: Route): string {
       return '#/cache';
     case 'sessions':
       return '#/sessions' + (r.session ? `/${enc(r.session)}` : '');
+    case 'works':
+      return '#/works';
+    case 'check':
+      return '#/check';
+    case 'proposals':
+      return '#/proposals' + (r.proposal ? `/${enc(r.proposal)}` : '');
     case 'journal':
       return (
         `#/u/${enc(r.user)}/s/${enc(r.space)}/j/${r.journal}` + (r.entry ? `/${enc(r.entry)}` : '')

@@ -35,9 +35,10 @@
   import { JOURNAL_TITLE, journalsOf } from '../lib/journals';
   import { go, href, routeUser, type Journal, type Route } from '../lib/router';
   import { NOTES_HINT, countDescription, countHint, formatCount, notesLabel, openLabel } from '../lib/counts';
-  import { counts } from '../lib/counts.svelte';
+  import { counts, proposalCounts } from '../lib/counts.svelte';
   import IndexBadge from './IndexBadge.svelte';
   import LazyFail from './LazyFail.svelte';
+  import { viewport } from '../lib/viewport.svelte';
 
   interface Props {
     /** Пользователи; свой — первым. */
@@ -71,6 +72,9 @@
   let errs = $state<Record<string, string>>({});
   /** Rules пользователя (`rules_heavy` — плашка у пространства Rules, M6 §8). */
   let rules = $state<Record<string, RulesStatus | null>>({});
+
+  /** Открытых кандидатов в Rules своего пользователя (кэш `proposals/counts`, общий с шапкой). */
+  const candidatesOf = (uid: string): number => (uid === ownId ? (proposalCounts.get(uid, 'rules')?.rules ?? 0) : 0);
 
   let menu = $state<{ x: number; y: number; items: MenuItem[] } | null>(null);
   let ask = $state<Ask | null>(null);
@@ -541,6 +545,25 @@
   </ul>
 {/snippet}
 
+<!-- бейджи-ссылки дерева: «кандидаты: N» у своих Rules (M7.3 §6.7 п. 5; число — кэш «Кандидаты N»
+     шапки) и «запросы: N» у решений. Плашка всегда компактная; на касании ссылка — своей строкой под
+     именем и с целью 44 px (прозрачная ссылка вокруг плашки): в строке высокий бейдж сжимал имя —
+     «Rules» до «R» (ревью r1 задачи 8, I3) -->
+{#snippet candidatesBadge(uid: string)}
+  {@const pc = candidatesOf(uid)}
+  {#if pc > 0}
+    <a class="badge-link" href={href({ name: 'proposals', proposal: null })} title="Кандидаты в Rules ждут решения"
+      ><span class="tag pending">кандидаты: {formatCount(pc)}</span></a
+    >
+  {/if}
+{/snippet}
+
+{#snippet requestsBadge(uid: string)}
+  <a class="badge-link" href={href({ name: 'solutions' })} title="Запросы доступа к решениям ждут решения"
+    ><span class="tag pending">запросы: {pending[uid]}</span></a
+  >
+{/snippet}
+
 {#snippet spaceRow(uid: string, s: Space, depth: number)}
   {@const ref = spaceRef(s)}
   {@const k = kSpace(uid, ref)}
@@ -571,12 +594,19 @@
           <span class="tag heavy" title={rulesHeavyText(rules[uid]!)}>много правил</span>
         {/if}
       </button>
+      {#if s.kind === 'rules' && uid === ownId && !viewport.coarse}
+        {@render candidatesBadge(uid)}
+      {/if}
       {#if c}
         <span class="num" class:zero={c.notes === 0} data-count="notes" aria-hidden="true" title={NOTES_HINT}>{formatCount(c.notes)}</span>
         <span id={countId(uid, ref)} hidden>{notesLabel(c.notes)}</span>
       {/if}
       <button type="button" class="more" aria-label="Действия: {s.name}" onclick={(e) => menuBelow(e, target)}>⋯</button>
     </div>
+    {#if s.kind === 'rules' && uid === ownId && viewport.coarse && candidatesOf(uid) > 0}
+      <!-- касание: бейдж — своей строкой под именем (в строке он сжимал «Rules» до «R», ревью r1) -->
+      <div class="tree-badges" style:--depth={depth}>{@render candidatesBadge(uid)}</div>
+    {/if}
     {@render status(kExport(uid, ref))}
     {#if importNote?.key === kImport(uid, ref)}
       <div class="tree-note muted" role="status" style:--depth={depth}>{importNote.text}</div>
@@ -668,12 +698,11 @@
                     {@render icon('solutions')}<span class="name">Solutions</span>
                     <span class="count">{solutions(spaces[u.id]).length}</span>
                   </button>
-                  {#if pending[u.id]}
-                    <a class="tag pending" href={href({ name: 'solutions' })} title="Запросы доступа к решениям ждут решения">
-                      запросы: {pending[u.id]}
-                    </a>
-                  {/if}
+                  {#if pending[u.id] && !viewport.coarse}{@render requestsBadge(u.id)}{/if}
                 </div>
+                {#if pending[u.id] && viewport.coarse}
+                  <div class="tree-badges" style:--depth={1}>{@render requestsBadge(u.id)}</div>
+                {/if}
                 {#if open[kSol(u.id)]}
                   {#if solutions(spaces[u.id]).length === 0}
                     <div class="tree-note muted" style:--depth={2}>Решений пока нет</div>
@@ -856,6 +885,11 @@
   .tag.pending {
     background: var(--accent);
     color: var(--accent-text);
+  }
+  .badge-link {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
     text-decoration: none;
   }
   /* числа разделов (§5.3 п. 2): справа в строке; ноль — приглушённо, цветом `--muted` без
@@ -966,10 +1000,16 @@
     .label {
       min-height: 44px;
     }
-    .tag.pending {
-      display: inline-flex;
+    /* бейдж-ссылка — своей строкой под именем (`.tree-badges`): цель касания 44 × 44 — сама ссылка,
+       плашка внутри — компактная */
+    .tree-badges {
+      display: flex;
       align-items: center;
+      padding: 0 4px 0 calc(58px + var(--depth) * 14px);
+    }
+    .badge-link {
       min-height: 44px;
+      min-width: 44px;
     }
     .tree-note {
       padding-left: calc(58px + var(--depth) * 14px);

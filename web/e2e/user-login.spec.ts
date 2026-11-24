@@ -6,6 +6,7 @@
 // ждёт `Retry-After` и повторяет отправку один раз (флейк M5.6, задача 15b M6; лимит не меняется).
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
+import { sectionNames } from './nav';
 import { ADMIN_STATE } from './session';
 
 const env = (k: string) => {
@@ -124,8 +125,12 @@ test('пользователь: вход, обязательная смена п
   await expect(tree).toBeVisible();
   await expect(tree).toContainText('Моя память');
   await expect(tree).toContainText(name);
+  // M7.3 (§6.9): «Проверка» и «Кандидаты» — у пользователя тоже (своя память); что не поместилось в
+  // шапку — в меню «Ещё» (ревью r1 задачи 8, I2): имена — полосы и меню по порядку
+  await expect
+    .poll(() => sectionNames(page))
+    .toEqual(['Заметки', 'Мои решения', 'Аккаунт', 'Подключение агента', 'Кэш выжимок', 'Сессии', 'Проверка', 'Кандидаты']);
   const nav = page.getByRole('navigation', { name: 'Разделы' });
-  await expect(nav.getByRole('link')).toHaveText(['Заметки', /Мои решения/, 'Аккаунт', /Подключение агента/, /Кэш выжимок/, 'Сессии']);
   await expect(page.getByRole('link', { name: 'Администрирование' })).toHaveCount(0);
   await expect(page.getByRole('link', { name: 'Индекс' })).toHaveCount(0);
   // прямой адрес раздела администратора — возврат к своим заметкам
