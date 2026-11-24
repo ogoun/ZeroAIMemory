@@ -6,18 +6,23 @@
 // По местам — карточка на виду при открытии (`card_in_view_on_open`), ряд статусов задачи под шапкой,
 // стек проверок ухода, набранное при 409, «Новый insight» с дублем, смена статуса задачи без окна.
 //
-// Режим съёмки `E2E_FORMS_SNAP=before|after` — только снимки каждой формы перечня (и мест задачи
-// 10b) в четырёх ширинах в `.tmp/e2e/screens/forms/<режим>/<форма>-<ширина>.png` и строка «форма
-// на виду или ниже видимой части» в `list.tsv` рядом, без проверок нового поведения: «до» — на
-// сборке 0.0.15 (шаг 1 задачи 10a), «после» — в конце задачи. Данные — REST по токену
-// администратора (агент) в своём решении `seedForms`.
-import { expect, test, type Locator, type Page } from '@playwright/test';
+// Задача 10b — остальные места перечня (Словарь, Вопросы, ленты, окна дерева, вложений, истории,
+// отчёта и кэша, администрирование, импорт, копии, индекс) теми же сценариями, и по местам: причина
+// смены надёжности в редакторе — окном, подтверждения отзыва токена и доступа и сброса шаблона,
+// шаблон инструкции под проверкой ухода, набранное при 409 в Словаре, запись ленты из адреса на виду.
+//
+// Режим съёмки `E2E_FORMS_SNAP=before|after` — только снимки каждой формы перечня в четырёх
+// ширинах в `.tmp/e2e/screens/forms/<режим>/<форма>-<ширина>.png` и строка «форма на виду или ниже
+// видимой части» в `list.tsv` рядом, без проверок нового поведения: «до» — на сборке до правок
+// задачи, «после» — в конце задачи. Данные — REST по токену администратора (агент) и сессией
+// администратора в своём решении `seedForms`.
+import { expect, request as pwRequest, test, type APIRequestContext, type Locator, type Page } from '@playwright/test';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { FORM_CASES, SNAP_ONLY, dialogOf, type FormCase } from './form-cases';
+import { FORM_CASES, customTemplate, dialogOf, sessionGet, type FormCase } from './form-cases';
 import { env, pageCtx, type PageCtx } from './mobile-pages';
-import { reviewSummary } from './seed';
+import { IDEAS_GUID, reviewSummary } from './seed';
 import { ADMIN_STATE } from './session';
 import { VIEWPORTS, touch, type ViewportName } from './viewports';
 
@@ -44,6 +49,25 @@ async function api<T = Record<string, unknown>>(method: string, path: string, bo
   });
   if (!r.ok) throw new Error(`${method} ${path}: HTTP ${r.status} ${await r.text()}`);
   return (r.status === 204 ? {} : await r.json()) as T;
+}
+
+/** Контексты запросов `adminSession` — закрываются после файла. */
+const sessionContexts: APIRequestContext[] = [];
+test.afterAll(async () => {
+  for (const s of sessionContexts.splice(0)) await s.dispose();
+});
+
+/** REST сессией администратора (cookie `ADMIN_STATE`, CSRF — из `auth/me`): разделы
+ * администратора и свои токены, которых токену не дают. */
+async function adminSession(): Promise<<T = Record<string, unknown>>(method: string, path: string, body?: unknown) => Promise<T>> {
+  const rc = await pwRequest.newContext({ baseURL: base(), storageState: ADMIN_STATE });
+  sessionContexts.push(rc);
+  const me = (await (await rc.get('api/v1/auth/me')).json()) as { csrf: string };
+  return async <T>(method: string, path: string, body?: unknown) => {
+    const r = await rc.fetch(`api/v1/${path}`, { method, headers: { 'X-CSRF-Token': me.csrf }, data: body });
+    if (!r.ok()) throw new Error(`${method} ${path}: HTTP ${r.status()} ${await r.text()}`);
+    return (r.status() === 204 ? {} : await r.json()) as T;
+  };
 }
 
 type Created = { id: string; rev: number };
@@ -87,6 +111,18 @@ async function seedForms(): Promise<void> {
   const question = await entryOf(guid, { kind: 'question', title: 'Вопрос форм E2E: окна или карточка?', body: 'Где править?', data: { options: [{ key: 'a', text: 'окна' }, { key: 'b', text: 'карточка' }] } });
   const changelog = await entryOf(guid, { kind: 'changelog', title: 'Запись форм E2E', body: 'Окна форм.', data: { kind: 'feat' } });
   const release = await entryOf(guid, { kind: 'release', title: 'Релиз форм E2E', body: 'Окна.', data: { version: '0.0.16' } });
+  // вопрос-предложение общей идеи Knowledge с задачей в общем решении: «начать» — подтверждение,
+  // «отложить» — окно с датой (задача 10b); ответа на него в сценариях форм нет
+  const shared = await entryOf('knowledge', { kind: 'idea', title: `Общая идея форм E2E ${Date.now().toString(36)}`, body: 'Замысел.', data: { origin: 'human' } });
+  const proposal = await api<{ question: { id: string } }>('POST', `entries/${shared.id}/propose`, { text: 'Подходит к работе форм.', space: IDEAS_GUID });
+  // администрирование (задача 10b): пользователь с паролем и токеном, свой токен администратора,
+  // решение с одобренным участником, выжимка кэша — для окон и подтверждений (ничего не отзывается)
+  const run = Date.now().toString(36);
+  const session = await adminSession();
+  const people = await people10b(session, run);
+  const cacheQuery = `Выжимка форм E2E ${run}`;
+  const src = await api<{ id: string }>('POST', 'nodes', { space: 'knowledge', path: `E2E/Формы/Источник ${run}`, kind: 'note', content: '# Источник\n\nТекст.\n' });
+  await api('POST', 'cache', { query: cacheQuery, summary: 'Выжимка для окон формы.', sources: [{ id: src.id }] });
   Object.assign(process.env, {
     E2E_FORMS_SOLUTION: guid,
     E2E_FORMS_TASK_OPEN: open.id,
@@ -99,7 +135,50 @@ async function seedForms(): Promise<void> {
     E2E_FORMS_QUESTION: question.id,
     E2E_FORMS_CHANGELOG: changelog.id,
     E2E_FORMS_RELEASE: release.id,
+    E2E_FORMS_QUESTION_SHARED: proposal.question.id,
+    E2E_FORMS_USER: people.user,
+    E2E_FORMS_USER_ID: people.userId,
+    E2E_FORMS_USER_TOKEN: people.userToken,
+    E2E_FORMS_OWN_TOKEN: people.ownToken,
+    E2E_FORMS_ACCESS_SOL: people.solution,
+    E2E_FORMS_PENDING_USER: people.pending,
+    E2E_FORMS_CACHE_QUERY: cacheQuery,
   });
+}
+
+type Session = Awaited<ReturnType<typeof adminSession>>;
+
+/** Пользователь с паролем входа и токеном `ro`, свой токен администратора, решение администратора с
+ * одобренным участником — этим пользователем; `tag` — уникальность имён. */
+async function people10b(
+  session: Session,
+  tag: string,
+): Promise<{ user: string; userId: string; userToken: string; ownToken: string; solution: string; plain: string; pending: string }> {
+  const user = `e2e-forms-${tag}`;
+  const u = await session<{ user: { id: string }; token: { plaintext: string } }>('POST', 'admin/users', { name: user });
+  await session('POST', `admin/users/${u.user.id}/password`, { password: ['forms', 'e2e', 'pass', '1'].join('-') });
+  const userToken = `e2e-forms-tok-${tag}`;
+  await session('POST', `admin/users/${u.user.id}/tokens`, { name: userToken, access: 'ro' });
+  const ownToken = `e2e-forms-own-${tag}`;
+  await session('POST', 'auth/tokens', { name: ownToken, access: 'ro' });
+  const solution = await newSolution(`Доступ форм E2E ${tag}`);
+  const r = await fetch(`${base()}api/v1/solutions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${u.token.plaintext}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ agent_solution_id: solution, name: `Доступ форм E2E ${tag}` }),
+  });
+  if (r.status !== 202) throw new Error(`запрос доступа ${user}: HTTP ${r.status} ${await r.text()}`);
+  await session('POST', `solutions/${solution}/access/${u.user.id}/approve`, { access: 'ro' });
+  // второй пользователь — запрос доступа ждёт решения («Отклонить запрос», ревью r1 задачи 10b)
+  const pending = `e2e-forms-wait-${tag}`;
+  const w = await session<{ token: { plaintext: string } }>('POST', 'admin/users', { name: pending });
+  const rw = await fetch(`${base()}api/v1/solutions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${w.token.plaintext}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ agent_solution_id: solution, name: `Доступ форм E2E ${tag}` }),
+  });
+  if (rw.status !== 202) throw new Error(`запрос доступа ${pending}: HTTP ${rw.status} ${await rw.text()}`);
+  return { user, userId: u.user.id, userToken, ownToken, solution, plain: u.token.plaintext, pending };
 }
 
 test.beforeAll(async () => {
@@ -146,9 +225,15 @@ async function goto(page: Page, hash: string): Promise<void> {
   await expect(page.getByRole('button', { name: 'Поиск', exact: true })).toBeVisible();
 }
 
+/** Страница строки (с её подменой ответов `prepare`). */
+async function gotoRow(page: Page, row: Pick<FormCase, 'page' | 'prepare'>): Promise<void> {
+  await row.prepare?.(page);
+  await goto(page, row.page(await ctxOf(page)));
+}
+
 /** Страница строки открыта, кнопка, открывшая окно, запоминается (`__opener`). */
 async function openRow(page: Page, row: FormCase): Promise<Locator> {
-  await goto(page, row.page(await ctxOf(page)));
+  await gotoRow(page, row);
   await page.evaluate(() => {
     const w = window as unknown as { __opener: Element | null };
     w.__opener = null;
@@ -156,8 +241,9 @@ async function openRow(page: Page, row: FormCase): Promise<Locator> {
       'click',
       (e) => {
         const b = e.target instanceof Element ? e.target.closest('button') : null;
-        // кнопка страницы или панели карточки (она тоже `role="dialog"`), не самого окна формы
-        if (b && !b.closest('[data-form-dialog]')) w.__opener = b;
+        // кнопка страницы или панели карточки (она тоже `role="dialog"`), не самого окна формы; пункт
+        // меню уходит вместе с меню — открывшая окно кнопка та, что открыла меню («⋯» дерева)
+        if (b && !b.closest('[data-form-dialog]') && !b.closest('[role="menu"]')) w.__opener = b;
       },
       true,
     );
@@ -212,13 +298,18 @@ const placeOf = (page: Page) =>
  */
 async function fieldsDense(scope: Locator, max = 24): Promise<void> {
   const gaps = await scope.locator('.fd-body').evaluate((b) => {
-    const els = [...b.querySelectorAll<HTMLElement>('label:not(.inline), fieldset')].filter((e) => e.getClientRects().length > 0);
+    // флажок строкой (`label.inline` не в группе вариантов с `legend` — импорт: «Это мой архив») —
+    // тоже поле окна, его низ — по самой подписи (цель касания 44 px), а не по квадрату флажка
+    // (задача 10b); варианты группы меряются группой (`fieldset`)
+    const els = [...b.querySelectorAll<HTMLElement>('label:not(.inline), fieldset, label.inline')]
+      .filter((e) => !(e.matches('label.inline') && e.closest('fieldset')?.querySelector(':scope > legend')))
+      .filter((e) => e.getClientRects().length > 0);
     const out: { gap: number; at: string }[] = [];
     for (let i = 1; i < els.length; i++) {
       const prev = els[i - 1];
       const next = els[i];
       if (prev.contains(next)) continue;
-      const ctl = prev.matches('fieldset') ? prev : (prev.querySelector('input, textarea, select') ?? prev);
+      const ctl = prev.matches('fieldset, label.inline') ? prev : (prev.querySelector('input, textarea, select') ?? prev);
       const gap = next.getBoundingClientRect().top - ctl.getBoundingClientRect().bottom;
       if (gap > 0) out.push({ gap: Math.round(gap), at: `${(prev.textContent ?? '').trim().slice(0, 20)} → ${(next.textContent ?? '').trim().slice(0, 20)}` });
     }
@@ -265,10 +356,7 @@ const settled = (page: Page) =>
 
 if (SNAP) {
   mkdirSync(screens, { recursive: true });
-  const rows: { id: string; name: string; page: FormCase['page']; open: FormCase['open']; legacy?: string; dialog?: string; added?: boolean }[] = [
-    ...FORM_CASES,
-    ...SNAP_ONLY,
-  ];
+  const rows: FormCase[] = FORM_CASES;
   for (const w of W4) {
     test.describe(`снимки ${SNAP} · ${w.name}`, () => {
       test.use({ viewport: VIEWPORTS[w.name], ...(w.touch ? touch : {}) });
@@ -277,7 +365,7 @@ if (SNAP) {
           nativeDialogs(page);
           // съёмка без проверок: место, которое не открылось, — строкой в списке, а не ожиданием
           page.setDefaultTimeout(8_000);
-          await goto(page, row.page(await ctxOf(page)));
+          await gotoRow(page, row);
           await page.waitForTimeout(400);
           let state = '';
           try {
@@ -327,7 +415,7 @@ if (!SNAP) {
           // фокус не переводится), ошибка сервера — у формы, набранное цело, уход по адресу — один вопрос
           test(`forms_inline_open_in_view ${row.id} ${w.name}`, async ({ page }) => {
             const problems = watch(page);
-            await goto(page, row.page(await ctxOf(page)));
+            await gotoRow(page, row);
             await row.open(page);
             const sc = inl.scope(page);
             const field = sc.getByLabel(row.first!).first();
@@ -351,7 +439,7 @@ if (!SNAP) {
                   })
                 : route.fallback(),
             );
-            await goto(page, row.page(await ctxOf(page)));
+            await gotoRow(page, row);
             await row.open(page);
             await row.fill!(page);
             const sc = inl.scope(page);
@@ -364,7 +452,7 @@ if (!SNAP) {
           test(`forms_inline_leave_asks ${row.id} ${w.name}`, async ({ page }) => {
             const native = nativeDialogs(page);
             const c = await ctxOf(page);
-            await goto(page, row.page(c));
+            await gotoRow(page, row);
             await row.open(page);
             await row.fill!(page);
             const sc = inl.scope(page);
@@ -568,16 +656,27 @@ if (!SNAP) {
         if (row.confirm && row.danger) {
           test(`forms_confirm_danger_focus_cancel ${row.id} ${w.name}`, async ({ page }) => {
             const d = await openRow(page, row);
+            // запрос действия (`route`) после открытия окна — не уходит
+            const sent: string[] = [];
+            const r = row.route;
+            page.on('request', (q) => {
+              if (r && q.method() === r.method && (typeof r.url === 'string' ? q.url().includes(r.url) : r.url.test(new URL(q.url()).pathname))) sent.push(q.url());
+            });
             const cancel = d.getByRole('button', { name: 'Отмена', exact: true });
             await expect(cancel).toBeFocused();
             await page.keyboard.press('Enter');
             await expect(d).toBeHidden();
-            // ничего не удалено и не снято: запись адреса — на месте, с прежним статусом
-            const id = /\/j\/[a-z]+\/([^/?#]+)/.exec(page.url())?.[1];
-            expect(id, 'запись в адресе').toBeTruthy();
-            const e = await getEntry(decodeURIComponent(id!));
-            expect(e.deleted_at).toBeNull();
-            expect(e.status).not.toBe('dropped');
+            await settled(page);
+            expect(sent, 'запрос действия после Enter на «Отмена»').toEqual([]);
+            // ничего не удалено, не снято и не отозвано: своя проверка строки или запись адреса журнала
+            if (row.kept) await row.kept(page);
+            else {
+              const id = /\/j\/[a-z]+\/([^/?#]+)/.exec(page.url())?.[1];
+              expect(id, 'запись в адресе').toBeTruthy();
+              const e = await getEntry(decodeURIComponent(id!));
+              expect(e.deleted_at).toBeNull();
+              expect(e.status).not.toBe('dropped');
+            }
           });
         }
 
@@ -598,7 +697,7 @@ if (!SNAP) {
               await submitOf(d).click();
               await expect(d).toBeHidden();
               await expect(page).not.toHaveURL(before);
-              await expect(page).toHaveURL(/\/j\/(tasks|insights|ideas)\/[0-9A-Z]{26}$/);
+              await expect(page).toHaveURL(/\/j\/(tasks|insights|ideas|glossary)\/[0-9A-Z]{26}$/);
               await headingInView(page);
               expect(problems, problems.join('\n')).toEqual([]);
             } finally {
@@ -607,11 +706,11 @@ if (!SNAP) {
           });
         }
 
-        if (phone && (row.id === 'task-create' || row.id === 'idea-create')) {
+        if (phone && (row.id === 'task-create' || row.id === 'idea-create' || row.id === 'term-new')) {
           for (const noNav of [false, true]) {
           test(`forms_phone_create_then_back ${row.id} ${w.name}${noNav ? ' no_nav_api' : ''}`, async ({ page }) => {
             if (noNav) await hideNavApi(page);
-            await goto(page, row.page(await ctxOf(page)));
+            await gotoRow(page, row);
             const board = page.url();
             // длина истории до окна: окно кладёт запись слоя, «Добавить» заменяет её записью
             // карточки — прибавилась одна запись, а не две
@@ -622,12 +721,13 @@ if (!SNAP) {
             await row.fill!(page);
             await submitOf(d).click();
             await expect(d).toBeHidden();
-            await expect(page).toHaveURL(/\/j\/(tasks|ideas)\/[0-9A-Z]{26}$/);
+            await expect(page).toHaveURL(/\/j\/(tasks|ideas|glossary)\/[0-9A-Z]{26}$/);
             await headingInView(page);
             expect(await page.evaluate(() => history.length)).toBe(len0 + 1);
             await page.goBack({ waitUntil: 'commit' });
             await expect(page).toHaveURL(board);
-            await expect(page.getByRole('button', { name: row.id === 'task-create' ? 'Новая задача' : 'Новая идея', exact: true })).toBeVisible();
+            const add = { 'task-create': 'Новая задача', 'idea-create': 'Новая идея', 'term-new': 'Новый термин' }[row.id]!;
+            await expect(page.getByRole('button', { name: add, exact: true })).toBeVisible();
           });
           }
         }
@@ -915,6 +1015,291 @@ if (!SNAP) {
       expect(problems, problems.join('\n')).toEqual([]);
     });
   });
+
+  // ---- по местам задачи 10b ----
+
+  test.describe('по местам (задача 10b) · desktop', () => {
+    test.use({ viewport: VIEWPORTS.desktop });
+
+    test('editor_certainty_reason_dialog', async ({ page }) => {
+      // причина смены `certainty:` — окно формы, а не системное `window.prompt`: поле в фокусе, Esc —
+      // сохранение не уходит, причина — сообщением ревизии. Человеку сервер причину не требует, поэтому
+      // первый PUT без сообщения отвечает подменой `page.route` так, как ответил бы агенту
+      const problems = watch(page, (p, s) => s === 422 && /\/nodes\//.test(p));
+      const native = nativeDialogs(page);
+      const c = await ctxOf(page);
+      const n = await api<{ id: string }>('POST', 'nodes', {
+        space: 'knowledge',
+        path: `E2E/Формы/Надёжность ${Date.now().toString(36)}`,
+        kind: 'note',
+        content: '---\ncertainty: hypothesis\n---\n# Надёжность\n\nТекст.\n',
+      });
+      const puts: (string | null)[] = [];
+      await page.route(new RegExp(`/api/v1/nodes/${n.id}$`), (route) => {
+        if (route.request().method() !== 'PUT') return route.fallback();
+        const body = route.request().postDataJSON() as { message?: string };
+        puts.push(body.message ?? null);
+        if (body.message) return route.fallback();
+        return route.fulfill({
+          status: 422,
+          contentType: 'application/problem+json',
+          body: JSON.stringify({ type: '/problems/certainty', title: 'Unprocessable Entity', status: 422, code: 'reason-required', detail: 'смена certainty требует причины' }),
+        });
+      });
+      await goto(page, `#/u/${c.user}/s/knowledge/n/${n.id}`);
+      await page.getByRole('button', { name: 'Править', exact: true }).click();
+      const editor = page.getByRole('region', { name: 'Редактор заметки' });
+      const content = editor.locator('.cm-content');
+      await expect(editor.locator('.state')).toHaveText(/^Ревизия \d+$/);
+      await content.click();
+      await page.keyboard.press('Control+End');
+      await page.keyboard.type(' Дописано.');
+      await editor.getByRole('button', { name: 'Сохранить', exact: true }).click();
+      const d = dialogOf(page, 'Причина смены надёжности');
+      await expect(d).toBeVisible();
+      await expect(d.getByLabel('Причина')).toBeFocused();
+      // Esc — окно закрыто, сохранение с причиной не ушло, текст в редакторе цел
+      await page.keyboard.press('Escape');
+      await expect(d).toBeHidden();
+      await settled(page);
+      expect(puts).toEqual([null]);
+      await expect(editor.getByRole('alert')).toHaveText('Не сохранено: смена certainty требует причины');
+      await expect(content).toContainText('Дописано.');
+      // снова «Сохранить» — окно; причина уходит сообщением ревизии
+      await editor.getByRole('button', { name: 'Сохранить', exact: true }).click();
+      await expect(d).toBeVisible();
+      await d.getByLabel('Причина').fill('проверено на стенде');
+      await submitOf(d).click();
+      await expect(d).toBeHidden();
+      await expect(editor.locator('.state')).toHaveText(/^Сохранено: ревизия \d+$/);
+      expect(puts).toEqual([null, null, 'проверено на стенде']);
+      // системных окон (`window.prompt`) не было
+      expect(native).toEqual([]);
+      expect(problems, problems.join('\n')).toEqual([]);
+    });
+
+    test('revoke_token_confirm', async ({ page }) => {
+      // «Отозвать» токен — подтверждение `danger`: до подтверждения ничего не отозвано, фокус — на
+      // «Отмена»; согласие — отозван, токен больше не пускает (аккаунт и пользователи)
+      const problems = watch(page);
+      const session = await adminSession();
+      const tag = Date.now().toString(36);
+      const own = `e2e-revoke-own-${tag}`;
+      const issued = await session<{ plaintext: string }>('POST', 'auth/tokens', { name: own, access: 'ro' });
+      const revokedOwn = async () => (await session<{ name: string; revoked_at: string | null }[]>('GET', 'auth/tokens')).find((t) => t.name === own)?.revoked_at ?? null;
+      await goto(page, '#/account');
+      const row = page.locator(`tr[data-token="${own}"]`);
+      const d = dialogOf(page, 'Отозвать токен?');
+      await row.getByRole('button', { name: 'Отозвать' }).click();
+      await expect(d).toContainText(own);
+      await expect(d.getByRole('button', { name: 'Отмена', exact: true })).toBeFocused();
+      expect(await revokedOwn()).toBeNull();
+      await d.getByRole('button', { name: 'Отмена', exact: true }).click();
+      await expect(d).toBeHidden();
+      expect(await revokedOwn()).toBeNull();
+      await row.getByRole('button', { name: 'Отозвать' }).click();
+      await d.getByRole('button', { name: 'Отозвать', exact: true }).click();
+      await expect(d).toBeHidden();
+      await expect(row).toContainText('отозван');
+      await expect(page.getByTestId('token-notice')).toHaveText(`Токен «${own}» отозван.`);
+      await expect(page.getByTestId('token-notice')).toBeFocused();
+      expect(await revokedOwn()).not.toBeNull();
+      expect((await fetch(`${base()}api/v1/spaces`, { headers: { Authorization: `Bearer ${issued.plaintext}` } })).status).toBe(401);
+
+      // токен пользователя — «Администрирование → Пользователи»
+      const name = `e2e-revoke-user-${tag}`;
+      const u = await session<{ user: { id: string } }>('POST', 'admin/users', { name });
+      const tok = `e2e-revoke-tok-${tag}`;
+      const ut = await session<{ plaintext: string }>('POST', `admin/users/${u.user.id}/tokens`, { name: tok, access: 'ro' });
+      const revokedUser = async () => (await session<{ name: string; revoked_at: string | null }[]>('GET', `admin/users/${u.user.id}/tokens`)).find((t) => t.name === tok)?.revoked_at ?? null;
+      await goto(page, '#/admin');
+      await page.locator(`tr[data-user="${name}"]`).getByRole('button', { name: 'Токены' }).click();
+      const trow = page.getByRole('row', { name: new RegExp(`^${tok} `) });
+      await trow.getByRole('button', { name: 'Отозвать' }).click();
+      await expect(d).toContainText(tok);
+      await expect(d.getByRole('button', { name: 'Отмена', exact: true })).toBeFocused();
+      await page.keyboard.press('Enter');
+      await expect(d).toBeHidden();
+      expect(await revokedUser()).toBeNull();
+      await trow.getByRole('button', { name: 'Отозвать' }).click();
+      await d.getByRole('button', { name: 'Отозвать', exact: true }).click();
+      await expect(d).toBeHidden();
+      await expect(trow).toContainText('отозван');
+      await expect(page.getByTestId('users-notice')).toHaveText(`Токен «${tok}» пользователя «${name}» отозван.`);
+      expect(await revokedUser()).not.toBeNull();
+      expect((await fetch(`${base()}api/v1/spaces`, { headers: { Authorization: `Bearer ${ut.plaintext}` } })).status).toBe(401);
+      expect(problems, problems.join('\n')).toEqual([]);
+    });
+
+    test('revoke_access_confirm', async ({ page }) => {
+      // «Отозвать» доступ участника — подтверждение `danger`: до подтверждения доступ цел
+      const problems = watch(page);
+      const session = await adminSession();
+      const p = await people10b(session, `ac${Date.now().toString(36)}`);
+      const state = async () => (await session<{ members: { user_name: string; state: string }[] }>('GET', `solutions/${p.solution}/access`)).members.find((m) => m.user_name === p.user)?.state;
+      await goto(page, '#/admin/solutions');
+      await page.locator(`tr[data-solution="${p.solution}"]`).getByRole('button', { name: 'Доступ' }).click();
+      const m = page.locator(`tr[data-member="${p.user}"]`);
+      const d = dialogOf(page, 'Отозвать доступ?');
+      await m.getByRole('button', { name: 'Отозвать' }).click();
+      await expect(d).toContainText(p.user);
+      await expect(d.getByRole('button', { name: 'Отмена', exact: true })).toBeFocused();
+      await page.keyboard.press('Enter');
+      await expect(d).toBeHidden();
+      expect(await state()).toBe('approved');
+      const entries = `spaces/${p.solution}/entries?kind=changelog`;
+      expect((await fetch(`${base()}api/v1/${entries}`, { headers: { Authorization: `Bearer ${p.plain}` } })).status).toBe(200);
+      await m.getByRole('button', { name: 'Отозвать' }).click();
+      await d.getByRole('button', { name: 'Отозвать', exact: true }).click();
+      await expect(d).toBeHidden();
+      await expect(m).toContainText('отозван');
+      expect(await state()).toBe('revoked');
+      expect((await fetch(`${base()}api/v1/${entries}`, { headers: { Authorization: `Bearer ${p.plain}` } })).status).toBe(403);
+      expect(problems, problems.join('\n')).toEqual([]);
+    });
+
+    test('template_reset_confirm', async ({ page }) => {
+      // «Сбросить к умолчанию» — подтверждение `danger`: до подтверждения запроса нет, фокус — на
+      // «Отмена»; согласие — `PATCH` со сбросом (`null`). «Свой шаблон» — подменой ответа настроек
+      const problems = watch(page);
+      const patches: unknown[] = [];
+      page.on('request', (r) => {
+        if (r.method() === 'PATCH' && /\/api\/v1\/admin\/settings$/.test(new URL(r.url()).pathname)) patches.push(r.postDataJSON());
+      });
+      await customTemplate(page);
+      await goto(page, '#/admin/settings');
+      const tpl = page.getByRole('region', { name: 'Шаблон инструкции' });
+      const reset = tpl.getByRole('button', { name: 'Сбросить к умолчанию' });
+      const d = dialogOf(page, 'Сбросить шаблон к умолчанию?');
+      await reset.click();
+      await expect(d).toContainText('Claude Code · ru');
+      await expect(d.getByRole('button', { name: 'Отмена', exact: true })).toBeFocused();
+      await page.keyboard.press('Enter');
+      await expect(d).toBeHidden();
+      await settled(page);
+      expect(patches).toEqual([]);
+      await reset.click();
+      await d.getByRole('button', { name: 'Сбросить', exact: true }).click();
+      await expect(d).toBeHidden();
+      expect(patches).toEqual([{ agent_setup: { templates: { 'claude.ru': null } } }]);
+      await expect(tpl.getByRole('status')).toHaveText(/^(Текст не изменился — версия прежняя\.|Шаблон сброшен к умолчанию, версия блока — v\d+\.)$/);
+      expect(problems, problems.join('\n')).toEqual([]);
+    });
+
+    test('settings_template_leave_asks', async ({ page }) => {
+      // шаблон инструкции — поле на виду под проверкой ухода: правка и переход — один вопрос;
+      // «Отмена» — страница и набранное на месте; черновик другого языка тоже держит уход
+      const seen: string[] = [];
+      let accept = false;
+      page.on('dialog', (dl) => {
+        seen.push(dl.message());
+        void (accept ? dl.accept() : dl.dismiss());
+      });
+      await goto(page, '#/admin/settings');
+      const tpl = page.getByRole('region', { name: 'Шаблон инструкции' });
+      const area = tpl.getByLabel('Текст шаблона');
+      await expect(area).not.toHaveValue('');
+      const typed = `## Правка шаблона ${Date.now().toString(36)}\nАдрес: {url}\nРешение: {solution}. {rules}`;
+      await area.fill(typed);
+      await page.evaluate((h) => (location.hash = h), '#/admin');
+      await expect.poll(() => seen.length).toBe(1);
+      expect(seen[0]).toBe(LEAVE_EDIT);
+      await expect(page).toHaveURL(/#\/admin\/settings$/);
+      await expect(area).toHaveValue(typed);
+      await settled(page);
+      expect(seen.length).toBe(1);
+      // другой язык: в поле — его шаблон, набранное — черновиком; переход снова спрашивает
+      await tpl.getByLabel('Язык шаблона').selectOption('en');
+      await expect(area).not.toHaveValue(typed);
+      await page.evaluate((h) => (location.hash = h), '#/admin');
+      await expect.poll(() => seen.length).toBe(2);
+      await expect(page).toHaveURL(/#\/admin\/settings$/);
+      // согласие — уход без сохранения
+      accept = true;
+      await page.evaluate((h) => (location.hash = h), '#/admin');
+      await expect(page).toHaveURL(/#\/admin$/);
+      expect(seen.length).toBe(3);
+      const s = await sessionGet<{ agent_setup: { templates: Record<string, { text: string }> } }>(page, 'admin/settings');
+      expect(s.agent_setup.templates['claude.ru'].text).not.toBe(typed);
+    });
+
+    test('glossary_409_keeps_typed', async ({ page }) => {
+      // правка термина в карточке: между открытием и сохранением термин правят через API — 409,
+      // форма открыта, набранное цело, нетронутое поле — из свежего термина, сообщение есть
+      const problems = watch(page, (p, s) => s === 409 && /\/entries\/[^/]+$/.test(p));
+      const g = env('E2E_FORMS_SOLUTION');
+      const tag = Date.now().toString(36);
+      const t = await entryOf(g, { kind: 'term', title: `Термин409${tag}`, data: { definition: 'Было.', aliases: [`a409${tag}`] } });
+      const c = await ctxOf(page);
+      await goto(page, `#/u/${c.user}/s/${g}/j/glossary/${t.id}`);
+      const card = page.getByRole('article', { name: 'Карточка термина' });
+      await card.getByRole('button', { name: 'Править', exact: true }).click();
+      const form = card.getByRole('form', { name: 'Правка термина' });
+      await expect(form.getByLabel('Имя')).toBeFocused();
+      await form.getByLabel('Определение').fill('Определение человека.');
+      // агент дописал псевдоним, пока форма открыта
+      await patch(t, { data: { definition: 'Было.', aliases: [`a409${tag}`, `b409${tag}`] } });
+      await form.getByRole('button', { name: 'Сохранить', exact: true }).click();
+      await expect(form.getByRole('alert')).toContainText('Запись изменилась, пока вы правили');
+      await expect(form.getByLabel('Определение')).toHaveValue('Определение человека.');
+      await expect(form.getByLabel(/Псевдонимы/)).toHaveValue(`a409${tag}\nb409${tag}`);
+      await expect(card).toContainText(`ревизия ${t.rev + 1}`);
+      // повтор сохраняет перенесённое
+      await form.getByRole('button', { name: 'Сохранить', exact: true }).click();
+      await expect(form).toBeHidden();
+      await expect(card.getByRole('heading', { name: `Термин409${tag}` })).toBeFocused();
+      await expect(card.getByRole('status')).toHaveText('Термин сохранён.');
+      const saved = await getEntry(t.id);
+      expect(saved.rev).toBe(t.rev + 2);
+      const data = (await api<{ data: { definition: string; aliases: string[] } }>('GET', `entries/${t.id}`)).data;
+      expect(data).toMatchObject({ definition: 'Определение человека.', aliases: [`a409${tag}`, `b409${tag}`] });
+      expect(problems, problems.join('\n')).toEqual([]);
+    });
+  });
+
+  /** Ленты без карточки (Вопросы, Changelog, Releases): по 30 записей в своём решении. */
+  let feedGuid = '';
+  const feedIds: Record<string, string[]> = {};
+  async function seedFeeds(): Promise<string> {
+    if (feedGuid) return feedGuid;
+    const g = await newSolution(`Ленты E2E ${Date.now().toString(36)}`);
+    const make = async (kind: string, extra: (i: number) => Record<string, unknown>) => {
+      const ids: string[] = [];
+      for (let i = 1; i <= 30; i++) ids.push((await entryOf(g, { kind, ...extra(i) })).id);
+      feedIds[kind] = ids;
+    };
+    await make('question', (i) => ({ title: `Вопрос ленты ${String(i).padStart(2, '0')}`, body: longBody('вопрос').slice(0, 600) }));
+    await make('changelog', (i) => ({ title: `Запись ленты ${String(i).padStart(2, '0')}`, body: longBody('запись').slice(0, 600), data: { kind: 'feat' } }));
+    await make('release', (i) => ({ title: `Релиз 1.${i}.0`, body: longBody('релиз').slice(0, 600), data: { version: `1.${i}.0` } }));
+    feedGuid = g;
+    return g;
+  }
+
+  for (const w of W3) {
+    test.describe(`ленты · ${w.name}`, () => {
+      test.use({ viewport: VIEWPORTS[w.name], ...(w.touch ? touch : {}) });
+      for (const j of [
+        { journal: 'questions', kind: 'question' },
+        { journal: 'changelog', kind: 'changelog' },
+        { journal: 'releases', kind: 'release' },
+      ]) {
+        test(`feed_entry_in_view_on_open ${j.kind} ${w.name}`, async ({ page }) => {
+          // запись из адреса — далеко внизу ленты (у Вопросов и Changelog новые — сверху): она на виду,
+          // фокус — на её заголовке (§6.14 п. 2, ленты без карточки)
+          test.setTimeout(120_000);
+          const problems = watch(page);
+          const g = await seedFeeds();
+          const c = await ctxOf(page);
+          const id = feedIds[j.kind][0];
+          await goto(page, `#/u/${c.user}/s/${g}/j/${j.journal}/${id}`);
+          await headingInView(page);
+          const focused = await page.evaluate(() => document.activeElement?.textContent?.trim() ?? '');
+          expect(focused).toMatch(j.kind === 'release' ? /^Релиз 1\.1\.0$/ : /ленты 01$/);
+          expect(problems, problems.join('\n')).toEqual([]);
+        });
+      }
+    });
+  }
 
   test.describe('по местам · phone', () => {
     test.use({ viewport: VIEWPORTS.phone, ...touch });

@@ -701,30 +701,43 @@ test.describe('телефон, сенсорный ввод', () => {
   });
 
   test('glossary_unsaved_back_asks_phone', async ({ page }) => {
-    // форма нового термина (карточки нет, адрес — список); без набранного «← Словарь» — сразу
+    // M7.3 (§6.14): «Новый термин» — окно формы (его «Назад» и несохранённое — `forms.spec.ts`,
+    // строка `term-new`); несохранённое карточки — правка термина на месте (правило В): «← Словарь»
+    // спрашивает, уход по адресу — один вопрос; без набранного «← Словарь» — сразу
     const problems = watch(page);
     const guid = await newSolution('словарь и несохранённое');
+    const t = await api<{ id: string }>('POST', `spaces/${guid}/entries`, {
+      kind: 'term',
+      title: 'Термин под правкой',
+      body: '',
+      data: { definition: 'Определение до правки', aliases: [] },
+    });
     const c = await pageCtx(page);
     await open(page, `#/u/${c.user}/s/${guid}/j/glossary`);
-    const add = page.getByRole('button', { name: 'Новый термин', exact: true });
-    const form = page.getByRole('form', { name: 'Новый термин' });
-    await add.tap();
-    await expect(form).toBeVisible();
-    await expect(add).toBeHidden();
+    const list = page.getByRole('list', { name: 'Термины' });
+    const row = list.getByRole('button', { name: 'Термин под правкой' });
+    const card = page.getByRole('article', { name: 'Карточка термина' });
+    const form = card.getByRole('form', { name: 'Правка термина' });
+    await row.tap();
+    await card.getByRole('button', { name: 'Править', exact: true }).tap();
+    await expect(form.getByLabel('Определение')).toHaveValue('Определение до правки');
     await unsavedAsksPhone(page, {
       label: 'Словарь',
       field: form.getByLabel('Определение'),
       typed: 'Определение, набранное на телефоне',
-      here: /\/j\/glossary$/,
+      here: new RegExp(`/j/glossary/${t.id}$`),
       away: `#/u/${c.user}/s/${guid}/j/insights`,
-      list: add,
+      list,
     });
-    await add.tap();
+    await expect(page).toHaveURL(/\/j\/glossary$/);
+    await row.tap();
+    await card.getByRole('button', { name: 'Править', exact: true }).tap();
     await expect(form).toBeVisible();
     await page.getByRole('link', { name: '← Словарь' }).tap();
-    await expect(add).toBeVisible();
+    await expect(list).toBeVisible();
     await expect(page.getByRole('alertdialog')).toHaveCount(0);
-    expect((await api<{ items: unknown[] }>('GET', `spaces/${guid}/glossary`)).items).toEqual([]);
+    const items = (await api<{ items: { definition: string }[] }>('GET', `spaces/${guid}/glossary`)).items;
+    expect(items.map((x) => x.definition)).toEqual(['Определение до правки']);
     expect(problems, problems.join('\n')).toEqual([]);
   });
 });

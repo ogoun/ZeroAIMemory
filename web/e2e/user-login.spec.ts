@@ -179,7 +179,9 @@ test('пользователь: вход, обязательная смена п
   await expect(row).toContainText('ro');
   const ok = await rc.get(`${base()}api/v1/spaces`, { headers: { Authorization: `Bearer ${plain}` } });
   expect(ok.status()).toBe(200);
+  // отзыв — с подтверждением (M7.3, §6.14 правило Д)
   await row.getByRole('button', { name: 'Отозвать' }).click();
+  await page.getByRole('dialog', { name: 'Отозвать токен?' }).getByRole('button', { name: 'Отозвать', exact: true }).click();
   await expect(row).toContainText('отозван');
   await page.screenshot({ path: `${screens}user-account.png`, fullPage: true });
 

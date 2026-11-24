@@ -43,9 +43,9 @@ export function rebase<T extends Record<string, unknown>>(
 
 /** Текст 409 формы (§6.14 п. 5), один у всех форм с ревизией: черновик перенесён на свежую запись;
  * `clash` — подписи полей, изменённых и здесь, и в другом месте (они помечены в форме), `rev` —
- * ревизия свежей записи. */
-export function rebaseText(clash: string[], rev?: number): string {
+ * ревизия свежей записи; `again` — что сделать снова (у окна отзыва — «отзовите снова»). */
+export function rebaseText(clash: string[], rev?: number, again = 'сохраните снова'): string {
   const now = rev === undefined ? '' : ` (сейчас ревизия ${rev})`;
   const both = clash.length ? ` Изменено и здесь, и в другом месте: ${clash.join(', ')} — сверьте перед сохранением.` : '';
-  return `Запись изменилась, пока вы правили${now}: проверьте и сохраните снова.${both}`;
+  return `Запись изменилась, пока вы правили${now}: проверьте и ${again}.${both}`;
 }
