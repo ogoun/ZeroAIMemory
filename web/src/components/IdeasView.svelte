@@ -903,7 +903,8 @@
       <p class="muted">Загрузка…</p>
     {:else}
       <!-- окно той же формы — сразу, пока чанк идёт (обычно он уже загружен заранее, `onMount`) -->
-      <FormDialog open={dialogMode} confirm title={IDEA_FORMS[m].title} submit={IDEA_FORMS[m].submit} busy onsubmit={() => {}} onclose={closeForm}>
+      <!-- того же вида, что окно формы: на телефоне сразу во весь экран, без скачка -->
+      <FormDialog open={dialogMode} title={IDEA_FORMS[m].title} submit={IDEA_FORMS[m].submit} busy onsubmit={() => {}} onclose={closeForm}>
         <p class="muted" aria-busy="true">Загрузка…</p>
       </FormDialog>
     {/if}

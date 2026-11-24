@@ -2321,7 +2321,9 @@ No MCP — `zam`; protocol — `zam guide`.
     список — в журнале этапа M7.
   - **Размер:** окно формы — общий чанк `FormDialog`, грузится при старте; стартовая загрузка —
     строка size-limit `start` ≤ 103 КБ gzip (`entry` и статические чанки `index.html`, кроме `api`,
-    у которого своя строка); журнал Insights — ленивым чанком, как «Идеи».
+    у которого своя строка; весь статический старт — `start+api`), сборка сверяет строки с
+    `index.html` (`build/start-budget.ts`); журналы Insights, Словарь, Вопросы, Changelog и
+    Releases — ленивыми чанками, как «Идеи».
 - **Бюджет:** начальный бандл ≤ 300 КБ gzip без учёта ленивых модулей. Ленивые чанки, по замерам аудита (gzip): редактор около 105–130 КБ, KaTeX около 77 КБ плюс шрифты, Mermaid около 200 КБ на flowchart, pdf.js — несколько МБ вместе с воркером. Размеры проверяются в CI (`size-limit`). Замеры M6 (dev, `npm run size`): `entry` 78,73 КБ (предел 103), `ReportsView` 8,61 (9), `CodeView` 8,08 (9), `IdeasView` 7,02 (7,2), `IdeaForm` 2,17 (2,5), `print` 1,61 (3); `SessionsView` 4,3 (4,8; предел добавлен задачей 13c), `entry` на 2026-11-14 — 78,79. e2e WebUI M6: новые спецификации `sessions.spec.ts` (3), `export.spec.ts` (1); новые сценарии в `reports.spec.ts` (+2, всего 14), `reports-print.spec.ts` (+2, 13), `code.spec.ts` (+1), `ideas.spec.ts` (+1, 18); `user-login.spec.ts` — повтор после `Retry-After` при 429 (задача 15b); всего сценариев — 114 (в 0.0.10-m5.7 — 104) — 114 passed (13b, release `zam-server` и `zam` из `d995536`).
 
 ### 15.5. «Подключение агента» — готовый текст для CLAUDE.md / AGENTS.md

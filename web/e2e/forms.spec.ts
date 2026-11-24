@@ -222,6 +222,22 @@ async function fieldsDense(scope: Locator, max = 24): Promise<void> {
       const gap = next.getBoundingClientRect().top - ctl.getBoundingClientRect().bottom;
       if (gap > 0) out.push({ gap: Math.round(gap), at: `${(prev.textContent ?? '').trim().slice(0, 20)} → ${(next.textContent ?? '').trim().slice(0, 20)}` });
     }
+    // и сверху вниз от шапки: шапка → пояснение → первое поле → … (у окна с одним полем — шапка или
+    // пояснение → поле); низ пояснения и рядов — по их содержимому (растянутая строка сетки выше
+    // своего текста), низ подписи — по её полю (ревью r2, N3)
+    const contentBottom = (e: Element): number => {
+      if (e.matches('label:not(.inline)')) return (e.querySelector('input, textarea, select') ?? e).getBoundingClientRect().bottom;
+      if (e.matches('header, fieldset')) return e.getBoundingClientRect().bottom;
+      const r = document.createRange();
+      r.selectNodeContents(e);
+      return r.getBoundingClientRect().bottom;
+    };
+    const head = b.closest('[data-form-dialog]')?.querySelector('header.fd-head');
+    const seq = [head, ...[...b.children].filter((e) => e.getClientRects().length > 0)].filter((e): e is Element => !!e);
+    for (let i = 1; i < seq.length; i++) {
+      const gap = seq[i].getBoundingClientRect().top - contentBottom(seq[i - 1]);
+      if (gap > 0) out.push({ gap: Math.round(gap), at: `${seq[i - 1].tagName.toLowerCase()} «${(seq[i - 1].textContent ?? '').trim().slice(0, 20)}» → ${seq[i].tagName.toLowerCase()}` });
+    }
     return out;
   });
   for (const g of gaps) expect(g.gap, `зазор между полями окна: ${g.at}`).toBeLessThanOrEqual(max);

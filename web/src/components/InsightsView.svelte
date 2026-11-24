@@ -787,7 +787,8 @@
   <!-- «Новый insight» — окно (§6.14 п. 7), ленивый чанк (загружен заранее, `onMount`); пока чанк
        идёт и если не пришёл — окно с тем же заголовком: «Загрузка…» или ошибка и «Обновить страницу» -->
   {#await import('./InsightNew.svelte')}
-    <FormDialog open confirm title="Новый insight" submit="Записать" busy onsubmit={() => {}} onclose={() => (newOpen = false)}>
+    <!-- заглушка — того же вида, что окно (на телефоне сразу во весь экран, без скачка) -->
+    <FormDialog open title="Новый insight" submit="Записать" busy onsubmit={() => {}} onclose={() => (newOpen = false)}>
       <p class="muted" aria-busy="true">Загрузка…</p>
     </FormDialog>
   {:then { default: InsightNew }}

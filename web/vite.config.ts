@@ -4,6 +4,7 @@ import license, { type Dependency } from 'rollup-plugin-license';
 import { allowed, licenseOf } from './build/license-policy';
 import { embeddedDeps } from './build/embedded-notices.mjs';
 import { pdfjsAssets } from './build/pdfjs-plugin.mjs';
+import { startBudget } from './build/start-budget-plugin.mjs';
 import { PDFJS_DIR, PDFJS_VERSION, pdfjsFiles } from './src/viewer-pdf/assets';
 
 // Путь от каталога web/ (npm запускает vite из него).
@@ -27,6 +28,9 @@ export default defineConfig({
   base: './',
   plugins: [
     svelte(),
+    // строки стартовой загрузки size-limit (`start`, `api`, `start+api`) сверяются с тем, что
+    // index.html грузит при старте: новый общий чанк старта вне строк — ошибка сборки (N1)
+    startBudget(),
     // данные pdf.js (воркер, CMap, WebAssembly, ICC) для /viewer/pdf — без песочницы JS PDF
     pdfjsAssets({ dir: PDFJS_DIR, version: PDFJS_VERSION, files: pdfjsFiles }),
     // Тексты лицензий именно тех пакетов, код которых попал в бандл.

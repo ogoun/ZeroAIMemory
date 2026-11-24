@@ -97,6 +97,15 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+/* заголовок карточки, на который журнал переводит фокус (§6.14 п. 2; `tabindex="-1"`): кольцо в
+   цвете продукта — только при фокусе с клавиатуры и при открытии по адресу (`:focus-visible`),
+   после щелчка мышью и касания — без рамки; чёрной рамки браузера нет */
+:is(h1, h2, h3)[tabindex='-1']:focus { outline: none; }
+:is(h1, h2, h3)[tabindex='-1']:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
 a { color: var(--accent); }
 button:disabled { opacity: 0.5; cursor: default; }
 .panel { padding: 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px; }
