@@ -109,24 +109,25 @@
   onsubmit={() => send(false)}
   {onclose}
 >
+  <!-- порядок §6.14 п. 7: «Вид», «Заголовок», «Текст», «Область», «Надёжность» -->
+  <label>
+    Вид
+    <select bind:value={kind}>
+      {#each INSIGHT_KINDS as k (k)}<option value={k}>{k}</option>{/each}
+    </select>
+  </label>
+  <label>Заголовок <input bind:value={title} required maxlength="500" data-autofocus /></label>
+  <label>Текст <textarea bind:value={body} rows="6"></textarea></label>
   <div class="row pair">
-    <label>
-      Вид
-      <select bind:value={kind}>
-        {#each INSIGHT_KINDS as k (k)}<option value={k}>{k}</option>{/each}
-      </select>
-    </label>
+    <label>Область <span class="muted small">(необязательно)</span> <input bind:value={area} maxlength="200" placeholder="например, web" /></label>
     <label>
       Надёжность
-      <select bind:value={certainty} aria-label="Надёжность" title={certainty ? CERTAINTY_TEXT[certainty] : undefined}>
+      <select bind:value={certainty} title={certainty ? CERTAINTY_TEXT[certainty] : undefined}>
         <option value="">не указана</option>
         {#each CERTAINTIES as c (c)}<option value={c}>{c}</option>{/each}
       </select>
     </label>
   </div>
-  <label>Заголовок <input bind:value={title} required maxlength="500" data-autofocus /></label>
-  <label>Текст <textarea bind:value={body} rows="6"></textarea></label>
-  <label>Область <span class="muted small">(необязательно)</span> <input bind:value={area} maxlength="200" placeholder="например, web" /></label>
   {#if dups}
     <section class="dups warn" aria-labelledby="insight-dups-title" data-testid="insight-duplicates">
       <h3 id="insight-dups-title">Похоже на уже записанное</h3>

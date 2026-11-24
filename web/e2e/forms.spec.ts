@@ -78,6 +78,7 @@ async function seedForms(): Promise<void> {
   const done = await entryOf(guid, { kind: 'task', title: 'Задача форм: выполненная', body: '' });
   await patch(done, { status: 'done' });
   const insight = await decision(guid, 'Решение форм E2E: окна');
+  const sup = await decision(guid, 'Решение форм E2E: замена');
   const ideaNew = await entryOf(guid, { kind: 'idea', title: 'Идея форм: новая', body: 'Замысел для окон решений.', data: { origin: 'human' } });
   const declined = await entryOf(guid, { kind: 'idea', title: 'Идея форм: отклонённая', body: 'Замысел.', data: { origin: 'human' } });
   await api('POST', `entries/${declined.id}/review`, { outcome: 'decline', summary: reviewSummary('то, что уже отклоняли') });
@@ -91,6 +92,7 @@ async function seedForms(): Promise<void> {
     E2E_FORMS_TASK_OPEN: open.id,
     E2E_FORMS_TASK_DONE: done.id,
     E2E_FORMS_INSIGHT: insight.id,
+    E2E_FORMS_INSIGHT_SUP: sup.id,
     E2E_FORMS_IDEA_NEW: ideaNew.id,
     E2E_FORMS_IDEA_DECLINED: declined.id,
     E2E_FORMS_TERM: term.id,
@@ -192,6 +194,39 @@ async function headingInView(page: Page, scope?: Locator): Promise<void> {
   expect(box!.y, 'заголовок выше нижнего края окна').toBeLessThan(vh - 20);
 }
 
+/** Браузер без Navigation API (Safari < 26.2, Firefox < 147): роутер считает записи по
+ * `history.state.zamIdx` — запасной путь (образец — `tasks.spec.ts`, `hideNavApi`). */
+const hideNavApi = (page: Page) =>
+  page.addInitScript(() => Object.defineProperty(window, 'navigation', { value: undefined, configurable: true }));
+/** Место в истории: индекс Navigation API, без него — номер записи роутера. */
+const placeOf = (page: Page) =>
+  page.evaluate(() => {
+    const nav = (globalThis as unknown as { navigation?: { currentEntry?: { index: number } } }).navigation;
+    return nav?.currentEntry?.index ?? (history.state as { zamIdx?: number } | null)?.zamIdx ?? null;
+  });
+
+/**
+ * Поля окна идут плотно сверху вниз (§6.14 п. 1; ревью r1 задачи 10a, I1): от низа поля (или набора
+ * полей) до верха следующей подписи — не больше обычного отступа (`gap` тела 10 px плюс поле на
+ * пометку). Растянутые на высоту тела строки сетки дали бы здесь сотни пикселей.
+ */
+async function fieldsDense(scope: Locator, max = 24): Promise<void> {
+  const gaps = await scope.locator('.fd-body').evaluate((b) => {
+    const els = [...b.querySelectorAll<HTMLElement>('label:not(.inline), fieldset')].filter((e) => e.getClientRects().length > 0);
+    const out: { gap: number; at: string }[] = [];
+    for (let i = 1; i < els.length; i++) {
+      const prev = els[i - 1];
+      const next = els[i];
+      if (prev.contains(next)) continue;
+      const ctl = prev.matches('fieldset') ? prev : (prev.querySelector('input, textarea, select') ?? prev);
+      const gap = next.getBoundingClientRect().top - ctl.getBoundingClientRect().bottom;
+      if (gap > 0) out.push({ gap: Math.round(gap), at: `${(prev.textContent ?? '').trim().slice(0, 20)} → ${(next.textContent ?? '').trim().slice(0, 20)}` });
+    }
+    return out;
+  });
+  for (const g of gaps) expect(g.gap, `зазор между полями окна: ${g.at}`).toBeLessThanOrEqual(max);
+}
+
 interface Width {
   name: ViewportName;
   touch: boolean;
@@ -202,6 +237,13 @@ const W3: Width[] = [
   { name: 'desktop', touch: false },
 ];
 const W4: Width[] = [...W3.slice(0, 2), { name: 'tabletLand', touch: true }, W3[2]];
+/** Строки, у которых «Назад» на телефоне проверяется и без Navigation API (ревью r1, M1 (б)). */
+const NO_NAV_ROWS = new Set(['task-create', 'task-reopen', 'insight-new', 'idea-create', 'idea-defer']);
+
+/** Второго системного вопроса нет: роутер спрашивает синхронно в `hashchange`, а откат и его
+ * `hashchange` приходят до двух кадров отрисовки — после них вопросу уже неоткуда взяться. */
+const settled = (page: Page) =>
+  page.evaluate(() => new Promise<void>((r) => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(r, 0)))));
 
 // ---- режим съёмки (шаг 1 и шаг 5 задачи 10a) ----
 
@@ -263,6 +305,64 @@ if (!SNAP) {
       const phone = w.name === 'phone';
 
       for (const row of FORM_CASES) {
+        if (row.inline) {
+          const inl = row.inline;
+          // форма на месте (правило А/В): видна при открытии, фокус — на первом поле (у поля на виду
+          // фокус не переводится), ошибка сервера — у формы, набранное цело, уход по адресу — один вопрос
+          test(`forms_inline_open_in_view ${row.id} ${w.name}`, async ({ page }) => {
+            const problems = watch(page);
+            await goto(page, row.page(await ctxOf(page)));
+            await row.open(page);
+            const sc = inl.scope(page);
+            const field = sc.getByLabel(row.first!).first();
+            await expect(field).toBeVisible();
+            if (inl.focus) await expect(field).toBeFocused();
+            const b = (await field.boundingBox())!;
+            expect(b.y, 'поле ниже шапки').toBeGreaterThanOrEqual(await headerBottom(page));
+            expect(b.y + b.height, 'поле выше нижнего края').toBeLessThanOrEqual(page.viewportSize()!.height);
+            expect(problems, problems.join('\n')).toEqual([]);
+          });
+          if (!three) continue;
+          test(`forms_server_error_keeps_input ${row.id} ${w.name}`, async ({ page }) => {
+            const problems = watch(page, (_p, st) => st === 422);
+            const r = row.route!;
+            await page.route(r.url, (route) =>
+              route.request().method() === r.method
+                ? route.fulfill({
+                    status: 422,
+                    contentType: 'application/problem+json',
+                    body: JSON.stringify({ type: '/problems/validation', title: 'Unprocessable Entity', status: 422, detail: 'Отказ сервера E2E' }),
+                  })
+                : route.fallback(),
+            );
+            await goto(page, row.page(await ctxOf(page)));
+            await row.open(page);
+            await row.fill!(page);
+            const sc = inl.scope(page);
+            const typed = await values(sc);
+            await sc.getByRole('button', { name: inl.submit, exact: true }).click();
+            await expect(sc.getByRole('alert')).toContainText('Отказ сервера E2E');
+            expect(await values(sc)).toEqual(typed);
+            expect(problems, problems.join('\n')).toEqual([]);
+          });
+          test(`forms_inline_leave_asks ${row.id} ${w.name}`, async ({ page }) => {
+            const native = nativeDialogs(page);
+            const c = await ctxOf(page);
+            await goto(page, row.page(c));
+            await row.open(page);
+            await row.fill!(page);
+            const sc = inl.scope(page);
+            const typed = await values(sc);
+            const here = page.url();
+            await page.evaluate((h) => (location.hash = h), `#/u/${c.user}/s/${env('E2E_FORMS_SOLUTION')}/j/glossary`);
+            await expect.poll(() => native.length).toBe(1);
+            expect(native[0]).toBe(LEAVE_EDIT);
+            await expect(page).toHaveURL(here);
+            expect(await values(sc)).toEqual(typed);
+          });
+          continue;
+        }
+
         test(`forms_open_focus_trap_esc ${row.id} ${w.name}`, async ({ page }) => {
           const problems = watch(page);
           const native = nativeDialogs(page);
@@ -361,6 +461,21 @@ if (!SNAP) {
           });
         }
 
+        if (phone && row.confirm) {
+          test(`forms_phone_header_actions ${row.id} ${w.name}`, async ({ page }) => {
+            // окно-подтверждение без полей на телефоне — прежний `.dialog` во всю ширину, не во весь
+            // экран; кнопки — внизу окна, «✕» нет
+            const d = await openRow(page, row);
+            const vp = page.viewportSize()!;
+            const box = (await d.boundingBox())!;
+            expect(box.width).toBeGreaterThanOrEqual(vp.width - 1);
+            expect(box.y, 'не от верха экрана').toBeGreaterThan(40);
+            expect(box.height, 'не во всю высоту').toBeLessThan(vp.height * 0.7);
+            await expect(d.getByRole('button', { name: 'Отмена', exact: true })).toBeVisible();
+            await expect(d.getByRole('button', { name: 'Закрыть', exact: true })).toHaveCount(0);
+          });
+        }
+
         if (phone && !row.confirm) {
           test(`forms_phone_header_actions ${row.id} ${w.name}`, async ({ page }) => {
             const d = await openRow(page, row);
@@ -381,13 +496,20 @@ if (!SNAP) {
             // тело прокручивается само (шапка закреплена)
             const ov = await d.locator('.fd-body').evaluate((e) => getComputedStyle(e).overflowY);
             expect(ov).toBe('auto');
+            // поля — плотно сверху вниз, свободное место — внизу (ревью r1, I1)
+            await fieldsDense(d);
+            // «✕» — в шапке слева, у заголовка (лист iOS/Material)
+            const x = (await head.getByRole('button', { name: 'Закрыть', exact: true }).boundingBox())!;
+            expect(x.x).toBeLessThan(vp.width / 3);
           });
 
-          test(`forms_phone_back_closes ${row.id} ${w.name}`, async ({ page }) => {
+          for (const noNav of NO_NAV_ROWS.has(row.id) ? [false, true] : [false]) {
+          test(`forms_phone_back_closes ${row.id} ${w.name}${noNav ? ' no_nav_api' : ''}`, async ({ page }) => {
+            if (noNav) await hideNavApi(page);
             const native = nativeDialogs(page);
             let d = await openRow(page, row);
             const url = page.url();
-            const at = () => page.evaluate(() => (globalThis as unknown as { navigation: { currentEntry: { index: number } } }).navigation.currentEntry.index);
+            const at = () => placeOf(page);
             // «Назад» закрывает окно, адрес прежний, страница под окном на месте
             await page.goBack({ waitUntil: 'commit' });
             await expect(d).toBeHidden();
@@ -424,6 +546,7 @@ if (!SNAP) {
             expect(await page.evaluate(() => (history.state as { zamLayer?: unknown } | null)?.zamLayer ?? null)).toBeNull();
             expect(native).toEqual([]);
           });
+          }
         }
 
         if (row.confirm && row.danger) {
@@ -446,21 +569,32 @@ if (!SNAP) {
         if (row.after === 'card' && row.fill) {
           test(`forms_create_opens_created_card ${row.id} ${w.name}`, async ({ page }) => {
             const problems = watch(page);
-            const d = await openRow(page, row);
-            const before = page.url();
-            await row.fill!(page);
-            await submitOf(d).click();
-            await expect(d).toBeHidden();
-            await expect(page).not.toHaveURL(before);
-            await expect(page).toHaveURL(/\/j\/(tasks|insights|ideas)\/[0-9A-Z]{26}$/);
-            await headingInView(page);
-            if (row.id === 'insight-supersede') process.env.E2E_FORMS_INSIGHT = /\/j\/insights\/([0-9A-Z]{26})$/.exec(page.url())![1];
-            expect(problems, problems.join('\n')).toEqual([]);
+            // замена меняет запись строки — на время теста своя свежая запись; общая запись строки
+            // остаётся живой для прочих тестов (и при падении этого)
+            const keep = process.env.E2E_FORMS_INSIGHT_SUP;
+            if (row.id === 'insight-supersede') {
+              process.env.E2E_FORMS_INSIGHT_SUP = (await decision(env('E2E_FORMS_SOLUTION'), `Решение форм E2E: замена ${Date.now().toString(36)}`)).id;
+            }
+            try {
+              const d = await openRow(page, row);
+              const before = page.url();
+              await row.fill!(page);
+              await submitOf(d).click();
+              await expect(d).toBeHidden();
+              await expect(page).not.toHaveURL(before);
+              await expect(page).toHaveURL(/\/j\/(tasks|insights|ideas)\/[0-9A-Z]{26}$/);
+              await headingInView(page);
+              expect(problems, problems.join('\n')).toEqual([]);
+            } finally {
+              process.env.E2E_FORMS_INSIGHT_SUP = keep;
+            }
           });
         }
 
         if (phone && (row.id === 'task-create' || row.id === 'idea-create')) {
-          test(`forms_phone_create_then_back ${row.id} ${w.name}`, async ({ page }) => {
+          for (const noNav of [false, true]) {
+          test(`forms_phone_create_then_back ${row.id} ${w.name}${noNav ? ' no_nav_api' : ''}`, async ({ page }) => {
+            if (noNav) await hideNavApi(page);
             await goto(page, row.page(await ctxOf(page)));
             const board = page.url();
             // длина истории до окна: окно кладёт запись слоя, «Добавить» заменяет её записью
@@ -479,6 +613,7 @@ if (!SNAP) {
             await expect(page).toHaveURL(board);
             await expect(page.getByRole('button', { name: row.id === 'task-create' ? 'Новая задача' : 'Новая идея', exact: true })).toBeVisible();
           });
+          }
         }
       }
     });
@@ -681,7 +816,7 @@ if (!SNAP) {
       await expect(page).toHaveURL(new RegExp(`/j/tasks/${t.id}$`));
       await expect(re).toBeVisible();
       await expect(re.getByLabel('Причина переоткрытия')).toHaveValue('набранная причина');
-      await page.waitForTimeout(300);
+      await settled(page);
       expect(native.length).toBe(1);
     });
 
@@ -768,6 +903,25 @@ if (!SNAP) {
   test.describe('по местам · phone', () => {
     test.use({ viewport: VIEWPORTS.phone, ...touch });
 
+    test('forms_phone_prompt_dense', async ({ page }) => {
+      // окно `Prompt` с полем (дерево: «Новая заметка») на телефоне — во весь экран, поле сразу под
+      // шапкой, свободное место — внизу (ревью r1, I1: в 0.0.15 оно было компактным окном)
+      const c = await ctxOf(page);
+      await goto(page, `#/u/${c.user}`);
+      const toggle = page.getByRole('button', { name: 'Показать дерево' });
+      if (await toggle.isVisible()) await toggle.click();
+      await page.locator('nav[aria-label="Дерево заметок"]').getByRole('button', { name: 'Действия: Knowledge' }).first().click();
+      await page.getByRole('menuitem', { name: 'Новая заметка' }).click();
+      const d = dialogOf(page, 'Новая заметка');
+      await expect(d.getByLabel('Имя')).toBeFocused();
+      await fieldsDense(d);
+      // поле — под шапкой и пояснением, в верхней части экрана, а не посреди пустого окна
+      const field = (await d.getByLabel('Имя').boundingBox())!;
+      expect(field.y + field.height, 'поле — в верхней части окна').toBeLessThan(page.viewportSize()!.height / 3);
+      await page.keyboard.press('Escape');
+      await expect(d).toBeHidden();
+    });
+
     test('leave_guard_stack_board_forms phone', async ({ page }) => {
       const g = env('E2E_FORMS_SOLUTION');
       const t = await entryOf(g, { kind: 'task', title: `Задача ухода телефона ${Date.now().toString(36)}`, body: '' });
@@ -783,7 +937,7 @@ if (!SNAP) {
       await expect.poll(() => native.length).toBe(1);
       await expect(re).toBeVisible();
       await expect(re.getByLabel('Причина переоткрытия')).toHaveValue('набранная причина');
-      await page.waitForTimeout(300);
+      await settled(page);
       expect(native.length).toBe(1);
     });
   });

@@ -16,7 +16,6 @@
   import Search from '../components/Search.svelte';
   import Tree, { type Reveal, type TreeChange } from '../components/Tree.svelte';
   import ChangelogView from '../components/ChangelogView.svelte';
-  import InsightsView from '../components/InsightsView.svelte';
   import GlossaryView from '../components/GlossaryView.svelte';
   import TasksView from '../components/TasksView.svelte';
   import QuestionsView from '../components/QuestionsView.svelte';
@@ -485,7 +484,13 @@
             <LazyFail error={e} />
           {/await}
         {:else if r.journal === 'insights'}
-          <InsightsView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+          {#await import('../components/InsightsView.svelte')}
+            <p class="muted">Загрузка…</p>
+          {:then { default: InsightsView }}
+            <InsightsView user={r.user} space={r.space} entry={r.entry} {onexpired} />
+          {:catch e}
+            <LazyFail error={e} />
+          {/await}
         {:else if r.journal === 'glossary'}
           <GlossaryView user={r.user} space={r.space} entry={r.entry} {onexpired} />
         {:else if r.journal === 'tasks'}

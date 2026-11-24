@@ -20,12 +20,11 @@
   // свежей записи (`rebase`, `formDraft.ts`), расхождения помечены, окно открыто. «Новый insight» —
   // окно `InsightNew` (ленивый чанк): кандидаты-дубли сервера — ссылками, «Записать всё равно»;
   // после записи — карточка созданной. «Полезно» / «Бесполезно» и «Пересмотреть» — сразу (Д).
-  import { tick, untrack } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import CertaintyBadge from './CertaintyBadge.svelte';
   import FileRefs from './FileRefs.svelte';
   import FormDialog from './FormDialog.svelte';
   import JournalSplit from './JournalSplit.svelte';
-  import Lazy from './Lazy.svelte';
   import Links from './Links.svelte';
   import Notice from './Notice.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
@@ -385,6 +384,8 @@
   async function open(u: string, id: string | null) {
     const my = ++eseq;
     mode = 'none';
+    // другая запись (переход по адресу уже спросил о набранном): окно «Новый insight» закрывается
+    if (id !== (cur?.id ?? null)) newOpen = false;
     actionError = '';
     curError = '';
     chain = [];
@@ -564,7 +565,7 @@
     base = next;
     cur = fresh;
     clash = r.clash.map(String);
-    dlgError = rebaseText(clash.map((k) => FIELD_LABEL[k] ?? k));
+    dlgError = rebaseText(clash.map((k) => FIELD_LABEL[k] ?? k), fresh.rev);
   }
 
   /** Поле — расхождение 409: помечено. */
@@ -706,6 +707,12 @@
   /** Итог действия в карточке (`Notice`): фокус после закрытия окна. */
   const cardNotice = () => document.querySelector<HTMLElement>('article[aria-label="Карточка insight"] .card-notice [role="status"]');
 
+  // чанк окна «Новый insight» — заранее, когда журнал открыт: первое нажатие открывает окно сразу
+  onMount(() => {
+    const t = setTimeout(() => void import('./InsightNew.svelte').catch(() => {}), 1500);
+    return () => clearTimeout(t);
+  });
+
   /** «Новый insight» записан: окно закрыто, карточка созданной — на виду и в фокусе (§6.14 п. 6). */
   async function created(e: Entry) {
     newOpen = false;
@@ -777,13 +784,26 @@
 <Prompt bind:ask />
 
 {#if newOpen}
-  <!-- «Новый insight» — окно (§6.14 п. 7), ленивый чанк: грузится при первом нажатии -->
-  <Lazy
-    what="Окно"
-    load={() => import('./InsightNew.svelte')}
-    props={{ user, space, oncreated: created, onclose: () => (newOpen = false), onexpired }}
-    oncancel={() => (newOpen = false)}
-  />
+  <!-- «Новый insight» — окно (§6.14 п. 7), ленивый чанк (загружен заранее, `onMount`); пока чанк
+       идёт и если не пришёл — окно с тем же заголовком: «Загрузка…» или ошибка и «Обновить страницу» -->
+  {#await import('./InsightNew.svelte')}
+    <FormDialog open confirm title="Новый insight" submit="Записать" busy onsubmit={() => {}} onclose={() => (newOpen = false)}>
+      <p class="muted" aria-busy="true">Загрузка…</p>
+    </FormDialog>
+  {:then { default: InsightNew }}
+    <InsightNew {user} {space} oncreated={created} onclose={() => (newOpen = false)} {onexpired} />
+  {:catch e}
+    <FormDialog
+      open
+      confirm
+      title="Новый insight"
+      submit="Обновить страницу"
+      onsubmit={() => location.reload()}
+      onclose={() => (newOpen = false)}
+    >
+      <p class="error" role="alert">Окно не загрузилось: {errorText(e)} — обновите страницу</p>
+    </FormDialog>
+  {/await}
 {/if}
 
 {#snippet table()}
@@ -1010,11 +1030,11 @@
   onclose={closeForm}
 >
   {#if mode === 'supersede'}
-    <label>Заголовок <input bind:value={sTitle} required data-autofocus aria-invalid={clashed('title')} /></label>
-    <label>Текст <textarea bind:value={sBody} rows="6" aria-invalid={clashed('body')}></textarea></label>
+    <label class:clash={clashed('title')}>Заголовок {@render clashNote('title')}<input bind:value={sTitle} required data-autofocus /></label>
+    <label class:clash={clashed('body')}>Текст {@render clashNote('body')}<textarea bind:value={sBody} rows="6"></textarea></label>
     <div class="row fd-pair">
-      <label>Вид
-        <select bind:value={sKind} aria-invalid={clashed('kind')}>{#each INSIGHT_KINDS as k (k)}<option value={k}>{k}</option>{/each}</select>
+      <label class:clash={clashed('kind')}>Вид {@render clashNote('kind')}
+        <select bind:value={sKind}>{#each INSIGHT_KINDS as k (k)}<option value={k}>{k}</option>{/each}</select>
       </label>
       <label>Надёжность
         <select bind:value={sCertainty} aria-label="Надёжность новой записи">
@@ -1029,24 +1049,30 @@
   {:else if mode === 'retract'}
     <label>Причина <textarea bind:value={rReason} rows="3" data-autofocus></textarea></label>
   {:else if mode === 'certainty'}
+    <!-- главный выбор окна — статус: фокус при открытии — на выбранном -->
     <fieldset class="row opts" class:clash={clashed('to')}>
-      <legend class="sr">Новый статус</legend>
+      <legend class="sr">Новый статус{clashed('to') ? ' — изменено и здесь, и в другом месте' : ''}</legend>
       {#each CERTAINTIES as x (x)}
-        <label class="inline opt" title={CERTAINTY_TEXT[x]}><input type="radio" bind:group={cTo} value={x} /> {x}</label>
+        <label class="inline opt" title={CERTAINTY_TEXT[x]}
+          ><input type="radio" bind:group={cTo} value={x} data-autofocus={cTo === x ? '' : undefined} /> {x}</label
+        >
       {/each}
-      <label class="inline opt"><input type="radio" bind:group={cTo} value="" /> без статуса</label>
+      <label class="inline opt"><input type="radio" bind:group={cTo} value="" data-autofocus={cTo === '' ? '' : undefined} /> без статуса</label>
     </fieldset>
+    {#if clashed('to')}<p class="clash-note" aria-hidden="true">статус изменён и здесь, и в другом месте</p>{/if}
     {#if cTo === 'theorem'}
       <div class="ev">
         <p class="muted small">Доказательство (data.evidence) <span class="muted small">(необязательно)</span>: что проверено, как и с каким результатом.</p>
-        <label>Проверено <input bind:value={evChecked} aria-invalid={clashed('checked')} /></label>
-        <label>Метод <input bind:value={evMethod} aria-invalid={clashed('method')} /></label>
-        <label>Результат <input bind:value={evResult} aria-invalid={clashed('result')} /></label>
+        <label class:clash={clashed('checked')}>Проверено {@render clashNote('checked')}<input bind:value={evChecked} /></label>
+        <label class:clash={clashed('method')}>Метод {@render clashNote('method')}<input bind:value={evMethod} /></label>
+        <label class:clash={clashed('result')}>Результат {@render clashNote('result')}<input bind:value={evResult} /></label>
       </div>
     {/if}
-    <label>Причина <span class="muted small">(необязательно)</span> <textarea bind:value={cReason} rows="2" data-autofocus></textarea></label>
+    <label>Причина <span class="muted small">(необязательно)</span> <textarea bind:value={cReason} rows="2"></textarea></label>
   {:else if mode === 'triggers'}
     {#if tDraft.length === 0}<p class="muted">Триггеров нет.</p>{/if}
+    {#if clashed('triggers')}<p class="clash-note">триггеры изменены и здесь, и в другом месте</p>{/if}
+    {#if tDraft.length}
     <ul class="triggers" class:clash={clashed('triggers')}>
       {#each tDraft as t, i (i)}
         <li>
@@ -1057,6 +1083,7 @@
         </li>
       {/each}
     </ul>
+    {/if}
     <div class="row add-trigger" role="group" aria-label="Новый триггер">
       <select bind:value={tType} aria-label="Тип триггера">
         {#each TRIGGER_TYPES as x (x)}<option value={x}>{TRIGGER_TEXT[x]}</option>{/each}
@@ -1080,9 +1107,14 @@
   {/if}
 </FormDialog>
 
+<!-- пометка поля-расхождения 409 в подписи (её читает и программа чтения с экрана) -->
+{#snippet clashNote(k: string)}
+  {#if clashed(k)}<span class="clash-note">изменено и здесь, и в другом месте</span>{/if}
+{/snippet}
+
 {#snippet adrFields()}
-  <fieldset class="adr-form">
-    <legend class="muted small">Решение (ADR)</legend>
+  <fieldset class="adr-form" class:clash={clashed('adr') || clashed('options')}>
+    <legend class="muted small">Решение (ADR){#if clashed('adr') || clashed('options')}<span class="clash-note">изменено и здесь, и в другом месте</span>{/if}</legend>
     <label>{ADR_TEXT.context} <textarea bind:value={adr.context} rows="2"></textarea></label>
     <label>{ADR_TEXT.options} <span class="muted small">(по одному в строке)</span> <textarea bind:value={adrOptions} rows="3"></textarea></label>
     <label>{ADR_TEXT.chosen} <input bind:value={adr.chosen} /></label>
@@ -1255,12 +1287,6 @@
   }
   .fd-pair > label {
     flex: 1 1 180px;
-  }
-  /* поле — расхождение 409 (изменено и здесь, и в другом месте) */
-  .clash {
-    outline: 1px solid var(--danger);
-    outline-offset: 2px;
-    border-radius: 4px;
   }
   .opt {
     display: inline-flex;

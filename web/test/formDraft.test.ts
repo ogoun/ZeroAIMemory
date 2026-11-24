@@ -5,7 +5,7 @@
 // `entryEdit.ts:117` для любых полей формы (Insights, «Идеи», «Задачи», «Словарь»).
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { isDirty, rebase } from '../src/lib/formDraft.ts';
+import { isDirty, rebase, rebaseText } from '../src/lib/formDraft.ts';
 import { isDirty as entryDirty, rebase as entryRebase } from '../src/lib/entryEdit.ts';
 
 test('rebase_untouched_from_fresh', () => {
@@ -54,4 +54,13 @@ test('form_draft_dirty', () => {
   // `entryEdit.ts` — тот же модуль (реэкспорт): прежняя форма правки записей живёт на нём
   assert.equal(entryDirty, isDirty);
   assert.equal(entryRebase, rebase);
+});
+
+test('rebase_text_one_for_all_forms', () => {
+  // один текст 409 у всех форм с ревизией; расхождения названы, ревизия — если известна
+  assert.equal(rebaseText([]), 'Запись изменилась, пока вы правили: проверьте и сохраните снова.');
+  assert.equal(
+    rebaseText(['заголовок', 'теги'], 7),
+    'Запись изменилась, пока вы правили (сейчас ревизия 7): проверьте и сохраните снова. Изменено и здесь, и в другом месте: заголовок, теги — сверьте перед сохранением.',
+  );
 });

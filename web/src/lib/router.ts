@@ -341,13 +341,12 @@ interface Layer {
   state: 'pending' | 'on' | 'dropping' | 'gone';
 }
 
+/** Запись слоя окна. Закрытие с переходом (после «Добавить» — к карточке созданного) отдельного
+ * вызова не требует: любой `go`, пока слой на вершине, заменяет его запись адресом перехода. */
 export interface LayerHandle {
   /** Снять запись слоя (окно закрыто кнопкой): `history.back()` без перехода роутера. Слой уже снят,
    * заменён или ушли с него — ничего. */
   drop: () => void;
-  /** Закрытие с переходом: запись слоя заменяется адресом `r` (разбор маршрута — как у `go`). Слой
-   * уже не на вершине — обычный `go(r)`. */
-  replaceWith: (r: Route) => void;
 }
 
 const layers: Layer[] = [];
@@ -409,10 +408,6 @@ export function pushLayer(close: () => void): LayerHandle {
       if (me.state !== 'on') return;
       if (!onTop(me)) return forget(me);
       startDrop(me);
-    },
-    replaceWith(r) {
-      if (me.state === 'pending') me.state = 'gone';
-      go(r);
     },
   };
 }

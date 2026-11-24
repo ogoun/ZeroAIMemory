@@ -463,7 +463,7 @@
     }
     const clash = ideaForm?.rebase(fresh) ?? [];
     cur = fresh;
-    actionError = isStaleEntry(e) ? rebaseText(clash) : errorText(e);
+    actionError = isStaleEntry(e) ? rebaseText(clash, fresh.rev) : errorText(e);
     void load(user, space, true);
   }
 
@@ -515,6 +515,12 @@
   const unsaved = (): boolean => mode === 'edit' && !!ideaForm?.dirty();
 
   onMount(() => guardLeave(unsaved));
+
+  // чанк форм — заранее, когда журнал открыт: окно решения открывается сразу
+  onMount(() => {
+    const t = setTimeout(() => void import('./IdeaForm.svelte').catch(() => {}), 1500);
+    return () => clearTimeout(t);
+  });
 
   /** Итог действия в карточке: фокус после закрытия окна (нажатая кнопка ушла вместе со статусом). */
   const cardNotice = () => document.querySelector<HTMLElement>('article[aria-label="Карточка идеи"] .notice');
@@ -893,7 +899,14 @@
 
 {#snippet form(m: IdeaForm)}
   {#await import('./IdeaForm.svelte')}
-    {#if m === 'edit'}<p class="muted">Загрузка…</p>{/if}
+    {#if m === 'edit'}
+      <p class="muted">Загрузка…</p>
+    {:else}
+      <!-- окно той же формы — сразу, пока чанк идёт (обычно он уже загружен заранее, `onMount`) -->
+      <FormDialog open={dialogMode} confirm title={IDEA_FORMS[m].title} submit={IDEA_FORMS[m].submit} busy onsubmit={() => {}} onclose={closeForm}>
+        <p class="muted" aria-busy="true">Загрузка…</p>
+      </FormDialog>
+    {/if}
   {:then { default: Form }}
     {#key opened}
       <Form

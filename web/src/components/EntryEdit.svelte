@@ -21,7 +21,8 @@
   // `leave()` не спрашивает и своей проверки ухода форма не ставит — их задаёт окно.
   import { onMount, untrack } from 'svelte';
   import { ApiError, errorText, getEntry, isStaleEntry, patchEntry, type Entry } from '../lib/api';
-  import { ESTIMATE_MAX, FIELD_TEXT, fieldsOf, isDirty, patchOf, rebase } from '../lib/entryEdit';
+  import { ESTIMATE_MAX, FIELD_TEXT, fieldsOf, isDirty, patchOf, rebase, type EditFields } from '../lib/entryEdit';
+  import { rebaseText } from '../lib/formDraft';
   import { LEAVE_EDIT, guardLeave } from '../lib/leaveEdit';
   import { CHANGELOG_KINDS, EDIT_TITLE, PRIORITIES, PRIORITY_TEXT } from '../lib/journals';
 
@@ -52,6 +53,8 @@
   let f = $state(untrack(() => fieldsOf(entry)));
   let busy = $state(false);
   let error = $state('');
+  /** Поля, изменённые и здесь, и в другом месте (409): помечены в форме (§6.14 п. 5). */
+  let clash = $state<(keyof EditFields)[]>([]);
   const title = untrack(() => EDIT_TITLE[entry.kind] ?? 'Правка записи');
   const inDialog = untrack(() => bare);
 
@@ -127,10 +130,12 @@
     f = r.fields;
     base = next;
     cur = fresh;
-    const clash = r.clash.length
-      ? ` Изменено и здесь, и в другом месте: ${r.clash.map((k) => FIELD_TEXT[k]).join(', ')} — сверьте перед сохранением.`
-      : '';
-    error = `Запись изменили в другом месте (сейчас ревизия ${fresh.rev}): форма обновлена, ваши правки остались — проверьте и сохраните снова.${clash}`;
+    clash = r.clash;
+    // один текст 409 у всех форм с ревизией (`formDraft.rebaseText`)
+    error = rebaseText(
+      r.clash.map((k) => FIELD_TEXT[k]),
+      fresh.rev,
+    );
     onreread?.(fresh);
   }
 </script>
@@ -150,42 +155,51 @@
   </form>
 {/if}
 
+<!-- пометка поля-расхождения 409 в подписи (её читает и программа чтения с экрана) -->
+{#snippet note(k: keyof EditFields)}
+  {#if clash.includes(k)}<span class="clash-note">изменено и здесь, и в другом месте</span>{/if}
+{/snippet}
+
 {#snippet fields()}
-  <label>Заголовок <input bind:value={f.title} required maxlength="500" use:focusOnOpen data-autofocus /></label>
-  <label>Текст <textarea bind:value={f.body} rows="4"></textarea></label>
+  <label class:clash={clash.includes('title')}>Заголовок {@render note('title')}<input bind:value={f.title} required maxlength="500" use:focusOnOpen data-autofocus /></label>
+  <label class:clash={clash.includes('body')}>Текст {@render note('body')}<textarea bind:value={f.body} rows="4"></textarea></label>
   {#if cur.kind === 'changelog'}
-    <label>
-      Вид
+    <label class:clash={clash.includes('kind')}>
+      Вид {@render note('kind')}
       <select bind:value={f.kind}>
         {#each CHANGELOG_KINDS as k (k)}<option value={k}>{k}</option>{/each}
       </select>
     </label>
   {:else if cur.kind === 'task'}
     <div class="row">
-      <label>
-        Приоритет
+      <label class:clash={clash.includes('priority')}>
+        Приоритет {@render note('priority')}
         <select bind:value={f.priority}>
           <option value="">без приоритета</option>
           {#each PRIORITIES as p (p)}<option value={p}>{PRIORITY_TEXT[p]}</option>{/each}
         </select>
       </label>
-      <label>
-        Кто ведёт
+      <label class:clash={clash.includes('owner')}>
+        Кто ведёт {@render note('owner')}
         <select bind:value={f.owner}>
           <option value="">не задано</option>
           {#each Object.entries(OWNER_TEXT) as [k, t] (k)}<option value={k}>{t}</option>{/each}
         </select>
       </label>
-      <label>
-        Оценка, минут
+      <label class:clash={clash.includes('estimate')}>
+        Оценка, минут {@render note('estimate')}
         <input bind:value={f.estimate} inputmode="numeric" pattern="[0-9]*" maxlength="6" title="от 1 до {ESTIMATE_MAX}" />
       </label>
     </div>
-    <label>Ссылки <span class="muted small">(по одной в строке)</span> <textarea bind:value={f.links} rows="2"></textarea></label>
+    <label class:clash={clash.includes('links')}
+      >Ссылки <span class="muted small">(по одной в строке)</span> {@render note('links')}<textarea bind:value={f.links} rows="2"></textarea></label
+    >
   {/if}
   <div class="row">
-    <label class="grow">Теги <span class="muted small">(через запятую)</span> <input bind:value={f.tags} /></label>
-    <label class="grow">Область <input bind:value={f.area} maxlength="200" /></label>
+    <label class="grow" class:clash={clash.includes('tags')}
+      >Теги <span class="muted small">(через запятую)</span> {@render note('tags')}<input bind:value={f.tags} /></label
+    >
+    <label class="grow" class:clash={clash.includes('area')}>Область {@render note('area')}<input bind:value={f.area} maxlength="200" /></label>
   </div>
 {/snippet}
 

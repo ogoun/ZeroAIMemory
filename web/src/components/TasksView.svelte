@@ -165,6 +165,8 @@
   let statusDlg = $state<StatusDialog | null>(null);
   /** Поля окна статуса при открытии (для `rebase` при 409). */
   let statusBase = { reason: '', blocked: '' };
+  /** Поля окна статуса, изменённые и здесь, и в другом месте (409): помечены. */
+  let statusClash = $state<string[]>([]);
   /** Ошибка открытого окна (сервер, проверка, 409). */
   let dlgError = $state('');
   /** «Корзина»: вместо доски — удалённые задачи. */
@@ -590,6 +592,7 @@
       sReason = '';
       sBlocked = str(c.data, 'blocked_by');
       statusBase = { reason: '', blocked: sBlocked };
+      statusClash = [];
       statusDlg = { to: s, kind: reopen ? 'reopen' : s === 'blocked' ? 'blocked' : 'final' };
       return;
     }
@@ -670,8 +673,12 @@
     sReason = r.fields.reason;
     sBlocked = r.fields.blocked;
     statusBase = next;
+    statusClash = r.clash.map(String);
     reread(fresh);
-    dlgError = rebaseText(r.clash.map((k) => (k === 'blocked' ? 'что мешает' : 'причина')));
+    dlgError = rebaseText(
+      r.clash.map((k) => (k === 'blocked' ? 'что мешает' : 'причина')),
+      fresh.rev,
+    );
   }
 
   function saveStep(e: SubmitEvent) {
@@ -1064,9 +1071,13 @@
         {#if actionError}<p class="error" role="alert">{actionError}</p>{/if}
 
         {#if c.status !== 'done' && c.status !== 'dropped'}
-          <form class="row step" onsubmit={saveStep}>
-            <input bind:value={stepDraft} placeholder="следующий шаг" aria-label="Следующий шаг" maxlength="2000" />
-            <button type="submit" disabled={busy}>Сохранить шаг</button>
+          <!-- поле на виду (правило А): видимая подпись над полем, «Сохранить шаг» — рядом -->
+          <form class="step" onsubmit={saveStep}>
+            <label for="{uid}-step">Следующий шаг</label>
+            <div class="row">
+              <input id="{uid}-step" bind:value={stepDraft} placeholder="что сделать дальше" maxlength="2000" />
+              <button type="submit" disabled={busy}>Сохранить шаг</button>
+            </div>
           </form>
         {:else if str(c.data, 'next_step')}
           <p class="muted">Дальше было: {str(c.data, 'next_step')}</p>
@@ -1146,9 +1157,16 @@
   onclose={() => ((statusDlg = null), (dlgError = ''))}
 >
   {#if statusDlg?.kind === 'reopen'}
-    <label>Причина переоткрытия <textarea bind:value={sReason} rows="3" required maxlength="2000" data-autofocus></textarea></label>
+    <label class:clash={statusClash.includes('reason')}
+      >Причина переоткрытия {#if statusClash.includes('reason')}<span class="clash-note">изменено и здесь, и в другом месте</span>{/if}
+      <textarea bind:value={sReason} rows="3" required maxlength="2000" data-autofocus></textarea></label
+    >
   {:else if statusDlg?.kind === 'blocked'}
-    <label>Что мешает <span class="muted small">(необязательно)</span> <input bind:value={sBlocked} maxlength="2000" data-autofocus /></label>
+    <label class:clash={statusClash.includes('blocked')}
+      >Что мешает <span class="muted small">(необязательно)</span>
+      {#if statusClash.includes('blocked')}<span class="clash-note">изменено и здесь, и в другом месте</span>{/if}
+      <input bind:value={sBlocked} maxlength="2000" data-autofocus /></label
+    >
   {/if}
 </FormDialog>
 
@@ -1356,7 +1374,12 @@
     font-size: 12px;
   }
   /* в панели и на телефоне кнопка переносится под поле, а не сжимает его */
-  input[aria-label='Следующий шаг'] {
+  .step label {
+    display: block;
+    margin-bottom: 4px;
+    font-size: 14px;
+  }
+  .step input {
     flex: 1 1 200px;
     min-width: 0;
   }

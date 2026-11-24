@@ -670,7 +670,8 @@ test('entry_edit_stale_rev_rereads', async ({ page }) => {
   expect((await stale).status()).toBe(409);
   // запись перечитана: ошибка видна, карточка — новой ревизии, нетронутые поля формы — агента,
   // набранный заголовок — человека
-  await expect(form.getByRole('alert')).toContainText(`Запись изменили в другом месте (сейчас ревизия ${other.rev})`);
+  // текст 409 — один у всех форм с ревизией (M7.3, §6.14 п. 5)
+  await expect(form.getByRole('alert')).toContainText(`Запись изменилась, пока вы правили (сейчас ревизия ${other.rev})`);
   await expect(card).toContainText(`ревизия ${other.rev}`);
   await expect(card).toContainText('Текст агента.');
   await expect(form.getByLabel('Текст')).toHaveValue('Текст агента.');

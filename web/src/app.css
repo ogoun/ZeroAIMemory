@@ -121,6 +121,11 @@ button:disabled { opacity: 0.5; cursor: default; }
 }
 .dialog.fd-wide { --dialog-w: 720px; }
 .warn { background: var(--warn-bg); color: var(--warn-text); padding: 8px 10px; border-radius: 6px; }
+/* поле — расхождение 409 (§6.14 п. 5): изменено и здесь, и в другом месте — рамка и пометка в
+   подписи (её читает и программа чтения с экрана) */
+.clash > :is(input, select, textarea), .clash:is(fieldset, ul) { border-color: var(--danger); }
+.clash:is(fieldset, ul) { outline: 1px solid var(--danger); outline-offset: 2px; border-radius: 4px; }
+.clash-note { margin-left: 6px; color: var(--danger); font-size: 12px; }
 /* карточка записи журнала: прокрутка к ней не прячет её начало под шапкой (§6.14 пп. 2–3) */
 article.card { scroll-margin-top: calc(var(--header-h) + 8px); }
 table { width: 100%; border-collapse: collapse; }

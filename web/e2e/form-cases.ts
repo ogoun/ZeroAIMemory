@@ -43,6 +43,10 @@ export interface FormCase {
   legacy?: string;
   /** Формы нет в 0.0.15 (снимок «до» — только экран, откуда она откроется). */
   added?: boolean;
+  /** Форма не в окне, а в карточке на месте (правка «Изменить», поле шага — правила А и В):
+   * где искать поля и ошибку (`scope`), чем отправить (`submit`); `focus` — фокус на `first` при
+   * открытии (поле на виду открытия нет — фокус не переводится). */
+  inline?: { scope: (p: Page) => Locator; submit: string; focus: boolean };
 }
 
 /** Окно формы по имени. */
@@ -173,7 +177,9 @@ export const FORM_CASES: FormCase[] = [
     id: 'insight-supersede',
     name: 'Заменить insight',
     dialog: 'Заменить запись',
-    page: (c) => journal(c, 'insights', c.env('E2E_FORMS_INSIGHT')),
+    // своя запись: удавшаяся замена (`forms_create_opens_created_card`) переводит строку на новую
+    // запись, не задевая прочие строки Insights
+    page: (c) => journal(c, 'insights', c.env('E2E_FORMS_INSIGHT_SUP')),
     open: (p) => pressIn(p, INSIGHT, 'Заменить'),
     first: 'Заголовок',
     fill: (p) => type(p, 'Заменить запись', 'Заголовок', `Решение форм E2E, уточнено ${stamp()}`),
@@ -209,7 +215,8 @@ export const FORM_CASES: FormCase[] = [
     name: 'Статус надёжности',
     page: (c) => journal(c, 'insights', c.env('E2E_FORMS_INSIGHT')),
     open: (p) => pressIn(p, INSIGHT, 'Сменить статус надёжности'),
-    first: 'Причина',
+    // фокус — на главном выборе окна: выбранный статус (запись агента — `hypothesis` по умолчанию)
+    first: 'hypothesis',
     fill: (p) => type(p, 'Статус надёжности', 'Причина', 'проверено на стенде'),
     route: PATCH_ENTRY,
     after: 'notice',
@@ -300,6 +307,42 @@ export const FORM_CASES: FormCase[] = [
     route: DECIDE,
     after: 'notice',
     legacy: 'Вернуть идею',
+  },
+  // ---- правка в карточке на месте и поле на виду (правила В и А, задача 10a) ----
+  {
+    id: 'task-edit',
+    name: 'Изменить задачу (в карточке)',
+    page: (c) => journal(c, 'tasks', c.env('E2E_FORMS_TASK_OPEN')),
+    open: (p) => pressIn(p, TASK, 'Изменить'),
+    first: 'Заголовок',
+    fill: (p) => p.getByRole('form', { name: 'Правка задачи' }).getByLabel('Заголовок').fill(`Задача форм: правка ${stamp()}`),
+    route: PATCH_ENTRY,
+    after: 'notice',
+    inline: { scope: (p) => p.getByRole('form', { name: 'Правка задачи' }), submit: 'Сохранить', focus: true },
+  },
+  {
+    id: 'task-step',
+    name: 'Следующий шаг (поле на виду)',
+    page: (c) => journal(c, 'tasks', c.env('E2E_FORMS_TASK_OPEN')),
+    open: async (p) => {
+      await expect(card(p, TASK).getByLabel('Следующий шаг')).toBeVisible();
+    },
+    first: 'Следующий шаг',
+    fill: (p) => card(p, TASK).getByLabel('Следующий шаг').fill(`шаг из e2e ${stamp()}`),
+    route: PATCH_ENTRY,
+    after: 'notice',
+    inline: { scope: (p) => card(p, TASK), submit: 'Сохранить шаг', focus: false },
+  },
+  {
+    id: 'idea-edit',
+    name: 'Изменить идею (в карточке)',
+    page: (c) => journal(c, 'ideas', c.env('E2E_FORMS_IDEA_NEW')),
+    open: (p) => pressIn(p, IDEA, 'Изменить'),
+    first: 'Заголовок',
+    fill: (p) => p.getByRole('form', { name: 'Правка идеи' }).getByLabel('Заголовок').fill(`Идея форм: правка ${stamp()}`),
+    route: PATCH_ENTRY,
+    after: 'notice',
+    inline: { scope: (p) => p.getByRole('form', { name: 'Правка идеи' }), submit: 'Сохранить', focus: true },
   },
   {
     id: 'idea-delete',

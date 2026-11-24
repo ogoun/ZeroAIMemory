@@ -1,7 +1,7 @@
 <script lang="ts" module>
   /** Последняя нажатая кнопка или ссылка (не в окне формы): при касании и в Safari нажатая кнопка
    * фокус не получает, а вернуть его при закрытии окна нужно на неё (как `activated` у
-   * `JournalSplit`). Нажатие старше секунды — не то, что открыло окно. */
+   * `JournalSplit`). Нажатие старше трёх секунд (чанк окна мог грузиться) — не то, что открыло окно. */
   let pressed: { el: HTMLElement; at: number } | null = null;
   if (typeof document !== 'undefined') {
     document.addEventListener(
@@ -15,7 +15,7 @@
   }
   function lastPressed(): HTMLElement | null {
     const p = pressed;
-    return p && Date.now() - p.at < 1000 && p.el.isConnected ? p.el : null;
+    return p && Date.now() - p.at < 3000 && p.el.isConnected ? p.el : null;
   }
 </script>
 
@@ -127,6 +127,9 @@
   let layer: LayerHandle | null = null;
   /** Окно во весь экран (телефон, форма с полями): при открытии — по ширине окна. */
   let full = false;
+  /** Адрес при открытии: отправка, сменившая адрес (карточка созданной записи), фокус на кнопку,
+   * открывшую окно, не возвращает — его переводит журнал на заголовок карточки. */
+  let hashAtOpen = '';
 
   const unsaved = () => !released && !!dirty?.();
 
@@ -158,6 +161,7 @@
     pending = false;
     thrown = '';
     released = false;
+    hashAtOpen = location.hash;
     if (opener && content?.contains(opener)) opener = null;
     // переход во время отправки — её итог (владелец открывает созданное), не уход с набранным
     offGuard = pushGuard({ dirty: () => open && !pending && unsaved(), release: () => (released = true) });
@@ -186,6 +190,8 @@
     if (a && a !== document.body && a.isConnected) return;
     const r = bySubmit ? refocus?.() : null;
     if (r && focusNow(r)) return;
+    // отправка открыла другую запись: фокус переведёт её карточка, а не кнопка под окном
+    if (bySubmit && location.hash !== hashAtOpen) return;
     if (back?.isConnected) focusNow(back);
   }
 
@@ -307,16 +313,20 @@
       <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
       <form class="fd-frame" bind:this={formEl} onsubmit={send} {onkeydown} {onclick} aria-busy={locked}>
         <header class="fd-head">
+          <!-- «✕»: на телефоне — слева («✕ · Заголовок · Добавить», как листы iOS и Material), у окна
+               по центру — справа; видна одна (вторая — `display: none`, вне порядка Tab) -->
           {#if !confirm}
-            <button type="button" class="fd-x" aria-label="Закрыть" onclick={requestClose}>✕</button>
+            <button type="button" class="fd-x fd-x-start" aria-label="Закрыть" onclick={requestClose}>✕</button>
           {/if}
           <div class="fd-titles">
             <Dialog.Title level={2} class="fd-title">{title}</Dialog.Title>
             {#if subject}<p class="fd-subject muted">{subject}</p>{/if}
           </div>
           {#if !confirm}
-            <!-- основное действие на телефоне — в шапке (нижнего ряда кнопок там нет) -->
-            <button type="submit" class="fd-head-submit {danger ? 'danger-fill' : 'primary'}" disabled={locked}>{submit}</button>
+            <!-- основное действие на телефоне — в шапке (нижнего ряда кнопок там нет); пока на экране
+                 вопрос о несохранённом — выключено, как и нижнее -->
+            <button type="submit" class="fd-head-submit {danger ? 'danger-fill' : 'primary'}" disabled={locked || asking}>{submit}</button>
+            <button type="button" class="fd-x fd-x-end" aria-label="Закрыть" onclick={requestClose}>✕</button>
           {/if}
         </header>
         {#if asking}
@@ -337,7 +347,7 @@
         <footer class="fd-foot" class:fd-has-extra={!!extra}>
           {#if extra}<div class="fd-extra row">{@render extra()}</div>{/if}
           <div class="fd-main row">
-            <button type="submit" class={danger ? 'danger-fill' : 'primary'} data-fd="submit" disabled={locked}>{submit}</button>
+            <button type="submit" class={danger ? 'danger-fill' : 'primary'} data-fd="submit" disabled={locked || asking}>{submit}</button>
             <button type="button" data-fd="cancel" onclick={requestClose} disabled={pending}>Отмена</button>
           </div>
         </footer>
@@ -382,7 +392,8 @@
     background: transparent;
     line-height: 1.4;
   }
-  .fd-head-submit {
+  .fd-head-submit,
+  .fd-x-start {
     display: none;
     flex: none;
   }
@@ -392,8 +403,11 @@
   .fd-ask p {
     margin: 0 0 8px;
   }
+  /* строки — по содержимому, сверху вниз: тело на телефоне растянуто на весь экран, а сетка по
+     умолчанию (`align-content: normal`) делила бы свободное место между строками поровну */
   .fd-body {
     display: grid;
+    align-content: start;
     gap: 10px;
     padding: 12px 16px;
     min-height: 0;
@@ -402,6 +416,10 @@
   }
   .fd-body > :global(*) {
     min-width: 0;
+  }
+  /* абзацы тела — без своих полей: отступ между строками один (`gap`) */
+  .fd-body > :global(p) {
+    margin: 0;
   }
   :global(.fd-desc) {
     margin: 0;
@@ -468,9 +486,14 @@
   /* телефон: окно формы во весь экран, основное действие — в шапке, нижнего ряда нет (кроме
      дополнительных кнопок); ширина — BP_TABLET (layout.ts) */
   @media (max-width: 719px) {
-    :global(.dialog.fd-form) .fd-head-submit {
+    :global(.dialog.fd-form) .fd-head-submit,
+    :global(.dialog.fd-form) .fd-x-start {
       display: inline-flex;
       align-items: center;
+      justify-content: center;
+    }
+    :global(.dialog.fd-form) .fd-x-end {
+      display: none;
     }
     :global(.dialog.fd-form) .fd-head {
       align-items: center;

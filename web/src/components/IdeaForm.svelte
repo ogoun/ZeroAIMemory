@@ -70,6 +70,9 @@
   type Fields = ReturnType<typeof fields>;
   /** Поля при открытии формы (после 409 — свежей идеи). */
   let base: Fields = fields();
+  /** Поля, изменённые и здесь, и в другом месте (409): помечены в форме. */
+  let clash = $state<string[]>([]);
+  const clashed = (k: keyof Fields) => clash.includes(k);
 
   /** В форме есть несохранённое (для вопроса «Закрыть без сохранения?»). */
   export function dirty(): boolean {
@@ -108,6 +111,7 @@
     tags = r.fields.tags;
     base = next;
     src = fresh;
+    clash = r.clash.map(String);
     return r.clash.map((k) => LABEL[k]);
   }
 
@@ -165,18 +169,18 @@
 
 {#snippet fieldsOf()}
   {#if m === 'create' || m === 'edit'}
-    <label>Заголовок <input bind:value={title} required maxlength="500" data-autofocus use:focusInline /></label>
-    <label>Замысел <textarea bind:value={body} rows="4"></textarea></label>
+    <label class:clash={clashed('title')}>Заголовок {@render note('title')}<input bind:value={title} required maxlength="500" data-autofocus use:focusInline /></label>
+    <label class:clash={clashed('body')}>Замысел {@render note('body')}<textarea bind:value={body} rows="4"></textarea></label>
     <div class="row pair">
-      <label>
-        Приоритет
+      <label class:clash={clashed('priority')}>
+        Приоритет {@render note('priority')}
         <select bind:value={priority}>
           {#each PRIORITIES as p (p)}<option value={p}>{PRIORITY_TEXT[p]}</option>{/each}
         </select>
       </label>
       {@render date('Не раньше', false)}
     </div>
-    <label>Теги (через запятую) <input bind:value={tags} aria-label="Теги идеи" /></label>
+    <label class:clash={clashed('tags')}>Теги (через запятую) {@render note('tags')}<input bind:value={tags} aria-label="Теги идеи" /></label>
   {:else if m === 'start'}
     <label>
       Пространство задачи
@@ -190,15 +194,21 @@
     {@render date('Отложить до', true)}
   {:else}
     <label
-      >Причина{m === 'decline' ? ' (необязательно)' : ''}
+      >Причина {#if m === 'decline'}<span class="muted small">(необязательно)</span>{/if}
       <textarea bind:value={reason} rows="3" maxlength="2000" required={m === 'reopen'} data-autofocus></textarea></label
     >
   {/if}
 {/snippet}
 
+<!-- пометка поля-расхождения 409 в подписи -->
+{#snippet note(k: keyof Fields)}
+  {#if clashed(k)}<span class="clash-note">изменено и здесь, и в другом месте</span>{/if}
+{/snippet}
+
 {#snippet date(label: string, required: boolean)}
-  <label>
-    Не раньше
+  <!-- видимая подпись — та же, что имя поля (WCAG 2.5.3): «Не раньше» или «Отложить до» -->
+  <label class:clash={clashed('horizon')}>
+    {label} {@render note('horizon')}
     <span class="row">
       <input
         type="date"
