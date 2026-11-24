@@ -1,15 +1,23 @@
 <script lang="ts">
   // «Словарь» (M4.5 §2): действующие термины пространства по алфавиту, поиск по имени,
   // псевдониму и определению, карточка (псевдонимы, «не путать с», код) и правка. Сессия WebUI —
-  // человек. Правка идёт с ревизией карточки (If-Match): запись изменилась — 409, карточка
-  // перечитывается. Имя или псевдоним занят другим термином — 409 term-conflict со ссылками
-  // на занявшие термины. Корзина (M7.2, спецификация §5.9 пп. 2–3): «Удалить» карточки — в
-  // корзину, с подтверждением; «Корзина» — вместо списка удалённые термины с «Восстановить»
-  // (`JournalTrash`, ленивый чанк; имя, занятое за это время, — 409 со ссылкой в тексте ошибки).
-  // Несохранённое (финальное ревью M7.2, I1): поля открытой формы (создание, правка, отзыв) против
-  // их значений при открытии — `unsaved()`; «← Словарь» сначала спрашивает «Закрыть без
-  // сохранения?» (`JournalSplit`), уход по адресу и другая форма — `LEAVE_EDIT` (`lib/leaveEdit.ts`).
-  import { onMount, untrack } from 'svelte';
+  // человек. Правка идёт с ревизией карточки (If-Match). Имя или псевдоним занят другим термином —
+  // 409 term-conflict со ссылками на занявшие термины. Корзина (M7.2, спецификация §5.9 пп. 2–3):
+  // «Удалить» карточки — в корзину, с подтверждением; «Корзина» — вместо списка удалённые термины с
+  // «Восстановить» (`JournalTrash`, ленивый чанк; имя, занятое за это время, — 409 со ссылкой в
+  // тексте ошибки).
+  //
+  // Карточка и формы (M7.3, спецификация §6.14, решения 80–86): ряд действий — сразу под шапкой
+  // карточки, до определения и псевдонимов (правило Г); «Новый термин» и «Отозвать» — окна формы
+  // (`FormDialog`, правило Б), после «Добавить» — карточка созданного термина (п. 6); «Править» —
+  // правка в карточке на месте: вид карточки сменяется формой, фокус — на первом поле, «Сохранить»
+  // — снова вид и фокус на заголовке, «Отмена» — фокус на «Править» (правило В, п. 3). Несохранённое
+  // правки — `unsaved()`: «← Словарь» спрашивает «Закрыть без сохранения?» (`JournalSplit`), уход по
+  // адресу — один вопрос стека проверок ухода (`guardLeave`); окна спрашивают о своём сами, журнал
+  // сам не спрашивает (п. 4). 409 правки и отзыва — термин перечитан, набранное остаётся, нетронутое
+  // поле — из свежего термина (`rebase`), поля-расхождения помечены, форма открыта (п. 5).
+  import { onMount, tick, untrack } from 'svelte';
+  import FormDialog from './FormDialog.svelte';
   import Notice from './Notice.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
   import TrashPanel from './TrashPanel.svelte';
@@ -27,8 +35,10 @@
     type Entry,
     type GlossaryItem,
   } from '../lib/api';
+  import { focusSoon, revealTop } from '../lib/focus';
+  import { isDirty, rebase, rebaseText } from '../lib/formDraft';
   import { AUTHOR_TEXT, JOURNAL_TITLE, fmtTime } from '../lib/journals';
-  import { LEAVE_EDIT, guardLeave } from '../lib/leaveEdit';
+  import { guardLeave } from '../lib/leaveEdit';
   import { go, href } from '../lib/router';
   import JournalSplit from './JournalSplit.svelte';
 
@@ -52,11 +62,9 @@
   let cur = $state<Entry | null>(null);
   let curError = $state('');
   let eseq = 0;
-  type Mode = 'none' | 'create' | 'edit' | 'retract';
-  let mode = $state<Mode>('none');
   let busy = $state(false);
+  /** Ошибка действия карточки и формы правки на месте. */
   let actionError = $state('');
-  let conflicts = $state<{ id: string; title: string; matched: string }[]>([]);
   let notice = $state('');
   /** «Корзина»: вместо списка — удалённые термины. */
   let trash = $state(false);
@@ -64,38 +72,38 @@
   let listNotice = $state('');
   let ask = $state<Ask | null>(null);
 
-  // форма
-  let fName = $state('');
-  let fDefinition = $state('');
-  let fAliases = $state('');
-  let fNot = $state('');
-  let fCode = $state('');
-  let fBody = $state('');
+  /** Поля термина в форме (списки — по одному в строке). */
+  type TermFields = { name: string; definition: string; aliases: string; not: string; code: string; body: string };
+  const EMPTY = (): TermFields => ({ name: '', definition: '', aliases: '', not: '', code: '', body: '' });
+  /** Подписи полей в тексте 409. */
+  const LABEL: Record<keyof TermFields, string> = {
+    name: 'имя',
+    definition: 'определение',
+    aliases: 'псевдонимы',
+    not: 'не путать с',
+    code: 'имена в коде',
+    body: 'пояснение',
+  };
+  type Conflict = { id: string; title: string; matched: string };
+
+  /** Правка в карточке на месте (правило В). */
+  let editing = $state(false);
+  let ef = $state<TermFields>(EMPTY());
+  /** Поля термина при открытии правки (после 409 — свежего): с ними сравнивается черновик. */
+  let eBase: TermFields = EMPTY();
+  /** Поля, изменённые и здесь, и в другом месте (409): помечены в форме. */
+  let eClash = $state<(keyof TermFields)[]>([]);
+  let eConflicts = $state<Conflict[]>([]);
+
+  /** Окно «Новый термин» (правило Б). */
+  let createOpen = $state(false);
+  let cf = $state<TermFields>(EMPTY());
+  let cConflicts = $state<Conflict[]>([]);
+  /** Окно «Отозвать термин» (правило Б). */
+  let retractOpen = $state(false);
   let rReason = $state('');
-
-  /** Поля открытой формы. */
-  const formState = (): string =>
-    mode === 'create' || mode === 'edit'
-      ? JSON.stringify([fName, fDefinition, fAliases, fNot, fCode, fBody])
-      : mode === 'retract'
-        ? rReason
-        : '';
-  /** Поля формы при её открытии (пустые или из термина карточки). */
-  let pristine = '';
-
-  /** Открыть форму `m`: поля уже заданы — их снимок для `unsaved()`. */
-  function openForm(m: Mode) {
-    mode = m;
-    pristine = formState();
-  }
-
-  /** В открытой форме есть несохранённое. */
-  const unsaved = (): boolean => mode !== 'none' && formState() !== pristine;
-
-  /** Действие закроет открытую форму: при несохранённом — сначала вопрос; `false` — остаться. */
-  const leaveForm = (): boolean => !unsaved() || window.confirm(LEAVE_EDIT);
-
-  onMount(() => guardLeave(unsaved));
+  /** Ошибка окна (создание, отзыв). */
+  let dlgError = $state('');
 
   const lines = (s: string) =>
     s
@@ -103,6 +111,22 @@
       .map((x) => x.trim())
       .filter(Boolean);
   const strs = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
+
+  /** Поля формы правки из термина. */
+  const fieldsOf = (c: Entry): TermFields => ({
+    name: c.title,
+    definition: typeof c.data.definition === 'string' ? c.data.definition : '',
+    aliases: strs(c.data.aliases).join('\n'),
+    not: strs(c.data.not_to_confuse).join('\n'),
+    code: strs(c.data.code).join('\n'),
+    body: c.body,
+  });
+
+  /** В правке на месте есть несохранённое (вопрос панели и проверка ухода); окна спрашивают сами. */
+  const unsaved = (): boolean => editing && isDirty(ef, eBase);
+
+  // правка на месте — в стеке проверок ухода (§6.14 п. 4); согласие уйти — черновик отпущен
+  onMount(() => guardLeave(unsaved, () => (editing = false)));
 
   function fail(e: unknown, set: (m: string) => void) {
     if (e instanceof ApiError && e.status === 401) return onexpired();
@@ -153,10 +177,12 @@
 
   async function open(u: string, id: string | null) {
     const my = ++eseq;
-    mode = 'none';
+    editing = false;
     actionError = '';
-    conflicts = [];
+    eConflicts = [];
     curError = '';
+    // другой термин (переход по адресу уже спросил о набранном): окна карточки закрываются
+    if (id !== (cur?.id ?? null)) retractOpen = false;
     if (!id) {
       cur = null;
       return;
@@ -217,7 +243,7 @@
     notice = '';
     ask = trashAsk(user, c, {
       deleted: async (msg) => {
-        mode = 'none';
+        editing = false;
         cur = null;
         go({ name: 'journal', user, space, journal: 'glossary', entry: null }, { replace: true });
         await load(user, space);
@@ -241,126 +267,216 @@
 
   /** Итог над списком (`Notice`): фокус после удаления — сюда, кнопки карточки уже нет. */
   let listEl = $state<HTMLElement | null>(null);
+  let root = $state<HTMLElement | null>(null);
+  /** Карточка термина (рядом со списком или вместо него). */
+  const cardEl = () => root?.querySelector<HTMLElement>('article[aria-label="Карточка термина"]');
 
-  /** Карточка или форма показана (в узкой области — вместо списка). */
-  let detailOpen = $derived(cur !== null || curError !== '' || mode === 'create' || mode === 'edit');
+  /** Карточка показана (в узкой области — вместо списка). */
+  let detailOpen = $derived(cur !== null || curError !== '');
 
-  /** «← Словарь»: адрес без записи закрывает карточку, форма нового термина закрывается здесь. */
+  /** «← Словарь»: несохранённое панель уже спросила — правка отпускается. */
   function closeDetail() {
-    mode = 'none';
+    editing = false;
     actionError = '';
-    conflicts = [];
+    eConflicts = [];
   }
 
-  function startCreate() {
-    if (!leaveForm()) return;
-    fName = '';
-    fDefinition = '';
-    fAliases = '';
-    fNot = '';
-    fCode = '';
-    fBody = '';
-    actionError = '';
-    conflicts = [];
-    openForm('create');
-  }
+  /** Итог действия в карточке: фокус после закрытия окна (нажатая кнопка могла уйти). */
+  const cardNotice = () => cardEl()?.querySelector<HTMLElement>('.card-notice [role="status"]');
+  /** Кнопка ряда действий карточки по подписи. */
+  const cardButton = (label: string) =>
+    [...(cardEl()?.querySelectorAll<HTMLElement>('[aria-label="Действия с термином"] button') ?? [])].find((b) => b.textContent?.trim() === label);
 
-  function startEdit() {
-    const c = cur;
-    if (!c || !leaveForm()) return;
-    fName = c.title;
-    fDefinition = typeof c.data.definition === 'string' ? c.data.definition : '';
-    fAliases = strs(c.data.aliases).join('\n');
-    fNot = strs(c.data.not_to_confuse).join('\n');
-    fCode = strs(c.data.code).join('\n');
-    fBody = c.body;
-    actionError = '';
-    conflicts = [];
-    openForm('edit');
-  }
-
-  function startRetract() {
-    if (!leaveForm()) return;
-    rReason = '';
-    actionError = '';
-    openForm('retract');
-  }
-
-  const formData = () => ({
-    definition: fDefinition.trim(),
-    aliases: lines(fAliases),
-    not_to_confuse: lines(fNot),
-    code: lines(fCode),
+  const formData = (f: TermFields) => ({
+    definition: f.definition.trim(),
+    aliases: lines(f.aliases),
+    not_to_confuse: lines(f.not),
+    code: lines(f.code),
   });
 
-  /** Действие: ошибка — понятным текстом; занятое имя — со ссылками; устаревшая ревизия — перечитать. */
-  async function act(fn: () => Promise<string | void>, done: string) {
-    if (busy) return;
+  // ---- «Новый термин» (окно) ----
+
+  function startCreate() {
+    cf = EMPTY();
+    cConflicts = [];
+    dlgError = '';
+    createOpen = true;
+  }
+
+  const createDirty = (): boolean => isDirty(cf, EMPTY());
+
+  /** «Добавить»: окно закрывается, открывается карточка созданного (адрес с `entry`: заголовок на
+   * виду и в фокусе; на телефоне запись слоя окна становится записью карточки), список
+   * перечитывается, итог — строкой (§6.14 п. 6). Занятое имя — ссылками в окне. */
+  async function submitCreate() {
+    const title = cf.name.trim();
+    if (!title || !cf.definition.trim()) {
+      dlgError = 'Укажите имя и определение.';
+      return;
+    }
+    dlgError = '';
+    cConflicts = [];
+    let id: string;
+    try {
+      id = (await createEntry(user, space, { kind: 'term', title, body: cf.body, data: formData(cf) })).id;
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) return onexpired();
+      cConflicts = termConflicts(e);
+      dlgError = errorText(e);
+      return;
+    }
+    createOpen = false;
+    select(id);
+    notice = 'Термин добавлен.';
+    await load(user, space);
+  }
+
+  // ---- правка в карточке ----
+
+  /** «Править»: вид карточки сменяется формой, карточка — с начала, фокус — на первом поле. */
+  async function startEdit() {
+    const c = cur;
+    if (!c) return;
+    ef = fieldsOf(c);
+    eBase = fieldsOf(c);
+    eClash = [];
+    eConflicts = [];
+    actionError = '';
+    notice = '';
+    editing = true;
+    await tick();
+    revealTop(cardEl());
+    cardEl()?.querySelector<HTMLElement>('form[aria-label="Правка термина"] input')?.focus();
+  }
+
+  /** «Отмена» правки: вид карточки, фокус — на «Править». */
+  function cancelEdit() {
+    editing = false;
+    actionError = '';
+    eConflicts = [];
+    focusSoon(() => cardButton('Править'));
+  }
+
+  async function submitEdit(e: SubmitEvent) {
+    e.preventDefault();
+    const c = cur;
+    if (!c || busy) return;
+    const title = ef.name.trim();
+    if (!title || !ef.definition.trim()) {
+      actionError = 'Укажите имя и определение.';
+      return;
+    }
     busy = true;
     actionError = '';
-    conflicts = [];
-    notice = '';
+    eConflicts = [];
     try {
-      const target = (await fn()) ?? cur?.id ?? null;
-      mode = 'none';
+      await patchEntry(user, c.id, c.rev, { title, body: ef.body, data: formData(ef) });
+    } catch (err) {
+      busy = false;
+      if (err instanceof ApiError && err.status === 401) return onexpired();
+      const tc = termConflicts(err);
+      if (tc.length) {
+        eConflicts = tc;
+        actionError = errorText(err);
+      } else if (isStaleEntry(err)) await staleEdit(c.id, err);
+      else actionError = errorText(err);
+      return;
+    }
+    editing = false;
+    try {
       await load(user, space);
-      if (target && target !== entry) select(target);
-      else await open(user, target);
-      notice = done;
-    } catch (e) {
-      const c = termConflicts(e);
-      if (c.length) {
-        conflicts = c;
-        actionError = errorText(e);
-      } else if (isStaleEntry(e) && cur) {
-        const msg = errorText(e);
-        await open(user, cur.id);
-        actionError = msg;
-      } else {
-        fail(e, (m) => (actionError = m));
-      }
+      await open(user, c.id);
+      notice = 'Термин сохранён.';
+      focusSoon(() => cardEl()?.querySelector('h2'));
     } finally {
       busy = false;
     }
   }
 
-  function submit(e: SubmitEvent) {
-    e.preventDefault();
-    const c = cur;
-    const title = fName.trim();
-    if (!title || !fDefinition.trim()) {
-      actionError = 'Укажите имя и определение.';
+  /** 409 правки: термин перечитан, черновик перенесён (`rebase`), форма открыта. */
+  async function staleEdit(id: string, e: unknown) {
+    let fresh: Entry;
+    try {
+      fresh = await getEntry(user, id);
+    } catch (err) {
+      actionError = `${errorText(e)} ${errorText(err)}`;
       return;
     }
-    if (mode === 'create') {
-      act(
-        async () => (await createEntry(user, space, { kind: 'term', title, body: fBody, data: formData() })).id,
-        'Термин добавлен.',
-      );
-    } else if (c) {
-      act(async () => {
-        await patchEntry(user, c.id, c.rev, { title, body: fBody, data: formData() });
-      }, 'Термин сохранён.');
-    }
+    const next = fieldsOf(fresh);
+    const r = rebase(ef, eBase, next);
+    ef = r.fields;
+    eBase = next;
+    eClash = r.clash;
+    cur = fresh;
+    actionError = rebaseText(
+      r.clash.map((k) => LABEL[k]),
+      fresh.rev,
+    );
+    void load(user, space);
   }
 
-  function submitRetract(e: SubmitEvent) {
-    e.preventDefault();
+  // ---- «Отозвать» (окно) ----
+
+  function startRetract() {
+    rReason = '';
+    dlgError = '';
+    actionError = '';
+    notice = '';
+    retractOpen = true;
+  }
+
+  /** Отзыв: успех — окно закрыто, карточка и список перечитаны, итог строкой; 409 — термин
+   * перечитан, причина остаётся, окно открыто (отозван в другом месте — окно закрыто, причина — в
+   * карточке). */
+  async function submitRetract() {
     const c = cur;
     if (!c) return;
     const reason = rReason.trim();
     if (!reason) {
-      actionError = 'Укажите причину отзыва.';
+      dlgError = 'Укажите причину отзыва.';
       return;
     }
-    act(async () => {
+    dlgError = '';
+    try {
       await retractEntry(user, c.id, reason, c.rev);
-      return '';
-    }, 'Термин отозван.');
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) return onexpired();
+      if (isStaleEntry(e)) {
+        let fresh: Entry;
+        try {
+          fresh = await getEntry(user, c.id);
+        } catch (err) {
+          dlgError = `${errorText(e)} ${errorText(err)}`;
+          return;
+        }
+        cur = fresh;
+        void load(user, space);
+        if (fresh.status !== 'active') {
+          retractOpen = false;
+          actionError = `Пока окно было открыто, термин стал «${statusText(fresh)}» в другом месте — отзыв не нужен.`;
+          return;
+        }
+        dlgError = rebaseText([], fresh.rev, 'отзовите снова');
+        return;
+      }
+      dlgError = errorText(e);
+      return;
+    }
+    retractOpen = false;
+    busy = true;
+    try {
+      await load(user, space);
+      await open(user, c.id);
+      notice = 'Термин отозван.';
+    } finally {
+      busy = false;
+    }
   }
+
+  const statusText = (c: Entry) => (c.status === 'retracted' ? 'отозван' : c.status === 'superseded' ? 'заменён' : 'действует');
 </script>
 
-<section class="journal glossary">
+<section class="journal glossary" bind:this={root}>
   <!-- список и карточка — рядом в широкой области, карточка вместо списка в узкой (§5.1 п. 5) -->
   <JournalSplit
     open={detailOpen}
@@ -435,80 +551,131 @@
       <header>
         <h2>{c.title}</h2>
         <div class="row meta">
-          <span class="chip status">{c.status === 'retracted' ? 'отозван' : c.status === 'superseded' ? 'заменён' : 'действует'}</span>
+          <span class="chip status">{statusText(c)}</span>
           <span class="muted small">{AUTHOR_TEXT[c.author.kind] ?? c.author.kind} · ревизия {c.rev} · {fmtTime(c.updated_at)}</span>
         </div>
       </header>
-      <p class="body">{String(c.data.definition ?? '')}</p>
-      {#if strs(c.data.aliases).length}
-        <p><span class="muted">Псевдонимы:</span> {#each strs(c.data.aliases) as a (a)}<span class="chip">{a}</span>{/each}</p>
-      {/if}
-      {#if strs(c.data.not_to_confuse).length}
-        <div>
-          <span class="muted">Не путать с:</span>
-          <ul>{#each strs(c.data.not_to_confuse) as x (x)}<li>{x}</li>{/each}</ul>
-        </div>
-      {/if}
-      {#if strs(c.data.code).length}
-        <p><span class="muted">В коде:</span> {#each strs(c.data.code) as x (x)}<code class="chip">{x}</code>{/each}</p>
-      {/if}
-      {#if c.body}<p class="body">{c.body}</p>{/if}
-      {#if c.retract_reason}<p class="warn">Отозвано: {c.retract_reason}</p>{/if}
 
-      <div class="row actions">
-        {#if c.status === 'active'}
-          <button type="button" onclick={startEdit}>Править</button>
-          <button type="button" class="danger" onclick={startRetract}>Отозвать</button>
-        {/if}
-        <button type="button" class="danger" onclick={() => askDelete(c)} disabled={busy}>Удалить</button>
-      </div>
-      <Notice text={notice} />
-      {#if mode === 'none' && actionError}<p class="error" role="alert">{actionError}</p>{/if}
-      {#if mode === 'retract'}
-        <form class="form" onsubmit={submitRetract} aria-label="Отзыв термина">
-          <h3>Отозвать термин</h3>
-          <p class="muted small">Запись остаётся в истории; имя и псевдонимы освобождаются.</p>
-          <label>Причина <textarea bind:value={rReason} rows="2"></textarea></label>
-          {@render formEnd('Отозвать')}
+      {#if editing}
+        <!-- правка на месте: форма вместо вида карточки (§6.14 п. 3) -->
+        <form class="form" onsubmit={submitEdit} aria-label="Правка термина">
+          <h3>Правка термина</h3>
+          {@render termFields(ef, eClash, false)}
+          {@render conflictList(eConflicts)}
+          {#if actionError && eConflicts.length === 0}<p class="error" role="alert">{actionError}</p>{/if}
+          <div class="row end">
+            <button type="submit" class="primary" disabled={busy}>Сохранить</button>
+            <button type="button" onclick={cancelEdit}>Отмена</button>
+          </div>
         </form>
+      {:else}
+        <!-- ряд действий — сразу под шапкой, до определения и псевдонимов (правило Г) -->
+        <div class="row actions" role="group" aria-label="Действия с термином">
+          {#if c.status === 'active'}
+            <button type="button" onclick={startEdit} disabled={busy}>Править</button>
+            <button type="button" class="danger" onclick={startRetract} disabled={busy}>Отозвать</button>
+          {/if}
+          <button type="button" class="danger" onclick={() => askDelete(c)} disabled={busy}>Удалить</button>
+        </div>
+        <div class="card-notice"><Notice text={notice} /></div>
+        {#if actionError}<p class="error" role="alert">{actionError}</p>{/if}
+
+        <p class="body">{String(c.data.definition ?? '')}</p>
+        {#if strs(c.data.aliases).length}
+          <p><span class="muted">Псевдонимы:</span> {#each strs(c.data.aliases) as a (a)}<span class="chip">{a}</span>{/each}</p>
+        {/if}
+        {#if strs(c.data.not_to_confuse).length}
+          <div>
+            <span class="muted">Не путать с:</span>
+            <ul>{#each strs(c.data.not_to_confuse) as x (x)}<li>{x}</li>{/each}</ul>
+          </div>
+        {/if}
+        {#if strs(c.data.code).length}
+          <p><span class="muted">В коде:</span> {#each strs(c.data.code) as x (x)}<code class="chip">{x}</code>{/each}</p>
+        {/if}
+        {#if c.body}<p class="body">{c.body}</p>{/if}
+        {#if c.retract_reason}<p class="warn">Отозвано: {c.retract_reason}</p>{/if}
       {/if}
     </article>
   {/if}
+{/snippet}
 
-  {#if mode === 'create' || mode === 'edit'}
-    <form class="form panel" onsubmit={submit} aria-label={mode === 'create' ? 'Новый термин' : 'Правка термина'}>
-      <h3>{mode === 'create' ? 'Новый термин' : 'Правка термина'}</h3>
-      <label>Имя <input bind:value={fName} required maxlength="200" /></label>
-      <label>Определение <textarea bind:value={fDefinition} rows="3" required></textarea></label>
-      <label>Псевдонимы <span class="muted small">(по одному в строке)</span> <textarea bind:value={fAliases} rows="2"></textarea></label>
-      <label>Не путать с <span class="muted small">(по одному в строке)</span> <textarea bind:value={fNot} rows="2"></textarea></label>
-      <label>Имена в коде <span class="muted small">(по одному в строке)</span> <textarea bind:value={fCode} rows="2"></textarea></label>
-      <label>Пояснение <textarea bind:value={fBody} rows="3"></textarea></label>
-      {#if conflicts.length}
-        <div class="warn" role="alert" data-testid="term-conflicts">
-          Занято другим термином:
-          <ul>
-            {#each conflicts as x (x.id + x.matched)}
-              <li>
-                «{x.matched}» — термин
-                <a href={href({ name: 'journal', user, space, journal: 'glossary', entry: x.id })}>«{x.title}»</a>
-              </li>
-            {/each}
-          </ul>
-        </div>
-      {/if}
-      {@render formEnd('Сохранить')}
-    </form>
+<!-- поля термина: окно «Новый термин» и правка в карточке; `clash` — поля-расхождения 409 -->
+{#snippet termFields(f: TermFields, clash: (keyof TermFields)[], autofocus: boolean)}
+  <!-- текст подписи с пометками — одной строкой над полем и в окне, и в карточке (сетка `.form label`) -->
+  <label class:clash={clash.includes('name')}
+    ><span>Имя {@render note(clash, 'name')}</span><input bind:value={f.name} required maxlength="200" data-autofocus={autofocus ? '' : undefined} /></label
+  >
+  <label class:clash={clash.includes('definition')}
+    ><span>Определение {@render note(clash, 'definition')}</span><textarea bind:value={f.definition} rows="3" required></textarea></label
+  >
+  <label class:clash={clash.includes('aliases')}
+    ><span>Псевдонимы <span class="muted small">(по одному в строке)</span> {@render note(clash, 'aliases')}</span><textarea bind:value={f.aliases} rows="2"
+    ></textarea></label
+  >
+  <label class:clash={clash.includes('not')}
+    ><span>Не путать с <span class="muted small">(по одному в строке)</span> {@render note(clash, 'not')}</span><textarea bind:value={f.not} rows="2"
+    ></textarea></label
+  >
+  <label class:clash={clash.includes('code')}
+    ><span>Имена в коде <span class="muted small">(по одному в строке)</span> {@render note(clash, 'code')}</span><textarea bind:value={f.code} rows="2"
+    ></textarea></label
+  >
+  <label class:clash={clash.includes('body')}><span>Пояснение {@render note(clash, 'body')}</span><textarea bind:value={f.body} rows="3"></textarea></label>
+{/snippet}
+
+<!-- пометка поля-расхождения 409 в подписи (её читает и программа чтения с экрана) -->
+{#snippet note(clash: (keyof TermFields)[], k: keyof TermFields)}
+  {#if clash.includes(k)}<span class="clash-note">изменено и здесь, и в другом месте</span>{/if}
+{/snippet}
+
+<!-- имя или псевдоним занят другим термином (409 term-conflict) — ссылками на занявшие -->
+{#snippet conflictList(list: Conflict[])}
+  {#if list.length}
+    <div class="warn" role="alert" data-testid="term-conflicts">
+      Занято другим термином:
+      <ul>
+        {#each list as x (x.id + x.matched)}
+          <li>
+            «{x.matched}» — термин
+            <a href={href({ name: 'journal', user, space, journal: 'glossary', entry: x.id })}>«{x.title}»</a>
+          </li>
+        {/each}
+      </ul>
+    </div>
   {/if}
 {/snippet}
 
-{#snippet formEnd(label: string)}
-  {#if actionError && conflicts.length === 0}<p class="error" role="alert">{actionError}</p>{/if}
-  <div class="row end">
-    <button type="submit" class="primary" disabled={busy}>{label}</button>
-    <button type="button" onclick={() => ((mode = 'none'), (actionError = ''), (conflicts = []))}>Отмена</button>
-  </div>
-{/snippet}
+<!-- «Новый термин» — окно (§6.14, правило Б); после «Добавить» — карточка созданного (п. 6) -->
+<FormDialog
+  open={createOpen}
+  title="Новый термин"
+  submit="Добавить"
+  error={cConflicts.length ? '' : dlgError}
+  dirty={createDirty}
+  onsubmit={submitCreate}
+  onclose={() => ((createOpen = false), (dlgError = ''), (cConflicts = []))}
+>
+  {@render termFields(cf, [], true)}
+  {@render conflictList(cConflicts)}
+</FormDialog>
+
+<!-- «Отозвать» — окно с причиной (правило Б) -->
+<FormDialog
+  open={retractOpen}
+  title="Отозвать термин"
+  subject={cur?.title}
+  description="Запись остаётся в истории; имя и псевдонимы освобождаются."
+  submit="Отозвать"
+  danger
+  error={dlgError}
+  dirty={() => rReason.trim() !== ''}
+  refocus={cardNotice}
+  onsubmit={submitRetract}
+  onclose={() => ((retractOpen = false), (dlgError = ''))}
+>
+  <label>Причина <textarea bind:value={rReason} rows="3" maxlength="2000" data-autofocus></textarea></label>
+</FormDialog>
 
 <style>
   .bar {

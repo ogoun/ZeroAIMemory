@@ -94,8 +94,11 @@ test('администратор: вход, пользователь, токен
   await expect(roRow.getByRole('cell', { name: 'ro', exact: true })).toBeVisible();
   await expect(roRow).toContainText(`zam_${ro.slice(4, 12)}`);
 
-  // Отзыв
+  // Отзыв — с подтверждением (M7.3, §6.14 правило Д: необратимое — окно `danger`)
   await roRow.getByRole('button', { name: 'Отозвать' }).click();
+  const revoke = page.getByRole('dialog', { name: 'Отозвать токен?' });
+  await revoke.getByRole('button', { name: 'Отозвать', exact: true }).click();
+  await expect(revoke).toHaveCount(0);
   await expect(roRow).toContainText('отозван');
   // Отдельный запрос без cookie сессии: отозванный токен отклоняется.
   const api = await request.get(`${base()}api/v1/spaces`, {

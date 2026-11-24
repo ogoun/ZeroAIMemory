@@ -414,8 +414,10 @@ test('ideas_proposal_answered_in_questions', async ({ page }) => {
   // у вопроса-предложения нет ответа текстом: только варианты
   await expect(q.getByRole('form', { name: 'Ответ текстом' })).toHaveCount(0);
   await q.getByRole('button', { name: 'отложить', exact: true }).click();
-  const form = q.getByRole('form', { name: 'Отложить идею' });
+  // M7.3 (§6.14, правило Б): «Отложить до» — окно формы, а не форма в элементе ленты
+  const form = page.getByRole('dialog', { name: 'Отложить' });
   const date = form.getByLabel('Отложить до');
+  await expect(date).toBeFocused();
   await expectUtcDay(date, 1, 'min');
   await expect(form.getByText('UTC', { exact: true })).toBeVisible();
   await date.fill(utc(10));
@@ -540,7 +542,7 @@ test('ideas_reopen_proposal_answered_in_questions', async ({ page }) => {
   await q.getByRole('button', { name: 'вернуть', exact: true }).click();
   expect((await sent).postDataJSON()).toEqual({ option: 'reopen', channel: 'webui' });
   await expect(q).toContainText('Ответ: вернуть');
-  await expect(q.getByRole('form', { name: 'Отложить идею' })).toHaveCount(0);
+  await expect(page.getByRole('dialog', { name: 'Отложить' })).toHaveCount(0);
   const e = await api('GET', `entries/${idea.id}`);
   expect(e.status).toBe('new');
   expect(e.data.prev_task_ids).toContain(task.id);
@@ -566,17 +568,18 @@ test('ideas_knowledge_proposal_start_in_shared_solution_warns', async ({ page })
     if (r.url().endsWith(`/entries/${question.id}/answer`)) answered = true;
   });
   await q.getByRole('button', { name: 'начать', exact: true }).click();
-  const confirm = q.getByRole('group', { name: 'Подтверждение «начать»' });
+  // M7.3 (§6.14, правило Б): подтверждение «начать» — окно, а не строка в элементе ленты; кнопка
+  // «начать» под модальным окном недоступна
+  const confirm = page.getByRole('dialog', { name: 'Начать идею в общем решении?' });
   await expect(confirm.getByTestId('shared-warning')).toHaveText(
     `Задача появится в решении «${IDEAS_NAME}», её увидят участники.`,
   );
-  // пока подтверждение открыто, исходная кнопка «начать» неактивна
-  await expect(q.getByRole('button', { name: 'начать', exact: true })).toBeDisabled();
+  await expect(confirm.getByRole('button', { name: 'Начать' })).toBeFocused();
   expect(answered).toBe(false);
-  // отмена — без ответа
+  // отмена — без ответа, фокус — снова на «начать»
   await confirm.getByRole('button', { name: 'Отмена' }).click();
   await expect(confirm).toHaveCount(0);
-  await expect(q.getByRole('button', { name: 'начать', exact: true })).toBeEnabled();
+  await expect(q.getByRole('button', { name: 'начать', exact: true })).toBeFocused();
   expect(answered).toBe(false);
   await q.getByRole('button', { name: 'начать', exact: true }).click();
   const sent = page.waitForRequest((r) => r.url().endsWith(`/entries/${question.id}/answer`));

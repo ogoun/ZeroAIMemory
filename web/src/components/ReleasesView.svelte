@@ -4,10 +4,15 @@
   // (M7.2, спецификация §5.9): у выбранного релиза — «Изменить» (`EntryEdit`: заголовок, текст,
   // теги, область; версия и коммиты — как есть) и «Удалить» (в корзину, с подтверждением);
   // «Корзина» — удалённые релизы с «Восстановить» (`JournalTrash`). Форма и корзина — ленивые чанки.
-  // Форма привязана к выбранному релизу: выбор другого, «Сравнить с», «Корзина» и переход по адресу
-  // её закрывают, при несохранённом — сначала вопрос (`EntryEdit`: проверка ухода и `leave()`).
-  // Переход к записи выключает «Корзину».
-  import { untrack } from 'svelte';
+  // Правка привязана к выбранному релизу: переход по адресу её закрывает, при несохранённом —
+  // сначала вопрос. Переход к записи выключает «Корзину».
+  //
+  // M7.3 (спецификация §6.14 п. 3, решение 85): лента без карточки — «Изменить» открывает правку в
+  // широком окне формы (`EditPanel` с `dialog`): окно на виду при любой прокрутке сравнения, вопрос
+  // о несохранённом задаёт окно, переход по адресу — стек проверок ухода; выбор другого релиза,
+  // «Сравнить с» и «Корзина» под модальным окном недоступны. Релиз из адреса — на виду и в фокусе
+  // заголовка сравнения (п. 2).
+  import { tick, untrack } from 'svelte';
   import DiffView from './DiffView.svelte';
   import EditPanel from './EditPanel.svelte';
   import Notice from './Notice.svelte';
@@ -22,7 +27,7 @@
     type ReleaseCompare,
   } from '../lib/api';
   import { trashAsk } from '../lib/entryTrash';
-  import { focusSoon } from '../lib/focus';
+  import { focusNow, focusSoon } from '../lib/focus';
   import { CHANGELOG_KINDS, dataStr, fmtTime } from '../lib/journals';
   import { go } from '../lib/router';
 
@@ -83,7 +88,26 @@
         trash = false;
         notice = '';
       }
+      revealFor = id ?? '';
       load(u, s, true);
+    });
+  });
+
+  /** Релиз из адреса: заголовок сравнения получит фокус, когда придут и сравнение, и список (§6.14
+   * п. 2). На узком экране список стоит над сравнением: прокрутка до его загрузки уехала бы вниз,
+   * когда список вырастет (ревью r1 задачи 10b, полный e2e). */
+  let revealFor = $state('');
+
+  $effect(() => {
+    const id = revealFor;
+    if (!id || loading || cmp?.to.id !== id) return;
+    untrack(() => {
+      revealFor = '';
+      void tick().then(() => {
+        const h = root?.querySelector<HTMLElement>('.compare h2');
+        h?.scrollIntoView({ block: 'start' });
+        focusNow(h);
+      });
     });
   });
 
@@ -132,30 +156,14 @@
     }
   }
 
-  /** Открытая форма правки (`EditPanel`): её несохранённое — в `leaveEdit`. */
-  let editor = $state<{ leave: () => boolean; release: () => void } | null>(null);
-
-  /** Действие закроет открытую форму: при несохранённом — сначала вопрос; `false` — остаться. */
-  function leaveEdit(): boolean {
-    if (!editing) return true;
-    if (editor && !editor.leave()) return false;
-    editor?.release();
-    editing = false;
-    return true;
-  }
-
-  /** «Сравнить с»: сравнение перечитывается — открытая форма закрывается (с вопросом). */
+  /** «Сравнить с»: сравнение перечитывается (под открытым окном правки недоступно). */
   function changeWith(el: HTMLSelectElement) {
-    if (!leaveEdit()) {
-      el.value = withId;
-      return;
-    }
     withId = el.value;
   }
 
   function pick(id: string) {
-    // уже выбранный — ничего (форма цела); другой — открытая форма закрывается, с вопросом
-    if (id === selected || !leaveEdit()) return;
+    // уже выбранный — ничего; другой — сравнение другого релиза
+    if (id === selected) return;
     withId = '';
     notice = '';
     go({ name: 'journal', user, space, journal: 'releases', entry: id }, { replace: true });
@@ -205,7 +213,6 @@
   }
 
   function toggleTrash() {
-    if (!leaveEdit()) return;
     trash = !trash;
     notice = '';
     // назад к списку: восстановленные из корзины — в нём
@@ -284,24 +291,23 @@
             <p class="muted small">
               Интервал: {cmp.from ? version(cmp.from) : 'начало журнала'} → {version(cmp.to)}
             </p>
-            {#if !editing}
-              {@const to = cmp.to}
-              <div class="row actions">
-                <button type="button" class="small-btn" onclick={() => ((editing = true), (actionError = ''), (notice = ''))}>Изменить</button>
-                <button type="button" class="small-btn danger" onclick={() => askDelete(to)}>Удалить</button>
-              </div>
-            {/if}
+            <div class="row actions">
+              <button type="button" class="small-btn" onclick={() => ((editing = true), (actionError = ''), (notice = ''))}>Изменить</button>
+              <button type="button" class="small-btn danger" onclick={() => cmp && askDelete(cmp.to)}>Удалить</button>
+            </div>
             {#if actionError}<p class="error" role="alert">{actionError}</p>{/if}
           </header>
           {#if editing}
+            <!-- «Изменить» — правка в широком окне формы (лента без карточки, правило В) -->
             <EditPanel
-              bind:this={editor}
+              dialog
               {user}
               entry={cmp.to}
               onsaved={(e) => refresh(`Релиз «${e.title}» сохранён.`)}
               oncancel={closeEdit}
               onreread={reread}
               {onexpired}
+              refocus={editButton}
             />
           {/if}
           {#if cmp.to.body}<p class="body">{cmp.to.body}</p>{/if}
@@ -426,5 +432,9 @@
   }
   .actions {
     margin-top: 6px;
+  }
+  /* заголовок сравнения — под шапку приложения при прокрутке к нему */
+  .compare h2 {
+    scroll-margin-top: calc(var(--header-h) + 8px);
   }
 </style>

@@ -217,9 +217,10 @@ test('Шаблон инструкции: предпросмотр, сохран�
   await expect(block).toContainText(`<!-- zeroaimemory:begin v${v0 + 1} -->`);
   await expect(block).toContainText('## Своя память');
 
-  // сброс к умолчанию — ещё одна версия
+  // сброс к умолчанию — ещё одна версия; с подтверждением (M7.3, §6.14 правило Д)
   await page.goto(`${base()}#/admin/settings`);
   await tpl.getByRole('button', { name: 'Сбросить к умолчанию' }).click();
+  await page.getByRole('dialog', { name: 'Сбросить шаблон к умолчанию?' }).getByRole('button', { name: 'Сбросить', exact: true }).click();
   await expect(tpl.getByRole('status')).toHaveText(`Шаблон сброшен к умолчанию, версия блока — v${v0 + 2}.`);
   await expect(tpl).toContainText('шаблон по умолчанию');
   await expect(area).toHaveValue(/ZeroAIMemoryUrl=\{url\}/);

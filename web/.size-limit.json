@@ -4,7 +4,7 @@
   { "name": "api (REST-клиент, общий чанк — грузится при старте)", "path": "dist/assets/api-*.js", "gzip": true, "limit": "29.7 KB" },
   { "name": "start+api (весь статический старт: строки start и api вместе)", "path": ["dist/assets/entry-*.js", "dist/assets/preload-helper-*.js", "dist/assets/index-client-*.js", "dist/assets/dialog-content-*.js", "dist/assets/FormDialog-*.js", "dist/assets/router-*.js", "dist/assets/journals-*.js", "dist/assets/time-*.js", "dist/assets/layout-*.js", "dist/assets/viewport.svelte-*.js", "dist/assets/focus-*.js", "dist/assets/tabs-*.js", "dist/assets/CertaintyBadge-*.js", "dist/assets/TrashPanel-*.js", "dist/assets/api-*.js"], "gzip": true, "limit": "129.5 KB" },
   { "name": "InsightsView (журнал «Insights»)", "path": "dist/assets/InsightsView-*.js", "gzip": true, "limit": "12.6 KB" },
-  { "name": "GlossaryView (журнал «Словарь»)", "path": "dist/assets/GlossaryView-*.js", "gzip": true, "limit": "5.7 KB" },
+  { "name": "GlossaryView (журнал «Словарь»)", "path": "dist/assets/GlossaryView-*.js", "gzip": true, "limit": "6.8 KB" },
   { "name": "QuestionsView (журнал «Вопросы»)", "path": "dist/assets/QuestionsView-*.js", "gzip": true, "limit": "5.3 KB" },
   { "name": "ChangelogView (журнал «Changelog»)", "path": "dist/assets/ChangelogView-*.js", "gzip": true, "limit": "3.7 KB" },
   { "name": "ReleasesView (журнал «Releases»)", "path": "dist/assets/ReleasesView-*.js", "gzip": true, "limit": "4.05 KB" },

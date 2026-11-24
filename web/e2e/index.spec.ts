@@ -77,9 +77,14 @@ test('индекс: модели не загружены, подсказка к�
   await expect(dlg).toBeHidden();
   await page.getByRole('button', { name: 'Полная переиндексация' }).click();
   await expect(dlg).toContainText('перечанкованы');
+  // полная — необратимое (`danger`): фокус — на «Отмена» (M7.3, §6.14 п. 1)
+  await expect(dlg.getByRole('button', { name: 'Отмена' })).toBeFocused();
   await dlg.getByRole('button', { name: 'Запустить' }).click();
+  // отказ сервера — в окне, окно открыто (M7.3, §6.14 п. 1: каркас `FormDialog`)
+  await expect(dlg.getByRole('alert')).toContainText('векторный индекс не запущен');
+  await expect(dlg).toBeVisible();
+  await dlg.getByRole('button', { name: 'Отмена' }).click();
   await expect(dlg).toBeHidden();
-  await expect(page.locator('p.error[role="alert"]')).toContainText('векторный индекс не запущен');
 
   // прямой адрес после F5 открывает ту же страницу
   await page.reload();

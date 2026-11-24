@@ -2,8 +2,10 @@
   // «Аккаунт» (§11.4, §15.1): смена своего пароля и свои токены агентов (выпуск и отзыв
   // `rw`/`ro`). В режиме `forced` — только смена пароля, заданного администратором: до неё
   // прочие разделы закрыты сервером (403 password-change-required). Новый токен — сразу
-  // «Подключение агента» (§15.5) с окном токена.
+  // «Подключение агента» (§15.5) с окном токена. «Отозвать» свой токен необратим (агенты и CLI с
+  // ним сразу теряют доступ) — окно-подтверждение `danger`, фокус на «Отмена» (M7.3, §6.14 Д).
   import { onMount } from 'svelte';
+  import Prompt, { type Ask } from '../components/Prompt.svelte';
   import {
     ApiError,
     changePassword,
@@ -17,6 +19,7 @@
   } from '../lib/api';
   import { openAgentSetup } from '../lib/agentSetup';
   import { fmtTime } from '../lib/journals';
+  import { guardLeave } from '../lib/leaveEdit';
 
   let {
     me,
@@ -92,21 +95,49 @@
     }
   }
 
-  async function revoke(t: TokenInfo) {
+  let ask = $state<Ask | null>(null);
+  let tokNotice = $state('');
+
+  /** «Отозвать» — подтверждение; ошибка — в окне, окно открыто. */
+  function revoke(t: TokenInfo) {
     tokError = '';
-    try {
-      await revokeOwnToken(t.id);
-      await loadTokens();
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 401) return onexpired();
-      tokError = errorText(err);
-    }
+    tokNotice = '';
+    ask = {
+      title: 'Отозвать токен?',
+      message: `Токен «${t.name}» (zam_${t.prefix}…) перестанет работать сразу: агенты и CLI с ним потеряют доступ. Вернуть его нельзя — только выпустить новый.`,
+      confirm: 'Отозвать',
+      danger: true,
+      run: async () => {
+        try {
+          await revokeOwnToken(t.id);
+        } catch (err) {
+          if (err instanceof ApiError && err.status === 401) return onexpired();
+          throw new Error(errorText(err));
+        }
+        tokNotice = `Токен «${t.name}» отозван.`;
+        await loadTokens();
+      },
+      // кнопка «Отозвать» ушла вместе с отзывом — фокус на итог
+      refocus: () => document.querySelector('[data-testid="token-notice"]'),
+    };
   }
 
   // свои токены — после обязательной смены пароля (до неё сервер их не отдаёт)
   onMount(() => {
     if (!forced) loadTokens();
   });
+
+  // формы страницы — поля на виду (§6.14, правило А, решение 88): набранное — в стеке проверок
+  // ухода; согласие уйти — поля очищаются. Текущий пароль не в счёт: его подставляет менеджер
+  // паролей при загрузке страницы — уход спросил бы о тексте, которого человек не набирал
+  onMount(() =>
+    guardLeave(
+      () => !!(newPw || repeatPw || tokenName.trim()),
+      () => {
+        oldPw = newPw = repeatPw = tokenName = '';
+      },
+    ),
+  );
 </script>
 
 <section class="panel">
@@ -153,6 +184,7 @@
       показывается один раз; утёкший токен отзовите и выпустите новый.
     </p>
     {#if tokError}<p class="error" role="alert">{tokError}</p>{/if}
+    <p class="muted notice" role="status" tabindex="-1" data-testid="token-notice">{tokNotice}</p>
     <!-- таблица — в `.table-wrap` (§5.1 п. 6): на телефоне прокручивается внутри -->
     <div class="table-wrap">
       <table aria-label="Мои токены">
@@ -168,7 +200,7 @@
                 {#if t.revoked_at}
                   <span class="muted">отозван</span>
                 {:else}
-                  <button class="danger" onclick={() => revoke(t)}>Отозвать</button>
+                  <button type="button" class="danger" onclick={() => revoke(t)}>Отозвать</button>
                 {/if}
               </td>
             </tr>
@@ -187,6 +219,7 @@
   </section>
 {/if}
 
+<Prompt bind:ask />
 
 <style>
   .pw {
@@ -200,5 +233,8 @@
   }
   .small {
     font-size: 12px;
+  }
+  .notice:empty {
+    margin: 0;
   }
 </style>
