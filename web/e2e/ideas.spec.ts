@@ -162,8 +162,9 @@ test('ideas_create_and_list', async ({ page }) => {
   await expect(row).toContainText('#ui');
 
   // создание: заголовок, замысел, приоритет, теги; origin ставит сервер (human)
+  // «Новая идея» — окно (M7.3, §6.14 правило Б); после «Записать» — карточка созданной
   await page.getByRole('button', { name: 'Новая идея' }).click();
-  const form = page.getByRole('form', { name: 'Новая идея' });
+  const form = page.getByRole('dialog', { name: 'Новая идея' });
   await form.getByLabel('Заголовок').fill('Идея E2E из формы');
   await form.getByLabel('Замысел').fill('Записать замысел из WebUI.');
   await form.getByLabel('Приоритет').selectOption('low');
@@ -258,7 +259,7 @@ test('ideas_knowledge_start_in_shared_solution_warns', async ({ page }) => {
   await openIdeas(page, id, 'knowledge');
   await expect(card(page)).toContainText(IDEA_KNOWLEDGE_TITLE);
   await card(page).getByRole('button', { name: 'Начать' }).click();
-  const form = page.getByRole('form', { name: 'Начать идею' });
+  const form = page.getByRole('dialog', { name: 'Начать: где поставить задачу' });
   const where = form.getByLabel('Пространство задачи');
   // без вопроса-предложения — Knowledge, предупреждения нет
   await expect(where).toHaveValue('knowledge');
@@ -285,24 +286,25 @@ test('ideas_defer_with_date_and_decline', async ({ page }) => {
   const idea = await newIdea('Идея E2E: отложить и отказаться');
   await openIdeas(page, idea.id);
   await card(page).getByRole('button', { name: 'Отложить' }).click();
-  const form = page.getByRole('form', { name: 'Отложить идею' });
+  // решение с полями — окно (M7.3, §6.14 правило Б)
+  const form = page.getByRole('dialog', { name: 'Отложить' });
   const date = form.getByLabel('Отложить до');
   // минимум — завтра по UTC, по умолчанию +30 дней, подпись UTC
   await expectUtcDay(date, 1, 'min');
   await expectUtcDay(date, 30);
   await expect(form.getByText('UTC', { exact: true })).toBeVisible();
-  // повторное нажатие той же кнопки карточки открывает форму заново: введённое сброшено; при
-  // введённом — сначала вопрос (финальное ревью M7.2, I1): «Отмена» — форма с введённым цела
+  // окно открывается заново со сброшенным введённым; при введённом Esc сначала спрашивает в окне
+  // (M7.3: кнопка карточки под окном недоступна — прежний сценарий «повторное нажатие» снят):
+  // «Продолжить правку» — введённое цело, «Закрыть без сохранения» — окно закрыто
   await date.fill(utc(7));
-  const again = card(page).getByRole('group', { name: 'Решение по идее' }).getByRole('button', { name: 'Отложить' });
-  for (const accept of [false, true]) {
-    page.once('dialog', (d) => {
-      expect([d.type(), d.message()]).toEqual(['confirm', 'В форме есть несохранённый текст. Закрыть её без сохранения?']);
-      void (accept ? d.accept() : d.dismiss());
-    });
-    await again.click();
-    if (!accept) await expect(date).toHaveValue(utc(7));
-  }
+  await page.keyboard.press('Escape');
+  const ask = form.getByTestId('fd-ask');
+  await ask.getByRole('button', { name: 'Продолжить правку' }).click();
+  await expect(date).toHaveValue(utc(7));
+  await page.keyboard.press('Escape');
+  await ask.getByRole('button', { name: 'Закрыть без сохранения' }).click();
+  await expect(form).toHaveCount(0);
+  await card(page).getByRole('group', { name: 'Решение по идее' }).getByRole('button', { name: 'Отложить' }).click();
   await expectUtcDay(date, 30);
   await date.fill(utc(5));
   const sent = page.waitForRequest((r) => r.url().endsWith(`/entries/${idea.id}/decide`));
@@ -313,7 +315,7 @@ test('ideas_defer_with_date_and_decline', async ({ page }) => {
   await expect(feed(page).locator(`[data-idea="${idea.id}"]`)).toContainText(`не раньше ${utc(5)}`);
 
   await card(page).getByRole('button', { name: 'Отказаться' }).click();
-  const dec = page.getByRole('form', { name: 'Отказаться от идеи' });
+  const dec = page.getByRole('dialog', { name: 'Отказаться' });
   await dec.getByLabel('Причина (необязательно)').fill('уже не нужно');
   await dec.getByRole('button', { name: 'Отказаться' }).click();
   await expect(card(page).locator('[data-status]')).toHaveText('Отклонена');
@@ -333,17 +335,20 @@ test('ideas_form_chunk_load_failure_shows_alert', async ({ page }) => {
   await openIdeas(page, idea.id);
   const actions = card(page).getByRole('group', { name: 'Решение по идее' });
   await actions.getByRole('button', { name: 'Отложить' }).click();
-  const alert = card(page).getByRole('alert');
+  // решение с полями — окно (M7.3, §6.14): сбой — в окне той формы, «Отмена» — назад к карточке
+  const failed = page.getByRole('dialog', { name: 'Отложить' });
+  const alert = failed.getByRole('alert');
   await expect(alert).toContainText('Форма не загрузилась');
   await expect(alert).toContainText('обновите страницу');
-  await expect(page.getByRole('form', { name: 'Отложить идею' })).toHaveCount(0);
-  await card(page).getByRole('button', { name: 'Отмена' }).click();
-  await expect(card(page).getByRole('alert')).toHaveCount(0);
+  await expect(failed.getByLabel('Отложить до')).toHaveCount(0);
+  await failed.getByRole('button', { name: 'Отмена' }).click();
+  await expect(failed).toHaveCount(0);
   await expect(actions.getByRole('button', { name: 'Отложить' })).toBeVisible();
-  // и у формы создания — вне карточки
+  // и у окна создания
   await page.getByRole('button', { name: 'Новая идея' }).click();
-  await expect(page.getByRole('alert').filter({ hasText: 'Форма не загрузилась' })).toBeVisible();
-  await page.getByRole('button', { name: 'Отмена' }).click();
+  const created = page.getByRole('dialog', { name: 'Новая идея' });
+  await expect(created.getByRole('alert').filter({ hasText: 'Форма не загрузилась' })).toBeVisible();
+  await created.getByRole('button', { name: 'Отмена' }).click();
   await expect(page.getByRole('alert')).toHaveCount(0);
 });
 
@@ -357,7 +362,7 @@ test('ideas_reopen_declined_with_reason', async ({ page }) => {
   await expect(card(page).locator('[data-status]')).toHaveText('Отклонена');
   await expect(card(page).getByRole('button', { name: 'Начать' })).toHaveCount(0);
   await card(page).getByRole('button', { name: 'Вернуть на разбор' }).click();
-  const form = page.getByRole('form', { name: 'Вернуть идею' });
+  const form = page.getByRole('dialog', { name: 'Вернуть на разбор' });
   await expect(form).toContainText('Вернуть на разбор');
   await form.getByLabel('Причина').fill('снова актуально');
   const sent = page.waitForRequest((r) => r.url().endsWith(`/entries/${idea.id}/decide`));
@@ -381,7 +386,7 @@ test('ideas_accepted_dropped_task_reopen', async ({ page }) => {
   await expect(card(page).getByRole('button', { name: 'Начать' })).toHaveCount(0);
   await expect(card(page).getByRole('button', { name: 'Отказаться' })).toBeVisible();
   await card(page).getByRole('button', { name: 'Вернуть на разбор' }).click();
-  const form = page.getByRole('form', { name: 'Вернуть идею' });
+  const form = page.getByRole('dialog', { name: 'Вернуть на разбор' });
   await form.getByLabel('Причина').fill('задачу сняли, вернёмся позже');
   await form.getByRole('button', { name: 'Вернуть' }).click();
   await expect(card(page).locator('[data-status]')).toHaveText('Непросмотрено');
@@ -441,14 +446,14 @@ test('ideas_stale_rev_conflict_rereads', async ({ page }) => {
   const saved = page.waitForResponse((r) => r.url().endsWith(`/entries/${idea.id}`) && r.request().method() === 'PATCH');
   await form.getByRole('button', { name: 'Сохранить' }).click();
   expect((await saved).status()).toBe(409);
-  // карточка перечитана: дополнение видно, правка не применена, ошибка с номером ревизии
-  await expect(card(page)).toContainText('Дополнение агента.');
+  // M7.3 (§6.14 п. 5): форма не закрывается — набранное цело, нетронутое поле (замысел) — из свежей
+  // идеи с дополнением агента, карточка — свежая ревизия, сообщение «Запись изменилась…»
+  await expect(form.getByLabel('Заголовок')).toHaveValue('Идея E2E: правка человека');
+  await expect(form.getByLabel('Замысел')).toHaveValue(/Дополнение агента\./);
   await expect(card(page).locator('h2')).toHaveText('Идея E2E: конфликт ревизии');
-  await expect(card(page).getByRole('alert')).toContainText('Запись изменилась');
+  await expect(form.getByRole('alert')).toContainText('Запись изменилась, пока вы правили');
   await expect(card(page)).toContainText(`ревизия ${idea.rev + 1}`);
-  // повтор после перечитывания проходит
-  await card(page).getByRole('button', { name: 'Изменить' }).click();
-  await form.getByLabel('Заголовок').fill('Идея E2E: правка человека');
+  // повтор с перенесённым набранным проходит
   await form.getByRole('button', { name: 'Сохранить' }).click();
   await expect(card(page).locator('h2')).toHaveText('Идея E2E: правка человека');
   expect(problems, problems.join('\n')).toEqual([]);
@@ -496,7 +501,7 @@ test('ideas_accepted_deleted_task_decline', async ({ page }) => {
   await expect(card(page).getByTestId('task-link')).toHaveCount(0);
   await expect(card(page).getByRole('button', { name: 'Вернуть на разбор' })).toBeVisible();
   await card(page).getByRole('button', { name: 'Отказаться' }).click();
-  await page.getByRole('form', { name: 'Отказаться от идеи' }).getByRole('button', { name: 'Отказаться' }).click();
+  await page.getByRole('dialog', { name: 'Отказаться' }).getByRole('button', { name: 'Отказаться' }).click();
   await expect(card(page).locator('[data-status]')).toHaveText('Отклонена');
   expect((await api('GET', `entries/${idea.id}`)).status).toBe('declined');
   expect(problems, problems.join('\n')).toEqual([]);

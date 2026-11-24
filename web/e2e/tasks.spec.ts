@@ -191,8 +191,8 @@ test.describe('настольный', () => {
     // правка из карточки перечитывает колонки, но не укорачивает догруженную: «выполнен» — 100
     await columnOf(page, 'открыт').getByRole('button', { name: 'Старая открытая задача' }).click();
     const card = page.getByRole('article', { name: 'Карточка задачи' });
+    // статус без обязательных полей — сразу по кнопке (M7.3, §6.14 решение 84)
     await card.getByRole('button', { name: '→ в работе' }).click();
-    await card.getByRole('button', { name: 'Применить' }).click();
     await expect(card.getByRole('status')).toHaveText('Статус: в работе.');
     await expect(columnOf(page, 'в работе')).toContainText('Старая открытая задача');
     await expect(columnOf(page, 'открыт').getByRole('heading')).toHaveText('открыт 0');
@@ -482,8 +482,8 @@ test.describe('настольный', () => {
     // «→ в работе» из карточки: задача ушла из «открыт» и появилась в «в работе», числа — сервера
     await columnOf(page, 'открыт').getByRole('button', { name: 'Смена: первая' }).click();
     const card = page.getByRole('article', { name: 'Карточка задачи' });
+    // статус без обязательных полей — сразу по кнопке (M7.3, §6.14 решение 84)
     await card.getByRole('button', { name: '→ в работе' }).click();
-    await card.getByRole('button', { name: 'Применить' }).click();
     await expect(card.getByRole('status')).toHaveText('Статус: в работе.');
     await expect(columnOf(page, 'открыт')).not.toContainText('Смена: первая');
     await expect(columnOf(page, 'в работе').locator(`[data-task="${first}"]`)).toHaveCount(1);
@@ -500,8 +500,9 @@ test.describe('настольный', () => {
     await expect(tabOf(p, 'В работе')).toHaveAccessibleName('В работе, 2 задачи');
     await p.getByRole('tabpanel').getByRole('button', { name: 'Смена: первая' }).tap();
     const pc = p.getByRole('article', { name: 'Карточка задачи' });
+    // конечный статус — окно-подтверждение (M7.3, §6.14 решение 84)
     await pc.getByRole('button', { name: '→ выполнен' }).tap();
-    await pc.getByRole('button', { name: 'Применить' }).tap();
+    await p.getByRole('dialog', { name: 'Отметить задачу выполненной?' }).getByRole('button', { name: 'Отметить выполненной' }).tap();
     await expect(pc.getByRole('status')).toHaveText('Статус: выполнен.');
     await p.getByRole('link', { name: '← Задачи' }).tap();
     await expect(tabOf(p, 'В работе')).toHaveAttribute('aria-selected', 'true');
@@ -727,7 +728,7 @@ test.describe('настольный', () => {
     const nextLink = list.getByRole('link', { name: 'Общая: следующий шаг' });
     await nextLink.click();
     await card.getByRole('button', { name: '→ выполнен' }).click();
-    await card.getByRole('button', { name: 'Применить' }).click();
+    await page.getByRole('dialog', { name: 'Отметить задачу выполненной?' }).getByRole('button', { name: 'Отметить выполненной' }).click();
     await expect(card.getByRole('status')).toHaveText('Статус: выполнен.');
     await expect(own).toHaveText('2/3');
     await expect(tile.getByRole('progressbar', { name: 'Выполнено подзадач' }).first()).toHaveAttribute('aria-valuenow', '2');
@@ -741,7 +742,7 @@ test.describe('настольный', () => {
     const n2Link = nestedRow.getByRole('link', { name: 'Вложенный: шаг 2' });
     await n2Link.click();
     await card.getByRole('button', { name: '→ выполнен' }).click();
-    await card.getByRole('button', { name: 'Применить' }).click();
+    await page.getByRole('dialog', { name: 'Отметить задачу выполненной?' }).getByRole('button', { name: 'Отметить выполненной' }).click();
     await expect(card.getByRole('status')).toHaveText('Статус: выполнен.');
     await expect(nestedRow.getByTestId('task-progress')).toHaveText('2/2');
     await expect(nestedRow.locator(`[data-subtask="${n2}"]`)).toContainText('выполнен');
@@ -967,9 +968,10 @@ test.describe('настольный', () => {
   test('task_edit_stale_keeps_next_step', async ({ page }) => {
     // ревью задачи 10, круги 1–2 (I1, M1, M3, N1): пока форма правки открыта, агент меняет следующий
     // шаг → 409 → карточка перечитана, поле «Следующий шаг» (его не трогали) — шаг агента,
-    // «Сохранить шаг» не затрёт его старым; смена статуса при набранном в форме — сначала вопрос
-    // («Отмена» вопроса — форма с текстом на месте); «Отмена» — фокус на «Изменить», Esc закрывает
-    // панель без вопроса о несохранённом
+    // «Сохранить шаг» не затрёт его старым; «Отмена» — фокус на «Изменить», Esc закрывает панель без
+    // вопроса о несохранённом. M7.3 (§6.14 п. 3): форма правки заменяет вид карточки — ряда статусов и
+    // поля шага, пока она открыта, нет (прежняя проверка «смена статуса при набранном спрашивает»
+    // снята вместе с кнопками)
     const problems = watch(page, (path, status) => status === 409 && /\/entries\/[0-9A-Za-z]+$/.test(path));
     const guid = await newSolution('правка и шаг агента');
     const t = await api<{ id: string; rev: number }>('POST', `spaces/${guid}/entries`, {
@@ -988,21 +990,15 @@ test.describe('настольный', () => {
     const form = card.getByRole('form', { name: 'Правка задачи' });
     await expect(form.getByLabel('Заголовок')).toBeFocused();
     await form.getByLabel('Заголовок').fill('Заголовок человека');
-    // кнопки карточки доступны (без отключений без причины), но закрыть форму с набранным молча нельзя
-    page.once('dialog', (d) => {
-      expect([d.type(), d.message()]).toEqual(['confirm', 'В форме есть несохранённый текст. Закрыть её без сохранения?']);
-      void d.dismiss();
-    });
-    await card.getByRole('group', { name: 'Смена статуса' }).getByRole('button').first().click();
-    await expect(form.getByLabel('Заголовок')).toHaveValue('Заголовок человека');
-    await expect(card.getByRole('form', { name: 'Смена статуса задачи' })).toHaveCount(0);
+    // правка — вместо вида карточки: ряда статусов и поля шага нет
+    await expect(card.getByRole('group', { name: 'Смена статуса' })).toHaveCount(0);
+    await expect(step).toHaveCount(0);
     const other = await api<{ rev: number }>('PATCH', `entries/${t.id}`, { next_step: 'шаг агента' }, { 'If-Match': `"${t.rev}"` });
     const stale = page.waitForResponse((r) => r.request().method() === 'PATCH' && r.url().endsWith(`/entries/${t.id}`));
     await form.getByRole('button', { name: 'Сохранить' }).click();
     expect((await stale).status()).toBe(409);
     await expect(form.getByRole('alert')).toContainText(`(сейчас ревизия ${other.rev})`);
     await expect(card).toContainText(`ревизия ${other.rev}`);
-    await expect(step).toHaveValue('шаг агента');
     await expect(form.getByLabel('Заголовок')).toHaveValue('Заголовок человека');
     await form.getByRole('button', { name: 'Отмена' }).click();
     await expect(form).toHaveCount(0);
@@ -1029,9 +1025,10 @@ test.describe('настольный', () => {
   for (const [suffix, noNavApi] of [['', false], ['_no_nav_api', true]] as const) {
     test(`task_edit_cancelled_leave_keeps_history${suffix}`, async ({ page }) => {
       // ревью задачи 10, круг 3 (N5): отменённый переход историю не меняет — панель потом закрывается
-      // и возвращает на доску. (а) ссылка в карточке («Подзадачи») при набранном → «Отмена» вопроса →
-      // форма цела → «Отмена» формы → Esc — панели нет, адрес — доска; (б) «назад» браузера при
-      // набранном → «Отмена» → «Закрыть» → «Закрыть без сохранения» — доска, а не страница до неё
+      // и возвращает на доску. (а) ссылка в карточке («Часть» в шапке шага — M7.3: правка заменяет
+      // вид карточки, раздела «Подзадачи» под формой нет) при набранном → «Отмена» вопроса → форма
+      // цела → «Отмена» формы → Esc — панели нет, адрес — доска; (б) «назад» браузера при набранном →
+      // «Отмена» → «Закрыть» → «Закрыть без сохранения» — доска, а не страница до неё
       if (noNavApi) await hideNavApi(page);
       const problems = watch(page);
       const guid = await newSolution('отменённый уход');
@@ -1053,15 +1050,15 @@ test.describe('настольный', () => {
           void (accept ? d.accept() : d.dismiss());
         });
 
-      // (а) ссылка карточки
-      await tile.click();
-      await expect(page).toHaveURL(new RegExp(`/j/tasks/${umbrella}$`));
+      // (а) ссылка карточки: шаг открыт с доски переходом по адресу (своей плитки у шага нет)
+      await page.evaluate((h) => (location.hash = h), tasksUrl(c.user, guid, step));
+      await expect(page).toHaveURL(new RegExp(`/j/tasks/${step}$`));
       const taskIdx = await place();
       await card.getByRole('button', { name: 'Изменить', exact: true }).click();
       await form.getByLabel('Заголовок').fill('Черновик заголовка');
       leave(false);
-      await card.getByTestId('task-subtasks').getByRole('link', { name: 'Шаг общей' }).click();
-      await expect(page).toHaveURL(new RegExp(`/j/tasks/${umbrella}$`));
+      await card.getByTestId('task-parent').getByRole('link', { name: /Общая под правкой/ }).click();
+      await expect(page).toHaveURL(new RegExp(`/j/tasks/${step}$`));
       await expect(form.getByLabel('Заголовок')).toHaveValue('Черновик заголовка');
       await expect.poll(place).toBe(taskIdx);
       await form.getByRole('button', { name: 'Отмена' }).click();
@@ -1085,6 +1082,7 @@ test.describe('настольный', () => {
       await expect(page).toHaveURL(/\/j\/tasks$/);
       await expect.poll(place).toBe(boardIdx);
       expect((await api<{ title: string }>('GET', `entries/${umbrella}`)).title).toBe('Общая под правкой');
+      expect((await api<{ title: string }>('GET', `entries/${step}`)).title).toBe('Шаг общей');
       expect(problems, problems.join('\n')).toEqual([]);
     });
 
@@ -1299,8 +1297,9 @@ test.describe('настольный', () => {
       await expect.poll(() => asked).toBe(1);
       await expect(page).toHaveURL(at(umbrella));
       await expect(form.getByLabel('Заголовок')).toHaveValue('Черновик у предела');
-      // (б) ссылка «Подзадачи» с «Отменой» — тоже новая запись на пределе
-      await card.getByTestId('task-subtasks').getByRole('link', { name: 'Шаг у предела' }).click();
+      // (б) переход по адресу подзадачи (как ссылка «Подзадачи»: M7.3 — правка заменяет вид
+      // карточки, раздела под формой нет) с «Отменой» — тоже новая запись на пределе
+      await page.evaluate((h) => (location.hash = h), tasksUrl(c.user, guid, sub));
       await expect.poll(() => asked).toBe(2);
       await expect(page).toHaveURL(at(umbrella));
       await expect(form.getByLabel('Заголовок')).toHaveValue('Черновик у предела');

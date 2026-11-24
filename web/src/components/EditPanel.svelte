@@ -4,8 +4,14 @@
   // Пробрасывает экспорты формы: `dirty()` (панель доски спрашивает перед закрытием), `leave()`
   // (действие журнала, которое закрыло бы форму, — сначала вопрос при несохранённом) и `release()`
   // (журнал уже спросил сам). Пока чанк не пришёл, несохранённого нет.
+  //
+  // `dialog` (M7.3, §6.14 п. 3, решение 85): правка в окне формы — у лент без карточки (Вопросы,
+  // Changelog, Releases): `FormDialog` (`wide`) с заголовком формы и записью в шапке, кнопки
+  // «Сохранить» и «Отмена» — у окна, поля — `EntryEdit` с `bare`; несохранённое спрашивает окно.
+  import FormDialog from './FormDialog.svelte';
   import Lazy from './Lazy.svelte';
   import type { Entry } from '../lib/api';
+  import { EDIT_TITLE } from '../lib/journals';
 
   interface Props {
     user: string;
@@ -14,14 +20,20 @@
     oncancel: () => void;
     onreread?: (e: Entry) => void;
     onexpired?: () => void;
+    /** Правка в окне формы, а не в карточке. */
+    dialog?: boolean;
+    /** Куда перевести фокус при закрытии окна (`dialog`); `null` — на кнопку, открывшую окно. */
+    refocus?: () => Element | null | undefined;
   }
 
-  let { user, entry, onsaved, oncancel, onreread, onexpired }: Props = $props();
+  let { user, entry, onsaved, oncancel, onreread, onexpired, dialog = false, refocus }: Props = $props();
 
-  let lazy = $state<{ instance: () => { dirty?: () => boolean; leave?: () => boolean; release?: () => void } | undefined } | null>(
-    null,
-  );
+  let lazy = $state<{
+    instance: () => { dirty?: () => boolean; leave?: () => boolean; release?: () => void; submit?: () => Promise<void> } | undefined;
+  } | null>(null);
   const form = () => lazy?.instance();
+  /** Окно открыто, пока форма не сохранена и не отменена (журнал закрывает её своим `mode`). */
+  let open = $state(true);
 
   export function dirty(): boolean {
     return form()?.dirty?.() ?? false;
@@ -34,12 +46,45 @@
   export function release(): void {
     form()?.release?.();
   }
+
+  const saved = (e: Entry) => {
+    open = false;
+    onsaved(e);
+  };
+  const cancel = () => {
+    open = false;
+    oncancel();
+  };
 </script>
 
-<Lazy
-  bind:this={lazy}
-  what="Форма"
-  load={() => import('./EntryEdit.svelte')}
-  props={{ user, entry, onsaved, oncancel, onreread, onexpired }}
-  {oncancel}
-/>
+{#if dialog}
+  <FormDialog
+    {open}
+    title={EDIT_TITLE[entry.kind] ?? 'Правка записи'}
+    subject={entry.title}
+    submit="Сохранить"
+    wide
+    {dirty}
+    {refocus}
+    onsubmit={async () => {
+      await form()?.submit?.();
+    }}
+    onclose={cancel}
+  >
+    <Lazy
+      bind:this={lazy}
+      what="Форма"
+      load={() => import('./EntryEdit.svelte')}
+      props={{ user, entry, onsaved: saved, oncancel: cancel, onreread, onexpired, bare: true }}
+      oncancel={cancel}
+    />
+  </FormDialog>
+{:else}
+  <Lazy
+    bind:this={lazy}
+    what="Форма"
+    load={() => import('./EntryEdit.svelte')}
+    props={{ user, entry, onsaved, oncancel, onreread, onexpired }}
+    {oncancel}
+  />
+{/if}

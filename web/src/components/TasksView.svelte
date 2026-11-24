@@ -28,14 +28,24 @@
   // Правка и корзина (M7.2, спецификация §5.9): в карточке — «Изменить» (`EntryEdit`: заголовок,
   // текст, приоритет, кто ведёт, оценка, ссылки, теги, область; несохранённое в форме — вопрос перед
   // закрытием панели) и «Удалить» (в корзину, с подтверждением); «Корзина» доски — вместо доски
-  // удалённые задачи с «Восстановить» (`JournalTrash`). Форма и корзина — ленивые чанки. Смена статуса,
-  // «Снять захват», «Сохранить шаг» и переход к другой задаче закрывают открытую форму правки, при
-  // несохранённом — сначала вопрос (`leaveEdit`, проверка ухода `EntryEdit`); 409 формы переносит и
-  // черновик шага (`reread`).
-  import { tick, untrack } from 'svelte';
+  // удалённые задачи с «Восстановить» (`JournalTrash`). Форма и корзина — ленивые чанки. 409 формы
+  // переносит и черновик шага (`reread`).
+  //
+  // Карточка и формы (M7.3, спецификация §6.14, задача владельца k:01M85AS1C0EZVV95FQZ2ZEQCET): под
+  // шапкой карточки (заголовок, статус, «Часть», захват, блокер) — ряд «Смена статуса», «Изменить» и
+  // «Удалить», поле «Следующий шаг»; текст, «Из идей», подзадачи и файлы — ниже (правило Г). Смена
+  // статуса без обязательных полей («→ в работе», «→ открыт») — сразу, итог строкой; «→ выполнен» и
+  // «→ снят» — окно-подтверждение (конечные статусы, обратно — только «Переоткрыть»); переоткрытие
+  // (причина) и «→ заблокирован» (что мешает) — окно формы (`FormDialog`); «Новая задача» — окно,
+  // после «Добавить» — карточка созданной. «Изменить» — правка в карточке на месте (вид карточки
+  // сменяется формой). Шаг и правка — под проверкой ухода (стек `pushGuard`): уход по адресу
+  // спрашивает один раз; окна спрашивают о несохранённом сами. 409 окна статуса — набранное
+  // остаётся, нетронутое — из свежей записи (`rebase`).
+  import { onMount, tick, untrack } from 'svelte';
   import FileRefs from './FileRefs.svelte';
   import JournalSplit from './JournalSplit.svelte';
   import EditPanel from './EditPanel.svelte';
+  import FormDialog from './FormDialog.svelte';
   import Notice from './Notice.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
   import StatusTabs from './StatusTabs.svelte';
@@ -53,9 +63,10 @@
     type Entry,
     type EntryStatus,
   } from '../lib/api';
-  import { LEAVE_EDIT } from '../lib/leaveEdit';
+  import { guardLeave } from '../lib/leaveEdit';
   import { trashAsk } from '../lib/entryTrash';
-  import { focusSoon } from '../lib/focus';
+  import { focusSoon, revealTop } from '../lib/focus';
+  import { rebase, rebaseText } from '../lib/formDraft';
   import { loadRefs, staleOf, type RefsByTarget } from '../lib/fileRefs';
   import {
     AUTHOR_TEXT,
@@ -140,11 +151,22 @@
   let cur = $state<Entry | null>(null);
   let curError = $state('');
   let eseq = 0;
-  type Mode = 'none' | 'create' | 'status' | 'edit';
+  /** Карточка: просмотр или правка на месте (`EditPanel` вместо вида карточки). */
+  type Mode = 'none' | 'edit';
   let mode = $state<Mode>('none');
   let busy = $state(false);
   let actionError = $state('');
   let notice = $state('');
+  /** Окно «Новая задача». */
+  let createOpen = $state(false);
+  /** Окно смены статуса: переоткрытие (причина), «заблокирован» (что мешает) или подтверждение
+   * конечного статуса. */
+  type StatusDialog = { to: EntryStatus; kind: 'reopen' | 'blocked' | 'final' };
+  let statusDlg = $state<StatusDialog | null>(null);
+  /** Поля окна статуса при открытии (для `rebase` при 409). */
+  let statusBase = { reason: '', blocked: '' };
+  /** Ошибка открытого окна (сервер, проверка, 409). */
+  let dlgError = $state('');
   /** «Корзина»: вместо доски — удалённые задачи. */
   let trash = $state(false);
   /** Итог действия, закрывшего карточку (удаление), — над доской. */
@@ -156,7 +178,6 @@
   let nStep = $state('');
   let nTitle = $state('');
   let nBody = $state('');
-  let toStatus = $state<EntryStatus>('open');
   let sReason = $state('');
   let sBlocked = $state('');
   let stepDraft = $state('');
@@ -393,6 +414,11 @@
     mode = 'none';
     actionError = '';
     curError = '';
+    // другая запись (переход по адресу уже спросил о набранном): окна закрываются
+    if (id !== (cur?.id ?? null)) {
+      statusDlg = null;
+      createOpen = false;
+    }
     if (!id) {
       cur = null;
       return;
@@ -481,44 +507,40 @@
     go({ name: 'journal', user, space, journal: 'tasks', entry: id });
   }
 
-  /** Карточка или форма показана (панелью поверх доски или вместо неё). */
-  let detailOpen = $derived(cur !== null || curError !== '' || mode === 'create');
+  /** Карточка показана (панелью поверх доски или вместо неё). */
+  let detailOpen = $derived(cur !== null || curError !== '');
 
-  /** Закрыли карточку («← Задачи», фон, Esc): форма новой задачи закрывается здесь. */
+  /** Закрыли карточку («← Задачи», фон, Esc): несохранённое панель уже спросила («Закрыть без
+   * сохранения?») — форма правки и черновик шага отпускаются, переход не спрашивает снова. */
   function closeDetail() {
-    // несохранённое панель уже спросила («Закрыть без сохранения?») — переход не спрашивает снова
     editor?.release();
     mode = 'none';
     actionError = '';
+    stepDraft = cur ? str(cur.data, 'next_step') : '';
   }
 
-  /** Действие закроет открытую форму правки (смена статуса, шаг, захват): при несохранённом —
-   * сначала вопрос; `false` — остаться. */
-  function leaveEdit(): boolean {
-    if (mode !== 'edit') return true;
-    if (editor && !editor.leave()) return false;
-    editor?.release();
-    mode = 'none';
-    return true;
-  }
-
-  /** Несохранённое в панели (вопрос перед закрытием): поля — так, как уйдут при отправке
-   * (обрезанные), против сохранённого в задаче. После сохранения и перечитывания карточки (`open`
-   * берёт `next_step` сервера) — пусто; после неудачной отправки набранное остаётся несохранённым. */
-  function unsaved(): boolean {
-    if (mode === 'create') return !!(nTitle.trim() || nBody.trim() || nStep.trim());
+  /** Черновик «Следующего шага» отличается от шага задачи (поле на виду, правило А): обрезанный —
+   * так, как уйдёт при сохранении. После сохранения и перечитывания карточки (`open` берёт
+   * `next_step` сервера) — пусто; после неудачной отправки набранное остаётся несохранённым. */
+  const stepDirty = (): boolean => {
     const c = cur;
-    if (!c) return false;
+    return !!c && c.status !== 'done' && c.status !== 'dropped' && stepDraft.trim() !== str(c.data, 'next_step');
+  };
+
+  /** Несохранённое в карточке (вопрос панели перед закрытием): правка на месте и шаг. Окна
+   * спрашивают о своём сами (`FormDialog`). */
+  function unsaved(): boolean {
+    if (!cur) return false;
     // форма правки сравнивает черновик с перечитанной записью сама (`EntryEdit.dirty`)
     if (mode === 'edit' && editor?.dirty()) return true;
-    if (mode === 'status') {
-      if (sReason.trim()) return true;
-      if (toStatus === 'blocked' && sBlocked.trim() !== str(c.data, 'blocked_by')) return true;
-    }
-    return c.status !== 'done' && c.status !== 'dropped' && stepDraft.trim() !== str(c.data, 'next_step');
+    return stepDirty();
   }
 
-  async function act(fn: () => Promise<string | void>, done: string) {
+  // шаг на виду — в стеке проверок ухода (§6.14 п. 4): уход по адресу спрашивает; согласие —
+  // черновик шага отпущен (новая карточка возьмёт свой шаг)
+  onMount(() => guardLeave(stepDirty, () => (stepDraft = cur ? str(cur.data, 'next_step') : '')));
+
+  async function act(fn: () => Promise<string | void>, done: string, focusNotice = false) {
     if (busy) return;
     busy = true;
     actionError = '';
@@ -531,10 +553,16 @@
       if (target && target !== entry) select(target);
       else await open(user, target);
       notice = done;
+      // нажатая кнопка ушла вместе с прежним статусом — фокус на итог
+      if (focusNotice) focusSoon(noticeEl);
     } catch (e) {
       if (isStaleEntry(e) && cur) {
+        // 409 (§6.14 п. 5): карточка перечитана; набранный шаг остаётся (правило `rebase`: тронутое —
+        // человека), нетронутый — из свежей записи
         const msg = errorText(e);
+        const typed = stepDirty() ? stepDraft : null;
         await open(user, cur.id);
+        if (typed !== null) stepDraft = typed;
         actionError = msg;
       } else {
         fail(e, (m) => (actionError = m));
@@ -550,37 +578,106 @@
       ? ['open']
       : TASK_COLUMNS.filter((s) => s !== e.status);
 
-  function startStatus(s: EntryStatus) {
-    if (!leaveEdit()) return;
-    toStatus = s;
-    sReason = '';
-    sBlocked = cur ? str(cur.data, 'blocked_by') : '';
-    actionError = '';
-    mode = 'status';
-  }
-
-  function submitStatus(e: SubmitEvent) {
-    e.preventDefault();
+  /** Кнопка ряда «Смена статуса» (решение 84): без обязательных полей — сразу; конечный статус —
+   * подтверждение; переоткрытие и «заблокирован» — окно с полем. */
+  function pressStatus(s: EntryStatus) {
     const c = cur;
-    if (!c) return;
+    if (!c || busy) return;
+    actionError = '';
+    dlgError = '';
     const reopen = c.status === 'done' || c.status === 'dropped';
-    if (reopen && !sReason.trim()) {
-      actionError = 'Переоткрытие требует причины.';
+    if (reopen || s === 'blocked' || s === 'done' || s === 'dropped') {
+      sReason = '';
+      sBlocked = str(c.data, 'blocked_by');
+      statusBase = { reason: '', blocked: sBlocked };
+      statusDlg = { to: s, kind: reopen ? 'reopen' : s === 'blocked' ? 'blocked' : 'final' };
       return;
     }
-    act(async () => {
+    act(
+      async () => {
+        await patchEntry(user, c.id, c.rev, { status: s });
+      },
+      `Статус: ${STATUS_TEXT[s]}.`,
+      true,
+    );
+  }
+
+  /** Заголовок, пояснение и кнопка окна статуса. */
+  const statusTitle = (d: StatusDialog | null): string =>
+    !d ? '' : d.kind === 'reopen' ? 'Переоткрыть задачу' : d.kind === 'blocked' ? 'Задача заблокирована' : d.to === 'done' ? 'Отметить задачу выполненной?' : 'Снять задачу?';
+  const statusDescription = (d: StatusDialog | null): string | undefined =>
+    !d
+      ? undefined
+      : d.kind === 'reopen'
+        ? 'Задача вернётся в «открыт»; причина останется в истории записи.'
+        : d.kind === 'blocked'
+          ? 'Задача перейдёт в «заблокирован»; что мешает — видно на доске и в карточке.'
+          : `Задача перейдёт в «${STATUS_TEXT[d.to]}» и уйдёт из работы; вернуть её можно только кнопкой «Переоткрыть» с причиной.`;
+  const statusSubmit = (d: StatusDialog | null): string =>
+    !d ? '' : d.kind === 'reopen' ? 'Переоткрыть' : d.kind === 'blocked' ? 'Заблокировать' : d.to === 'done' ? 'Отметить выполненной' : 'Снять задачу';
+
+  /** Набранное в окне статуса против полей при открытии. */
+  const statusDirty = (): boolean =>
+    !!statusDlg && (sReason.trim() !== '' || (statusDlg.kind === 'blocked' && sBlocked.trim() !== statusBase.blocked.trim()));
+
+  /** Окно статуса: запрос; ошибка и 409 — в окне (набранное остаётся, нетронутое — из свежей
+   * записи), успех — окно закрыто, доска и карточка перечитаны, итог строкой. */
+  async function submitStatus() {
+    const c = cur;
+    const d = statusDlg;
+    if (!c || !d) return;
+    const reason = sReason.trim();
+    if (d.kind === 'reopen' && !reason) {
+      dlgError = 'Переоткрытие требует причины.';
+      return;
+    }
+    dlgError = '';
+    try {
       await patchEntry(user, c.id, c.rev, {
-        status: toStatus,
-        ...(reopen ? { reason: sReason.trim() } : {}),
-        ...(toStatus === 'blocked' && sBlocked.trim() ? { blocked_by: sBlocked.trim() } : {}),
+        status: d.to,
+        ...(d.kind === 'reopen' ? { reason } : {}),
+        ...(d.kind === 'blocked' && sBlocked.trim() ? { blocked_by: sBlocked.trim() } : {}),
       });
-    }, `Статус: ${STATUS_TEXT[toStatus]}.`);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) return onexpired();
+      if (isStaleEntry(e)) return staleStatus(c.id);
+      dlgError = errorText(e);
+      return;
+    }
+    statusDlg = null;
+    busy = true;
+    try {
+      await reloadBoard();
+      reloadRefs();
+      await open(user, c.id);
+      notice = `Статус: ${STATUS_TEXT[d.to]}.`;
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** 409 окна статуса: запись перечитана, черновик перенесён (`rebase`), окно открыто. */
+  async function staleStatus(id: string) {
+    let fresh: Entry;
+    try {
+      fresh = await getEntry(user, id);
+    } catch (e) {
+      dlgError = errorText(e);
+      return;
+    }
+    const next = { reason: '', blocked: str(fresh.data, 'blocked_by') };
+    const r = rebase({ reason: sReason, blocked: sBlocked }, statusBase, next);
+    sReason = r.fields.reason;
+    sBlocked = r.fields.blocked;
+    statusBase = next;
+    reread(fresh);
+    dlgError = rebaseText(r.clash.map((k) => (k === 'blocked' ? 'что мешает' : 'причина')));
   }
 
   function saveStep(e: SubmitEvent) {
     e.preventDefault();
     const c = cur;
-    if (!c || !leaveEdit()) return;
+    if (!c) return;
     act(async () => {
       await patchEntry(user, c.id, c.rev, { next_step: stepDraft.trim() });
     }, 'Следующий шаг сохранён.');
@@ -588,19 +685,24 @@
 
   function release() {
     const c = cur;
-    if (!c || !leaveEdit()) return;
-    act(async () => {
-      await releaseTask(user, c.id);
-    }, 'Захват снят.');
+    if (!c) return;
+    act(
+      async () => {
+        await releaseTask(user, c.id);
+      },
+      'Захват снят.',
+      true,
+    );
   }
 
-  function startEdit() {
-    // открыта форма статуса с набранной причиной или блокером — сначала вопрос
-    const typed = mode === 'status' && (!!sReason.trim() || (toStatus === 'blocked' && sBlocked.trim() !== str(cur?.data ?? {}, 'blocked_by')));
-    if (typed && !window.confirm(LEAVE_EDIT)) return;
+  /** «Изменить»: вид карточки сменяется формой (правило В), карточка — с начала, фокус — на первом
+   * поле формы (`EntryEdit`). */
+  async function startEdit() {
     actionError = '';
     notice = '';
     mode = 'edit';
+    await tick();
+    revealTop(detailEl());
   }
 
   /** Правка сохранена (`EntryEdit`): доска и ссылки — заново, карточка перечитана, фокус — на её
@@ -631,6 +733,8 @@
 
   /** Карточка задачи (в панели или вместо доски). */
   const detailEl = () => root?.querySelector<HTMLElement>('article[aria-label="Карточка задачи"]');
+  /** Итог действия в карточке (`Notice`): фокус после смены статуса и закрытия окна. */
+  const noticeEl = () => detailEl()?.querySelector<HTMLElement>('.card-notice [role="status"]');
 
   /** «Удалить»: в корзину; панель закрывается, итог — над доской. */
   function askDelete(c: Entry) {
@@ -668,29 +772,42 @@
     nTitle = '';
     nBody = '';
     nStep = '';
-    actionError = '';
-    mode = 'create';
+    dlgError = '';
+    createOpen = true;
   }
 
-  function submitCreate(e: SubmitEvent) {
-    e.preventDefault();
+  const createDirty = () => !!(nTitle.trim() || nBody.trim() || nStep.trim());
+
+  /** «Добавить»: окно закрывается, открывается карточка созданной (адрес с `entry`: заголовок на
+   * виду и в фокусе; на телефоне запись слоя окна становится записью карточки — одна «Назад»
+   * возвращает к доске), доска перечитывается, итог — строкой (§6.14 п. 6). */
+  async function submitCreate() {
     const title = nTitle.trim();
     if (!title) {
-      actionError = 'Укажите заголовок.';
+      dlgError = 'Укажите заголовок.';
       return;
     }
-    act(
-      async () =>
-        (
-          await createEntry(user, space, {
-            kind: 'task',
-            title,
-            body: nBody,
-            data: nStep.trim() ? { next_step: nStep.trim() } : {},
-          })
-        ).id,
-      'Задача добавлена.',
-    );
+    dlgError = '';
+    let id: string;
+    try {
+      id = (
+        await createEntry(user, space, {
+          kind: 'task',
+          title,
+          body: nBody,
+          data: nStep.trim() ? { next_step: nStep.trim() } : {},
+        })
+      ).id;
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) return onexpired();
+      dlgError = errorText(e);
+      return;
+    }
+    createOpen = false;
+    select(id);
+    notice = 'Задача добавлена.';
+    await reloadBoard();
+    reloadRefs();
   }
 </script>
 
@@ -701,7 +818,7 @@
     open={detailOpen}
     mode="overlay"
     back={{ href: href({ name: 'journal', user, space, journal: 'tasks', entry: null }), label: JOURNAL_TITLE.tasks }}
-    label={mode === 'create' && !cur ? 'Новая задача' : 'Задача'}
+    label="Задача"
     onclose={closeDetail}
     dirty={unsaved}
     {entry}
@@ -903,6 +1020,7 @@
     {@const c = cur}
     {@const claim = claimOf(c)}
     <article class="card panel" aria-label="Карточка задачи">
+      <!-- шапка: заголовок, статус и короткие строки состояния (часть, захват, блокер, выполнено) -->
       <header>
         <h2>{c.title}</h2>
         <div class="row meta">
@@ -910,122 +1028,129 @@
           <span class="muted small">{AUTHOR_TEXT[c.author.kind] ?? c.author.kind} · ревизия {c.rev} · {fmtTime(c.updated_at)}</span>
         </div>
         {#if c.stale && c.last_activity_at}{@render idle(c.last_activity_at)}{/if}
+        {#if c.parent}
+          {@const pp = progressText(c.parent.subtasks)}
+          <p class="part-of" data-testid="task-parent">
+            Часть: <a href={taskHref(c.parent.id)} onclick={() => (notice = '')}>{entryRef('task', c.parent.id)} «{c.parent.title}»</a>{pp ? ` (${pp})` : ''}
+          </p>
+        {/if}
+        {#if claim}<p class="claim" data-testid="claim">{claimText(claim)}</p>{/if}
+        {#if c.status === 'blocked' && str(c.data, 'blocked_by')}<p class="blocked">Блокер: {str(c.data, 'blocked_by')}</p>{/if}
+        {#if c.status === 'done'}
+          <p class="muted">
+            Выполнено {fmtTime(str(c.data, 'done_at'))}{#if c.duration_min !== undefined && c.duration_min !== null}, длительность {durationText(c.duration_min)}{/if}
+          </p>
+        {/if}
       </header>
-      {#if c.parent}
-        {@const pp = progressText(c.parent.subtasks)}
-        <p class="part-of" data-testid="task-parent">
-          Часть: <a href={taskHref(c.parent.id)} onclick={() => (notice = '')}>{entryRef('task', c.parent.id)} «{c.parent.title}»</a>{pp ? ` (${pp})` : ''}
-        </p>
-      {/if}
-      {#if c.body}<p class="body">{c.body}</p>{/if}
-      {#if c.ideas?.length}
-        <div class="ideas" data-testid="task-ideas">
-          <span class="muted">{c.ideas.length > 1 ? 'Из идей:' : 'Из идеи:'}</span>
-          {#each c.ideas as i (i.id)}
-            <a href={ideaHref(c, i.id, i.space_id)}>{entryRef('idea', i.id)} «{i.title}»</a>
-            {#if i.status}<span class="chip">{entryStatusText('idea', i.status)}</span>{/if}
+
+      {#if mode === 'edit'}
+        <!-- правка на месте: форма вместо вида карточки (§6.14 п. 3) -->
+        <EditPanel bind:this={editor} {user} entry={c} onsaved={edited} oncancel={cancelEdit} onreread={reread} {onexpired} />
+      {:else}
+        <!-- ряды действий и поле шага — сразу под шапкой, до длинных разделов (правило Г) -->
+        <div class="row actions" role="group" aria-label="Смена статуса">
+          {#each targets(c) as s (s)}
+            <button type="button" onclick={() => pressStatus(s)} disabled={busy}>
+              {c.status === 'done' || c.status === 'dropped' ? 'Переоткрыть' : `→ ${STATUS_TEXT[s]}`}
+            </button>
           {/each}
+          {#if claim}<button type="button" class="danger" onclick={release} disabled={busy}>Снять захват</button>{/if}
         </div>
-      {/if}
-      {#if c.subtasks?.total}
-        {@const s = c.subtasks}
-        {@const pt = progressText(s)}
-        {@const items = s.items ?? []}
-        <!-- раздел «Подзадачи 8/13»: шаги в порядке связей (`subtasks.items`, до 200) -->
-        <section class="subtasks-card" aria-labelledby="{uid}-subs-title" data-testid="task-subtasks">
-          <h3 id="{uid}-subs-title">Подзадачи{pt ? ` ${pt}` : ''}</h3>
-          {#if pt}{@render progressBar(progressValue(s))}{/if}
-          {#if items.length}
-            <ol>
-              {#each items as k (k.id)}
-                <li>
-                  <span class="chip">{k.status ? STATUS_TEXT[k.status] : ''}</span>
-                  <a href={taskHref(k.id)} onclick={() => (notice = '')}>{k.title}</a>
-                  {#if k.claimed}
-                    <span class="claim small" data-testid="subtask-claim" title="до {fmtTime(k.claimed.until)}">в работе у {k.claimed.agent || 'агент'}</span>
-                  {/if}
-                </li>
-              {/each}
-            </ol>
-          {/if}
-          {#if s.truncated}
-            <p class="muted small">… и ещё {s.total - items.length}: полный список — «Подзадачи» под задачей на доске.</p>
-          {/if}
-        </section>
-      {/if}
-      {#if claim}
-        <p class="claim" data-testid="claim">{claimText(claim)}</p>
-      {/if}
-      {#if c.status === 'blocked' && str(c.data, 'blocked_by')}<p class="blocked">Блокер: {str(c.data, 'blocked_by')}</p>{/if}
-      {#if c.status === 'done'}
-        <p class="muted">
-          Выполнено {fmtTime(str(c.data, 'done_at'))}{#if c.duration_min !== undefined && c.duration_min !== null}, длительность {durationText(c.duration_min)}{/if}
-        </p>
-      {/if}
-      <FileRefs refs={refs.get(entryRef('task', c.id)) ?? []} />
-
-      {#if c.status !== 'done' && c.status !== 'dropped'}
-        <form class="row" onsubmit={saveStep}>
-          <input bind:value={stepDraft} placeholder="следующий шаг" aria-label="Следующий шаг" maxlength="2000" />
-          <button type="submit" disabled={busy}>Сохранить шаг</button>
-        </form>
-      {:else if str(c.data, 'next_step')}
-        <p class="muted">Дальше было: {str(c.data, 'next_step')}</p>
-      {/if}
-
-      <div class="row actions" role="group" aria-label="Смена статуса">
-        {#each targets(c) as s (s)}
-          <button type="button" onclick={() => startStatus(s)} disabled={busy}>
-            {c.status === 'done' || c.status === 'dropped' ? 'Переоткрыть' : `→ ${STATUS_TEXT[s]}`}
-          </button>
-        {/each}
-        {#if claim}<button type="button" class="danger" onclick={release} disabled={busy}>Снять захват</button>{/if}
-      </div>
-      {#if mode !== 'edit'}
         <div class="row actions" role="group" aria-label="Правка задачи">
           <button type="button" onclick={startEdit} disabled={busy}>Изменить</button>
           <button type="button" class="danger" onclick={() => askDelete(c)} disabled={busy}>Удалить</button>
         </div>
-      {/if}
-      <Notice text={notice} />
+        <div class="card-notice"><Notice text={notice} /></div>
+        {#if actionError}<p class="error" role="alert">{actionError}</p>{/if}
 
-      {#if mode === 'edit'}
-        <EditPanel bind:this={editor} {user} entry={c} onsaved={edited} oncancel={cancelEdit} onreread={reread} {onexpired} />
-      {:else if mode === 'status'}
-        <form class="form" onsubmit={submitStatus} aria-label="Смена статуса задачи">
-          <h3>Статус: {STATUS_TEXT[toStatus]}</h3>
-          {#if c.status === 'done' || c.status === 'dropped'}
-            <label>Причина переоткрытия <textarea bind:value={sReason} rows="2" required></textarea></label>
-          {/if}
-          {#if toStatus === 'blocked'}
-            <label>Что мешает <input bind:value={sBlocked} maxlength="2000" /></label>
-          {/if}
-          {@render formEnd('Применить')}
-        </form>
-      {:else if actionError}
-        <p class="error" role="alert">{actionError}</p>
+        {#if c.status !== 'done' && c.status !== 'dropped'}
+          <form class="row step" onsubmit={saveStep}>
+            <input bind:value={stepDraft} placeholder="следующий шаг" aria-label="Следующий шаг" maxlength="2000" />
+            <button type="submit" disabled={busy}>Сохранить шаг</button>
+          </form>
+        {:else if str(c.data, 'next_step')}
+          <p class="muted">Дальше было: {str(c.data, 'next_step')}</p>
+        {/if}
+
+        {#if c.body}<p class="body">{c.body}</p>{/if}
+        {#if c.ideas?.length}
+          <div class="ideas" data-testid="task-ideas">
+            <span class="muted">{c.ideas.length > 1 ? 'Из идей:' : 'Из идеи:'}</span>
+            {#each c.ideas as i (i.id)}
+              <a href={ideaHref(c, i.id, i.space_id)}>{entryRef('idea', i.id)} «{i.title}»</a>
+              {#if i.status}<span class="chip">{entryStatusText('idea', i.status)}</span>{/if}
+            {/each}
+          </div>
+        {/if}
+        {#if c.subtasks?.total}
+          {@const s = c.subtasks}
+          {@const pt = progressText(s)}
+          {@const items = s.items ?? []}
+          <!-- раздел «Подзадачи 8/13»: шаги в порядке связей (`subtasks.items`, до 200) -->
+          <section class="subtasks-card" aria-labelledby="{uid}-subs-title" data-testid="task-subtasks">
+            <h3 id="{uid}-subs-title">Подзадачи{pt ? ` ${pt}` : ''}</h3>
+            {#if pt}{@render progressBar(progressValue(s))}{/if}
+            {#if items.length}
+              <ol>
+                {#each items as k (k.id)}
+                  <li>
+                    <span class="chip">{k.status ? STATUS_TEXT[k.status] : ''}</span>
+                    <a href={taskHref(k.id)} onclick={() => (notice = '')}>{k.title}</a>
+                    {#if k.claimed}
+                      <span class="claim small" data-testid="subtask-claim" title="до {fmtTime(k.claimed.until)}">в работе у {k.claimed.agent || 'агент'}</span>
+                    {/if}
+                  </li>
+                {/each}
+              </ol>
+            {/if}
+            {#if s.truncated}
+              <p class="muted small">… и ещё {s.total - items.length}: полный список — «Подзадачи» под задачей на доске.</p>
+            {/if}
+          </section>
+        {/if}
+        <FileRefs refs={refs.get(entryRef('task', c.id)) ?? []} />
       {/if}
     </article>
   {/if}
+{/snippet}
 
-  {#if mode === 'create'}
-    <form class="form panel" onsubmit={submitCreate} aria-label="Новая задача">
-      <h3>Новая задача</h3>
-      <label>Заголовок <input bind:value={nTitle} required maxlength="300" /></label>
-      <label>Описание <textarea bind:value={nBody} rows="3"></textarea></label>
-      <label>Следующий шаг <input bind:value={nStep} maxlength="2000" /></label>
-      {@render formEnd('Добавить')}
-    </form>
+<!-- «Новая задача» — окно (§6.14, правило Б); после «Добавить» — карточка созданной (п. 6) -->
+<FormDialog
+  open={createOpen}
+  title="Новая задача"
+  submit="Добавить"
+  error={dlgError}
+  dirty={createDirty}
+  onsubmit={submitCreate}
+  onclose={() => ((createOpen = false), (dlgError = ''))}
+>
+  <label>Заголовок <input bind:value={nTitle} required maxlength="300" data-autofocus /></label>
+  <label>Описание <textarea bind:value={nBody} rows="4"></textarea></label>
+  <label>Следующий шаг <input bind:value={nStep} maxlength="2000" /></label>
+</FormDialog>
+
+<!-- смена статуса: переоткрытие и «заблокирован» — окно с полем, конечный статус — подтверждение
+     (решение 84) -->
+<FormDialog
+  open={statusDlg !== null}
+  title={statusTitle(statusDlg)}
+  subject={cur?.title}
+  description={statusDescription(statusDlg)}
+  submit={statusSubmit(statusDlg)}
+  confirm={statusDlg?.kind === 'final'}
+  danger={statusDlg?.to === 'dropped'}
+  error={dlgError}
+  dirty={statusDirty}
+  refocus={noticeEl}
+  onsubmit={submitStatus}
+  onclose={() => ((statusDlg = null), (dlgError = ''))}
+>
+  {#if statusDlg?.kind === 'reopen'}
+    <label>Причина переоткрытия <textarea bind:value={sReason} rows="3" required maxlength="2000" data-autofocus></textarea></label>
+  {:else if statusDlg?.kind === 'blocked'}
+    <label>Что мешает <span class="muted small">(необязательно)</span> <input bind:value={sBlocked} maxlength="2000" data-autofocus /></label>
   {/if}
-{/snippet}
-
-{#snippet formEnd(label: string)}
-  {#if actionError}<p class="error" role="alert">{actionError}</p>{/if}
-  <div class="row end">
-    <button type="submit" class="primary" disabled={busy}>{label}</button>
-    <button type="button" onclick={() => ((mode = 'none'), (actionError = ''))}>Отмена</button>
-  </div>
-{/snippet}
+</FormDialog>
 
 <style>
   .bar {
@@ -1215,32 +1340,17 @@
   .actions {
     margin-top: 12px;
   }
-  .form {
-    display: grid;
-    gap: 8px;
+  .actions + .actions {
+    margin-top: 8px;
+  }
+  header p {
+    margin: 4px 0 0;
+  }
+  .card-notice :global(.notice:not(:empty)) {
+    margin: 8px 0 0;
+  }
+  .step {
     margin-top: 12px;
-    padding: 12px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-  }
-  .form h3 {
-    margin: 0;
-    font-size: 15px;
-  }
-  .form label {
-    display: grid;
-    gap: 4px;
-  }
-  .form textarea {
-    font: inherit;
-    padding: 6px 10px;
-    color: var(--text);
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-  }
-  .end {
-    justify-content: flex-end;
   }
   .small {
     font-size: 12px;

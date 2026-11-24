@@ -20,11 +20,18 @@
   // `<details>` (открыт первый непустой раздел, число — в заголовке); чипы статусов — полоса;
   // фильтры (приоритет, тег, поиск) на телефоне — под кнопкой «Фильтры»; сбой загрузки чанка формы
   // — `LazyFail`. «Корзина» (M7.2, спецификация §5.9 п. 3) — вместо ленты удалённые идеи с
-  // «Восстановить» (`JournalTrash`, ленивый чанк). Несохранённое в открытой форме (финальное ревью
-  // M7.2, I1) — `IdeaForm.dirty()`: «← Идеи» сначала спрашивает «Закрыть без сохранения?»
-  // (`JournalSplit`), уход по адресу, другая форма и решение кнопкой карточки — `LEAVE_EDIT`
-  // (`lib/leaveEdit.ts`).
+  // «Восстановить» (`JournalTrash`, ленивый чанк).
+  //
+  // Карточка и формы (M7.3, спецификация §6.14, решения 80–86): ряд решений — сразу под шапкой
+  // карточки, до текста, разбора и истории (правило Г); «Новая идея» и решения с полями («Начать»
+  // идеи Knowledge, «Отложить», «Отказаться», «Вернуть на разбор») — окна формы (`IdeaForm` в
+  // `FormDialog`, правило Б), после «Записать» — карточка созданной; «Изменить» — правка в карточке
+  // на месте (вид карточки сменяется формой, правило В). Несохранённое правки — `IdeaForm.dirty()`:
+  // «← Идеи» спрашивает «Закрыть без сохранения?» (`JournalSplit`), уход по адресу — один вопрос
+  // стека проверок ухода; окна спрашивают о своём сами. 409 правки и решения — идея перечитана,
+  // набранное остаётся, нетронутое — из свежей идеи (`IdeaForm.rebase`), форма открыта (п. 5).
   import { onMount, tick, untrack, type Snippet } from 'svelte';
+  import FormDialog from './FormDialog.svelte';
   import JournalSplit from './JournalSplit.svelte';
   import LazyFail from './LazyFail.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
@@ -38,6 +45,7 @@
     entryCounts,
     errorText,
     getEntry,
+    isStaleEntry,
     listEntries,
     patchEntry,
     searchIdeas,
@@ -51,6 +59,7 @@
   import { copyText } from '../lib/clipboard';
   import {
     IDEA_CHIPS,
+    IDEA_FORMS,
     IDEA_TABS as TABS,
     REVIEW_OUTCOME_TEXT,
     chipCount,
@@ -87,8 +96,10 @@
     fmtTime,
     type IdeaPriority,
   } from '../lib/journals';
+  import { focusSoon } from '../lib/focus';
+  import { rebaseText } from '../lib/formDraft';
   import { SPLIT_MIN } from '../lib/layout';
-  import { LEAVE_EDIT, guardLeave } from '../lib/leaveEdit';
+  import { guardLeave } from '../lib/leaveEdit';
   import { snippetParts } from '../lib/snippet';
   import { go, href } from '../lib/router';
   import { onTabKey } from '../lib/tabs';
@@ -340,8 +351,8 @@
     go({ name: 'journal', user, space, journal: 'ideas', entry: id });
   }
 
-  /** Карточка или форма создания показана (рядом с лентой или вместо неё). */
-  let detailOpen = $derived(cur !== null || curError !== '' || mode === 'create');
+  /** Карточка показана (рядом с лентой или вместо неё). */
+  let detailOpen = $derived(cur !== null || curError !== '');
 
   function selectTab(t: Tab) {
     if (tab === t) return;
@@ -396,16 +407,64 @@
     }
   }
 
-  /** Решение по идее; `accept` — ещё и ссылка на созданную задачу. */
-  function decide(c: Entry, decision: IdeaDecision, opts: DecisionOpts = {}) {
+  /** Решение по идее; `accept` — ещё и ссылка на созданную задачу. `form` — из окна формы. */
+  function decide(c: Entry, decision: IdeaDecision, opts: DecisionOpts = {}, form = false) {
     let task = '';
-    act(
+    return (form ? formAct : act)(
       async () => {
         const r = await decideIdea(user, c.id, decision, opts);
         if (r.task) task = r.task.id;
       },
       () => decisionNotice(decision, entryRef('task', task), opts.horizon),
     );
+  }
+
+  /** Отправка формы (окна или правки в карточке): успех — форма закрыта, лента перечитана,
+   * карточка — та же или созданной идеи (сразу: на телефоне запись слоя окна становится её
+   * записью), итог строкой; после правки — фокус на заголовке карточки. Ошибка — в форме; 409 —
+   * идея перечитана, набранное перенесено (`staleIdea`), форма открыта. */
+  async function formAct(fn: () => Promise<string | void>, done: string | (() => string)) {
+    if (busy) return;
+    busy = true;
+    actionError = '';
+    let target: string | null;
+    try {
+      target = (await fn()) ?? cur?.id ?? null;
+    } catch (e) {
+      busy = false;
+      if (e instanceof ApiError && e.status === 401) return onexpired();
+      if (e instanceof ApiError && e.status === 409 && cur) return staleIdea(cur.id, e);
+      actionError = errorText(e);
+      return;
+    }
+    const edited = mode === 'edit';
+    mode = 'none';
+    const other = !!target && target !== entry;
+    if (other) select(target!);
+    try {
+      await load(user, space, true);
+      if (!other) await open(user, target);
+      notice = typeof done === 'string' ? done : done();
+      if (edited) focusSoon(() => document.querySelector('article[aria-label="Карточка идеи"] h2'));
+    } finally {
+      busy = false;
+    }
+  }
+
+  /** 409 формы: ревизия устарела или идею решили в другом месте — идея перечитана, правка
+   * переносит набранное (`IdeaForm.rebase`), форма открыта; лента — заново. */
+  async function staleIdea(id: string, e: unknown) {
+    let fresh: Entry;
+    try {
+      fresh = await getEntry(user, id);
+    } catch (err) {
+      actionError = `${errorText(e)} ${errorText(err)}`;
+      return;
+    }
+    const clash = ideaForm?.rebase(fresh) ?? [];
+    cur = fresh;
+    actionError = isStaleEntry(e) ? rebaseText(clash) : errorText(e);
+    void load(user, space, true);
   }
 
   /** «Удалить» отклонённой идеи — в корзину, с подтверждением (M6.5 §6). */
@@ -449,35 +508,39 @@
 
   /** Номер открытия формы: повторное нажатие той же кнопки создаёт форму заново (поля сброшены). */
   let opened = $state(0);
-  /** Загруженная открытая форма (`IdeaForm`): её несохранённое — в `unsaved()`. */
-  let ideaForm = $state<{ dirty: () => boolean } | null>(null);
+  /** Загруженная открытая форма (`IdeaForm`): её несохранённое и перенос набранного при 409. */
+  let ideaForm = $state<{ dirty: () => boolean; rebase: (fresh: Entry) => string[] } | null>(null);
 
-  /** В открытой форме есть несохранённое; форма, которую журнал уже закрыл (`mode`), — нет. */
-  const unsaved = (): boolean => mode !== 'none' && !!ideaForm?.dirty();
-
-  /** Действие закроет открытую форму: при несохранённом — сначала вопрос; `false` — остаться. */
-  const leaveForm = (): boolean => !unsaved() || window.confirm(LEAVE_EDIT);
+  /** Несохранённое правки в карточке (вопрос панели и проверка ухода); окна спрашивают сами. */
+  const unsaved = (): boolean => mode === 'edit' && !!ideaForm?.dirty();
 
   onMount(() => guardLeave(unsaved));
 
-  /** Открыть форму `m` (создание, правка, решение с полями). */
+  /** Итог действия в карточке: фокус после закрытия окна (нажатая кнопка ушла вместе со статусом). */
+  const cardNotice = () => document.querySelector<HTMLElement>('article[aria-label="Карточка идеи"] .notice');
+
+  /** Окно формы открыто (создание, решения с полями). */
+  let dialogMode = $derived(mode !== 'none' && mode !== 'edit');
+
+  /** Открыть форму `m` (создание и решения с полями — окно, правка — в карточке). */
   function show(m: IdeaForm) {
-    if (!leaveForm()) return;
     actionError = '';
+    notice = '';
     opened++;
     mode = m;
   }
 
+  /** Форму закрыли («Отмена», окно — «✕», Esc, фон): после правки фокус — на «Изменить». */
   function closeForm() {
+    const edited = mode === 'edit';
     mode = 'none';
     actionError = '';
+    if (edited) focusSoon(() => [...document.querySelectorAll<HTMLElement>('[aria-label="Решение по идее"] button')].find((b) => b.textContent?.trim() === 'Изменить'));
   }
 
   /** Кнопка карточки (`ideaButtons`): решение сразу, форма с полями или подтверждение удаления. */
   function press(a: IdeaAction, c: Entry) {
-    // решение сразу закроет открытую форму (`act`): при несохранённом — сначала вопрос
     const now = a === 'adopt' || (a === 'start' && !knowledge);
-    if (now && !leaveForm()) return;
     if (a === 'adopt')
       act(async () => {
         await adoptIdea(user, c.id);
@@ -489,20 +552,21 @@
   }
 
   /** Заполненная форма (`IdeaForm.svelte`): создание, правка или решение. */
-  function submitted(f: IdeaSubmit) {
+  function submitted(f: IdeaSubmit): Promise<void> | undefined {
     const c = cur;
-    if ('create' in f) act(async () => (await createEntry(user, space, { kind: 'idea', ...f.create })).id, 'Идея записана.');
-    else if (!c) return;
-    else if ('patch' in f) {
+    if ('create' in f) return formAct(async () => (await createEntry(user, space, { kind: 'idea', ...f.create })).id, 'Идея записана.');
+    if (!c) return;
+    if ('patch' in f) {
       // возвращённую, дописанную человеком, сервер возвращает на разбор (`returned → new`)
       let after: EntryStatus | null = c.status;
-      act(
+      return formAct(
         async () => {
           after = (await patchEntry(user, c.id, c.rev, f.patch)).status;
         },
         () => editNotice(c.status, after),
       );
-    } else decide(c, f.decision, f.opts);
+    }
+    return decide(c, f.decision, f.opts, true);
   }
 
   async function copyRef(ref: string, text: string) {
@@ -536,6 +600,9 @@
 </section>
 
 <Prompt bind:ask />
+
+<!-- окна формы — «Новая идея» и решения с полями (§6.14, правило Б) -->
+{#if dialogMode}{@render form(mode as IdeaForm)}{/if}
 
 {#snippet ideasList()}
   <!-- «Корзина» — одна кнопка в обоих видах: фокус на ней переживает переключение -->
@@ -656,7 +723,6 @@
 {/snippet}
 
 {#snippet ideaDetail()}
-  {#if mode === 'create'}{@render form('create')}{/if}
   {#if curError}<p class="error" role="alert">{curError}</p>{/if}
   {#if cur}
     {@const c = cur}
@@ -673,81 +739,83 @@
           {@render marks(agent, [])}
           <span class="muted small">{entryRef('idea', c.id)} · {AUTHOR_TEXT[c.author.kind] ?? c.author.kind} · ревизия {c.rev} · {fmtTime(c.updated_at)}</span>
         </div>
+        {#if c.status === 'deferred' && str(c.data, 'horizon')}<p class="muted">Отложена до {str(c.data, 'horizon')} (UTC).</p>{/if}
       </header>
-      {#if c.body}<p class="body">{c.body}</p>{/if}
-      {#if c.tags.length}<div class="row">{@render marks(false, c.tags)}</div>{/if}
-      {#if c.status === 'returned' && rv?.missing}
-        <div class="warn ask" data-testid="review-missing">
-          <p><strong>Агент просит дописать:</strong></p>
-          <p class="body">{rv.missing}</p>
-          <p class="small">Допишите идею кнопкой «Изменить»: после сохранения она вернётся на разбор.</p>
-        </div>
-      {/if}
-      {#if c.status === 'deferred' && str(c.data, 'horizon')}<p class="muted">Отложена до {str(c.data, 'horizon')} (UTC).</p>{/if}
-      {#if curQuestion && (c.status === 'proposed' || rel)}
-        <div class="proposal" data-testid={rel ? 'reopen-proposed' : undefined}>
-          <p><strong>{rel ? 'Предложено вернуть' : 'Агент предлагает начать'}.</strong> <a href={questionHref(curQuestion.id)}>Вопрос {entryRef('question', curQuestion.id)}</a></p>
-          {#if curQuestion.body}<p class="body">{curQuestion.body}</p>{/if}
-        </div>
-      {/if}
-      {#if c.task && !c.task.deleted && !rel}
-        <p>
-          <a href={taskHref(c.task.id)} data-testid="task-link">Задача {entryRef('task', c.task.id)}</a>
-          <span class="muted small">{c.task.title ?? ''}</span>
-        </p>
-      {/if}
-      {#if rel}
-        <p class="warn" data-testid="task-released">
-          Задача {rel}{#if c.task && !c.task.deleted}: <a href={taskHref(c.task.id)}>{entryRef('task', c.task.id)}</a>{/if}. Идею можно вернуть на
-          разбор или отказаться от неё.
-        </p>
-      {/if}
-
-      {#if rv}
-        <section class="review" aria-label="Разбор агента" data-testid="idea-review">
-          <h3>Разбор агента</h3>
-          <p class="row">
-            <span class="chip outcome" data-outcome={rv.outcome}>{REVIEW_OUTCOME_TEXT[rv.outcome]}</span>
-            {#if rv.outcome === 'plan' && rv.task}<span>→ {@render ref(rv.task)}</span>{/if}
-            <span class="muted small" data-testid="review-by">{reviewerLabel(rv, c.reviewers, viewer)} · {fmtTime(rv.at)}</span>
-          </p>
-          {#if reviewNote(c)}<p class="muted small" data-testid="review-note">{reviewNote(c)}</p>{/if}
-          <p class="body">{rv.summary}</p>
-          {#if rv.missing && c.status !== 'returned'}<p class="body"><strong>Не хватало:</strong> {rv.missing}</p>{/if}
-          {#if rv.basis.length}{@render refs('Опирался на', rv.basis, 'review-basis')}{/if}
-          {#if rv.similar.length}{@render refs('Похожие', rv.similar, 'review-similar')}{/if}
-          {#if c.status === 'declined' && reviewCurrent(c)}
-            <p class="muted small">Согласны с отклонением — удалите идею или оставьте её: отклонённая служит образцом «уже обсуждали». Не согласны — верните на разбор с доводом.</p>
-          {/if}
-        </section>
-      {/if}
-      {#if older.length}
-        <details class="history" data-testid="review-history">
-          <summary>История разборов ({older.length})</summary>
-          {#each older as h, i (i)}
-            <div class="past">
-              <p class="row">
-                <span class="chip outcome" data-outcome={h.outcome}>{REVIEW_OUTCOME_TEXT[h.outcome]}</span>
-                <span class="muted small">{reviewerLabel(h, c.reviewers, viewer)} · {fmtTime(h.at)}</span>
-              </p>
-              <p class="body">{h.summary}</p>
-              {#if h.missing}<p class="body"><strong>Не хватало:</strong> {h.missing}</p>{/if}
-            </div>
+      {#if mode === 'edit'}
+        <!-- правка на месте: форма вместо вида карточки (§6.14 п. 3) -->
+        {@render form('edit')}
+      {:else}
+        <!-- ряд решений — сразу под шапкой, до текста, разбора и истории (правило Г) -->
+        <div class="row actions" role="group" aria-label="Решение по идее">
+          {#each ideaButtons(c.status, agent, !!rel) as b (b.act)}
+            <button type="button" class={b.cls} onclick={() => press(b.act, c)} disabled={busy}>{b.title}</button>
           {/each}
-        </details>
-      {/if}
+        </div>
+        <!-- итог действия: живая область есть всегда (фокус после закрытия окна — сюда) -->
+        <p class="muted notice" role="status" tabindex="-1">{notice}</p>
+        {#if actionError && !dialogMode}<p class="error" role="alert">{actionError}</p>{/if}
+        {#if c.body}<p class="body">{c.body}</p>{/if}
+        {#if c.tags.length}<div class="row">{@render marks(false, c.tags)}</div>{/if}
+        {#if c.status === 'returned' && rv?.missing}
+          <div class="warn ask" data-testid="review-missing">
+            <p><strong>Агент просит дописать:</strong></p>
+            <p class="body">{rv.missing}</p>
+            <p class="small">Допишите идею кнопкой «Изменить»: после сохранения она вернётся на разбор.</p>
+          </div>
+        {/if}
+        {#if curQuestion && (c.status === 'proposed' || rel)}
+          <div class="proposal" data-testid={rel ? 'reopen-proposed' : undefined}>
+            <p><strong>{rel ? 'Предложено вернуть' : 'Агент предлагает начать'}.</strong> <a href={questionHref(curQuestion.id)}>Вопрос {entryRef('question', curQuestion.id)}</a></p>
+            {#if curQuestion.body}<p class="body">{curQuestion.body}</p>{/if}
+          </div>
+        {/if}
+        {#if c.task && !c.task.deleted && !rel}
+          <p>
+            <a href={taskHref(c.task.id)} data-testid="task-link">Задача {entryRef('task', c.task.id)}</a>
+            <span class="muted small">{c.task.title ?? ''}</span>
+          </p>
+        {/if}
+        {#if rel}
+          <p class="warn" data-testid="task-released">
+            Задача {rel}{#if c.task && !c.task.deleted}: <a href={taskHref(c.task.id)}>{entryRef('task', c.task.id)}</a>{/if}. Идею можно вернуть на
+            разбор или отказаться от неё.
+          </p>
+        {/if}
 
-      <div class="row actions" role="group" aria-label="Решение по идее">
-        {#each ideaButtons(c.status, agent, !!rel) as b (b.act)}
-          <button type="button" class={b.cls} onclick={() => press(b.act, c)} disabled={busy}>{b.title}</button>
-        {/each}
-      </div>
-      {#if notice}<p class="muted" role="status">{notice}</p>{/if}
+        {#if rv}
+          <section class="review" aria-label="Разбор агента" data-testid="idea-review">
+            <h3>Разбор агента</h3>
+            <p class="row">
+              <span class="chip outcome" data-outcome={rv.outcome}>{REVIEW_OUTCOME_TEXT[rv.outcome]}</span>
+              {#if rv.outcome === 'plan' && rv.task}<span>→ {@render ref(rv.task)}</span>{/if}
+              <span class="muted small" data-testid="review-by">{reviewerLabel(rv, c.reviewers, viewer)} · {fmtTime(rv.at)}</span>
+            </p>
+            {#if reviewNote(c)}<p class="muted small" data-testid="review-note">{reviewNote(c)}</p>{/if}
+            <p class="body">{rv.summary}</p>
+            {#if rv.missing && c.status !== 'returned'}<p class="body"><strong>Не хватало:</strong> {rv.missing}</p>{/if}
+            {#if rv.basis.length}{@render refs('Опирался на', rv.basis, 'review-basis')}{/if}
+            {#if rv.similar.length}{@render refs('Похожие', rv.similar, 'review-similar')}{/if}
+            {#if c.status === 'declined' && reviewCurrent(c)}
+              <p class="muted small">Согласны с отклонением — удалите идею или оставьте её: отклонённая служит образцом «уже обсуждали». Не согласны — верните на разбор с доводом.</p>
+            {/if}
+          </section>
+        {/if}
+        {#if older.length}
+          <details class="history" data-testid="review-history">
+            <summary>История разборов ({older.length})</summary>
+            {#each older as h, i (i)}
+              <div class="past">
+                <p class="row">
+                  <span class="chip outcome" data-outcome={h.outcome}>{REVIEW_OUTCOME_TEXT[h.outcome]}</span>
+                  <span class="muted small">{reviewerLabel(h, c.reviewers, viewer)} · {fmtTime(h.at)}</span>
+                </p>
+                <p class="body">{h.summary}</p>
+                {#if h.missing}<p class="body"><strong>Не хватало:</strong> {h.missing}</p>{/if}
+              </div>
+            {/each}
+          </details>
+        {/if}
 
-      {#if mode !== 'none' && mode !== 'create'}
-        {@render form(mode)}
-      {:else if actionError && mode !== 'create'}
-        <p class="error" role="alert">{actionError}</p>
       {/if}
     </article>
   {/if}
@@ -825,17 +893,19 @@
 
 {#snippet form(m: IdeaForm)}
   {#await import('./IdeaForm.svelte')}
-    <p class="muted">Загрузка…</p>
+    {#if m === 'edit'}<p class="muted">Загрузка…</p>{/if}
   {:then { default: Form }}
     {#key opened}
       <Form
         bind:this={ideaForm}
         {m}
-        idea={cur}
+        open={dialogMode}
+        idea={m === 'create' ? null : cur}
         {targets}
         space0={defaultTarget()}
         {busy}
         error={actionError}
+        refocus={cardNotice}
         onsubmit={submitted}
         onerror={(e) => (actionError = e)}
         oncancel={closeForm}
@@ -843,9 +913,23 @@
     {/key}
   {:catch e}
     <!-- чанк формы не пришёл: сервер обновился (у чанков новые имена) или нет сети (§5.1 п. 9) -->
-    <LazyFail error={e} label="Форма не загрузилась" hint="обновите страницу">
-      <button type="button" onclick={closeForm}>Отмена</button>
-    </LazyFail>
+    {#if m === 'edit'}
+      <LazyFail error={e} label="Форма не загрузилась" hint="обновите страницу">
+        <button type="button" onclick={closeForm}>Отмена</button>
+      </LazyFail>
+    {:else}
+      <!-- окно формы — с той же ошибкой (`role="alert"`) и «Обновить страницу» -->
+      <FormDialog
+        open={dialogMode}
+        confirm
+        title={IDEA_FORMS[m].title}
+        submit="Обновить страницу"
+        onsubmit={() => location.reload()}
+        onclose={closeForm}
+      >
+        <p class="error" role="alert">Форма не загрузилась: {errorText(e)} — обновите страницу</p>
+      </FormDialog>
+    {/if}
   {/await}
 {/snippet}
 
@@ -1058,6 +1142,15 @@
   }
   .actions {
     margin-top: 12px;
+  }
+  header p {
+    margin: 4px 0 0;
+  }
+  .notice {
+    margin: 8px 0 0;
+  }
+  .notice:empty {
+    margin: 0;
   }
   .small {
     font-size: 12px;
