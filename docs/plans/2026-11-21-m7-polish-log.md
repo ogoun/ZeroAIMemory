@@ -5987,6 +5987,77 @@ TDD круга: RED — `has_code_block_cases` (`<pre>`), `proposals_rules` — 
 - ветка «у источника уже есть предложение» — тест `rules_item_existing_source_reported`: отказ
   при проверке с причиной и `warnings` с `o:<id>` при закрытии работы (покрытие кода круга 1).
 
+### M7.3 · Задача 6 — «Открыл ли агент подсказку» и «Шумные»: сервер и CLI
+
+Спецификация §6.6 пп. 1–4 (WebUI — задача 8, решение 91); worktree `.tmp/m73/wt-t6`, ветка
+`m7.3-t6` от `c6188ae6` (задачи 1–5 и 7 слиты), параллельно с задачей 10a.
+
+**Хранилище**: `UsageCounts.opened` — `usage_counts` и `usage_counts_many` считают открытия тем же
+чтением (`usage_opened_target`; общий `opened_many_in` с `opened_counts_many`);
+`UsageSource::parse`; `open_source(db, session, target)` — `source` последнего `recall_shown` этой
+сессии (`usage_target`) и «уже открыто» одним чтением (повтор не берёт запись базы);
+`noisy_ids(db, since)` — `shown ≥ NOISY_MIN_SHOWN (10)`, ни одного `useful` и открытия с `since`
+(`GROUP BY … HAVING` по `usage_target`, `NOT EXISTS` по `usage_opened_target`), `NOISY_WINDOW_DAYS
+= 30`; `sessions::hint_shown(db, session, epoch, targets)` — показ подсказкой (`RECALL_PART`)
+**в эпоху** (через `seen_revs`; `seen_entry_ids` эпох не различает). Схема — 0027 задачи 1.
+
+**Сервер**: `api::opened` — `record(p, s, targets)` (токен и явная сессия с текущей эпохой →
+`hint_shown` в базе сессии → `open_source` и `record_opened` в базе цели) и `record_get` для
+`GET /entries/{id}`, `GET /nodes/{id}`, `GET /nodes/by-path` (`seen_session` по `X-Zam-Session`).
+`/read` — после отметки выданного, по элементам `Text`, `Budget`, `Unchanged`; поле `Fetched`
+`stale_key` → `target_key` (не забирается `fill_stale_refs`: нужно и открытию). Лента `noisy`
+(`parse_flag`) — `only_ids` из `noisy_ids` с `max(now − 30 сут, usage_opened_since)` и поле
+`opened_since`; `FEATURES` — `usage_opened` в конце (указание координатора, как `works`,
+`memory_check`, `proposals`). CLI `zam insight show` — `usage_line`.
+
+- [решение исполнителя, задача 6] **`/read` — открытие и у `unchanged` (`if_rev`) и у элемента,
+  не влезшего в бюджет**: агент запросил цель после подсказки — это и есть отклик на неё; ошибка
+  элемента (нет, доступ, неверная секция) — не открытие. У `GET` — только успешный ответ.
+- [решение исполнителя, задача 6] **`source` — событие последнего показа этой сессии из `usage`**
+  базы цели: у `session_seen` события нет, а `usage` пишется тем же `record` `/recall` (подмножество
+  целей `session_seen` — в `usage`). Показа в `usage` нет (сбой учёта показа) — открытие не
+  пишется: «открыто» без «показано» исказило бы счётчики.
+- [решение исполнителя, задача 6] **Служебные `GET` MCP — не открытие**: `memory_write` ищет id
+  заметки `GET /nodes/by-path` (расширение `McpOrigin`); чтение агентом через MCP —
+  `memory_read` → `POST /read`, оно считается (с явной сессией `zam mcp` или аргументом
+  `session_id`). `GET` CLI в сессии агента (`zam insight show`, `zam read` с `ZAM_SESSION` или
+  сессией хуков) — открытие.
+- [решение исполнителя, задача 6] **Некорректный `X-Zam-Session` у `GET /entries/{id}` и
+  `GET /nodes/*` — не 400**: раньше эти маршруты заголовок не читали, ответ не меняется (DEBUG);
+  у `/read` — 400, как и было.
+- [решение исполнителя, задача 6] **Открытие в `GET /entries/{id}` пишется до счётчиков**: ответ
+  того же чтения уже показывает `opened` с этой сессией.
+- [решение исполнителя, задача 6] **`noisy` — 422 без `kind=insight` и с `deleted=only`**, значение
+  — флагом (`1 | 0 | true | false`, иначе 400), как `from_idea` и `top_level`; сервер без признака
+  параметр молча пропускает (у `ListQuery` нет `deny_unknown_fields`) — клиент шлёт его только с
+  признаком (строка `docs/api-compat.md`).
+- [решение исполнителя, задача 6] **Окно «шумных» — и для оценок `useful`**: «по событиям с
+  `max(…)`» (§6.6 п. 3) — все три условия по одному окну; давняя оценка «полезно» запись из
+  «шумных» не выводит, счётчики карточки при этом — за всё время (решение 68, цена — в нём).
+- [решение исполнителя, задача 6] **Строка руководства** (§6.6 п. 4) — `deploy/README-install.md`,
+  «Работа с заметками из CLI», абзац «Польза подсказок»; протокол `zam guide` не меняется: агенту
+  новое поведение не нужно (открытие — побочный учёт чтения).
+
+**Бюджеты и совместимость**: хуки, `/recall`, блок v8, MCP (11 инструментов, описания) не
+тронуты; новые поля — `usage.opened` и `opened_since` (только с `noisy=1`); старый `zam` с новым
+сервером — `usage` с лишним полем (печать прежняя, `--json` — как есть); новый `zam` со старым
+сервером — прежняя строка (тест `insight_show_opened`). Ночная проверка не читает `/read`,
+`/entries`, `/nodes` — `check_run_leaves_no_traces` (сверяет и `usage_opened`) зелёный.
+
+TDD: RED — `usage_opened` 5 FAILED из 7 (`opened_after_hint_read`, `opened_once_per_session`,
+`not_opened_other_epoch` — строк нет; `usage_opened_in_entry_json` — `usage` без `opened`;
+`noisy_window_from_migration` — `noisy` пропущен, лента целиком), `not_opened_webui` и
+`not_opened_without_hint` на прежнем коде зелёные (защищают от лишней записи);
+`boot::health_features_documented` — таблица против `FEATURES`; CLI `insight_show_opened` и
+`insight_feedback_counts` (ожидание с `opened`) — прежняя строка «показы · полезно · бесполезно».
+GREEN (`ZAM_REQUIRE_ML=1`) — `usage_opened` 7/7, `boot` 15, `zam-server --lib` 385, `recall` 55,
+`read_batch` 13, `read_focus` 20, `read_since_rev` 7, `read_attachments` 9, `journals` 20, `nodes`
+20, `insights` 19, `sessions` 17 (ожидание `usage` с `opened`), `session_tokens` 6, `check_run` 27
+(в том числе `check_run_leaves_no_traces`), `mcp` 84, `proposals_rules` 26, `tasks` 24,
+`reports_invisible` 17, `secrets` 44; `zam-store` `--lib` 129, `sessions` 19, `user_db` 11 (в том
+числе `usage_target_index_kept`); `zam-cli` `--bin zam` 237, `--test insights` 16; clippy
+`zam-store`, `zam-server`, `zam-cli` `--all-targets -D warnings` и `fmt --all --check` — чисто.
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

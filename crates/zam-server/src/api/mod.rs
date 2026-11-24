@@ -20,6 +20,7 @@ pub mod ideas;
 pub mod index;
 pub mod insights;
 pub mod nodes;
+pub mod opened;
 pub mod previews;
 pub mod proposals;
 pub mod questions;

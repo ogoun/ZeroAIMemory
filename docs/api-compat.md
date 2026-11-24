@@ -80,6 +80,7 @@
 | `works` | M7.3 §6.1–§6.3 | Внутренние работы памяти: настройки исполнителя `works` в `GET/PATCH /auth/settings` и `/admin/users/{id}/settings` (`mode`, `kinds` — `{<вид>: режим}`, `null` в `PATCH` снимает вид; `model` — `{protocol, vault: "v:<id>", model, auth, max_tokens, token_field, body_extra, pinned}`, `confirm_url` подтверждения адреса; `limits`, `check: on|off`, `pause {class, since, from?, to?}` — пишет только сервер; `effective: {<вид>: {mode, reason}}`, причины `disabled`, `model_access_off`, `no_model`, `paused`), `warnings` ответа `PATCH`; `POST /works/model/test`, `GET /works/calls`; очередь `GET /works`, `GET /works/usage`, `POST /works/run`, `POST /works/{id}/result`, `POST /works/{id}/release`; пакет `POST /recall {event: "work"}`, строка работ дайджеста; MCP — событие `work` у `memory_recall`, вид `work` у `memory_log` (`required` — `["kind"]`); `zam work` (раздел «Внутренние работы» ниже). Сервер без флага — 400 на событие `work`, 404 на `/works*`. |
 | `memory_check` | M7 §6.4–§6.5 | Ночная проверка памяти: пробы (`probes`, ссылка `x:`), прогоны и вердикт к базе — `GET /check/status`, `GET /check/runs?limit=`, `GET /check/runs/{id}`, `POST /check/run` (ручной прогон: человек или токен `rw`, 202 `{run}`; идёт — 409 `/problems/check-running`; `[works] enabled = false` — 409 `/problems/works-disabled`), `POST /check/accept {run}` («Принять как норму» — только сессия WebUI, токен — 403; не последний ночной прогон эпизода — 409 `/problems/check-accept-not-latest`), `GET /check/probes?kind=&status=&split=`; строка дайджеста `session_start` при регрессии; ключ конфигурации `[works] check`, настройка пользователя `works.check`. Раздел «Ночная проверка памяти» ниже. Сервер без флага маршрутов `/check` не знает (404). |
 | `proposals` | M7.3 §6.7 | Кандидаты в Rules (предложения человеку, ссылка `o:`): `POST /proposals {type: "rule", path, content, reason, basis?}` (токен `rw`; 201 `{proposal: "o:<id>"}`, тот же путь и текст — 200 `existing: true`; открытых 50 — 409 `/problems/proposals-full`), `GET /proposals?type=&status=&author=me`, `GET /proposals/counts` → `{rules}`, `GET /proposals/{id}` (с `rules_tokens {now, after}`), `POST /proposals/{id}/accept {path?, content?}` и `/decline {note?}` (только сессия WebUI, токен — 403), `/withdraw` (автор-агент); поле `candidate` у MCP `memory_write`; `detail` 403 записи агента в Rules — с подсказкой `candidate`; вид работы `rules`; `zam rules`. Раздел «Кандидаты в Rules» ниже. Сервер без флага — 404 на `/proposals*`, поле `candidate` MCP не знает (запись в Rules — 403). |
+| `usage_opened` | M7.3 §6.6 | «Агент открыл подсказку»: чтение узла или записи по токену явной сессией (`POST /read` — любой уровень, секция, фокус; `GET /entries/{id}`; `GET /nodes/{id}` и `GET /nodes/by-path`) после показа этой цели подсказкой `/recall` той же сессии в той же эпохе — одно открытие на сессию и цель; поле `opened` в `usage {shown, opened, useful, useless}` у `GET /entries/{id}` и insight ленты; «шумные» — `GET /spaces/{space}/entries?kind=insight&noisy=1` с полем ответа `opened_since`; `zam insight show` — «показы · открыто · полезно · бесполезно» (раздел «Открытие подсказок» ниже). Сервер без флага отдаёт `usage` без `opened`, а параметр `noisy` молча пропускает (лента целиком) — клиент шлёт его только с флагом. |
 
 Правило для разработки сервера: задача, которая вводит возможность или ключ конфигурации,
 добавляет строку в `FEATURES` (`crates/zam-server/src/api/health.rs`) и строку в эту таблицу;
@@ -838,3 +839,38 @@ CLI `zam`, свой клиент) получает значения, похож�
   итога для неё нет).
 - **CLI** `zam rules candidate <путь> --file F --reason R [--basis ID]…`, `zam rules candidates
   [--status S]`; сервер без флага — код 1 «обновите zam-server до 0.0.16-m7.3 или новее».
+
+## Открытие подсказок (`usage_opened`)
+
+С 0.0.16-m7.3 (M7.3 §6.6, флаг `usage_opened`, решения координатора 50 и 68). Явную оценку
+(`feedback`) агенты ставят редко; «открыл» — косвенный признак того, что подсказка пригодилась.
+
+- **Когда пишется.** Чтение цели — узла или записи журнала — **по токену** с явной сессией
+  (`X-Zam-Session`, `session_id` тела `/read`, аргумент `session_id` MCP, сессия `zam mcp`):
+  `POST /read` (любой уровень, секция, фокус, `range`, дифф `since_rev`, `unchanged` по `if_rev`
+  и элемент, не влезший в бюджет; ошибка элемента — нет), `GET /entries/{id}`, `GET /nodes/{id}`
+  и `GET /nodes/by-path` (успешный ответ) — после показа этой цели подсказкой `/recall` той же
+  сессии **в той же эпохе** (`session_seen`, часть `recall`). Одна строка на сессию и цель: повтор,
+  в том числе после новой эпохи, ничего не меняет. `source` — событие последнего показа этой
+  сессии (`session_start`, `prompt`, `pre_tool`, `post_tool`, `brief`); строка лежит в базе цели
+  (у общего решения — в базе владельца, `user_id` — читавший участник). Без сессии, с неявной
+  сессией MCP, из сессии WebUI, без показа и при показе в прежней эпохе — ничего; служебное
+  чтение узла самим MCP (id заметки для `memory_write`) — не открытие. Ночная проверка
+  (`memory_check`) открытий не пишет.
+- **Нижняя граница.** Агенту может хватить строки подсказки — тогда он «не открывал»; учёт
+  открытий начинается с обновления до 0.0.16 (`opened_since`).
+- **`usage {shown, opened, useful, useless}`** — в `GET /entries/{id}` (любая запись) и у каждой
+  insight ленты; `opened` — число сессий, открывших запись.
+- **«Шумные»** — `GET /spaces/{space}/entries?kind=insight&noisy=1`: insight, у которых по
+  событиям окна `max(now − 30 сут, opened_since)` не меньше 10 показов, ни одного открытия и ни
+  одной оценки `useful`; прочие фильтры ленты действуют. `usage` записей — за всё время: окно —
+  только условие отбора, поэтому у «шумной» записи показов может быть больше 10. В ответе — поле
+  `opened_since`: начало учёта открытий (момент применения миграции 0027, формат времени
+  хранилища; `null` — неизвестно); первые 30 суток после него фильтр неполон — WebUI пишет
+  «данные об открытии копятся с <дата>». `noisy` без `kind=insight` или с `deleted=only` — 422,
+  значение не `1 | 0 | true | false` — 400; без `noisy` (или `noisy=0`) ответ прежний, без
+  `opened_since`.
+- **CLI.** `zam insight show` — «показы: N · открыто: M · полезно: K · бесполезно: L»; сервер без
+  флага (`usage` без `opened`) — прежняя строка «показы · полезно · бесполезно». `zam insight show`
+  в сессии агента (`ZAM_SESSION`, сессия хуков) после подсказки — тоже открытие.
+- Открытия — в копии сервера; в экспорт пространства и архив — нет; уборка сессий их не трогает.
