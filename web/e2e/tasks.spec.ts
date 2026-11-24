@@ -4,7 +4,7 @@
 // карточка — панель поверх доски на широкой. Сценарии с точными числами — каждый в своём новом
 // решении (`POST /api/v1/solutions`, пре-флайт N15): в решении E2E уже есть задачи сида и
 // спецификаций, идущих раньше. Данные — REST по токену администратора (агент).
-import { expect, test, type Page, type Request } from '@playwright/test';
+import { expect, test, type Locator, type Page, type Request } from '@playwright/test';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { env, pageCtx } from './mobile-pages';
@@ -32,6 +32,22 @@ function watch(page: Page, allow: (path: string, status: number) => boolean = ()
     if (r.status() >= 400 && !expected) problems.push(`HTTP ${r.status()} ${r.request().method()} ${path}`);
   });
   return problems;
+}
+
+/**
+ * Кольцо фокуса заголовка карточки (ревью r2 задачи 10a, N5): совпадает ли `:focus-visible`,
+ * стиль и цвет рамки, цвет акцента темы (`--accent`, через пробный элемент).
+ */
+async function headingRing(heading: Locator) {
+  return heading.evaluate((el) => {
+    const probe = document.createElement('span');
+    probe.style.color = 'var(--accent)';
+    document.body.append(probe);
+    const accent = getComputedStyle(probe).color;
+    probe.remove();
+    const s = getComputedStyle(el);
+    return { visible: el.matches(':focus-visible'), style: s.outlineStyle, color: s.outlineColor, accent };
+  });
 }
 
 /** REST по токену администратора (агент); `extra` — заголовки. */
@@ -228,6 +244,10 @@ test.describe('настольный', () => {
     const sheet = page.getByRole('dialog', { name: 'Задача', exact: true });
     const card = sheet.getByRole('article', { name: 'Карточка задачи' });
     await expect(card.getByRole('heading', { name: 'Панель: открытая' })).toBeFocused();
+    // открыли щелчком — фокус на заголовке без рамки (ни своей, ни браузера)
+    const clicked = await headingRing(card.getByRole('heading', { name: 'Панель: открытая' }));
+    expect(clicked.visible, ':focus-visible после щелчка').toBe(false);
+    expect(clicked.style, 'рамка после щелчка').toBe('none');
     const sb = (await sheet.boundingBox())!;
     const header = (await page.locator('header.topbar').boundingBox())!;
     expect(Math.round(sb.width)).toBe(480);
@@ -352,6 +372,11 @@ test.describe('настольный', () => {
     await page.goto('about:blank');
     await open(page, tasksUrl(c.user, guid, id));
     await expect(sheet.getByRole('heading', { name: 'Панель: открытая' })).toBeFocused();
+    // открыли по адресу — видимое кольцо цвета акцента темы, не чёрная рамка браузера
+    const byUrl = await headingRing(sheet.getByRole('heading', { name: 'Панель: открытая' }));
+    expect(byUrl.visible, ':focus-visible при открытии по адресу').toBe(true);
+    expect(byUrl.style, 'рамка при открытии по адресу').toBe('solid');
+    expect(byUrl.color, 'цвет рамки — акцент темы').toBe(byUrl.accent);
     const h1 = await historyLength();
     await page.keyboard.press('Escape');
     await expect(sheet).toHaveCount(0);
