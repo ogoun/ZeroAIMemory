@@ -370,23 +370,44 @@ pub const NOISY_MIN_SHOWN: i64 = 10;
 /// Окно «шумных», суток: события с `max(now − NOISY_WINDOW_DAYS, usage_opened_since)`.
 pub const NOISY_WINDOW_DAYS: i64 = 30;
 
-/// «Шумные» записи журналов базы (M7 §6.6 п. 3, решение координатора 68): по событиям с `since`
-/// (включительно) — показов не меньше [`NOISY_MIN_SHOWN`], ни одной оценки `useful` и ни одного
-/// открытия. Окно — только условие отбора: счётчики записей вызывающий берёт за всё время
-/// ([`usage_counts_many`]). Вид записи и пространство не проверяются — их ставит фильтр ленты.
+/// Нижняя граница окна в `usage`: `id` последней строки старше начала окна (`?1`). Обход — с конца
+/// по `rowid` до первой такой строки, то есть по строкам окна, а не по всей истории.
+const NOISY_LO_SQL: &str = "SELECT id FROM usage WHERE ts < ?1 ORDER BY id DESC LIMIT 1";
+
+/// Отбор «шумных» ([`noisy_ids`]): показы окна — диапазоном `rowid` (`id > ?3`; `+target_kind` не
+/// даёт планировщику уйти в `usage_target` и обойти все показы записей за всё время), с точной
+/// проверкой `ts`; открытия — по окну (`usage_opened_target`), оценка `useful` — за всё время
+/// (`usage_target`).
+const NOISY_SQL: &str = "SELECT u.target_id FROM usage u
+     WHERE u.id > ?3 AND +u.target_kind = 'entry' AND u.event = 'recall_shown' AND u.ts >= ?1
+     GROUP BY u.target_id
+     HAVING count(*) >= ?2
+        AND NOT EXISTS (SELECT 1 FROM usage x
+                        WHERE x.target_kind = 'entry' AND x.target_id = u.target_id
+                          AND x.event = 'useful')
+        AND NOT EXISTS (SELECT 1 FROM usage_opened o
+                        WHERE o.target_kind = 'entry' AND o.target_id = u.target_id
+                          AND o.ts >= ?1)";
+
+/// «Шумные» записи журналов базы (M7 §6.6 п. 3, решение координатора 68 и круга правок 1 задачи
+/// 6): показов с `since` (включительно) не меньше [`NOISY_MIN_SHOWN`] и ни одного открытия с
+/// `since`, а оценки `useful` нет **за всё время** — любая «полезно», в том числе до начала учёта
+/// открытий и старше окна, запись исключает. Окно — только условие отбора: счётчики записей
+/// вызывающий берёт за всё время ([`usage_counts_many`]). Вид записи и пространство не
+/// проверяются — их ставит фильтр ленты. Окно `usage` — по `id`: строки только дописываются, `ts`
+/// — время записи, поэтому `id` растёт вместе с ним; стоимость — по строкам окна, а не истории.
 pub async fn noisy_ids(db: &Db, since: Timestamp) -> Result<Vec<Id>, StoreError> {
     let since = fmt_ts(since);
     db.read(move |c| {
-        let mut st = c.prepare_cached(
-            "SELECT u.target_id FROM usage u
-             WHERE u.target_kind = 'entry' AND u.ts >= ?1
-             GROUP BY u.target_id
-             HAVING sum(u.event = 'recall_shown') >= ?2 AND sum(u.event = 'useful') = 0
-                AND NOT EXISTS (SELECT 1 FROM usage_opened o
-                                WHERE o.target_kind = 'entry' AND o.target_id = u.target_id
-                                  AND o.ts >= ?1)",
-        )?;
-        let rows = st.query_map(params![since, NOISY_MIN_SHOWN], |r| r.get::<_, String>(0))?;
+        let lo: i64 = c
+            .prepare_cached(NOISY_LO_SQL)?
+            .query_row([&since], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0);
+        let mut st = c.prepare_cached(NOISY_SQL)?;
+        let rows = st.query_map(params![since, NOISY_MIN_SHOWN, lo], |r| {
+            r.get::<_, String>(0)
+        })?;
         let mut out = Vec::new();
         for id in rows {
             if let Ok(id) = id?.parse::<Id>() {
@@ -443,4 +464,58 @@ pub async fn usage_counts(db: &Db, target: TargetRef) -> Result<UsageCounts, Sto
         Ok(out)
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use rusqlite::Connection;
+
+    use super::{NOISY_LO_SQL, NOISY_SQL};
+
+    fn schema() -> Connection {
+        let c = Connection::open_in_memory().unwrap();
+        for m in crate::USER_MIGRATIONS {
+            c.execute_batch(m.sql).unwrap();
+        }
+        c
+    }
+
+    /// Строки `EXPLAIN QUERY PLAN` запроса с `n` параметрами-строками.
+    fn plan(c: &Connection, sql: &str, n: usize) -> Vec<String> {
+        let mut st = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let args = vec!["x"; n];
+        st.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// «Шумные» без миграций (круг правок 1 задачи 6, Minor 1): нижняя граница окна — обход
+    /// `usage` с конца по `rowid` без сортировки, показы окна — диапазоном `rowid`, а не через
+    /// `usage_target` по всей истории; оценка `useful` и открытия — по своим индексам.
+    #[test]
+    fn noisy_window_by_rowid() {
+        let c = schema();
+        let lo = plan(&c, NOISY_LO_SQL, 1);
+        assert!(
+            lo.iter().any(|l| l == "SCAN usage") && !lo.iter().any(|l| l.contains("B-TREE")),
+            "{lo:?}"
+        );
+        let main = plan(&c, NOISY_SQL, 3);
+        assert!(
+            main.iter()
+                .any(|l| l.starts_with("SEARCH u USING INTEGER PRIMARY KEY (rowid>?)")),
+            "{main:?}"
+        );
+        assert!(
+            main.iter().any(|l| l.starts_with("SEARCH x USING ")
+                && l.contains("usage_target (target_kind=? AND target_id=? AND event=?)")),
+            "{main:?}"
+        );
+        assert!(
+            main.iter()
+                .any(|l| l.starts_with("SEARCH o USING ") && l.contains("usage_opened_target")),
+            "{main:?}"
+        );
+    }
 }

@@ -6031,9 +6031,10 @@ TDD круга: RED — `has_code_block_cases` (`<pre>`), `proposals_rules` — 
   — флагом (`1 | 0 | true | false`, иначе 400), как `from_idea` и `top_level`; сервер без признака
   параметр молча пропускает (у `ListQuery` нет `deny_unknown_fields`) — клиент шлёт его только с
   признаком (строка `docs/api-compat.md`).
-- [решение исполнителя, задача 6] **Окно «шумных» — и для оценок `useful`**: «по событиям с
-  `max(…)`» (§6.6 п. 3) — все три условия по одному окну; давняя оценка «полезно» запись из
-  «шумных» не выводит, счётчики карточки при этом — за всё время (решение 68, цена — в нём).
+- [решение координатора, круг правок 1 задачи 6; заменяет решение исполнителя 6] **Окно «шумных»
+  — у показов и открытий, оценка `useful` — за всё время**: любая «полезно», в том числе до
+  выпуска и старше 30 суток, запись исключает (у «шумной» записи в карточке всегда `useful = 0`);
+  §6.6 п. 3 и цена решения 68 уточнены в спецификации.
 - [решение исполнителя, задача 6] **Строка руководства** (§6.6 п. 4) — `deploy/README-install.md`,
   «Работа с заметками из CLI», абзац «Польза подсказок»; протокол `zam guide` не меняется: агенту
   новое поведение не нужно (открытие — побочный учёт чтения).
@@ -6050,13 +6051,50 @@ TDD: RED — `usage_opened` 5 FAILED из 7 (`opened_after_hint_read`, `opened_o
 `not_opened_without_hint` на прежнем коде зелёные (защищают от лишней записи);
 `boot::health_features_documented` — таблица против `FEATURES`; CLI `insight_show_opened` и
 `insight_feedback_counts` (ожидание с `opened`) — прежняя строка «показы · полезно · бесполезно».
-GREEN (`ZAM_REQUIRE_ML=1`) — `usage_opened` 7/7, `boot` 15, `zam-server --lib` 385, `recall` 55,
+GREEN (`ZAM_REQUIRE_ML=1`, до круга правок) — `usage_opened` 7/7, `boot` 15,
+`zam-server --lib` 385, `recall` 55,
 `read_batch` 13, `read_focus` 20, `read_since_rev` 7, `read_attachments` 9, `journals` 20, `nodes`
 20, `insights` 19, `sessions` 17 (ожидание `usage` с `opened`), `session_tokens` 6, `check_run` 27
 (в том числе `check_run_leaves_no_traces`), `mcp` 84, `proposals_rules` 26, `tasks` 24,
 `reports_invisible` 17, `secrets` 44; `zam-store` `--lib` 129, `sessions` 19, `user_db` 11 (в том
 числе `usage_target_index_kept`); `zam-cli` `--bin zam` 237, `--test insights` 16; clippy
 `zam-store`, `zam-server`, `zam-cli` `--all-targets -D warnings` и `fmt --all --check` — чисто.
+
+**Круг правок 1** (ревью r1: ✅ с ⚠️ 2, Needs fixes — 1 Important, 4 Minor):
+- Important 1 (решение координатора): `noisy_ids` — `useful` за всё время (`NOT EXISTS` по
+  `usage_target`), показы и открытия — по окну. Тест `noisy_window_from_migration`: запись с
+  оценкой до начала учёта и 12 показами в окне и запись с оценкой старше 30 суток — не «шумные»;
+  открытие старше окна запись не защищает (`opened: 1` в карточке «шумной»). ТЗ §10.5 (строки
+  «шумные» согласованы), `docs/api-compat.md`, CHANGELOG, спецификация §6.6 п. 3 и цена решения
+  68 — в этом worktree.
+- Minor 1: окно `usage` — по `rowid` без миграции: `NOISY_LO_SQL` (`id` последней строки старше
+  начала окна — обход с конца) и `id > lo` в `NOISY_SQL` с `+target_kind` (иначе планировщик уходит
+  в `usage_target` и обходит все показы записей); точная проверка `ts` осталась. Модульный тест
+  `usage::tests::noisy_window_by_rowid` — `EXPLAIN QUERY PLAN`: `SEARCH u USING INTEGER PRIMARY KEY
+  (rowid>?)`, граница — `SCAN usage` без B-дерева, `useful` и открытия — по своим индексам. Строки
+  теста ленты пишутся по порядку времени, как у сервера.
+- Minor 2: служебные чтения `zam` в сессии агента (ревизия для `zam write`, `zam insight triggers
+  | revisit | certify | append | supersede`) — открытие, записано явно (`docs/api-compat.md`, ТЗ
+  §10.5, модуль `api::opened`).
+- Minor 3: тесты решений исполнителя 1, 3, 4, 5 — `opened_read_any_form` (секция, фокус,
+  `unchanged`, `(budget)` — открытие; ошибка элемента — нет), `opened_via_mcp_read_not_service_get`
+  (`memory_write` с `base_rev` — не открытие, `memory_read` с явной сессией — открытие),
+  `get_bad_session_header_ignored` (200, ответ прежний), `noisy=1&deleted=only` — 422 в
+  `noisy_window_from_migration`.
+- Minor 4: пакет разбора идей (`idea_review`, `source = agent`) — тоже подсказка; `agent` дописан в
+  список источников (`docs/api-compat.md`, ТЗ §10.5), поведение прежнее
+  **[решение исполнителя, задача 6, круг 1: первый вариант ревью]**.
+- ⚠️ 2: тест `usage_target_index_kept` остаётся в `zam-store/tests/user_db.rs` (задача 1); в
+  спецификации §6.6 «Проверка» место указано.
+
+TDD круга: RED — `noisy_window_from_migration` (в «шумных» — обе записи с оценкой вне окна); новые
+тесты Minor 3 на прежнем коде зелёные — они закрепляют решения исполнителя, а не меняют поведение;
+`noisy_window_by_rowid` написан вместе с запросом. GREEN (`ZAM_REQUIRE_ML=1`) — `usage_opened`
+10/10, `zam-server --lib` 385, `boot` 15, `check_run` 27 (с `check_run_leaves_no_traces`),
+`insights` 19, `sessions` 17, `read_attachments` 9, `read_batch` 13, `read_budget_memory` 1,
+`read_focus` 20, `read_focus_ml` 2, `read_since_rev` 7, `journals` 20, `entries_index` 5,
+`entries_revision` 4, `nodes` 20, `mcp` 84; `zam-store --lib` 130 (с `noisy_window_by_rowid`);
+`zam-cli --test insights` 16; clippy трёх крейтов `-D warnings` и `fmt --all --check` — чисто.
 
 ## Уточнить у владельца
 

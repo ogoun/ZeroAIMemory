@@ -213,6 +213,138 @@ async fn opened_after_hint_read() {
     );
 }
 
+/// `/read` любой формы — секция, фокус, `unchanged` по `if_rev`, элемент `(budget)` — открытие
+/// (решение исполнителя 1); ошибка элемента — нет.
+#[tokio::test]
+async fn opened_read_any_form() {
+    let a = server("read-forms").await;
+    let n = rule(&a).await;
+    let mn = format!("n:{n}");
+    let big = a
+        .note(
+            "knowledge",
+            "длинная",
+            &format!("# Длинная\n\n{}\n", "Слово за словом. ".repeat(200)),
+        )
+        .await;
+    let mb = format!("n:{}", big["id"].as_str().unwrap());
+    for (s, item) in [
+        ("s-sec", json!({"section": "Квазар"})),
+        ("s-focus", json!({"focus": "квазар"})),
+        ("s-unch", json!({"if_rev": 1})),
+        ("s-err", json!({"section": "Нет такой секции"})),
+    ] {
+        digest(&a, s, &mn).await;
+        let j = read(&a, Some(s), &mn, item).await.json();
+        let it = &j["items"][0];
+        match s {
+            "s-unch" => assert_eq!(it["unchanged"], true, "{j}"),
+            "s-err" => assert!(it["error"].is_string(), "{j}"),
+            _ => assert!(it["error"].is_null(), "{j}"),
+        }
+    }
+    // правило — вторым элементом за длинной заметкой в малом бюджете: `(budget)`
+    digest(&a, "s-budget", &mn).await;
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            READ,
+            Some(json!({"items": [{"id": mb}, {"id": mn}], "budget_tokens": 40})),
+            &[(SESSION, "s-budget")],
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    let j = r.json();
+    assert_eq!(j["items"][1]["budget"], true, "{j}");
+    let rows: Vec<(String, String)> = opened_rows(&a)
+        .await
+        .into_iter()
+        .map(|r| (r.0, r.2))
+        .collect();
+    let want: Vec<(String, String)> = ["s-budget", "s-focus", "s-sec", "s-unch"]
+        .iter()
+        .map(|s| (s.to_string(), n.clone()))
+        .collect();
+    assert_eq!(rows, want);
+}
+
+/// JSON-RPC `tools/call` к `/mcp` по первому токену с заголовками `extra`; текст ответа.
+async fn mcp_tool(a: &Api, extra: &[(&str, &str)], name: &str, args: Value) -> String {
+    let mut b = axum::http::Request::builder()
+        .method(Method::POST)
+        .uri("/mcp")
+        .header(axum::http::header::HOST, "memory.lan:7700")
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .header(
+            axum::http::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", a.token),
+        );
+    for (k, v) in extra {
+        b = b.header(*k, *v);
+    }
+    let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                      "params": {"name": name, "arguments": args}});
+    let r = a
+        .send(b.body(axum::body::Body::from(body.to_string())).unwrap())
+        .await;
+    ok(&r, StatusCode::OK);
+    let j = r.json();
+    assert!(j["result"]["isError"] != true, "{name}: {j}");
+    j["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// MCP: служебный `GET /nodes/by-path` самого `memory_write` (id заметки для правки) — не
+/// открытие; `memory_read` с явной сессией — открытие (решение исполнителя 3).
+#[tokio::test]
+async fn opened_via_mcp_read_not_service_get() {
+    let a = server("mcp").await;
+    let n = rule(&a).await;
+    let mn = format!("n:{n}");
+    digest(&a, "s-mcp", &mn).await;
+    let h = [(SESSION, "s-mcp")];
+    mcp_tool(
+        &a,
+        &h,
+        "memory_write",
+        json!({"path": format!("rules:/{RULE_PATH}"),
+               "content": "# Квазар\n\nПеред сборкой дважды проверяй квазар.\n",
+               "base_rev": 1}),
+    )
+    .await;
+    assert!(opened_rows(&a).await.is_empty());
+    let text = mcp_tool(&a, &h, "memory_read", json!({"items": [{"id": mn}]})).await;
+    assert!(text.contains("дважды"), "{text}");
+    let rows = opened_rows(&a).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        (rows[0].0.as_str(), rows[0].2.as_str()),
+        ("s-mcp", n.as_str())
+    );
+}
+
+/// Некорректный `X-Zam-Session` у `GET /entries/{id}` и `GET /nodes/{id}` — прежний ответ 200, без
+/// открытия (решение исполнителя 4: раньше заголовок здесь не читался).
+#[tokio::test]
+async fn get_bad_session_header_ignored() {
+    let a = server("bad-session").await;
+    let e = insight(&a, "Квазар в сборке", "quasar").await;
+    let n = rule(&a).await;
+    let bad = "x".repeat(200);
+    let plain = get(&a, None, &format!("/api/v1/entries/{e}")).await;
+    let j = get(&a, Some(bad.as_str()), &format!("/api/v1/entries/{e}")).await;
+    assert_eq!(j, plain);
+    get(&a, Some(bad.as_str()), &format!("/api/v1/nodes/{n}")).await;
+    assert!(opened_rows(&a).await.is_empty());
+}
+
 /// Одно событие на сессию и цель (первичный ключ): повторные чтения той же сессией, в том числе
 /// после новой эпохи с новым показом, строк не добавляют; другая сессия — своя строка.
 #[tokio::test]
@@ -413,9 +545,31 @@ async fn noisy(a: &Api) -> (Vec<String>, Value) {
     (ids, j)
 }
 
-/// §6.6 п. 3, решение 68: «шумные» — `shown ≥ 10`, `opened = 0`, `useful = 0` по событиям окна
-/// `max(now − 30 сут, usage_opened_since)`: показы до начала учёта открытий и старше 30 суток в
-/// окно не входят; у записей — прежний `usage` за всё время; `opened_since` — начало учёта.
+/// Открытие записи `target` сессией `session` в момент `at` (`usage_opened`).
+async fn opened_at(a: &Api, target: &str, session: &str, at: Timestamp) {
+    zam_store::record_opened(
+        &a.st.users.get(a.st.admin_id).await.unwrap(),
+        &zam_store::OpenedEvent {
+            ts: at,
+            user_id: a.st.admin_id,
+            session_id: session.into(),
+            target: TargetRef {
+                kind: TargetKind::Entry,
+                id: target.parse::<Id>().unwrap(),
+            },
+            source: zam_store::UsageSource::Prompt,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// §6.6 п. 3, решения 68 и круга правок 1 задачи 6: «шумные» — `shown ≥ 10` и `opened = 0` по
+/// событиям окна `max(now − 30 сут, usage_opened_since)`, `useful = 0` — за всё время: показы до
+/// начала учёта открытий и старше 30 суток в окно не входят, открытие старше окна запись не
+/// защищает, а любая оценка «полезно» (до начала учёта, старше 30 суток) — исключает; у записей —
+/// прежний `usage` за всё время; `opened_since` — начало учёта. Строки `usage` пишутся по порядку
+/// времени, как у сервера (`id` растёт со временем записи — по нему `noisy_ids` берёт окно).
 #[tokio::test]
 async fn noisy_window_from_migration() {
     let a = server("noisy").await;
@@ -426,41 +580,59 @@ async fn noisy_window_from_migration() {
     let noisy_one = insight(&a, "Шумная", never).await;
     let opened = insight(&a, "Открытая", never).await;
     let useful = insight(&a, "Полезная", never).await;
+    let useful_early = insight(&a, "Полезная до учёта", never).await;
+    let useful_old = insight(&a, "Полезная давно", never).await;
+    let opened_old = insight(&a, "Открытая давно", never).await;
     let few = insight(&a, "Редкая", never).await;
     let old = insight(&a, "Старая", never).await;
     let since = now - day * 3;
     set_since(&a, since).await;
-    usage_rows(&a, &before_since, "recall_shown", now - day * 5, 12, "w1").await;
-    usage_rows(&a, &noisy_one, "recall_shown", now - day, 12, "w1").await;
     // давние показы — в счётчиках записи, но не в окне
     usage_rows(&a, &noisy_one, "recall_shown", now - day * 50, 5, "w0").await;
-    usage_rows(&a, &opened, "recall_shown", now - day, 12, "w1").await;
-    zam_store::record_opened(
-        &a.st.users.get(a.st.admin_id).await.unwrap(),
-        &zam_store::OpenedEvent {
-            ts: now - day,
-            user_id: a.st.admin_id,
-            session_id: "w1".into(),
-            target: TargetRef {
-                kind: TargetKind::Entry,
-                id: opened.parse::<Id>().unwrap(),
-            },
-            source: zam_store::UsageSource::Prompt,
-        },
-    )
-    .await
-    .unwrap();
-    usage_rows(&a, &useful, "recall_shown", now - day, 12, "w1").await;
+    usage_rows(&a, &useful_old, "useful", now - day * 45, 1, "w0").await;
+    opened_at(&a, &opened_old, "w0", now - day * 45).await;
+    usage_rows(&a, &old, "recall_shown", now - day * 40, 12, "w1").await;
+    usage_rows(&a, &before_since, "recall_shown", now - day * 5, 12, "w1").await;
+    // оценка «полезно» до начала учёта открытий
+    usage_rows(&a, &useful_early, "useful", now - day * 5, 1, "w1").await;
+    for t in [
+        &noisy_one,
+        &opened,
+        &useful,
+        &useful_early,
+        &useful_old,
+        &opened_old,
+    ] {
+        usage_rows(&a, t, "recall_shown", now - day, 12, "w1").await;
+    }
+    opened_at(&a, &opened, "w1", now - day).await;
     usage_rows(&a, &useful, "useful", now - day, 1, "w1").await;
     usage_rows(&a, &few, "recall_shown", now - day, 9, "w1").await;
-    usage_rows(&a, &old, "recall_shown", now - day * 40, 12, "w1").await;
 
-    let (ids, j) = noisy(&a).await;
-    assert_eq!(ids, std::slice::from_ref(&noisy_one), "{j}");
+    let (mut ids, j) = noisy(&a).await;
+    ids.sort();
+    let mut want = vec![noisy_one.clone(), opened_old.clone()];
+    want.sort();
+    assert_eq!(ids, want, "{j}");
     assert_eq!(j["opened_since"], ts(since), "{j}");
+    let card = |id: &str| {
+        j["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == id)
+            .unwrap()["usage"]
+            .clone()
+    };
     assert_eq!(
-        j["items"][0]["usage"],
+        card(&noisy_one),
         json!({"shown": 17, "opened": 0, "useful": 0, "useless": 0}),
+        "{j}"
+    );
+    // открытие старше окна — в счётчиках записи, но запись «шумная»
+    assert_eq!(
+        card(&opened_old),
+        json!({"shown": 12, "opened": 1, "useful": 0, "useless": 0}),
         "{j}"
     );
 
@@ -469,26 +641,27 @@ async fn noisy_window_from_migration() {
     set_since(&a, long_ago).await;
     let (mut ids, j) = noisy(&a).await;
     ids.sort();
-    let mut want = vec![before_since, noisy_one];
+    let mut want = vec![before_since, noisy_one, opened_old];
     want.sort();
     assert_eq!(ids, want, "{j}");
     assert_eq!(j["opened_since"], ts(long_ago), "{j}");
 
-    // `noisy` — фильтр ленты insight; значение — флаг
-    let r = a
-        .t(
-            Method::GET,
+    // `noisy` — фильтр живой ленты insight; значение — флаг
+    for (uri, code) in [
+        (
             "/api/v1/spaces/knowledge/entries?kind=changelog&noisy=1",
-            None,
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
-    let r = a
-        .t(
-            Method::GET,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "/api/v1/spaces/knowledge/entries?kind=insight&noisy=1&deleted=only",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
             "/api/v1/spaces/knowledge/entries?kind=insight&noisy=maybe",
-            None,
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let r = a.t(Method::GET, uri, None).await;
+        assert_eq!(r.status, code, "{uri}: {}", r.text());
+    }
 }
