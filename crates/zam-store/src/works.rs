@@ -469,10 +469,19 @@ pub async fn finish(
 
 /// Запись принятого элемента итога (пробы, кандидаты) — в **той же транзакции**, что закрытие
 /// работы ([`finish_claimed`]): работу сняли, она истекла или закрыта другим итогом — не
-/// записано ничего. Варианты добавляют виды работ (задачи 4 и 7 плана M7.3); без фичи
-/// `test-hooks` перечисление пока пусто.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// записано ничего. Варианты добавляют виды работ (задачи 4 и 7 плана M7.3).
+#[derive(Debug, Clone, PartialEq)]
 pub enum ItemWrite {
+    /// Проба вида `probe` (вид работы `probes`, §6.4 п. 2): пространство и работа пробы — этой
+    /// работы. При записи ещё раз, в транзакции, сверяются предел новых проб постановки работы
+    /// (`works.origin`) с момента `since` — не больше `cap` — и [`crate::probes::insert_probe`]
+    /// (повтор вопроса, предел активных): проверка элемента шла до транзакции, а итоги разных
+    /// работ пользователя принимаются параллельно. Не прошедшая сверку проба не пишется (WARN).
+    Probe {
+        probe: crate::probes::NewProbe,
+        since: Timestamp,
+        cap: u32,
+    },
     /// Тестовый вид `echo` (фича `test-hooks`): строка `proposals` типа [`ECHO_PROPOSAL_TYPE`]
     /// (читатели предложений пропускают неизвестный тип с WARN).
     #[cfg(feature = "test-hooks")]
@@ -494,6 +503,29 @@ pub const ECHO_PROPOSAL_TYPE: &str = "echo";
 fn apply_write(t: &rusqlite::Transaction<'_>, w: &Work, x: &ItemWrite) -> Result<(), StoreError> {
     let _ = (t, w);
     match *x {
+        ItemWrite::Probe {
+            ref probe,
+            since,
+            cap,
+        } => {
+            let made = crate::probes::new_since_tx(t, w.origin.as_str(), since)?;
+            if made >= cap {
+                tracing::warn!(work = %w.id, made, cap, "внутренние работы: предел новых проб исчерпан при записи — проба не записана");
+                return Ok(());
+            }
+            let p = crate::probes::NewProbe {
+                space: Some(w.space_id),
+                work_id: Some(w.id),
+                ..probe.clone()
+            };
+            match crate::probes::insert_tx(t, &p)? {
+                crate::probes::InsertOutcome::Inserted(_) => {}
+                o => {
+                    tracing::warn!(work = %w.id, outcome = ?o, "внутренние работы: проба не записана");
+                }
+            }
+            Ok(())
+        }
         #[cfg(feature = "test-hooks")]
         ItemWrite::Echo {
             ref target,
@@ -926,6 +958,53 @@ pub async fn accepted_refs(db: &Db, kind: WorkKind) -> Result<HashSet<(String, i
         }
     }
     Ok(out)
+}
+
+/// Пары «ссылка, ревизия» кандидатов, уже отправленных в пакетах вида в этом запуске
+/// постановки (решение координатора 80): ночью — `items` работ вида с `origin = nightly` той же
+/// ночи `night`, у ручного запуска (`night` нет) — работ `origin` с `since` (сутки UTC); и
+/// работ вида с обращением к модели этого запуска (`work_calls.run = run`: работа прошлой ночи,
+/// возвращённая в очередь и выполненная сейчас, — ревью r2 задачи 4, N2); **любое** состояние
+/// работы (без итога, отклонённые проверкой, `failed`, снятые). Той же ночью (теми же сутками
+/// ручных запусков) их сборщик снова не берёт; следующей — они снова кандидаты. Из базы, а не из
+/// памяти цикла: перезапуск посреди ночи отсев не снимает. Хвост пакета сверх бюджета снят с
+/// работы до выдачи (`set_items`) — он не отправлялся и сюда не входит.
+pub async fn offered_refs(
+    db: &Db,
+    kind: WorkKind,
+    origin: Origin,
+    night: Option<civil::Date>,
+    since: Timestamp,
+    run: Option<&str>,
+) -> Result<HashSet<(String, i64)>, StoreError> {
+    let run = run.map(str::to_string);
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT items FROM works
+             WHERE kind = ?1
+               AND ((origin = ?2
+                     AND (CASE WHEN ?3 IS NOT NULL THEN night = ?3 ELSE created_at >= ?4 END))
+                    OR (?5 IS NOT NULL AND id IN (SELECT work_id FROM work_calls
+                                                  WHERE run = ?5 AND work_id IS NOT NULL)))",
+        )?;
+        let rows = st.query_map(
+            params![
+                kind.as_str(),
+                origin.as_str(),
+                night.map(|d| d.to_string()),
+                fmt_ts(since),
+                run
+            ],
+            |r| r.get::<_, String>(0),
+        )?;
+        let mut out = HashSet::new();
+        for items in rows {
+            let items: Vec<WorkItem> = serde_json::from_str(&items?).unwrap_or_default();
+            out.extend(items.into_iter().map(|i| (i.target, i.rev)));
+        }
+        Ok(out)
+    })
+    .await
 }
 
 /// Итоги (`result`) работ вида в состояниях `states`, закрытых за последние
