@@ -620,6 +620,7 @@ mod tests {
             token_field: TokenField::Auto,
             body_extra: Map::new(),
             pinned: None,
+            external: None,
         }
     }
 

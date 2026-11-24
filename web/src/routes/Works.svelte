@@ -4,7 +4,9 @@
   // Д §6.14); подключённая модель — окно формы `FormDialog` (правило Б): запись личного Vault по
   // имени (уходит как `v:<id>`, её адрес и класс — LAN, вне LAN, петля — видны до сохранения),
   // модель, ключ, предел ответа, `body_extra` с рецептами и «Проверить подключение» в окне; плашка
-  // «данные памяти уходят за пределы локальной сети» при подключении вне LAN; пауза — причина,
+  // «данные памяти уходят за пределы локальной сети» при подключении вне LAN (поле сервера
+  // `works.model.external`: по закреплённому адресу, без DNS; ревью r1, I1) и «Отключить модель»;
+  // пауза — причина,
   // подсказка и у `vault_changed` «был → стал» с «Подтвердить адрес» (окно-подтверждение, шлёт
   // `confirm_url` = «стал»; 409 — новые «был → стал» в том же окне); ночь — время в поясе сервера
   // и местное, окно, итог последней ночи по видам и выключатель ночной проверки; очередь работ и
@@ -20,6 +22,7 @@
   import { localTime } from '../lib/time';
   import { viewport } from '../lib/viewport.svelte';
   import {
+    connInput,
     listWorks,
     patchWorks,
     runWorks,
@@ -48,8 +51,6 @@
     addressView,
     bodyExtraText,
     callTokensText,
-    externalHost,
-    externalOf,
     nightText,
     num,
     outcomeText,
@@ -86,8 +87,6 @@
   let connError = $state('');
   let runNotice = $state('');
   let busy = $state(false);
-  /** Хост вне LAN из ответа последнего сохранения (`warnings`). */
-  let savedExternal = $state<string | null>(null);
   /** Время ответа: «у вас 04:30» — от него. */
   let now = $state(Date.now());
 
@@ -184,12 +183,11 @@
     };
   });
 
-  /** Правка настроек: ответ — все настройки; вне LAN — хост для плашки. */
+  /** Правка настроек: ответ — все настройки (у подключения — `external` и `host` для плашки). */
   async function save(patch: WorksPatch) {
     const r = await patchWorks(patch);
     settings = r.works;
     attention.pause = r.works.pause?.class ?? null;
-    if (patch.model) savedExternal = externalHost(r.warnings);
     return r;
   }
 
@@ -231,15 +229,21 @@
     }
   }
 
+  /** Итог выключателя ночной проверки — у него же (раздел «Ночь»). */
+  let nightNotice = $state('');
+  let nightError = $state('');
+
   async function setCheck(on: boolean) {
-    modeNotice = '';
-    modeError = '';
+    nightNotice = '';
+    nightError = '';
     try {
       await save({ check: on ? 'on' : 'off' });
-      runNotice = on ? 'Ночная проверка вашей памяти включена.' : 'Ночная проверка вашей памяти выключена (ручной прогон — на странице «Проверка памяти»).';
+      nightNotice = on ? 'Ночная проверка вашей памяти включена.' : 'Ночная проверка вашей памяти выключена (ручной прогон — на странице «Проверка памяти»).';
     } catch (e) {
       if (expired(e)) return;
-      modeError = errorText(e);
+      nightError = errorText(e);
+      // выбор не принят: выключатель — снова по сохранённой настройке
+      if (settings) settings = { ...settings };
     }
   }
 
@@ -372,7 +376,8 @@
   async function testInDialog() {
     dlgTesting = true;
     try {
-      if (isDirty(fieldsNow(), base) && !(await saveConn(false))) return;
+      // набранное не сохранено или подключения ещё нет — сначала сохранить (сервер проверяет сохранённое)
+      if ((!settings?.model || isDirty(fieldsNow(), base)) && !(await saveConn(false))) return;
       dlgError = '';
       const r = await runTest();
       if (r.ok) dlgNotice = `${dlgNotice ? `${dlgNotice} ` : ''}${r.text}`;
@@ -399,10 +404,9 @@
   async function confirmAddress() {
     const m = settings?.model;
     if (!m) throw new Error('Подключения нет: сохраните его заново.');
-    const { pinned: _p, ...conn } = m;
-    void _p;
     try {
-      await save({ model: { ...conn, confirm_url: confirmNow } });
+      // только поля входа: `pinned`, `host`, `external` ответа сервер в `PATCH` не принимает
+      await save({ model: { ...connInput(m), confirm_url: confirmNow } });
     } catch (e) {
       if (expired(e)) return;
       if (e instanceof ApiError && e.status === 409 && e.problem?.code === 'vault_changed') {
@@ -449,8 +453,27 @@
 
   // ---- производное ----
 
+  // ---- «Отключить модель» (окно-подтверждение, необратимо: подключение придётся вводить заново) ----
+
+  let disconnectOpen = $state(false);
+
+  async function disconnect() {
+    try {
+      await save({ model: null });
+    } catch (e) {
+      if (expired(e)) return;
+      throw new Error(errorText(e));
+    }
+    disconnectOpen = false;
+    connNotice = 'Модель отключена: данные памяти ей больше не уходят. Режим «модель» не действует, пока не подключите её снова.';
+    await loadQueue();
+  }
+
   let pause = $derived(settings?.pause ?? null);
-  let external = $derived(settings?.model ? (savedExternal ?? externalOf(settings.model.pinned, calls)) : null);
+  /** Хост подключения вне LAN — только по полю сервера (`external`, без DNS при чтении). */
+  let external = $derived(settings?.model?.external ? settings.model.host || 'адрес подключения' : null);
+  /** Какой-нибудь вид работает в режиме «модель» — данные уходят сейчас, иначе — уйдут при выборе. */
+  let modelActive = $derived(Object.values(settings?.effective ?? {}).some((e) => e.mode === 'model'));
   let modelVault = $derived(settings?.model ? vault.find((v) => `v:${v.id}` === settings!.model!.vault) ?? null : null);
   /** Итог последней ночи по видам. */
   let lastNight = $derived.by(() => {
@@ -471,8 +494,13 @@
 
   {#if external}
     <div class="alert ext" role="note" aria-label="Данные вне локальной сети" data-testid="works-external">
-      <p class="alert-title">Данные памяти уходят за пределы локальной сети: {external}</p>
-      <p>Подключённая модель — вне LAN: ей уходит маскированный пакет работ (без Human, Vault и записей участников).</p>
+      {#if modelActive}
+        <p class="alert-title">Данные памяти уходят за пределы локальной сети: {external}</p>
+        <p>Подключённая модель — вне локальной сети: ей уходит маскированный пакет работ (без Human, Vault и записей участников).</p>
+      {:else}
+        <p class="alert-title">Подключённая модель — вне локальной сети: {external}</p>
+        <p>Данные памяти уйдут за пределы локальной сети, когда вид работ будет в режиме «модель»: ей уходит маскированный пакет работ (без Human, Vault и записей участников).</p>
+      {/if}
     </div>
   {/if}
   {#if pause}
@@ -538,7 +566,7 @@
     {#if s.model}
       {@const m = s.model}
       <dl class="facts">
-        <div><dt>Запись Vault</dt><dd>{modelVault?.title ?? 'запись'} <span class="muted">({m.vault})</span></dd></div>
+        <div><dt>Запись Vault</dt><dd title={m.vault}>{modelVault?.title ?? 'запись личного Vault'}</dd></div>
         <div><dt>Адрес</dt><dd><code class="path">{m.pinned ? pinnedUrl(m.pinned) : 'не закреплён'}</code></dd></div>
         <div><dt>Модель</dt><dd>{m.model}</dd></div>
         <div><dt>Ключ</dt><dd>{m.auth === 'key' ? 'значение записи Vault' : 'без ключа'}</dd></div>
@@ -554,7 +582,10 @@
     {/if}
     <div class="row actions">
       <button type="button" class="primary" onclick={openConn}>{s.model ? 'Изменить подключение' : 'Подключить модель'}</button>
-      {#if s.model}<button type="button" disabled={busy} onclick={testFromPage}>Проверить подключение</button>{/if}
+      {#if s.model}
+        <button type="button" disabled={busy} onclick={testFromPage}>Проверить подключение</button>
+        <button type="button" class="danger" disabled={busy} onclick={() => (disconnectOpen = true)}>Отключить модель</button>
+      {/if}
     </div>
     <div bind:this={connBox}><Notice text={connNotice} /></div>
     {#if connError}<p class="error" role="alert">{connError}</p>{/if}
@@ -583,8 +614,10 @@
     {#if settings}
       <label class="opt">
         <input type="checkbox" checked={settings.check === 'on'} onchange={(e) => setCheck(e.currentTarget.checked)} />
-        Ночная проверка моей памяти <code class="muted small">works.check</code>
+        Ночная проверка моей памяти
       </label>
+      <Notice text={nightNotice} />
+      {#if nightError}<p class="error" role="alert">{nightError}</p>{/if}
     {/if}
   </section>
 
@@ -657,8 +690,7 @@
     </dl>
     <p class="muted small">
       Вход и выход модели по журналу отправок. Потолок сервера — {num(u.ceiling.daily)} в сутки и {num(u.ceiling.monthly)}
-      в месяц (<code>[works] max_daily_tokens</code>, <code>max_monthly_tokens</code>); не помещается — запрос не
-      отправляется до следующей ночи.
+      в месяц (настройка администратора сервера); не помещается — запрос не отправляется до следующей ночи.
     </p>
   </section>
 {/if}
@@ -713,7 +745,7 @@
 <FormDialog
   open={connOpen}
   title="Подключение модели"
-  description="OpenAI-совместимый Chat Completions. Адрес (data.url с /v1, как у поставщика) и ключ — запись вашего личного Vault."
+  description="OpenAI-совместимый Chat Completions. Адрес (поле url записи, с /v1, как у поставщика) и ключ — запись вашего личного Vault."
   submit="Сохранить"
   wide
   busy={dlgTesting}
@@ -763,8 +795,9 @@
   </label>
   <label>
     Поле предела
-    <select bind:value={fField}>
-      <option value="auto">авто (у api.openai.com — max_completion_tokens)</option>
+    <span class="field-note muted" id="works-field-note">авто — max_completion_tokens у api.openai.com, max_tokens у прочих</span>
+    <select bind:value={fField} aria-describedby="works-field-note">
+      <option value="auto">авто</option>
       <option value="max_tokens">max_tokens</option>
       <option value="max_completion_tokens">max_completion_tokens</option>
     </select>
@@ -778,8 +811,9 @@
     {#each RECIPES as r (r.name)}<button type="button" class="small-btn" onclick={() => addRecipe(r.value)}>{r.title}</button>{/each}
   </div>
   {#snippet extra()}
+    <!-- без сохранённого подключения проверять нечего: сначала сохранить (сервер проверяет сохранённое) -->
     <button type="button" disabled={dlgTesting || !choices.length} onclick={testInDialog}>
-      {connOpen && isDirty(fieldsNow(), base) ? 'Сохранить и проверить' : 'Проверить подключение'}
+      {connOpen && (!settings?.model || isDirty(fieldsNow(), base)) ? 'Сохранить и проверить' : 'Проверить подключение'}
     </button>
   {/snippet}
 </FormDialog>
@@ -788,11 +822,31 @@
   open={confirmOpen}
   confirm
   title="Подтвердить новый адрес подключения?"
-  description="Был {confirmWas} → стал {confirmNow}. После подтверждения сервер будет отправлять пакеты работ и ключ на новый адрес. Если адрес меняли не вы — отмените и верните прежний адрес в записи Vault."
+  description="После подтверждения сервер будет отправлять пакеты работ и ключ на новый адрес. Если адрес меняли не вы — отмените и верните прежний адрес в записи Vault."
   submit="Подтвердить адрес"
   refocus={() => connBox?.querySelector('[role="status"]')}
   onsubmit={confirmAddress}
   onclose={() => (confirmOpen = false)}
+>
+  <!-- адреса — моноширинно, каждый своей строкой: сверка «был / стал» — последний рубеж против подмены -->
+  <dl class="addr-change" data-testid="works-confirm-change">
+    <dt>Был</dt>
+    <dd><code data-testid="works-confirm-was">{confirmWas}</code></dd>
+    <dt>Стал</dt>
+    <dd><code data-testid="works-confirm-now">{confirmNow}</code></dd>
+  </dl>
+</FormDialog>
+
+<FormDialog
+  open={disconnectOpen}
+  confirm
+  danger
+  title="Отключить модель?"
+  description="Подключение удалится: модель больше не получит данных памяти, режим «модель» перестанет действовать. Запись Vault останется; подключить можно заново."
+  submit="Отключить"
+  refocus={() => connBox?.querySelector('[role="status"]')}
+  onsubmit={disconnect}
+  onclose={() => (disconnectOpen = false)}
 />
 
 <FormDialog
@@ -866,6 +920,27 @@
     flex-wrap: wrap;
     gap: 8px;
     align-items: center;
+  }
+  /* телефон: подпись вида — над выбором у обоих видов (одно выравнивание, ревью r1) */
+  @media (max-width: 719px) {
+    .kind label {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 4px;
+    }
+  }
+  .addr-change {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 4px 12px;
+    margin: 0;
+  }
+  .addr-change dt {
+    color: var(--muted);
+  }
+  .addr-change dd {
+    margin: 0;
+    overflow-wrap: anywhere;
   }
   .actions {
     margin: 12px 0 8px;

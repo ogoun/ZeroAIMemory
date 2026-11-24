@@ -12,8 +12,6 @@ import { call, type UserSettings } from './api';
 export const attention = $state<{ regression: boolean | null; pause: string | null }>({ regression: null, pause: null });
 
 const REFRESH_MS = 30_000;
-/** Прогонов в чтении: ночной среди ручных (`GET /check/runs`, новые первыми). */
-export const RUNS = 60;
 let at = 0;
 let inflight = false;
 
@@ -23,15 +21,16 @@ export async function refreshAttention(): Promise<void> {
   inflight = true;
   at = Date.now();
   try {
-    type Run = { trigger: string; status: string; verdict: { kind: string } | null; accepted_at: string | null };
+    type Run = { verdict: { kind: string } | null; accepted_at: string | null };
     const [runs, set] = await Promise.allSettled([
-      call<{ items: Run[] }>('GET', `check/runs?limit=${RUNS}`),
+      // последний законченный ночной прогон — фильтром сервера, сколько бы ручных ни было после
+      call<{ items: Run[] }>('GET', 'check/runs?trigger=nightly&status=done&limit=1'),
       call<UserSettings>('GET', 'auth/settings'),
     ]);
     if (runs.status === 'fulfilled') {
-      // то же правило, что `latestNightly` и `regressionOpen` (`checkVerdict.ts`): модуль страницы в
-      // стартовую загрузку не тянется
-      const n = runs.value.items.find((r) => r.trigger === 'nightly' && r.status === 'done');
+      // то же правило, что `regressionOpen` (`checkVerdict.ts`): модуль страницы в стартовую
+      // загрузку не тянется
+      const n = runs.value.items[0];
       attention.regression = !!n && n.verdict?.kind === 'regression' && !n.accepted_at;
     }
     if (set.status === 'fulfilled') attention.pause = set.value.works?.pause?.class ?? null;

@@ -9,7 +9,8 @@
 // `check_accept_new_norm_human_only` задачи 5.
 import { expect, test, type Page } from '@playwright/test';
 import { pageSnapshots } from './page-snaps';
-import { RUN_M1, RUN_N1, agent, checkFixture, human, resetWorks } from './seed-internal';
+import { sectionItem } from './nav';
+import { RUN_M1, RUN_N1, agent, checkFixture, human, resetWorks, runsReply } from './seed-internal';
 import { ADMIN_STATE } from './session';
 
 const env = (k: string) => {
@@ -27,7 +28,7 @@ pageSnapshots('check', () => '#/check', {
   prepare: async (p) => {
     const f = checkFixture();
     await p.route(/\/api\/v1\/check\/status$/, (r) => r.fulfill({ json: f.status }));
-    await p.route(/\/api\/v1\/check\/runs(\?.*)?$/, (r) => r.fulfill({ json: f.runs }));
+    await p.route(/\/api\/v1\/check\/runs(\?.*)?$/, (r) => r.fulfill({ json: runsReply(r.request().url(), f.runs) }));
   },
 });
 
@@ -95,14 +96,19 @@ test('check_status_and_failing', async ({ page }) => {
   // метрики к медиане базы
   await expect(page.getByRole('table', { name: 'Метрики к медиане базы' })).toContainText('Найдено поиском (test)');
   // проваленная проба: вопрос, ожидаемая цель ссылкой, где нашлась, совет
+  // какие из проб агента провалятся, зависит от записей прогона e2e (поиск без векторов находит
+  // часть по общим словам), поэтому берётся первая проваленная из своих, а не первая своя
   const failing = page.getByRole('table', { name: 'Проваленные пробы' });
-  const p = probes[0];
-  const row = failing.locator('tr').filter({ hasText: p.question });
+  await expect(failing.locator('tbody tr').first()).toBeVisible();
+  const texts = await failing.locator('tbody tr').allTextContents();
+  const p = probes.find((x) => texts.some((t) => t.includes(x.question)));
+  expect(p, 'хотя бы одна проба агента — среди проваленных').toBeTruthy();
+  const row = failing.locator('tr').filter({ hasText: p!.question });
   await expect(row).toBeVisible();
   await expect(row).toContainText('не нашлась и в глубоком поиске');
   await expect(row).toContainText('нет слов спрашивающего');
   // цель — переход к её карточке
-  await row.getByRole('button', { name: `Открыть ${p.target}`, exact: true }).click();
+  await row.getByRole('button', { name: `Открыть ${p!.target}`, exact: true }).click();
   await expect(page).toHaveURL(/#\/u\/[^/]+\/s\/[^/]+\/(j\/[a-z]+|n)\/[0-9A-Z]{26}$/);
   await expect(page.locator('h1, h2').filter({ hasText: /\S/ }).first()).toBeVisible();
   expect(problems, problems.join('\n')).toEqual([]);
@@ -115,7 +121,7 @@ test('check_accept_new_norm', async ({ page }) => {
   let accepted = false;
   const bodies: unknown[] = [];
   await page.route(/\/api\/v1\/check\/status$/, (r) => r.fulfill({ json: checkFixture(accepted).status }));
-  await page.route(/\/api\/v1\/check\/runs(\?.*)?$/, (r) => r.fulfill({ json: checkFixture(accepted).runs }));
+  await page.route(/\/api\/v1\/check\/runs(\?.*)?$/, (r) => r.fulfill({ json: runsReply(r.request().url(), checkFixture(accepted).runs) }));
   await page.route(/\/api\/v1\/check\/accept$/, async (r) => {
     bodies.push(r.request().postDataJSON());
     accepted = true;
@@ -123,11 +129,13 @@ test('check_accept_new_norm', async ({ page }) => {
     return r.fulfill({ json: n1 });
   });
   await page.goto(`${base()}#/check`);
-  // точка у «Проверка» — с первого экрана (оболочка читает прогоны сама)
-  const nav = page.getByRole('navigation', { name: 'Разделы' });
-  await expect(nav.getByRole('link', { name: 'Проверка', exact: true }).getByTestId('check-dot')).toBeVisible();
+  // точка у «Проверка» — с первого экрана (оболочка читает прогоны сама); раздел может быть в «Ещё»
+  await expect((await sectionItem(page, 'Проверка')).getByTestId('check-dot')).toBeVisible();
+  await page.keyboard.press('Escape');
   await expect(page.getByTestId('check-verdict')).toContainText('Вердикт: ухудшение: поиск −12 п. п. (62 % → 50 %)');
   await expect(page.getByTestId('check-verdict')).toContainText('ручной прогон');
+  // последний прогон — ручной: у кнопки — строка об открытой регрессии ночного (ревью r1, Minor 6)
+  await expect(page.getByTestId('check-open-regression')).toContainText('Открыта регрессия ночного прогона 2026-11-23');
   // «Принять как норму» — окно-подтверждение (правило Б), фокус — на основной кнопке
   await page.getByRole('button', { name: 'Принять как норму', exact: true }).click();
   const d = page.getByRole('dialog', { name: 'Принять как норму?', exact: true });

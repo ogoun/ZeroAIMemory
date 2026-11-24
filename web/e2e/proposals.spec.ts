@@ -75,7 +75,7 @@ test('proposals_rule_accept_creates_note', async ({ page }) => {
   await expect(d.getByLabel('Путь в Rules')).toHaveValue(path);
   await expect(d.getByLabel('Текст правила')).toHaveValue(content);
   const tokens = await d.getByTestId('proposal-tokens').innerText();
-  const m = /^Rules в каждой сессии: ([\d ]+) → ([\d ]+) токенов \(\+([\d ]+)\)/.exec(tokens);
+  const m = /^Rules в каждой сессии: ([\d ]+) → ([\d ]+) токен(?:а|ов)? \(\+([\d ]+)\)/.exec(tokens);
   expect(m, tokens).not.toBeNull();
   const n = (s: string) => Number(s.replace(/ /g, ''));
   expect(n(m![2])).toBeGreaterThan(n(m![1]));

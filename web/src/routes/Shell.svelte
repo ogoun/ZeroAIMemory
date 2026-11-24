@@ -12,11 +12,16 @@
   // M7.3 (§6.9): разделы «Проверка» (точка при открытой регрессии ночной проверки) и «Кандидаты N»
   // (открытые кандидаты в Rules); «Внутренние работы» — в меню аккаунта телефона и рядом с логином
   // на планшете и компьютере (меню аккаунта там нет, §5.1 п. 3), с точкой, пока исполнитель на
-  // паузе; три страницы — ленивыми чанками.
+  // паузе; три страницы — ленивыми чанками. Полоса разделов шапки (ревью r1 задачи 8, I2) — без
+  // прокрутки и обрезки: по замеру скрытой копии — полные подписи, если помещаются все разделы,
+  // иначе короткие, а что не помещается и так — в меню «Ещё ▾» (`NavMore`, признаки скрытых
+  // разделов — и на кнопке); ширина полосы — остаток шапки, замер — при каждом изменении её или
+  // содержимого (`ResizeObserver`).
   import { onMount, tick, untrack } from 'svelte';
   import DocView from '../components/DocView.svelte';
   import AccountMenu from '../components/AccountMenu.svelte';
   import LazyFail from '../components/LazyFail.svelte';
+  import NavMore from '../components/NavMore.svelte';
   import Search from '../components/Search.svelte';
   import Tree, { type Reveal, type TreeChange } from '../components/Tree.svelte';
   import TasksView from '../components/TasksView.svelte';
@@ -275,6 +280,91 @@
   /** Открытых кандидатов в Rules своего пользователя («Кандидаты N», §6.7 п. 5). */
   let candidates = $derived(proposalCounts.get(me.user_id, 'rules')?.rules ?? 0);
 
+  // ---- разделы шапки: подписи и меню «Ещё» по замеру (ревью r1, I2) ----
+
+  /** Раздел шапки: `short` — короткая подпись (имя ссылки — всегда полное `label`). */
+  type Section = { key: string; to: Route; label: string; short?: string; current: boolean };
+
+  let sectionList = $derived.by((): Section[] => {
+    const r = route;
+    const list: Section[] = [{ key: 'home', to: { name: 'home', user: me.user_id }, label: 'Заметки', current: !!routeUser(r) }];
+    if (admin) {
+      list.push(
+        { key: 'index', to: { name: 'index' }, label: 'Индекс', current: r.name === 'index' },
+        { key: 'admin', to: { name: 'admin' }, label: 'Администрирование', short: 'Админ', current: isAdmin(r) },
+      );
+    } else {
+      list.push(
+        { key: 'mysolutions', to: { name: 'mysolutions' }, label: 'Мои решения', short: 'Решения', current: r.name === 'mysolutions' },
+        { key: 'account', to: { name: 'account' }, label: 'Аккаунт', current: r.name === 'account' },
+      );
+    }
+    list.push(
+      { key: 'agentsetup', to: { name: 'agentsetup' }, label: 'Подключение агента', short: 'Агент', current: r.name === 'agentsetup' },
+      { key: 'cache', to: { name: 'cache' }, label: 'Кэш выжимок', short: 'Кэш', current: r.name === 'cache' },
+      { key: 'sessions', to: { name: 'sessions' }, label: 'Сессии', current: r.name === 'sessions' },
+      { key: 'check', to: { name: 'check' }, label: 'Проверка', current: r.name === 'check' },
+      { key: 'proposals', to: { name: 'proposals', proposal: null }, label: 'Кандидаты', current: r.name === 'proposals' },
+    );
+    return list;
+  });
+
+  /** Описание признака раздела (точка, число) для чтения с экрана — id скрытого текста. */
+  const describedOf = (key: string): string | undefined =>
+    key === 'check' && attention.regression ? 'nav-check-dot' : key === 'proposals' && candidates ? 'nav-candidates' : undefined;
+
+  let navEl = $state<HTMLElement | null>(null);
+  let measureEl = $state<HTMLElement | null>(null);
+  /** Подписи полосы: полные — если помещаются все разделы. */
+  let shortLabels = $state(false);
+  /** Разделов в полосе; остальные — в «Ещё». */
+  let fit = $state(Infinity);
+
+  /** Замер: ширины пунктов скрытой копии (полные и короткие подписи, кнопка «Ещё») против ширины
+   * полосы. Запас 1 px — на дробные ширины. */
+  function fitSections() {
+    const nav = navEl;
+    const m = measureEl;
+    if (!nav || !m) return;
+    const avail = nav.clientWidth - 1;
+    const gap = parseFloat(getComputedStyle(nav).columnGap) || 0;
+    const widths = (sel: string) => [...m.querySelectorAll<HTMLElement>(sel)].map((e) => e.getBoundingClientRect().width);
+    const full = widths('[data-full]');
+    const short = widths('[data-short]');
+    const more = m.querySelector<HTMLElement>('[data-more]')?.getBoundingClientRect().width ?? 0;
+    const total = (ws: number[]) => ws.reduce((a, b) => a + b, 0) + gap * Math.max(0, ws.length - 1);
+    if (total(full) <= avail) {
+      shortLabels = false;
+      fit = Infinity;
+      return;
+    }
+    shortLabels = true;
+    if (total(short) <= avail) {
+      fit = Infinity;
+      return;
+    }
+    let w = more;
+    let k = 0;
+    while (k < short.length && w + gap + short[k] <= avail) w += gap + short[k++];
+    fit = k;
+  }
+
+  $effect(() => {
+    const nav = navEl;
+    const m = measureEl;
+    if (!nav || !m) return;
+    const ro = new ResizeObserver(() => fitSections());
+    ro.observe(nav);
+    ro.observe(m);
+    return () => ro.disconnect();
+  });
+
+  let shownSections = $derived(sectionList.slice(0, fit));
+  let moreSections = $derived(sectionList.slice(fit));
+  /** Признаки скрытых в «Ещё» разделов — на кнопке. */
+  let moreDot = $derived(attention.regression && moreSections.some((x) => x.key === 'check'));
+  let moreNum = $derived(moreSections.some((x) => x.key === 'proposals') ? candidates : 0);
+
   /** Имена пользователей для баннера перенарезки администратора. */
   let userNames = $derived(Object.fromEntries(users.map((u) => [u.id, u.name])));
 
@@ -287,47 +377,63 @@
 
 <svelte:window {onkeydown} />
 
-<!-- Разделы: в шапке (на планшете — короткие подписи) или строками в панели телефона -->
+<!-- Признаки раздела у подписи: точка при открытой регрессии (§6.9 п. 2) и число открытых
+     кандидатов (п. 3) — вне имени ссылки (описание — `aria-describedby`); у замера — без testid -->
+{#snippet sectionBadges(key: string, measure: boolean)}
+  {#if key === 'check' && attention.regression}<span class="dot" aria-hidden="true" data-testid={measure ? undefined : 'check-dot'}
+    ></span>{/if}
+  {#if key === 'proposals' && candidates}<span class="nav-num" aria-hidden="true" data-testid={measure ? undefined : 'candidates-count'}
+      >{formatCount(candidates)}</span
+    >{/if}
+{/snippet}
+
+<!-- Ссылка раздела: в полосе — короткая или полная подпись (имя — всегда полное), в меню «Ещё» и в
+     панели телефона — полная -->
+{#snippet sectionLink(x: Section, menuitem: boolean)}
+  <a
+    class={menuitem ? 'menu-item' : 'item'}
+    href={href(x.to)}
+    role={menuitem ? 'menuitem' : undefined}
+    tabindex={menuitem ? -1 : undefined}
+    aria-current={x.current ? 'page' : undefined}
+    aria-label={x.short && !menuitem ? x.label : undefined}
+    aria-describedby={describedOf(x.key)}
+    >{#if x.short && !menuitem}<span class="long">{x.label}</span><span class="short" aria-hidden="true">{x.short}</span
+      >{:else}{x.label}{/if}{@render sectionBadges(x.key, false)}</a
+  >
+{/snippet}
+
+<!-- Разделы: в шапке (подписи и «Ещё» — по замеру) или строками в панели телефона -->
 {#snippet sections(rows: boolean)}
-  <!-- разделов больше, чем влезает в шапку планшета: текущий — в видимой части полосы (M7.3) -->
-  <nav class="topnav" class:rows aria-label="Разделы" use:revealSelected={route.name}>
-    <a href={href({ name: 'home', user: me.user_id })} aria-current={routeUser(route) ? 'page' : undefined}>Заметки</a>
-    {#if admin}
-      <a href={href({ name: 'index' })} aria-current={route.name === 'index' ? 'page' : undefined}>Индекс</a>
-      <!-- на планшете — короткая подпись (имя ссылки для доступности — полное) -->
-      <a href={href({ name: 'admin' })} aria-current={isAdmin(route) ? 'page' : undefined} aria-label="Администрирование"
-        ><span class="long">Администрирование</span><span class="short" aria-hidden="true">Админ</span></a
-      >
-    {:else}
-      <a href={href({ name: 'mysolutions' })} aria-current={route.name === 'mysolutions' ? 'page' : undefined}
-        aria-label="Мои решения"><span class="long">Мои решения</span><span class="short" aria-hidden="true">Решения</span></a
-      >
-      <a href={href({ name: 'account' })} aria-current={route.name === 'account' ? 'page' : undefined}>Аккаунт</a>
+  <nav class="topnav" class:rows class:short-labels={!rows && shortLabels} aria-label="Разделы" bind:this={navEl}>
+    {#each rows ? sectionList : shownSections as x (x.key)}{@render sectionLink(x, false)}{/each}
+    {#if !rows && moreSections.length}
+      <NavMore current={moreSections.some((x) => x.current)} describedby={[moreDot && 'nav-check-dot', moreNum && 'nav-candidates'].filter(Boolean).join(' ') || undefined} closeKey={`${nav}|${fit}`}>
+        {#snippet badges()}
+          {#if moreDot}<span class="dot" aria-hidden="true" data-testid="more-dot"></span>{/if}
+          {#if moreNum}<span class="nav-num" aria-hidden="true" data-testid="more-count">{formatCount(moreNum)}</span>{/if}
+        {/snippet}
+        {#each moreSections as x (x.key)}{@render sectionLink(x, true)}{/each}
+      </NavMore>
     {/if}
-    <a href={href({ name: 'agentsetup' })} aria-current={route.name === 'agentsetup' ? 'page' : undefined}
-      aria-label="Подключение агента"><span class="long">Подключение агента</span><span class="short" aria-hidden="true">Агент</span></a
-    >
-    <a href={href({ name: 'cache' })} aria-current={route.name === 'cache' ? 'page' : undefined}
-      aria-label="Кэш выжимок"><span class="long">Кэш выжимок</span><span class="short" aria-hidden="true">Кэш</span></a
-    >
-    <a href={href({ name: 'sessions' })} aria-current={route.name === 'sessions' ? 'page' : undefined}>Сессии</a>
-    <!-- M7.3 (§6.9 пп. 2–3): точка при открытой регрессии, число открытых кандидатов — вне имени
-         ссылки (описание для чтения с экрана — `aria-describedby`, как у чисел полосы журналов) -->
-    <a
-      href={href({ name: 'check' })}
-      aria-current={route.name === 'check' ? 'page' : undefined}
-      aria-describedby={attention.regression ? 'nav-check-dot' : undefined}
-      >Проверка{#if attention.regression}<span class="dot" aria-hidden="true" data-testid="check-dot"></span>{/if}</a
-    >
     {#if attention.regression}<span id="nav-check-dot" hidden>ночная проверка: ухудшение поиска</span>{/if}
-    <a
-      href={href({ name: 'proposals', proposal: null })}
-      aria-current={route.name === 'proposals' ? 'page' : undefined}
-      aria-describedby={candidates ? 'nav-candidates' : undefined}
-      >Кандидаты{#if candidates}<span class="nav-num" aria-hidden="true" data-testid="candidates-count">{formatCount(candidates)}</span>{/if}</a
-    >
     {#if candidates}<span id="nav-candidates" hidden>кандидатов в Rules ждут решения: {formatCount(candidates)}</span>{/if}
   </nav>
+  {#if !rows}
+    <!-- скрытая копия для замера: все разделы полными и короткими подписями и кнопка «Ещё» со всеми
+         признаками (запас) — те же правила стиля, что у полосы -->
+    <div class="nav-measure" aria-hidden="true" inert>
+      <div class="topnav" bind:this={measureEl}>
+        {#each sectionList as x (x.key)}<span class="item" data-full>{x.label}{@render sectionBadges(x.key, true)}</span>{/each}
+        {#each sectionList as x (x.key)}<span class="item short-item" data-short>{x.short ?? x.label}{@render sectionBadges(x.key, true)}</span>{/each}
+        <span class="item nav-more-btn" data-more
+          >Ещё<span class="caret">▾</span>{#if attention.regression}<span class="dot"></span>{/if}{#if candidates}<span class="nav-num"
+              >{formatCount(candidates)}</span
+            >{/if}</span
+        >
+      </div>
+    </div>
+  {/if}
 {/snippet}
 
 <!-- «Внутренние работы» с точкой паузы исполнителя (§6.2 п. 5): у логина (планшет — «Работы») -->
@@ -738,30 +844,88 @@
     white-space: nowrap;
     font-weight: 600;
   }
+  /* полоса разделов — остаток шапки (`flex: 1`); что не помещается — в «Ещё» по замеру, поэтому
+     без прокрутки; `overflow-x: clip` — страховка до первого замера (меню «Ещё» — `fixed`, не
+     обрезается), кольцо фокуса крайних пунктов — в поле `overflow-clip-margin` */
   .topnav {
+    flex: 1;
     display: flex;
+    align-items: center;
     gap: 4px;
-    /* пунктов больше, чем влезает на узком экране: меню прокручивается само, страница — нет */
     min-width: 0;
-    overflow-x: auto;
-    /* с мышью при переполнении видна тонкая полоса прокрутки, при касании — скрыта */
-    scrollbar-width: thin;
+    overflow-x: clip;
+    overflow-clip-margin: 4px;
   }
-  .topnav a {
+  .topnav .item,
+  .topnav :global(.nav-more-btn) {
     flex: none;
+    display: inline-flex;
+    align-items: center;
     padding: 6px 10px;
+    border: 0;
     border-radius: 6px;
+    background: transparent;
+    font: inherit;
+    line-height: inherit;
     color: var(--muted);
     text-decoration: none;
+    white-space: nowrap;
   }
-  .topnav a:hover {
+  .topnav a.item:hover,
+  .topnav :global(.nav-more-btn:hover) {
     background: var(--hover);
   }
   .topnav .short {
     display: none;
   }
-  .topnav a[aria-current='page'] {
+  .topnav.short-labels .long {
+    display: none;
+  }
+  .topnav.short-labels .short {
+    display: inline;
+  }
+  .topnav a.item[aria-current='page'],
+  .topnav :global(.nav-more-btn.current) {
     color: var(--text);
+    background: var(--selected);
+  }
+  .topnav :global(.caret) {
+    margin-left: 4px;
+    font-size: 0.8em;
+  }
+  /* скрытая копия полосы для замера: размеры — по своему содержимому, места в шапке не занимает
+     и страницу не раздвигает */
+  .nav-measure {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 0;
+    height: 0;
+    overflow: hidden;
+    visibility: hidden;
+    pointer-events: none;
+  }
+  .nav-measure .topnav {
+    flex: none;
+    width: max-content;
+    overflow: visible;
+  }
+  /* пункты меню «Ещё» — полные подписи с признаками, строками */
+  .menu-item {
+    display: flex;
+    align-items: center;
+    min-height: 36px;
+    padding: 0 12px;
+    border-radius: 6px;
+    color: var(--text);
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .menu-item:hover,
+  .menu-item:focus-visible {
+    background: var(--hover);
+  }
+  .menu-item[aria-current='page'] {
     background: var(--selected);
   }
   /* разделы строками по 44 px — в панели телефона */
@@ -790,7 +954,6 @@
   }
   .search-btn {
     flex: none;
-    margin-left: auto;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -964,18 +1127,16 @@
     /* разделы шапки в ряд — с зазором между целями (`--touch-gap`, app.css) */
     .topnav:not(.rows) {
       gap: var(--touch-gap);
-      scrollbar-width: none;
-    }
-    .topnav:not(.rows)::-webkit-scrollbar {
-      display: none;
     }
     /* строки «Разделов» панели — свои правила (44 px, по левому краю) */
-    .topnav:not(.rows) a {
-      display: inline-flex;
-      align-items: center;
+    .topnav:not(.rows) .item,
+    .topnav:not(.rows) :global(.nav-more-btn) {
       justify-content: center;
       min-height: 44px;
       min-width: 44px;
+    }
+    .menu-item {
+      min-height: 44px;
     }
     .drawer-toggle,
     .search-btn,
@@ -986,17 +1147,6 @@
     /* зазор полосы при касании — `--touch-gap` */
     .strip-over {
       margin-left: calc(-12px - var(--num-w) - var(--touch-gap));
-    }
-  }
-
-  /* до 1439 (BP_FULL_LABELS, layout.ts): длинные разделы — короткими подписями (имя ссылки —
-     полное): с M7.3 в шапке ещё «Проверка» и «Кандидаты N», полные подписи помещаются с 1440 px */
-  @media (max-width: 1439px) {
-    .topnav:not(.rows) .long {
-      display: none;
-    }
-    .topnav:not(.rows) .short {
-      display: inline;
     }
   }
 
@@ -1030,7 +1180,8 @@
     .drawer-toggle {
       display: grid;
     }
-    .topnav:not(.rows) a {
+    .topnav:not(.rows) .item,
+    .topnav:not(.rows) :global(.nav-more-btn) {
       padding: 6px;
       font-size: 14px;
     }

@@ -15,7 +15,7 @@
 // только как открыть форму на 0.0.15, без проверок; 10b заменяет их полными строками.
 import { expect, type Locator, type Page } from '@playwright/test';
 import { IDEAS_GUID } from './seed';
-import { checkFixture } from './seed-internal';
+import { checkFixture, runsReply } from './seed-internal';
 import type { PageCtx } from './mobile-pages';
 
 export interface FormCase {
@@ -41,6 +41,9 @@ export interface FormCase {
   confirm?: boolean;
   /** Подтверждение необратимого: фокус — на «Отмена». */
   danger?: boolean;
+  /** После «Отмена» у подтверждения необратимого — данные на месте (не запись журнала из адреса:
+   * её проверка — по умолчанию). */
+  kept?: (p: Page) => Promise<void>;
   as?: 'admin' | 'user';
   /** Снимки «до» (0.0.15): `aria-label` прежней формы в карточке — на виду ли она. */
   legacy?: string;
@@ -383,8 +386,8 @@ export const FORM_CASES: FormCase[] = [
     after: 'notice',
     inline: { scope: (p) => p.getByRole('form', { name: 'Правка идеи' }), submit: 'Сохранить', focus: true },
   },
-  // ---- страницы M7.3 (задача 8): подключение модели, «Подтвердить адрес», «Запустить сейчас»,
-  // «Принять как норму», «Принять» и «Отклонить» кандидата ----
+  // ---- страницы M7.3 (задача 8): подключение модели, «Подтвердить адрес», «Отключить модель»,
+  // «Запустить сейчас», «Принять как норму», «Принять» и «Отклонить» кандидата ----
   {
     id: 'works-model',
     name: 'Подключение модели',
@@ -416,6 +419,28 @@ export const FORM_CASES: FormCase[] = [
     added: true,
   },
   {
+    // ревью r1 задачи 8, Minor 7: подключение убирается из интерфейса — опасное подтверждение
+    id: 'works-disconnect',
+    name: 'Отключить модель',
+    dialog: 'Отключить модель?',
+    page: (c) => `#/u/${c.user}`,
+    open: async (p) => {
+      await mockWorks(p, (w) => ({ ...w, model: w.model ?? mockModel() }));
+      await goHash(p, '#/works', 'Внутренние работы');
+      await press(p, 'Отключить модель');
+    },
+    route: { method: 'PATCH', url: SETTINGS },
+    after: 'notice',
+    confirm: true,
+    danger: true,
+    added: true,
+    kept: async (p) => {
+      // подключение на месте: сводка и кнопка «Отключить модель» видны
+      await expect(p.getByRole('button', { name: 'Отключить модель', exact: true })).toBeVisible();
+      await expect(p.getByRole('button', { name: 'Изменить подключение', exact: true })).toBeVisible();
+    },
+  },
+  {
     id: 'works-run',
     name: 'Запустить сейчас',
     dialog: 'Запустить «Пробы ночной проверки» сейчас?',
@@ -439,7 +464,7 @@ export const FORM_CASES: FormCase[] = [
       // эпизод регрессии — подстановкой (решение 66): на release-сборке его не подготовить
       const f = checkFixture();
       await p.route(/\/api\/v1\/check\/status$/, (route) => route.fulfill({ json: f.status }));
-      await p.route(/\/api\/v1\/check\/runs(\?.*)?$/, (route) => route.fulfill({ json: f.runs }));
+      await p.route(/\/api\/v1\/check\/runs(\?.*)?$/, (route) => route.fulfill({ json: runsReply(route.request().url(), f.runs) }));
       await goHash(p, '#/check', 'Проверка памяти');
       await press(p, 'Принять как норму');
     },

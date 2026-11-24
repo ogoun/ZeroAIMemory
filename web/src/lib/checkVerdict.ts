@@ -241,11 +241,6 @@ export function verdictNote(v: CheckVerdict): string {
   }
 }
 
-/** Последний законченный **ночной** прогон (`GET /check/runs`, новые первыми) — по нему сервер
- * решает, открыта ли регрессия (строка дайджеста, `check::digest_line`) и что можно принять. */
-export const latestNightly = (runs: CheckRun[] | null | undefined): CheckRun | null =>
-  runs?.find((r) => r.trigger === 'nightly' && r.status === 'done') ?? null;
-
 /**
  * Вердикт, который показывает страница. Принятая норма начинает базу заново — «накопление базы
  * 1/5», хотя сохранённый вердикт прогона прежний: у самого принятого прогона (`accepted_at`) и у
@@ -268,7 +263,7 @@ export function runStatusText(r: Pick<CheckRun, 'status' | 'error'>): string {
     case 'skipped':
       return 'пропущен: шла переиндексация — выдача неполна, сравнение бессмысленно';
     case 'timeout':
-      return 'превышен предел времени прогона ([works] check_max_min): метрики по пройденным пробам, без вердикта';
+      return 'превышен предел времени прогона (настройка администратора сервера): метрики по пройденным пробам, без вердикта';
     case 'failed':
       return r.error === 'interrupted' ? 'прерван остановкой сервера' : `сбой: ${r.error ?? 'причина не известна'}`;
     default:
@@ -280,7 +275,8 @@ export function runStatusText(r: Pick<CheckRun, 'status' | 'error'>): string {
 export const triggerText = (t: CheckRun['trigger']): string => (t === 'nightly' ? 'ночной' : 'ручной');
 
 /** Регрессия открыта (точка у «Проверка», строка дайджеста агента): последний законченный ночной
- * прогон — `regression`, норма не принята (правило сервера `check::digest_line`). */
+ * прогон (`GET /check/runs?trigger=nightly&status=done&limit=1`) — `regression`, норма не принята
+ * (правило сервера `check::digest_line`). */
 export const regressionOpen = (nightly: CheckRun | null | undefined): boolean =>
   !!nightly && nightly.verdict?.kind === 'regression' && !nightly.accepted_at;
 

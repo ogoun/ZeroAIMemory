@@ -631,6 +631,8 @@ async fn resolve_model(
         token_field: input.token_field,
         body_extra,
         pinned: Some(base),
+        // класс маршрута при закреплении — для показа без DNS (`works.model.external` ответа)
+        external: Some(external.is_some()),
     };
     Ok((json!(conn), external))
 }

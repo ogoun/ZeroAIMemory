@@ -1,10 +1,13 @@
 // Внутренние работы и кандидаты в Rules в WebUI (M7.3, спецификация §6.1–§6.3, §6.7, §6.9 пп. 1,
-// 3): тексты режимов, причин и паузы, адрес записи Vault подключения (LAN, вне LAN, петля — те же
-// диапазоны, что у сервера, §6.2 п. 6), `body_extra` с рецептами, время ночи с поясом сервера и
-// местным временем, журнал отправок, итог работы, кандидаты. Одно место для правил страниц
-// «Внутренние работы» и «Кандидаты в Rules».
+// 3): тексты режимов, причин и паузы, подсказка о классе адреса записи Vault до сохранения (LAN, вне
+// LAN, петля — по диапазонам сервера §6.2 п. 6, вложенный IPv4 — как у сервера; свой адрес машины
+// сервера и адреса имени клиент не знает — решает сервер при сохранении), `body_extra` с рецептами,
+// время ночи с поясом сервера и местным временем, журнал отправок, итог работы, кандидаты. Класс
+// **сохранённого** подключения (плашка «вне LAN») — поле `external` ответа настроек, не отсюда.
+// Тексты — для человека: без ключей конфигурации и номеров этапов.
 // Модуль без DOM и без runtime-импортов, кроме `.ts`: его читает `node --test`
 // (`web/test/worksText.test.ts`).
+import { plural } from './plural.ts';
 import { localTime } from './time.ts';
 
 /** Режим исполнителя: выкл, агент в своей сессии, подключённая модель. */
@@ -34,9 +37,9 @@ export const KIND_SHORT: Record<string, string> = { probes: 'пробы', rules:
 export function reasonText(reason: string | null | undefined): string {
   switch (reason) {
     case 'disabled':
-      return 'внутренние работы выключены на сервере ([works] enabled = false)';
+      return 'внутренние работы выключены на сервере (настройка администратора)';
     case 'model_access_off':
-      return 'обращения к модели выключены на сервере ([works] model_access = "off")';
+      return 'обращения к модели запрещены на сервере (настройка администратора)';
     case 'no_model':
       return 'нет подключения модели';
     case 'paused':
@@ -63,9 +66,9 @@ export function pauseHint(cls: string): string {
     case 'auth':
       return 'Проверьте значение (ключ) записи Vault подключения, затем сохраните подключение или проверьте его — пауза снимется.';
     case 'not_found':
-      return 'Проверьте имя модели и data.url записи Vault (с /v1, как у поставщика), затем сохраните подключение или проверьте его.';
+      return 'Проверьте имя модели и адрес записи Vault (с /v1, как у поставщика), затем сохраните подключение или проверьте его.';
     case 'blocked':
-      return 'Адрес петли, link-local и свои адреса сервера разрешает только администратор ([works] allow_loopback); вне LAN при model_access = "lan" обращений нет.';
+      return 'Адреса машины сервера и служебные локальные адреса подходят, только если их разрешил администратор сервера; если сервер ограничен локальной сетью, внешний адрес не подойдёт.';
     case 'vault':
       return 'Выберите запись личного Vault заново и сохраните подключение.';
     default:
@@ -89,6 +92,16 @@ function v4(s: string): number[] | null {
   if (!m) return null;
   const b = m.slice(1).map(Number);
   return b.every((x) => x <= 255) ? b : null;
+}
+
+/** IPv4, вложенный в адрес IPv6 (как `embedded_v4` сервера): IPv4-совместимый `::a.b.c.d` (кроме
+ * `::` и `::1`), NAT64 `64:ff9b::/96`, 6to4 `2002::/16`. */
+function embedded4(s: number[]): number[] | null {
+  const octets = (a: number, b: number) => [a >> 8, a & 0xff, b >> 8, b & 0xff];
+  if (s.slice(0, 6).every((x) => x === 0) && !(s[6] === 0 && (s[7] === 0 || s[7] === 1))) return octets(s[6], s[7]);
+  if (s[0] === 0x64 && s[1] === 0xff9b && s.slice(2, 6).every((x) => x === 0)) return octets(s[6], s[7]);
+  if (s[0] === 0x2002) return octets(s[1], s[2]);
+  return null;
 }
 
 function reach4([a, b]: number[]): Reach {
@@ -134,6 +147,13 @@ export function reachOfHost(host: string): Reach {
   if (six.slice(0, 5).every((x) => x === 0) && six[5] === 0xffff) {
     return reach4([six[6] >> 8, six[6] & 0xff, six[7] >> 8, six[7] & 0xff]);
   }
+  // вложенный IPv4 только ужесточает класс (как у сервера): петля и link-local внутри — их класс,
+  // частный адрес внутри LAN не делает (такие адреса маршрутизируются наружу)
+  const inner = embedded4(six);
+  if (inner) {
+    const r = reach4(inner);
+    if (r === 'loopback' || r === 'link_local') return r;
+  }
   if ((six[0] & 0xffc0) === 0xfe80) return 'link_local';
   if ((six[0] & 0xfe00) === 0xfc00) return 'lan';
   return 'external';
@@ -166,19 +186,19 @@ export function addressView(addr: string): AddressView | null {
   return { host: u.host, reach, problem };
 }
 
-/** Класс адреса — строкой под выбором записи. */
+/** Класс адреса — подписью у выбора записи (подсказка до сохранения: окончательно решает сервер). */
 export function reachText(r: Reach): string {
   switch (r) {
     case 'lan':
-      return 'в локальной сети';
+      return 'в локальной сети (если это не адрес самой машины сервера — сервер уточнит при сохранении)';
     case 'external':
       return 'вне локальной сети: данные памяти уйдут за её пределы';
     case 'loopback':
-      return 'петля (этот же сервер): только если администратор разрешил [works] allow_loopback';
+      return 'эта же машина: подойдёт, только если такие адреса разрешил администратор сервера';
     case 'link_local':
-      return 'link-local: только если администратор разрешил [works] allow_loopback';
+      return 'служебный локальный адрес: подойдёт, только если такие адреса разрешил администратор сервера';
     default:
-      return 'имя: в LAN оно или нет, сервер проверит при сохранении';
+      return 'имя: в локальной сети оно или нет, сервер проверит при сохранении';
   }
 }
 
@@ -200,28 +220,6 @@ export function pinnedHost(p: Pinned): string {
 
 /** Полный закреплённый адрес: «https://api.example.com/v1» (как «был → стал» паузы). */
 export const pinnedUrl = (p: Pinned): string => `${p.scheme}://${pinnedHost(p)}${p.path}`;
-
-/**
- * Подключение вне LAN — постоянная плашка страницы (§6.2 п. 6, §6.9 п. 1). Сервер сообщает это в
- * ответе `PATCH` (`warnings`); после перезагрузки страница судит по закреплённому адресу: литерал
- * IP — по диапазонам §6.2 п. 6, `localhost` — нет, имя — по последней строке журнала отправок к
- * этому хосту (`external`), без строк — не известно (`null`) до первого обращения.
- */
-export function externalOf(p: Pinned | null | undefined, calls: { host: string; external: boolean }[]): string | null {
-  if (!p) return null;
-  const host = pinnedHost(p);
-  const r = reachOfHost(p.host);
-  if (r === 'external') return host;
-  if (r !== 'name') return null;
-  const last = calls.find((c) => c.host === host);
-  return last?.external ? host : null;
-}
-
-/** Хост из предупреждений ответа `PATCH` (`works_model_external: <хост>`). */
-export function externalHost(warnings: string[] | undefined): string | null {
-  const w = warnings?.find((x) => x.startsWith('works_model_external:'));
-  return w ? w.slice('works_model_external:'.length).trim() || null : null;
-}
 
 // ---- body_extra (§6.2 п. 1) ----
 
@@ -434,9 +432,10 @@ export function proposalAuthorText(kind: string, author: string | null | undefin
 }
 
 /** Сумма Rules в дайджесте и прирост (§6.7 п. 4): «Rules в каждой сессии: 1 840 → 1 990 токенов
- * (+150)». */
+ * (+150)», «0 → 43 токена (+43)» — форма по второму числу. */
 export function rulesTokensText(t: { now: number; after: number } | null | undefined): string {
   if (!t) return '';
   const d = t.after - t.now;
-  return `Rules в каждой сессии: ${num(t.now)} → ${num(t.after)} токенов (${d >= 0 ? '+' : '−'}${num(Math.abs(d))})`;
+  const word = plural(t.after, 'токен', 'токена', 'токенов');
+  return `Rules в каждой сессии: ${num(t.now)} → ${num(t.after)} ${word} (${d >= 0 ? '+' : '−'}${num(Math.abs(d))})`;
 }

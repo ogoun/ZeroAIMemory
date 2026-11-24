@@ -6,8 +6,6 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   addressView,
-  externalHost,
-  externalOf,
   pinnedHost,
   pinnedUrl,
   nextSlot,
@@ -37,6 +35,13 @@ test('works_reach_ranges', () => {
   for (const h of ['203.0.113.10', '8.8.8.8', '172.32.0.1', '100.128.0.1', '[2001:db8::1]']) {
     assert.equal(reachOfHost(h), 'external', h);
   }
+  // вложенный IPv4 (как у сервера): петля и link-local внутри — их класс, частный внутри — вне LAN
+  assert.equal(reachOfHost('[::127.0.0.1]'), 'loopback');
+  assert.equal(reachOfHost('[64:ff9b::7f00:1]'), 'loopback');
+  assert.equal(reachOfHost('[2002:7f00:1::]'), 'loopback');
+  assert.equal(reachOfHost('[64:ff9b::a9fe:a9fe]'), 'link_local');
+  assert.equal(reachOfHost('[::10.0.0.5]'), 'external');
+  assert.equal(reachOfHost('[2002:c0a8:1::]'), 'external');
   // имя: что за ним — узнаёт сервер
   assert.equal(reachOfHost('api.openai.com'), 'name');
   assert.equal(reachOfHost('qwen.lan'), 'name');
@@ -56,26 +61,16 @@ test('works_address_view', () => {
   assert.equal(vaultAddress({ url: ' https://a.example.com/v1 ' }), 'https://a.example.com/v1');
   assert.equal(vaultAddress({ address: 'http://10.0.0.2:11434/v1' }), 'http://10.0.0.2:11434/v1');
   assert.equal(vaultAddress({}), '');
-  assert.equal(externalHost(['works_model_external: 203.0.113.10']), '203.0.113.10');
-  assert.equal(externalHost([]), null);
-  assert.equal(externalHost(undefined), null);
 });
 
-test('works_pinned_external', () => {
+test('works_pinned_address', () => {
+  // класс сохранённого подключения — поле `external` ответа настроек (сервер, без DNS); здесь —
+  // только запись адреса
   const ext = { scheme: 'https', host: '203.0.113.10', port: 443, path: '/v1' };
   assert.equal(pinnedHost(ext), '203.0.113.10');
   assert.equal(pinnedUrl(ext), 'https://203.0.113.10/v1');
   assert.equal(pinnedUrl({ scheme: 'http', host: '127.0.0.1', port: 8123, path: '/v1' }), 'http://127.0.0.1:8123/v1');
   assert.equal(pinnedHost({ scheme: 'http', host: '::1', port: 80, path: '' }), '[::1]');
-  // литерал вне LAN — плашка без журнала; LAN и петля — нет
-  assert.equal(externalOf(ext, []), '203.0.113.10');
-  assert.equal(externalOf({ ...ext, host: '192.168.1.5', scheme: 'http', port: 8080 }, []), null);
-  // имя — по последней строке журнала к этому хосту
-  const name = { scheme: 'https', host: 'api.openai.com', port: 443, path: '/v1' };
-  assert.equal(externalOf(name, []), null);
-  assert.equal(externalOf(name, [{ host: 'api.openai.com', external: true }, { host: 'api.openai.com', external: false }]), 'api.openai.com');
-  assert.equal(externalOf(name, [{ host: 'other.example.com', external: true }]), null);
-  assert.equal(externalOf(null, []), null);
 });
 
 test('works_body_extra', () => {
@@ -135,5 +130,8 @@ test('works_proposal_texts', () => {
   assert.equal(proposalAuthorText('agent', 's-42', 's-42'), 'агент, сессия s-42');
   assert.equal(proposalAuthorText('agent', null, null), 'агент');
   assert.equal(rulesTokensText({ now: 1840, after: 1990 }), 'Rules в каждой сессии: 1 840 → 1 990 токенов (+150)');
+  // форма слова — по второму числу
+  assert.equal(rulesTokensText({ now: 0, after: 43 }), 'Rules в каждой сессии: 0 → 43 токена (+43)');
+  assert.equal(rulesTokensText({ now: 20, after: 21 }), 'Rules в каждой сессии: 20 → 21 токен (+1)');
   assert.equal(rulesTokensText(null), '');
 });

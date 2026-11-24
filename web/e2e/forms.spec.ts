@@ -572,6 +572,7 @@ if (!SNAP) {
             await expect(cancel).toBeFocused();
             await page.keyboard.press('Enter');
             await expect(d).toBeHidden();
+            if (row.kept) return row.kept(page);
             // ничего не удалено и не снято: запись адреса — на месте, с прежним статусом
             const id = /\/j\/[a-z]+\/([^/?#]+)/.exec(page.url())?.[1];
             expect(id, 'запись в адресе').toBeTruthy();

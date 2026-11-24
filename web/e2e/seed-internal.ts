@@ -160,6 +160,18 @@ export function checkFixture(accepted = false): { status: Record<string, unknown
   };
 }
 
+/** Ответ `GET /check/runs?…` по подставленному списку — фильтр как у сервера: `trigger`, `status`,
+ * `limit` (новые первыми). Точка «Проверка» и страница берут последний законченный ночной прогон
+ * фильтром `?trigger=nightly&status=done&limit=1`. */
+export function runsReply(url: string, runs: { items: Record<string, unknown>[] }): { items: Record<string, unknown>[] } {
+  const q = new URL(url).searchParams;
+  const trigger = q.get('trigger');
+  const status = q.get('status');
+  const limit = Number(q.get('limit') ?? 30);
+  const items = runs.items.filter((r) => (!trigger || r.trigger === trigger) && (!status || r.status === status));
+  return { items: items.slice(0, limit) };
+}
+
 /** Записи Vault и кандидат; `mock` — базовый адрес подставной модели (`http://127.0.0.1:<порт>`). */
 export async function seedInternal(base: string, token: string, mock: string): Promise<InternalSeed> {
   const vault = (title: string, url: string) =>

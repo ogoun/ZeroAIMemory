@@ -246,7 +246,9 @@
             <h2>rules:/{c.path}</h2>
             <div class="row meta">
               <span class="chip status" data-testid="proposal-status">{PROPOSAL_STATUS_TEXT[c.status] ?? c.status}</span>
-              <span class="muted small">{proposalAuthorText(c.author_kind, c.author, c.session)} · {localTime(c.created_at)}{c.work ? ` · работа ${c.work}` : ''}</span>
+              <span class="muted small" title={c.work ? `внутренняя работа ${c.work}` : undefined}
+                >{proposalAuthorText(c.author_kind, c.author, c.session)} · {localTime(c.created_at)}{c.work ? ' · из внутренней работы' : ''}</span
+              >
             </div>
           </header>
           {#if c.status === 'proposed'}
@@ -316,7 +318,13 @@
 >
   <label>
     Путь в Rules
-    <input bind:value={aPath} required data-autofocus spellcheck="false" />
+    <!-- префикс пространства — видимый, как в заголовке карточки («rules:/…»); в поле — путь -->
+    <span class="row path-row"><span class="prefix" aria-hidden="true">rules:/</span><input
+        bind:value={aPath}
+        required
+        data-autofocus
+        spellcheck="false"
+      /></span>
   </label>
   <label>
     Текст правила
@@ -448,5 +456,13 @@
     border: 0;
     background: transparent;
     color: var(--accent);
+  }
+  .path-row {
+    gap: 4px;
+  }
+  .prefix {
+    flex: none;
+    font: 14px ui-monospace, Consolas, monospace;
+    color: var(--muted);
   }
 </style>

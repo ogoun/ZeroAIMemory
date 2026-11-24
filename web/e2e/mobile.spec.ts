@@ -12,6 +12,7 @@ import { mkdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { loginChangingPassword } from './login';
 import { PAGES, env, pageCtx } from './mobile-pages';
+import { moreButton, sectionItem, sectionsNav } from './nav';
 import { IDEAS_GUID, SOLUTION_GUID } from './seed';
 import { ADMIN_STATE } from './session';
 import { VIEWPORTS, minGap, minTarget, noHorizontalScroll, touch, type ViewportName } from './viewports';
@@ -737,14 +738,22 @@ test.describe('планшет, сенсорный ввод', () => {
   test('tablet_tree_is_drawer', async ({ page }) => {
     const problems = watch(page);
     await open(page);
-    // разделы — в шапке короткими подписями (имя ссылки — полное), «Выйти» — в шапке
+    // разделы — в шапке короткими подписями (имя ссылки — полное), что не поместилось — в «Ещё ▾»
+    // (ревью r1 задачи 8, I2); «Выйти» — в шапке
     const sections = header(page).getByRole('navigation', { name: 'Разделы' });
     await expect(sections).toBeVisible();
     await expect(sections.getByRole('link', { name: 'Администрирование' })).toHaveText('Админ', { useInnerText: true });
-    await expect(sections.getByRole('link', { name: 'Сессии' })).toBeVisible();
-    await minTarget(sections.getByRole('link'), 44);
-    // восемь разделов (M7.3 §6.9: «Проверка» и «Кандидаты») — семь зазоров
-    expect(await minGap(sections.getByRole('link'), 8)).toBe(7);
+    await expect(moreButton(page)).toBeVisible();
+    const links = sections.getByRole('link');
+    await minTarget(links.or(moreButton(page)), 44);
+    // зазор — между всеми соседними целями полосы, и до «Ещё»
+    expect(await minGap(links, 8)).toBe((await links.count()) - 1);
+    const lastBox = (await links.last().boundingBox())!;
+    const moreBox = (await moreButton(page).boundingBox())!;
+    expect(moreBox.x - (lastBox.x + lastBox.width), 'зазор до «Ещё»').toBeGreaterThanOrEqual(7.5);
+    await expect(await sectionItem(page, 'Кандидаты')).toBeInViewport({ ratio: 1 });
+    await page.keyboard.press('Escape');
+    await expect(moreButton(page)).toBeFocused();
     await expect(page.getByRole('button', { name: 'Выйти' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Меню аккаунта' })).toHaveCount(0);
     // дерево — выдвижная панель, в ней только дерево
@@ -761,8 +770,8 @@ test.describe('планшет, сенсорный ввод', () => {
   });
 
   test('tablet_header_720', async ({ page }) => {
-    // самый узкий планшет: шапка помещается, разделы при нехватке места прокручиваются внутри
-    // своей полосы, страница вбок не прокручивается
+    // самый узкий планшет: шапка помещается, что не поместилось — в «Ещё ▾» (ревью r1 задачи 8,
+    // I2; прежде — прокрутка полосы без признака), страница вбок не прокручивается
     const problems = watch(page);
     await page.setViewportSize({ width: 720, height: 1024 });
     await open(page);
@@ -775,13 +784,14 @@ test.describe('планшет, сенсорный ввод', () => {
     const search = (await page.getByRole('button', { name: 'Поиск', exact: true }).boundingBox())!;
     expect(nav.x + nav.width, 'разделы не заходят под «Поиск»').toBeLessThanOrEqual(search.x + 0.5);
     await expect(page.getByRole('button', { name: 'Выйти' })).toBeInViewport({ ratio: 1 });
-    // последний раздел достижим (прокруткой полосы разделов, если не поместился)
-    const last = sections.getByRole('link', { name: 'Сессии' });
-    await last.scrollIntoViewIfNeeded();
+    // полоса не переполнена, последний раздел — в «Ещё», целиком в окне
+    expect(await sections.evaluate((n) => n.scrollWidth <= n.clientWidth), 'полоса разделов без переполнения').toBe(true);
+    const last = await sectionItem(page, 'Кандидаты');
     await expect(last).toBeInViewport({ ratio: 1 });
+    await page.keyboard.press('Escape');
     expect(await noHorizontalScroll(page)).toBe(true);
-    await minTarget(sections.getByRole('link'), 44);
-    await minGap(sections.getByRole('link'), 8);
+    await minTarget(sections.getByRole('link').or(moreButton(page)), 44);
+    await minGap(sections.getByRole('link').or(moreButton(page)), 8);
     await page.screenshot({ path: `${screens}tablet-720-header.png` });
     expect(problems, problems.join('\n')).toEqual([]);
   });
@@ -789,6 +799,30 @@ test.describe('планшет, сенсорный ввод', () => {
 
 test.describe('планшет в альбомной ориентации, сенсорный ввод', () => {
   test.use({ viewport: VIEWPORTS.tabletLand, ...touch });
+
+  test('tree_badges_compact', async ({ page }) => {
+    // ревью r1 задачи 8 (I3): бейдж «кандидаты: N» у Rules (и «запросы: N» у решений — тот же
+    // образец) на касании — своей строкой под именем: «Rules» целиком, плашка компактная, а цель
+    // касания — ссылка 44 × 44; число из двух цифр — подстановкой
+    const problems = watch(page);
+    await page.route(/\/api\/v1\/proposals\/counts$/, (r) => r.fulfill({ json: { rules: 12 } }));
+    await open(page);
+    const t = treeNav(page);
+    const badge = t.getByRole('link', { name: 'кандидаты: 12', exact: true });
+    await expect(badge).toBeVisible();
+    await minTarget(badge, 44);
+    const plaque = (await badge.locator('.tag').boundingBox())!;
+    expect(plaque.height, 'плашка компактная').toBeLessThan(24);
+    const rules = t.getByRole('button', { name: 'Rules', exact: true });
+    await expect(rules).toBeVisible();
+    const name = await rules.locator('.name').evaluate((e) => ({ text: (e as HTMLElement).innerText, cut: e.scrollWidth > e.clientWidth }));
+    expect(name, '«Rules» целиком').toEqual({ text: 'Rules', cut: false });
+    // плашка — под строкой с именем, не в ней
+    const row = (await rules.boundingBox())!;
+    expect(plaque.y, 'бейдж — под именем').toBeGreaterThanOrEqual(row.y + row.height - 0.5);
+    await sidebar(page).screenshot({ path: `${screens}tabletLand-tree-badges.png` });
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
 
   test('card_keeps_focus_on_width_change', async ({ page }) => {
     // поворот 1180 → 820 и обратно с открытой формой правки: раскладка меняется (рядом ↔ вместо
@@ -832,6 +866,118 @@ test.describe('планшет в альбомной ориентации, сен
     ).toBeFocused();
     expect(problems, problems.join('\n')).toEqual([]);
   });
+});
+
+/** Имена ссылок (имя для доступности: `aria-label` или текст без `aria-hidden`). */
+const linkNames = (els: Element[]) =>
+  els.map(
+    (e) =>
+      e.getAttribute('aria-label') ??
+      [...e.childNodes]
+        .filter((n) => !(n instanceof Element && n.getAttribute('aria-hidden') === 'true'))
+        .map((n) => n.textContent ?? '')
+        .join('')
+        .trim(),
+  );
+
+test('header_sections_fit', async ({ browser }) => {
+  // ревью r1 задачи 8 (I2): на 820, 1024, 1180, 1366 и 1440 px у администратора и пользователя
+  // каждая видимая ссылка полосы разделов — подписью целиком (`scrollWidth ≤ clientWidth`, в
+  // границах полосы), полоса не переполнена и не заходит под «Поиск»; не поместившиеся — в
+  // «Ещё ▾» (точка и число — на кнопке и в меню), меню — с клавиатуры (Enter, End, ↓, Esc); число
+  // кандидатов из двух цифр и точка регрессии — подстановкой
+  test.setTimeout(300_000);
+  mkdirSync(screens, { recursive: true });
+  const all = {
+    admin: ['Заметки', 'Индекс', 'Администрирование', 'Подключение агента', 'Кэш выжимок', 'Сессии', 'Проверка', 'Кандидаты'],
+    user: ['Заметки', 'Мои решения', 'Аккаунт', 'Подключение агента', 'Кэш выжимок', 'Сессии', 'Проверка', 'Кандидаты'],
+  };
+  const layout: string[] = [];
+  for (const as of ['admin', 'user'] as const) {
+    const state = as === 'user' ? await userSession(browser) : ADMIN_STATE;
+    for (const w of [820, 1024, 1180, 1366, 1440]) {
+      const touchy = w === 820 || w === 1180;
+      const ctx = await browser.newContext({
+        storageState: state,
+        viewport: { width: w, height: 900 },
+        ...(touchy ? touch : { hasTouch: false, isMobile: false }),
+      });
+      const page = await ctx.newPage();
+      const problems = watch(page);
+      await page.route(/\/api\/v1\/proposals\/counts$/, (r) => r.fulfill({ json: { rules: 12 } }));
+      await page.route(/\/api\/v1\/check\/runs(\?.*)?$/, (r) =>
+        r.fulfill({ json: { items: [{ run: 'R', trigger: 'nightly', status: 'done', verdict: { kind: 'regression' }, accepted_at: null }] } }),
+      );
+      await open(page);
+      const nav = sectionsNav(page);
+      // признаки пришли (в полосе или в меню), шрифты загружены, замер полосы — после них
+      await expect(page.locator('[data-testid="candidates-count"]')).toHaveCount(1);
+      await expect(page.locator('[data-testid="check-dot"]')).toHaveCount(1);
+      await page.evaluate(() => document.fonts.ready.then(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))));
+      const at = `${as} ${w}`;
+      const m = await nav.evaluate((n) => {
+        const nr = n.getBoundingClientRect();
+        const search = document.querySelector('header.topbar .search-btn')!.getBoundingClientRect();
+        const items = [...n.querySelectorAll<HTMLElement>(':scope > a, :scope .nav-more-btn')];
+        return {
+          over: n.scrollWidth > n.clientWidth + 0.5,
+          underSearch: nr.right > search.left + 0.5,
+          cut: items
+            .filter((e) => {
+              const r = e.getBoundingClientRect();
+              return e.scrollWidth > e.clientWidth || r.left < nr.left - 0.5 || r.right > nr.right + 0.5;
+            })
+            .map((e) => `${e.textContent} ${e.scrollWidth}/${e.clientWidth}`),
+        };
+      });
+      expect(m, `${at}: полоса разделов`).toEqual({ over: false, underSearch: false, cut: [] });
+      const shown = await nav.locator(':scope > a').evaluateAll(linkNames);
+      let hidden: string[] = [];
+      const more = moreButton(page);
+      if (await more.count()) {
+        await expect(more).toHaveAttribute('aria-haspopup', 'menu');
+        await expect(more).toHaveAttribute('aria-expanded', 'false');
+        if (touchy) await minTarget(more, 44);
+        await more.focus();
+        await page.keyboard.press('Enter');
+        await expect(more).toHaveAttribute('aria-expanded', 'true');
+        const menu = nav.getByRole('menu', { name: 'Ещё разделы' });
+        const items = menu.getByRole('menuitem');
+        await expect(items.first()).toBeFocused();
+        await expect(menu).toBeInViewport({ ratio: 1 });
+        hidden = await items.evaluateAll(linkNames);
+        // признаки скрытых разделов — и на кнопке, и у пунктов меню
+        if (hidden.includes('Кандидаты')) {
+          await expect(more.getByTestId('more-count'), at).toHaveText('12');
+          await expect(menu.getByTestId('candidates-count'), at).toHaveText('12');
+        }
+        if (hidden.includes('Проверка')) {
+          await expect(more.getByTestId('more-dot'), at).toBeVisible();
+          await expect(menu.getByTestId('check-dot'), at).toBeVisible();
+        }
+        if (touchy) await minTarget(items, 44);
+        await page.keyboard.press('End');
+        await expect(items.last()).toBeFocused();
+        await page.keyboard.press('ArrowDown');
+        await expect(items.first()).toBeFocused();
+        await page.screenshot({ path: `${screens}header-${as}-${w}-more.png` });
+        await page.keyboard.press('Escape');
+        await expect(more).toHaveAttribute('aria-expanded', 'false');
+        await expect(more).toBeFocused();
+        await expect(menu).toBeHidden();
+      } else {
+        await expect(nav.getByTestId('candidates-count'), at).toBeVisible();
+        await expect(nav.getByTestId('check-dot'), at).toBeVisible();
+      }
+      expect([...shown, ...hidden], `${at}: все разделы, по порядку`).toEqual(all[as]);
+      expect(await noHorizontalScroll(page), `${at}: страница вбок`).toBe(true);
+      layout.push(`${at}: ${shown.length} в полосе${hidden.length ? `, в «Ещё» — ${hidden.join(', ')}` : ''}`);
+      await page.screenshot({ path: `${screens}header-${as}-${w}.png`, clip: { x: 0, y: 0, width: w, height: 64 } });
+      expect(problems, `${at}: ${problems.join('\n')}`).toEqual([]);
+      await ctx.close();
+    }
+  }
+  console.log(`раскладка шапки:\n${layout.join('\n')}`);
 });
 
 test.describe('настольный', () => {

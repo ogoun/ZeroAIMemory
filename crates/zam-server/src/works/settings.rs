@@ -120,6 +120,13 @@ pub struct ModelConn {
     /// Закреплённый адрес записи Vault (заполняет клиент модели, задача 2 плана).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned: Option<PinnedAddr>,
+    /// Закреплённый адрес — вне LAN: класс маршрута при закреплении (`PATCH`, §6.2 п. 6; у имени —
+    /// по его адресам на момент сохранения). `None` — подключение сохранено до поля: класс — по
+    /// хосту без DNS ([`super::egress::assumed_external`]). Для WebUI — поле `external` ответа
+    /// настроек ([`UserWorks::to_json`]); при чтении настроек DNS не спрашивается (задача 8,
+    /// ревью r1, решение координатора).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<bool>,
 }
 
 fn max_tokens_default() -> u32 {
@@ -274,8 +281,51 @@ impl UserWorks {
             .collect()
     }
 
+    /// Подключение для ответа настроек: хранимые поля и для показа (не хранятся, в `PATCH` не
+    /// принимаются) — `host` (хост адреса, как в предупреждении `works_model_external`) и
+    /// `external` (вне LAN), см. [`Self::model_reach`]. Нет подключения — `null`.
+    fn model_view(&self) -> Value {
+        let Some(m) = &self.model else {
+            return Value::Null;
+        };
+        let mut v = json!(m);
+        let (host, external) = self.model_reach(m);
+        v["host"] = json!(host);
+        v["external"] = json!(external);
+        v
+    }
+
+    /// Хост и «вне LAN» подключения без DNS (WebUI: постоянная плашка «данные уходят за пределы
+    /// локальной сети», §6.9 п. 1): на паузе `vault_changed` — по «стал» (`pause.to`: после
+    /// подтверждения данные уйдут туда; имя — считается внешним, адреса не проверены), иначе — по
+    /// закреплённому адресу и классу, сохранённому при закреплении (`external`; нет — по хосту:
+    /// литерал — по диапазонам, `localhost` — нет, имя — да). Адреса нет — `(None, false)`.
+    pub fn model_reach(&self, m: &ModelConn) -> (Option<String>, bool) {
+        let changed = self
+            .pause
+            .as_ref()
+            .filter(|p| p.class == super::model::CallClass::VaultChanged.as_str())
+            .and_then(|p| p.to.as_deref())
+            .and_then(|to| super::egress::parse_base_url(to).ok());
+        if let Some(b) = changed {
+            return (
+                Some(super::egress::host_label(&b)),
+                super::egress::assumed_external(&b.host),
+            );
+        }
+        match &m.pinned {
+            Some(p) => (
+                Some(super::egress::host_label(p)),
+                m.external
+                    .unwrap_or_else(|| super::egress::assumed_external(&p.host)),
+            ),
+            None => (None, false),
+        }
+    }
+
     /// Поле `works` ответа настроек: общий режим (с умолчанием сервера), переопределения видов,
-    /// подключение, пределы, проверка, пауза и действующий режим каждого вида с причиной `off`.
+    /// подключение (с `host` и `external` для показа), пределы, проверка, пауза и действующий режим
+    /// каждого вида с причиной `off`.
     pub fn to_json(&self, s: &WorksSection) -> Value {
         let kinds: Map<String, Value> = self
             .kinds
@@ -295,7 +345,7 @@ impl UserWorks {
         json!({
             "mode": self.value(WORKS_MODE, s),
             "kinds": kinds,
-            "model": self.value(WORKS_MODEL, s),
+            "model": self.model_view(),
             "limits": self.value(WORKS_LIMITS, s),
             "check": self.value(WORKS_CHECK, s),
             "pause": self.value(WORKS_PAUSE, s),
@@ -370,6 +420,7 @@ mod tests {
             token_field: TokenField::Auto,
             body_extra: Map::new(),
             pinned: None,
+            external: None,
         }
     }
 
@@ -562,5 +613,92 @@ mod tests {
             })
         );
         assert_eq!(u.pause, Some(pause()));
+    }
+
+    fn pinned(scheme: &str, host: &str, port: u16) -> PinnedAddr {
+        BaseUrl {
+            scheme: scheme.into(),
+            host: host.into(),
+            port,
+            path: "/v1".into(),
+        }
+    }
+
+    /// Задача 8, ревью r1 (I1): «вне LAN» подключения в ответе настроек — без DNS: литерал LAN и
+    /// внешний — по диапазонам, имя — по классу, сохранённому при закреплении (нет поля — имя
+    /// считается внешним), на паузе `vault_changed` — по «стал»; поле и хост — только в ответе.
+    #[test]
+    fn model_external_view_without_dns() {
+        let s = WorksSection::default();
+        let view = |c: ModelConn, pause: Option<Pause>| {
+            let u = UserWorks {
+                model: Some(c),
+                pause,
+                ..UserWorks::default()
+            };
+            let v = u.to_json(&s)["model"].clone();
+            (v["host"].clone(), v["external"].clone())
+        };
+        let with = |p: PinnedAddr, external: Option<bool>| ModelConn {
+            pinned: Some(p),
+            external,
+            ..conn()
+        };
+        // литерал LAN и внешний — по диапазонам (и без сохранённого класса)
+        assert_eq!(
+            view(with(pinned("http", "192.168.1.20", 8080), None), None),
+            (json!("192.168.1.20:8080"), json!(false))
+        );
+        assert_eq!(
+            view(with(pinned("https", "203.0.113.10", 443), Some(true)), None),
+            (json!("203.0.113.10"), json!(true))
+        );
+        // имя — по классу закрепления; без него — внешнее (адреса не проверены)
+        let name = pinned("https", "api.example.com", 443);
+        assert_eq!(
+            view(with(name.clone(), Some(true)), None),
+            (json!("api.example.com"), json!(true))
+        );
+        assert_eq!(view(with(name.clone(), Some(false)), None).1, json!(false));
+        assert_eq!(view(with(name, None), None).1, json!(true));
+        assert_eq!(
+            view(with(pinned("http", "localhost", 8080), None), None).1,
+            json!(false)
+        );
+        // пауза `vault_changed` — по «стал»
+        let changed = Pause {
+            class: "vault_changed".into(),
+            from: Some("http://192.168.1.20:8080/v1".into()),
+            to: Some("https://203.0.113.10/v1".into()),
+            ..pause()
+        };
+        assert_eq!(
+            view(
+                with(pinned("http", "192.168.1.20", 8080), Some(false)),
+                Some(changed)
+            ),
+            (json!("203.0.113.10"), json!(true))
+        );
+        // пауза другого класса — по закреплённому
+        assert_eq!(
+            view(
+                with(pinned("http", "192.168.1.20", 8080), Some(false)),
+                Some(pause())
+            )
+            .1,
+            json!(false)
+        );
+        // поля показа не хранятся: значение настройки (сравнение правки, аудит) — без них
+        let u = UserWorks {
+            model: Some(with(pinned("http", "192.168.1.20", 8080), Some(false))),
+            ..UserWorks::default()
+        };
+        let stored = u.value(WORKS_MODEL, &s);
+        assert!(
+            stored.get("host").is_none() && stored["external"] == json!(false),
+            "{stored}"
+        );
+        assert_eq!(u.to_json(&s)["model"]["host"], json!("192.168.1.20:8080"));
+        assert_eq!(UserWorks::default().to_json(&s)["model"], Value::Null);
     }
 }

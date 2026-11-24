@@ -6,7 +6,6 @@ import { test } from 'node:test';
 import {
   acceptRun,
   flagText,
-  latestNightly,
   foundText,
   metricRows,
   ppText,
@@ -114,22 +113,16 @@ test('verdict_accepted_norm_starts_base', () => {
 });
 
 test('verdict_accept_target_latest_nightly', () => {
-  // правило сервера (`check::digest_line`): последний законченный ночной прогон — регрессия без
-  // принятой нормы; ручные прогоны и прогоны без вердикта не в счёт
-  const manual = run({ run: 'M1', trigger: 'manual', night: null });
-  const timeout = run({ run: 'T1', status: 'timeout', verdict: null });
-  const runs = [manual, timeout, run({ run: 'R1' }), run({ run: 'R0' })];
-  assert.equal(latestNightly(runs)?.run, 'R1');
-  assert.equal(regressionOpen(latestNightly(runs)), true);
-  assert.equal(acceptRun(latestNightly(runs)), 'R1');
-  // последний ночной — в норме (эпизод снят): ни кнопки, ни точки, даже если ручной — регрессия
-  const ok = [manual, run({ run: 'R2', verdict: v({ kind: 'ok' }) }), run({ run: 'R1' })];
-  assert.equal(regressionOpen(latestNightly(ok)), false);
-  assert.equal(acceptRun(latestNightly(ok)), null);
+  // правило сервера (`check::digest_line`): последний законченный ночной прогон (его отдаёт фильтр
+  // сервера `?trigger=nightly&status=done&limit=1`) — регрессия без принятой нормы
+  assert.equal(regressionOpen(run({ run: 'R1' })), true);
+  assert.equal(acceptRun(run({ run: 'R1' })), 'R1');
+  // последний ночной — в норме (эпизод снят): ни кнопки, ни точки
+  assert.equal(regressionOpen(run({ run: 'R2', verdict: v({ kind: 'ok' }) })), false);
+  assert.equal(acceptRun(run({ run: 'R2', verdict: v({ kind: 'ok' }) })), null);
   // норма принята — ни кнопки, ни точки
-  assert.equal(acceptRun(latestNightly([run({ accepted_at: '2026-11-23T08:00:00.000000Z' })])), null);
+  assert.equal(acceptRun(run({ accepted_at: '2026-11-23T08:00:00.000000Z' })), null);
   // ночных прогонов нет
-  assert.equal(latestNightly([manual]), null);
   assert.equal(regressionOpen(null), false);
   assert.equal(acceptRun(null), null);
 });
@@ -138,7 +131,7 @@ test('verdict_run_status_and_failing', () => {
   assert.equal(runStatusText({ status: 'failed', error: 'interrupted' }), 'прерван остановкой сервера');
   assert.equal(runStatusText({ status: 'failed', error: 'база недоступна' }), 'сбой: база недоступна');
   assert.match(runStatusText({ status: 'skipped', error: null }), /переиндексация/);
-  assert.match(runStatusText({ status: 'timeout', error: null }), /check_max_min/);
+  assert.match(runStatusText({ status: 'timeout', error: null }), /предел времени прогона \(настройка администратора сервера\)/);
   const f = { probe: 'x:1', question: 'q', kind: 'probe', split: 'test', target: 'i:1', advice: 'term' };
   assert.equal(foundText({ ...f, rank: null }), 'не нашлась и в глубоком поиске');
   assert.equal(foundText({ ...f, rank: 14 }), 'в глубоком поиске на месте 14 — за границей бюджета основного');

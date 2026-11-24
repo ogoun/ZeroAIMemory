@@ -5,6 +5,9 @@
 // соединения — «Проверить подключение» не нажимается); журнал отправок без текста; пауза
 // `vault_changed` после правки `data.url` по токену — точка у «Внутренних работ», «был → стал»,
 // «Подтвердить адрес» с `confirm_url` = «стал» (полный адрес) и новыми «был → стал» при 409.
+// Плашка «вне LAN» — только по полю сервера `works.model.external` (ревью r1 задачи 8, I1): и после
+// перезагрузки, и у имени (ответ подставлен); текст — по действующему режиму, «Отключить модель».
+// Каждый сценарий готовит своё подключение сам (ревью r1, Minor 11).
 import { expect, test, type Page, type Request } from '@playwright/test';
 import { MOCK_REPLY_MARK, type MockRequest } from './mock-model';
 import { pageSnapshots } from './page-snaps';
@@ -23,8 +26,22 @@ const mock = () => env('E2E_MOCK_MODEL');
 test.use({ storageState: ADMIN_STATE });
 test.describe.configure({ mode: 'serial' });
 
-// снимки «до/после» (`E2E_FORMS_SNAP`): «Внутренние работы» и Insights с фильтром «Шумные»
-pageSnapshots('works', () => '#/works');
+// снимки «до/после» (`E2E_FORMS_SNAP`): «Внутренние работы» (без подключения и с подключением вне
+// LAN на паузе «адрес изменён» — пауза подставлена в ответ настроек) и Insights с фильтром «Шумные»
+pageSnapshots('works', () => '#/works', { prepare: (p) => resetWorks(p) });
+pageSnapshots('works-external', () => '#/works', {
+  prepare: async (p) => {
+    await resetWorks(p);
+    await connect(p, env('E2E_VAULT_EXT'));
+    await p.route(/\/api\/v1\/auth\/settings$/, async (r) => {
+      if (r.request().method() !== 'GET') return r.continue();
+      const resp = await r.fetch();
+      const j = (await resp.json()) as { works: Record<string, unknown> };
+      j.works.pause = { class: 'vault_changed', since: new Date().toISOString(), from: 'https://203.0.113.10/v1', to: 'https://203.0.113.10/v2' };
+      return r.fulfill({ response: resp, json: j });
+    });
+  },
+});
 pageSnapshots('insights-noisy', (c) => `#/u/${c.user}/s/${SOLUTION_GUID}/j/insights`, {
   after: (p) => p.getByLabel('Шумные', { exact: true }).check(),
 });
@@ -87,7 +104,10 @@ test('works_settings_and_connection_test', async ({ page }) => {
   await expect(d.getByLabel('Запись Vault')).toBeFocused();
   await d.getByLabel('Запись Vault').selectOption({ label: 'E2E модель (LAN)' });
   await expect(d.getByTestId('works-address')).toContainText(`${mock()}/v1`);
-  await expect(d.getByTestId('works-address')).toContainText('петля');
+  await expect(d.getByTestId('works-address')).toContainText('эта же машина');
+  // без сохранённого подключения проверять нечего — кнопка «Сохранить и проверить» (ревью r1, Minor 1)
+  await expect(d.getByRole('button', { name: 'Сохранить и проверить', exact: true })).toBeVisible();
+  await expect(d.getByRole('button', { name: 'Проверить подключение', exact: true })).toHaveCount(0);
   await d.getByLabel('Имя модели').fill('e2e-mock');
   // рецепт body_extra — в поле JSON
   await d.getByRole('button', { name: 'Ответ — JSON-объект' }).click();
@@ -125,11 +145,19 @@ test('works_settings_and_connection_test', async ({ page }) => {
   await expect(page.getByTestId('works-effective-rules')).toHaveText('действует: агент');
   // ночь — время в поясе сервера и местное, окно
   await expect(page.getByTestId('works-night')).toHaveText(/^\d\d:\d\d UTC \(у вас \d\d:\d\d\), окно 2 ч$/);
+  // итог выключателя ночной проверки — у него же, в разделе «Ночь» (ревью r1, Minor 8)
+  const night = page.getByRole('region', { name: 'Ночь' });
+  await night.getByLabel('Ночная проверка моей памяти').uncheck();
+  await expect(night.getByRole('status')).toContainText('Ночная проверка вашей памяти выключена');
+  await night.getByLabel('Ночная проверка моей памяти').check();
+  await expect(night.getByRole('status')).toContainText('Ночная проверка вашей памяти включена');
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
 test('works_external_banner_testnet', async ({ page }) => {
   const problems = watch(page);
+  await resetWorks(page);
+  await connect(page, env('E2E_VAULT_LAN'));
   await open(page);
   await page.getByRole('button', { name: 'Изменить подключение', exact: true }).click();
   const d = dialog(page, 'Подключение модели');
@@ -147,11 +175,43 @@ test('works_external_banner_testnet', async ({ page }) => {
   await expect(page.getByTestId('works-external')).toContainText('Данные памяти уходят за пределы локальной сети: 203.0.113.10');
   // «Проверить подключение» к нему не нажимается: обращений к модели нет
   expect((await mockRequests()).length).toBe(before);
-  // назад — к модели в LAN: плашки нет
+  // класс — поле сервера в ответе настроек (по закреплённому адресу, без DNS при чтении)
+  const read = await human<{ works: { model: { host: string; external: boolean } } }>(page, 'GET', 'auth/settings');
+  expect([read.works.model.host, read.works.model.external]).toEqual(['203.0.113.10', true]);
+  // ни один вид не в режиме «модель» — данные не уходят: «уйдут, когда …» (ревью r1, Minor 7)
+  await human(page, 'PATCH', 'auth/settings', { works: { mode: 'off' } });
+  await page.reload();
+  const banner2 = page.getByTestId('works-external');
+  await expect(banner2).toContainText('Подключённая модель — вне локальной сети: 203.0.113.10');
+  await expect(banner2).toContainText('уйдут за пределы локальной сети, когда вид работ будет в режиме «модель»');
+  // «Отключить модель» — окно-подтверждение (опасное действие): подключение удаляется, плашки нет
+  await page.getByRole('button', { name: 'Отключить модель', exact: true }).click();
+  const off = dialog(page, 'Отключить модель?');
+  await expect(off).toBeVisible();
+  await off.getByRole('button', { name: 'Отключить', exact: true }).click();
+  await expect(off).toBeHidden();
+  await expect(page.getByRole('status').filter({ hasText: 'Модель отключена' })).toBeVisible();
+  await expect(page.getByTestId('works-external')).toHaveCount(0);
+  expect((await human<{ works: { model: unknown } }>(page, 'GET', 'auth/settings')).works.model).toBeNull();
+  // модель в LAN: плашки нет
   await connect(page, env('E2E_VAULT_LAN'));
   await page.reload();
   await expect(page.getByRole('heading', { name: 'Подключённая модель' })).toBeVisible();
   await expect(page.getByTestId('works-external')).toHaveCount(0);
+  // плашка — только по полю сервера: имя, закреплённое во внешний адрес (ответ подставлен — DNS в
+  // e2e нет; правило сервера — тест Rust `model_external_field_in_settings`), и после перезагрузки
+  await page.route(/\/api\/v1\/auth\/settings$/, async (r) => {
+    if (r.request().method() !== 'GET') return r.continue();
+    const resp = await r.fetch();
+    const j = (await resp.json()) as { works: { model: Record<string, unknown> } };
+    j.works.model = { ...j.works.model, host: 'models.example.com', external: true };
+    return r.fulfill({ response: resp, json: j });
+  });
+  await page.reload();
+  await expect(page.getByTestId('works-external')).toContainText('Данные памяти уходят за пределы локальной сети: models.example.com');
+  await page.reload();
+  await expect(page.getByTestId('works-external')).toContainText('models.example.com');
+  await page.unroute(/\/api\/v1\/auth\/settings$/);
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
@@ -223,10 +283,13 @@ test('works_pause_dot_and_confirm_address', async ({ page }) => {
   await setUrl('/v3');
   await page.getByRole('button', { name: 'Подтвердить адрес', exact: true }).click();
   const d = dialog(page, 'Подтвердить новый адрес подключения?');
-  await expect(d).toContainText(`Был ${mock()}/v1 → стал ${mock()}/v2`);
+  // адреса — моноширинно, каждый своей строкой (ревью r1, Minor 2)
+  await expect(d.getByTestId('works-confirm-was')).toHaveText(`${mock()}/v1`);
+  await expect(d.getByTestId('works-confirm-now')).toHaveText(`${mock()}/v2`);
+  expect(await d.getByTestId('works-confirm-now').evaluate((e) => getComputedStyle(e).fontFamily)).toMatch(/mono|Consolas/i);
   await d.getByRole('button', { name: 'Подтвердить адрес', exact: true }).click();
   await expect(d.getByRole('alert')).toContainText(`Адрес снова изменился: был ${mock()}/v1 → стал ${mock()}/v3`);
-  await expect(d).toContainText(`Был ${mock()}/v1 → стал ${mock()}/v3`);
+  await expect(d.getByTestId('works-confirm-now')).toHaveText(`${mock()}/v3`);
   await d.getByRole('button', { name: 'Подтвердить адрес', exact: true }).click();
   await expect(d).toBeHidden();
   await expect(page.getByRole('status').filter({ hasText: `Адрес подтверждён: ${mock()}/v3. Пауза снята.` })).toBeVisible();

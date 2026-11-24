@@ -11,12 +11,11 @@
   import FormDialog from '../components/FormDialog.svelte';
   import Notice from '../components/Notice.svelte';
   import { ApiError, errorText, type Me } from '../lib/api';
-  import { RUNS, attention } from '../lib/attention.svelte';
+  import { attention } from '../lib/attention.svelte';
   import {
     PROBE_KIND_TEXT,
     acceptRun,
     foundText,
-    latestNightly,
     metricRows,
     regressionOpen,
     runStatusText,
@@ -30,7 +29,7 @@
   import { go } from '../lib/router';
   import { localTime } from '../lib/time';
   import { viewport } from '../lib/viewport.svelte';
-  import { acceptCheck, checkRuns, checkStatus, refRoute, runCheck } from '../lib/worksApi';
+  import { acceptCheck, checkStatus, lastNightlyRun, refRoute, runCheck } from '../lib/worksApi';
 
   let { me, onexpired }: { me: Me; onexpired: () => void } = $props();
 
@@ -68,10 +67,11 @@
   async function load() {
     const my = ++seq;
     try {
-      const [r, runs] = await Promise.all([checkStatus(), checkRuns(RUNS)]);
+      // последний законченный ночной прогон — фильтром сервера (`?trigger=nightly&status=done`)
+      const [r, n] = await Promise.all([checkStatus(), lastNightlyRun()]);
       if (my !== seq) return;
       st = r;
-      nightly = latestNightly(runs.items);
+      nightly = n;
       error = '';
       attention.regression = regressionOpen(nightly);
     } catch (e) {
@@ -196,6 +196,12 @@
         <button type="button" class="primary" onclick={() => (acceptOpen = true)}>Принять как норму</button>
       {/if}
     </div>
+    {#if target && nightly?.verdict && last?.run !== nightly.run}
+      <!-- последний прогон — не этот ночной (ручной поверх эпизода): регрессия открыта по ночному -->
+      <p class="warn small" data-testid="check-open-regression">
+        {`Открыта регрессия ночного прогона ${nightly.night ?? ''}: ${verdictText(nightly.verdict)}. «Принять как норму» относится к нему.`}
+      </p>
+    {/if}
     <div bind:this={noticeBox}><Notice text={notice} /></div>
     {#if actionError}<p class="error" role="alert">{actionError}</p>{/if}
     <p class="muted small">
@@ -278,7 +284,7 @@
     <p data-testid="check-probes">{probesLine}</p>
     <p class="muted small">
       Вопросы исполнителя приходят из внутренних работ (вид «Пробы ночной проверки»), из кэша выжимок — каждую ночь сами,
-      посторонние вопросы — общий набор сервера. Ввод и снятие проб вручную — в M7.4.
+      посторонние вопросы — общий набор сервера. Ввод и снятие проб вручную появятся в следующих версиях.
     </p>
   </section>
 {/if}

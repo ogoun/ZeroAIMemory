@@ -46,9 +46,9 @@ export async function refRoute(user: string, ref: string): Promise<Route | null>
 
 // ---- настройки исполнителя (§6.1 п. 2, §6.2 п. 1) ----
 
-/** Подключение `works.model`: запись личного Vault — `v:<id>` (адрес — её `data.url`, ключ — её
- * значение), закреплённый при сохранении адрес — `pinned`. */
-export interface ModelConn {
+/** Вход подключения `works.model` (`PATCH`): запись личного Vault — `v:<id>` (адрес — её
+ * `data.url`, ключ — её значение). */
+export interface ModelConnInput {
   protocol: 'openai';
   vault: string;
   model: string;
@@ -56,8 +56,28 @@ export interface ModelConn {
   max_tokens: number;
   token_field: 'auto' | 'max_tokens' | 'max_completion_tokens';
   body_extra: Record<string, unknown>;
-  pinned?: { scheme: string; host: string; port: number; path: string };
 }
+
+/** Подключение в ответе настроек: вход, закреплённый при сохранении адрес (`pinned`) и поля для
+ * показа — `host` и `external` («вне LAN» по закреплённому адресу и классу, сохранённому при
+ * закреплении, а на паузе «адрес изменён» — по «стал»; сервер считает без DNS, задача 8, ревью
+ * r1). Поля показа и `pinned` в `PATCH` не отправляются (вход сервера строгий). */
+export interface ModelConn extends ModelConnInput {
+  pinned?: { scheme: string; host: string; port: number; path: string };
+  host?: string | null;
+  external?: boolean;
+}
+
+/** Вход для `PATCH` из подключения ответа — только поля входа. */
+export const connInput = (m: ModelConnInput): ModelConnInput => ({
+  protocol: m.protocol,
+  vault: m.vault,
+  model: m.model,
+  auth: m.auth,
+  max_tokens: m.max_tokens,
+  token_field: m.token_field,
+  body_extra: m.body_extra,
+});
 
 /** Пауза исполнителя (`{class, since}`; у `vault_changed` — полные адреса «был → стал»). */
 export interface WorksPause {
@@ -85,7 +105,7 @@ export interface WorksSettings {
 export interface WorksPatch {
   mode?: WorksMode;
   kinds?: Partial<Record<WorkKind, WorksMode | null>>;
-  model?: (Omit<ModelConn, 'pinned'> & { confirm_url?: string }) | null;
+  model?: (ModelConnInput & { confirm_url?: string }) | null;
   check?: 'on' | 'off';
 }
 
@@ -189,8 +209,17 @@ export const workCalls = (days: number) => call<{ days: number; calls: WorkCall[
 // ---- проверка памяти (§6.5) ----
 
 export const checkStatus = () => call<CheckStatus>('GET', 'check/status');
-/** Прогоны, новые первыми (без провалов проб): у каждого — `accepted_at`, эпизод, повод. */
-export const checkRuns = (limit: number) => call<{ items: CheckRun[] }>('GET', `check/runs?limit=${limit}`);
+/** Прогоны, новые первыми (без провалов проб): у каждого — `accepted_at`, эпизод, повод;
+ * `trigger`/`status` — фильтр сервера. */
+export const checkRuns = (limit: number, f: { trigger?: 'nightly' | 'manual'; status?: string } = {}) =>
+  call<{ items: CheckRun[] }>(
+    'GET',
+    `check/runs?limit=${limit}${f.trigger ? `&trigger=${f.trigger}` : ''}${f.status ? `&status=${f.status}` : ''}`,
+  );
+/** Последний законченный ночной прогон — по нему открыта ли регрессия и что можно принять
+ * (правило строки дайджеста сервера). */
+export const lastNightlyRun = async (): Promise<CheckRun | null> =>
+  (await checkRuns(1, { trigger: 'nightly', status: 'done' })).items[0] ?? null;
 /** Ручной прогон (202 `{run}`); идёт — 409 `/problems/check-running`. */
 export const runCheck = () => call<{ run: string; status: string }>('POST', 'check/run');
 /** «Принять как норму» — последний законченный ночной прогон эпизода. */

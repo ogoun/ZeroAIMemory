@@ -929,7 +929,7 @@
       </tbody>
     </table>
   </div>
-  {#if !loading && items.length === 0 && !error}<p class="muted">Записей нет.</p>{/if}
+  {#if !loading && items.length === 0 && !error}<p class="muted">{fNoisy ? 'Шумных записей нет.' : 'Записей нет.'}</p>{/if}
   {#if loading}<p class="muted">Загрузка…</p>{/if}
   {#if next}
     <button type="button" class="more" aria-disabled={loading} aria-busy={loading} onclick={more}>Показать ещё</button>
