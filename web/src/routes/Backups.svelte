@@ -37,7 +37,8 @@
   let confirmDel = $state<BackupCopy | null>(null);
   let sending = $state(false);
   let actionMsg = $state('');
-  let actionErr = $state('');
+  /** Итог «Снять копию сейчас» — до конца копии (дальше — строка последнего прогона). */
+  const STARTED = 'Копия запущена: её ход — ниже.';
   /** Поколение запроса: ответ устаревшего опроса не затирает свежий. */
   let seq = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -67,6 +68,7 @@
       st = r;
       now = Date.now();
       error = '';
+      if (!r.running && actionMsg === STARTED) actionMsg = '';
     } catch (e) {
       if (my !== seq) return;
       if (expired(e)) return;
@@ -93,14 +95,15 @@
     };
   });
 
-  /** «Снять копию»: ошибка — в окне (исключение), окно открыто; копия уже идёт (по расписанию или
-   * из другой вкладки) — окно закрыто, её ход виден ниже. */
+  /** «Снять копию»: ошибка — в окне (исключение), окно открыто; копия запущена или уже идёт (по
+   * расписанию, из другой вкладки) — итог строкой и ход копии перечитаны до закрытия окна: фокус
+   * при закрытии — на строку итога, а не на кнопку, которую идущая копия выключает. */
   async function run() {
     sending = true;
     actionMsg = '';
-    actionErr = '';
     try {
       await startBackup();
+      actionMsg = STARTED;
     } catch (e) {
       if (expired(e)) return;
       if (!(e instanceof ApiError && e.status === 409)) throw new Error(errorText(e));
@@ -108,8 +111,8 @@
     } finally {
       sending = false;
     }
-    confirmRun = false;
     await load();
+    confirmRun = false;
   }
 
   /** «Удалить» копию: ошибка — в окне, окно открыто; копии уже нет — окно закрыто, итог строкой. */
@@ -118,7 +121,6 @@
     if (!c) return;
     sending = true;
     actionMsg = '';
-    actionErr = '';
     try {
       await deleteBackup(c.name);
       actionMsg = `Копия ${c.name} удалена.`;
@@ -200,7 +202,6 @@
       </p>
     {/if}
     {#if actionMsg}<p class="small" role="status" tabindex="-1" data-testid="backup-action">{actionMsg}</p>{/if}
-    {#if actionErr}<p class="error" role="alert">{actionErr}</p>{/if}
 
     <h3>Готовые копии</h3>
     {#if !st.items.length}
@@ -274,11 +275,13 @@
   {/if}
 </section>
 
-<!-- подтверждения — окна на общем каркасе (§6.14 п. 1): на телефоне — во всю ширину, не во весь экран -->
+<!-- подтверждения — окна на общем каркасе (§6.14 п. 1): на телефоне — во всю ширину, не во весь экран;
+     при автокопиях снятие удаляет старшие копии сверх `keep` — необратимо: `danger`, фокус на «Отмена» -->
 <FormDialog
   open={confirmRun}
   confirm
-  title="Снять копию сейчас"
+  danger={st?.schedule === 'daily'}
+  title="Снять копию сейчас?"
   description={'Сервер снимет полную копию каталога данных в каталог копий, не останавливаясь: запись и поиск работают. ' +
     'На большой базе это займёт минуты и место на диске размером с базы и новые вложения.' +
     (st?.schedule === 'daily' ? ` Лишние копии сверх ${st.keep} будут удалены, начиная с самых старых.` : '')}
@@ -293,7 +296,7 @@
   open={confirmDel !== null}
   confirm
   danger
-  title="Удалить копию"
+  title="Удалить копию?"
   submit="Удалить"
   busy={sending}
   refocus={actionStatus}

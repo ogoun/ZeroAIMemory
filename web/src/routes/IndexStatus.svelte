@@ -338,7 +338,7 @@
   open={confirm !== null}
   confirm
   danger={!!confirm?.full}
-  title={confirm?.full ? 'Полная переиндексация' : 'Переиндексация из embeddings'}
+  title={confirm?.full ? 'Запустить полную переиндексацию?' : 'Переиндексировать из embeddings?'}
   submit="Запустить"
   busy={sending}
   refocus={() => document.querySelector('[data-testid="reindex-status"]')}

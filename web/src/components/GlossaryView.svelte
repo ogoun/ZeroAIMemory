@@ -456,7 +456,7 @@
           actionError = `Пока окно было открыто, термин стал «${statusText(fresh)}» в другом месте — отзыв не нужен.`;
           return;
         }
-        dlgError = rebaseText([], fresh.rev);
+        dlgError = rebaseText([], fresh.rev, 'отзовите снова');
         return;
       }
       dlgError = errorText(e);
@@ -602,20 +602,26 @@
 
 <!-- поля термина: окно «Новый термин» и правка в карточке; `clash` — поля-расхождения 409 -->
 {#snippet termFields(f: TermFields, clash: (keyof TermFields)[], autofocus: boolean)}
+  <!-- текст подписи с пометками — одной строкой над полем и в окне, и в карточке (сетка `.form label`) -->
   <label class:clash={clash.includes('name')}
-    >Имя {@render note(clash, 'name')}<input bind:value={f.name} required maxlength="200" data-autofocus={autofocus ? '' : undefined} /></label
+    ><span>Имя {@render note(clash, 'name')}</span><input bind:value={f.name} required maxlength="200" data-autofocus={autofocus ? '' : undefined} /></label
   >
-  <label class:clash={clash.includes('definition')}>Определение {@render note(clash, 'definition')}<textarea bind:value={f.definition} rows="3" required></textarea></label>
+  <label class:clash={clash.includes('definition')}
+    ><span>Определение {@render note(clash, 'definition')}</span><textarea bind:value={f.definition} rows="3" required></textarea></label
+  >
   <label class:clash={clash.includes('aliases')}
-    >Псевдонимы <span class="muted small">(по одному в строке)</span> {@render note(clash, 'aliases')}<textarea bind:value={f.aliases} rows="2"></textarea></label
+    ><span>Псевдонимы <span class="muted small">(по одному в строке)</span> {@render note(clash, 'aliases')}</span><textarea bind:value={f.aliases} rows="2"
+    ></textarea></label
   >
   <label class:clash={clash.includes('not')}
-    >Не путать с <span class="muted small">(по одному в строке)</span> {@render note(clash, 'not')}<textarea bind:value={f.not} rows="2"></textarea></label
+    ><span>Не путать с <span class="muted small">(по одному в строке)</span> {@render note(clash, 'not')}</span><textarea bind:value={f.not} rows="2"
+    ></textarea></label
   >
   <label class:clash={clash.includes('code')}
-    >Имена в коде <span class="muted small">(по одному в строке)</span> {@render note(clash, 'code')}<textarea bind:value={f.code} rows="2"></textarea></label
+    ><span>Имена в коде <span class="muted small">(по одному в строке)</span> {@render note(clash, 'code')}</span><textarea bind:value={f.code} rows="2"
+    ></textarea></label
   >
-  <label class:clash={clash.includes('body')}>Пояснение {@render note(clash, 'body')}<textarea bind:value={f.body} rows="3"></textarea></label>
+  <label class:clash={clash.includes('body')}><span>Пояснение {@render note(clash, 'body')}</span><textarea bind:value={f.body} rows="3"></textarea></label>
 {/snippet}
 
 <!-- пометка поля-расхождения 409 в подписи (её читает и программа чтения с экрана) -->

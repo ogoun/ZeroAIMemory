@@ -93,8 +93,23 @@
     });
   });
 
-  /** Релиз из адреса: заголовок сравнения получит фокус, когда сравнение придёт (§6.14 п. 2). */
-  let revealFor = '';
+  /** Релиз из адреса: заголовок сравнения получит фокус, когда придут и сравнение, и список (§6.14
+   * п. 2). На узком экране список стоит над сравнением: прокрутка до его загрузки уехала бы вниз,
+   * когда список вырастет (ревью r1 задачи 10b, полный e2e). */
+  let revealFor = $state('');
+
+  $effect(() => {
+    const id = revealFor;
+    if (!id || loading || cmp?.to.id !== id) return;
+    untrack(() => {
+      revealFor = '';
+      void tick().then(() => {
+        const h = root?.querySelector<HTMLElement>('.compare h2');
+        h?.scrollIntoView({ block: 'start' });
+        focusNow(h);
+      });
+    });
+  });
 
   async function load(u: string, s: string, reset: boolean) {
     const my = ++seq;
@@ -133,16 +148,7 @@
     cmpLoading = true;
     try {
       const r = await compareRelease(u, id, w && w !== id ? w : undefined);
-      if (my === cseq) {
-        cmp = r;
-        if (revealFor && revealFor === id) {
-          revealFor = '';
-          await tick();
-          const h = root?.querySelector<HTMLElement>('.compare h2');
-          h?.scrollIntoView({ block: 'nearest' });
-          focusNow(h);
-        }
-      }
+      if (my === cseq) cmp = r;
     } catch (e) {
       if (my === cseq) fail(e, (m) => (cmpError = m));
     } finally {

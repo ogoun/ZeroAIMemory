@@ -65,6 +65,8 @@
     submit: string;
     danger?: boolean;
     busy?: boolean;
+    /** Основное действие доступно (импорт без файла — нет): кнопка выключена, без `aria-busy`. */
+    canSubmit?: boolean;
     /** Ошибка (сервер, проверка формы) — внутри окна, над кнопками; окно остаётся открытым. */
     error?: string;
     /** Итог внутри окна (не ошибка). */
@@ -94,6 +96,7 @@
     submit,
     danger = false,
     busy = false,
+    canSubmit = true,
     error = '',
     notice = '',
     wide = false,
@@ -197,6 +200,8 @@
    * его обратно; после снятия он падал на `body` — место терялось (нестабильный
    * `forms_open_focus_trap_esc task-create phone`, задача 10b по сообщению координатора). */
   function restoreAfter(back: HTMLElement | null, bySubmit: boolean, box: HTMLElement | null, frames: number) {
+    // окно открыли снова (тот же экземпляр) до снятия прежнего содержимого — фокус у него
+    if (shown) return;
     if (box?.isConnected && frames < 30) {
       requestAnimationFrame(() => restoreAfter(back, bySubmit, box, frames + 1));
       return;
@@ -267,7 +272,7 @@
 
   async function send(e?: Event) {
     e?.preventDefault();
-    if (locked || asking) return;
+    if (locked || asking || !canSubmit) return;
     pending = true;
     thrown = '';
     try {
@@ -354,7 +359,7 @@
           {#if !confirm}
             <!-- основное действие на телефоне — в шапке (нижнего ряда кнопок там нет); пока на экране
                  вопрос о несохранённом — выключено, как и нижнее -->
-            <button type="submit" class="fd-head-submit {danger ? 'danger-fill' : 'primary'}" disabled={locked || asking}>{submit}</button>
+            <button type="submit" class="fd-head-submit {danger ? 'danger-fill' : 'primary'}" disabled={locked || asking || !canSubmit}>{submit}</button>
             <button type="button" class="fd-x fd-x-end" aria-label="Закрыть" onclick={requestClose}>✕</button>
           {/if}
         </header>
@@ -376,7 +381,7 @@
         <footer class="fd-foot" class:fd-has-extra={!!extra}>
           {#if extra}<div class="fd-extra row">{@render extra()}</div>{/if}
           <div class="fd-main row">
-            <button type="submit" class={danger ? 'danger-fill' : 'primary'} data-fd="submit" disabled={locked || asking}>{submit}</button>
+            <button type="submit" class={danger ? 'danger-fill' : 'primary'} data-fd="submit" disabled={locked || asking || !canSubmit}>{submit}</button>
             <button type="button" data-fd="cancel" onclick={requestClose} disabled={pending}>Отмена</button>
           </div>
         </footer>

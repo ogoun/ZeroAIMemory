@@ -11,6 +11,8 @@
 // параллельные задачи иначе правят одну строку). Данные строк — `E2E_FORMS_*` (наполнение —
 // `seedForms` в `forms.spec.ts`) и `E2E_*` global-setup.
 import { expect, type Locator, type Page } from '@playwright/test';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { IDEAS_GUID } from './seed';
 import type { PageCtx } from './mobile-pages';
 
@@ -111,6 +113,14 @@ const TERM = 'Карточка термина';
 const question = (p: Page, k: string) => p.locator(`[data-question="${process.env[k]}"]`);
 /** Запись ленты Changelog из адреса (открытая сверху — первая). */
 const changelogEntry = (p: Page) => p.locator(`article[data-entry="${process.env.E2E_FORMS_CHANGELOG}"]`).first();
+/** Участники решения форм раскрыты («Доступ» — переключатель: при повторном открытии окна строки
+ * уже на виду), строка участника k — на виду. */
+async function accessOf(p: Page, k: string): Promise<void> {
+  const m = p.locator(`tr[data-member="${process.env[k]}"]`);
+  if (!(await m.isVisible())) await p.locator(`tr[data-solution="${process.env.E2E_FORMS_ACCESS_SOL}"]`).getByRole('button', { name: 'Доступ' }).click();
+  await expect(m).toBeVisible();
+}
+
 /** Строка пользователя форм в таблице «Пользователи». */
 const userRow = (p: Page) => p.locator(`tr[data-user="${process.env.E2E_FORMS_USER}"]`);
 
@@ -658,8 +668,10 @@ export const FORM_CASES: FormCase[] = [
     dialog: 'Отозвать токен?',
     page: () => '#/admin',
     open: async (p) => {
-      await userRow(p).getByRole('button', { name: 'Токены' }).click();
-      await p.getByRole('row', { name: new RegExp(`^${process.env.E2E_FORMS_USER_TOKEN} `) }).getByRole('button', { name: 'Отозвать' }).click();
+      const row = p.getByRole('row', { name: new RegExp(`^${process.env.E2E_FORMS_USER_TOKEN} `) });
+      // раскрытие — переключатель: открытое повторно (сценарий «Назад») уже раскрыто
+      if (!(await row.isVisible())) await userRow(p).getByRole('button', { name: 'Токены' }).click();
+      await row.getByRole('button', { name: 'Отозвать' }).click();
     },
     route: { method: 'DELETE', url: /\/api\/v1\/admin\/tokens\/[^/?]+$/ },
     after: 'notice',
@@ -691,7 +703,7 @@ export const FORM_CASES: FormCase[] = [
     dialog: 'Отозвать доступ?',
     page: () => '#/admin/solutions',
     open: async (p) => {
-      await p.locator(`tr[data-solution="${process.env.E2E_FORMS_ACCESS_SOL}"]`).getByRole('button', { name: 'Доступ' }).click();
+      await accessOf(p, 'E2E_FORMS_USER');
       await p.locator(`tr[data-member="${process.env.E2E_FORMS_USER}"]`).getByRole('button', { name: 'Отозвать' }).click();
     },
     route: { method: 'POST', url: /\/api\/v1\/solutions\/[^/?]+\/access\/[^/?]+\/revoke$/ },
@@ -702,6 +714,20 @@ export const FORM_CASES: FormCase[] = [
       const r = await sessionGet<{ members: { user_name: string; state: string }[] }>(p, `solutions/${process.env.E2E_FORMS_ACCESS_SOL}/access`);
       expect(r.members.find((m) => m.user_name === process.env.E2E_FORMS_USER)?.state).toBe('approved');
     },
+  },
+  {
+    id: 'access-reject',
+    name: 'Отклонить запрос доступа',
+    dialog: 'Отклонить запрос?',
+    page: () => '#/admin/solutions',
+    open: async (p) => {
+      await accessOf(p, 'E2E_FORMS_PENDING_USER');
+      await p.locator(`tr[data-member="${process.env.E2E_FORMS_PENDING_USER}"]`).getByRole('button', { name: 'Отклонить' }).click();
+    },
+    first: 'Причина',
+    fill: (p) => type(p, 'Отклонить запрос?', 'Причина', 'решение закрытое'),
+    route: { method: 'POST', url: /\/api\/v1\/solutions\/[^/?]+\/access\/[^/?]+\/reject$/ },
+    after: 'notice',
   },
   {
     id: 'template-reset',
@@ -743,11 +769,15 @@ export const FORM_CASES: FormCase[] = [
     page: (c) => `#/u/${c.user}`,
     open: (p) => treeMenu(p, 'Knowledge', 'Импорт (.zip)…'),
     first: 'Архив (.zip)',
+    // выбранный архив — несохранённое окна (ревью r1 задачи 10b, ⚠️ 2); отказ приёма — в окне
+    fill: (p) => dialogOf(p, 'Импорт архива').getByLabel('Архив (.zip)').setInputFiles(emptyZip()),
+    route: { method: 'POST', url: /\/api\/v1\/spaces\/[^/?]+\/import(\?|$)/ },
     after: 'none',
   },
   {
     id: 'backup-run',
     name: 'Снять копию сейчас',
+    dialog: 'Снять копию сейчас?',
     page: () => '#/admin/backups',
     open: (p) => press(p, 'Снять копию сейчас'),
     route: { method: 'POST', url: /\/api\/v1\/admin\/backups$/ },
@@ -755,8 +785,26 @@ export const FORM_CASES: FormCase[] = [
     confirm: true,
   },
   {
+    id: 'backup-delete',
+    name: 'Удалить копию',
+    dialog: 'Удалить копию?',
+    page: () => '#/admin/backups',
+    // копия в списке — подменой ответа (снимать настоящую копию для окна долго; ackups.spec.ts
+    // удаляет настоящую)
+    prepare: (p) => fakeBackup(p),
+    open: (p) => p.getByRole('button', { name: `Удалить копию ${FAKE_BACKUP}` }).click(),
+    route: { method: 'DELETE', url: /\/api\/v1\/admin\/backups\/[^/?]+$/ },
+    after: 'notice',
+    confirm: true,
+    danger: true,
+    kept: async (p) => {
+      await expect(p.getByRole('button', { name: `Удалить копию ${FAKE_BACKUP}` })).toBeVisible();
+    },
+  },
+  {
     id: 'reindex',
     name: 'Переиндексация из embeddings',
+    dialog: 'Переиндексировать из embeddings?',
     page: () => '#/admin/index',
     open: (p) => press(p, 'Переиндексировать из embeddings'),
     route: REINDEX,
@@ -766,6 +814,7 @@ export const FORM_CASES: FormCase[] = [
   {
     id: 'reindex-full',
     name: 'Полная переиндексация',
+    dialog: 'Запустить полную переиндексацию?',
     page: () => '#/admin/index',
     open: (p) => press(p, 'Полная переиндексация'),
     route: REINDEX,
@@ -808,4 +857,28 @@ export async function customTemplate(p: Page): Promise<void> {
     j.agent_setup.templates['claude.ru'].custom = true;
     await route.fulfill({ response: r, json: j });
   });
+}
+/** Копия каталога копий в ответе `GET /admin/backups` (подмена): окно «Удалить копию?» без
+ * настоящей копии. */
+export const FAKE_BACKUP = '2026-01-02_030405-e2e-forms';
+async function fakeBackup(p: Page): Promise<void> {
+  await p.route(/\/api\/v1\/admin\/backups$/, async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback();
+    const r = await route.fetch();
+    const j = (await r.json()) as { items: unknown[] };
+    j.items = [
+      { name: FAKE_BACKUP, created_at: '2026-01-02T03:04:05Z', server_version: '0.0.16', bytes: 4096, files: 3, dbs: 2, blobs: 0, drift: [] },
+      ...j.items,
+    ];
+    await route.fulfill({ response: r, json: j });
+  });
+}
+
+/** Пустой архив `.zip` (только конец каталога) для поля «Архив (.zip)» окна импорта. */
+function emptyZip(): string {
+  const dir = fileURLToPath(new URL('../../.tmp/e2e/', import.meta.url));
+  mkdirSync(dir, { recursive: true });
+  const f = `${dir}forms-empty.zip`;
+  writeFileSync(f, Buffer.from('PK\u0005\u0006'.padEnd(22, '\u0000'), 'latin1'));
+  return f;
 }

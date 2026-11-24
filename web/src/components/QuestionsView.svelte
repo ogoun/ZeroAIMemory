@@ -511,7 +511,7 @@
 <FormDialog
   open={deferQ !== null}
   title={DEFER_FORM.title}
-  subject={deferQ?.title}
+  subject={deferQ ? `Вопрос: ${deferQ.title}` : undefined}
   description="Идея вернётся к разбору не раньше этой даты."
   submit={DEFER_FORM.submit}
   error={dlgError}
@@ -535,7 +535,7 @@
   open={startQ !== null}
   confirm
   title="Начать идею в общем решении?"
-  subject={startQ?.title}
+  subject={startQ ? `Вопрос: ${startQ.title}` : undefined}
   submit={START_SUBMIT}
   error={dlgError}
   refocus={answeredHeading}

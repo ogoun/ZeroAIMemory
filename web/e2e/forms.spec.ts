@@ -16,7 +16,7 @@
 // видимой части» в `list.tsv` рядом, без проверок нового поведения: «до» — на сборке до правок
 // задачи, «после» — в конце задачи. Данные — REST по токену администратора (агент) и сессией
 // администратора в своём решении `seedForms`.
-import { expect, request as pwRequest, test, type Locator, type Page } from '@playwright/test';
+import { expect, request as pwRequest, test, type APIRequestContext, type Locator, type Page } from '@playwright/test';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -51,10 +51,17 @@ async function api<T = Record<string, unknown>>(method: string, path: string, bo
   return (r.status === 204 ? {} : await r.json()) as T;
 }
 
+/** Контексты запросов `adminSession` — закрываются после файла. */
+const sessionContexts: APIRequestContext[] = [];
+test.afterAll(async () => {
+  for (const s of sessionContexts.splice(0)) await s.dispose();
+});
+
 /** REST сессией администратора (cookie `ADMIN_STATE`, CSRF — из `auth/me`): разделы
  * администратора и свои токены, которых токену не дают. */
 async function adminSession(): Promise<<T = Record<string, unknown>>(method: string, path: string, body?: unknown) => Promise<T>> {
   const rc = await pwRequest.newContext({ baseURL: base(), storageState: ADMIN_STATE });
+  sessionContexts.push(rc);
   const me = (await (await rc.get('api/v1/auth/me')).json()) as { csrf: string };
   return async <T>(method: string, path: string, body?: unknown) => {
     const r = await rc.fetch(`api/v1/${path}`, { method, headers: { 'X-CSRF-Token': me.csrf }, data: body });
@@ -134,6 +141,7 @@ async function seedForms(): Promise<void> {
     E2E_FORMS_USER_TOKEN: people.userToken,
     E2E_FORMS_OWN_TOKEN: people.ownToken,
     E2E_FORMS_ACCESS_SOL: people.solution,
+    E2E_FORMS_PENDING_USER: people.pending,
     E2E_FORMS_CACHE_QUERY: cacheQuery,
   });
 }
@@ -145,7 +153,7 @@ type Session = Awaited<ReturnType<typeof adminSession>>;
 async function people10b(
   session: Session,
   tag: string,
-): Promise<{ user: string; userId: string; userToken: string; ownToken: string; solution: string; plain: string }> {
+): Promise<{ user: string; userId: string; userToken: string; ownToken: string; solution: string; plain: string; pending: string }> {
   const user = `e2e-forms-${tag}`;
   const u = await session<{ user: { id: string }; token: { plaintext: string } }>('POST', 'admin/users', { name: user });
   await session('POST', `admin/users/${u.user.id}/password`, { password: ['forms', 'e2e', 'pass', '1'].join('-') });
@@ -161,7 +169,16 @@ async function people10b(
   });
   if (r.status !== 202) throw new Error(`запрос доступа ${user}: HTTP ${r.status} ${await r.text()}`);
   await session('POST', `solutions/${solution}/access/${u.user.id}/approve`, { access: 'ro' });
-  return { user, userId: u.user.id, userToken, ownToken, solution, plain: u.token.plaintext };
+  // второй пользователь — запрос доступа ждёт решения («Отклонить запрос», ревью r1 задачи 10b)
+  const pending = `e2e-forms-wait-${tag}`;
+  const w = await session<{ token: { plaintext: string } }>('POST', 'admin/users', { name: pending });
+  const rw = await fetch(`${base()}api/v1/solutions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${w.token.plaintext}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ agent_solution_id: solution, name: `Доступ форм E2E ${tag}` }),
+  });
+  if (rw.status !== 202) throw new Error(`запрос доступа ${pending}: HTTP ${rw.status} ${await rw.text()}`);
+  return { user, userId: u.user.id, userToken, ownToken, solution, plain: u.token.plaintext, pending };
 }
 
 test.beforeAll(async () => {
@@ -689,7 +706,7 @@ if (!SNAP) {
           });
         }
 
-        if (phone && (row.id === 'task-create' || row.id === 'idea-create')) {
+        if (phone && (row.id === 'task-create' || row.id === 'idea-create' || row.id === 'term-new')) {
           for (const noNav of [false, true]) {
           test(`forms_phone_create_then_back ${row.id} ${w.name}${noNav ? ' no_nav_api' : ''}`, async ({ page }) => {
             if (noNav) await hideNavApi(page);
@@ -704,12 +721,13 @@ if (!SNAP) {
             await row.fill!(page);
             await submitOf(d).click();
             await expect(d).toBeHidden();
-            await expect(page).toHaveURL(/\/j\/(tasks|ideas)\/[0-9A-Z]{26}$/);
+            await expect(page).toHaveURL(/\/j\/(tasks|ideas|glossary)\/[0-9A-Z]{26}$/);
             await headingInView(page);
             expect(await page.evaluate(() => history.length)).toBe(len0 + 1);
             await page.goBack({ waitUntil: 'commit' });
             await expect(page).toHaveURL(board);
-            await expect(page.getByRole('button', { name: row.id === 'task-create' ? 'Новая задача' : 'Новая идея', exact: true })).toBeVisible();
+            const add = { 'task-create': 'Новая задача', 'idea-create': 'Новая идея', 'term-new': 'Новый термин' }[row.id]!;
+            await expect(page.getByRole('button', { name: add, exact: true })).toBeVisible();
           });
           }
         }

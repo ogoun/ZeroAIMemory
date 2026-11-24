@@ -13,6 +13,9 @@
   // «Импортировать», затем «Отмена» справа, «Проверить без записи» — дополнительной кнопкой слева;
   // на телефоне — во весь экран («✕ · Импорт архива · Импортировать», «Назад» закрывает окно).
   // Логика отправки прежняя: вопрос «Прервать отправку?» — свой, внутри окна, вверху тела.
+  // Несохранённое — выбранный архив или изменённые параметры до запуска (`dirty`): Esc, «✕»,
+  // «Отмена» и «Назад» сначала спрашивают в окне, как у прочих окон; после итога или ошибки
+  // запуска — нет (запуск был). Без файла обе кнопки запуска выключены.
   import { onDestroy, tick } from 'svelte';
   import FormDialog from './FormDialog.svelte';
   import {
@@ -69,6 +72,11 @@
   let keepBtn = $state<HTMLButtonElement | null>(null);
 
   let busy = $derived(phase !== 'idle');
+  /** Запуск был (итог или ошибка): выбранное «отправлено», вопрос о несохранённом не нужен. */
+  let ran = $state(false);
+
+  /** Выбран архив или изменены параметры, а запуска ещё не было. */
+  const unsent = (): boolean => phase === 'idle' && !ran && (file !== null || own || onConflict !== 'skip' || axioms !== 'demote');
 
   /** Отправка тела (до 202): прервать — `abort()`. */
   let sending: AbortController | null = null;
@@ -210,6 +218,7 @@
     job = null;
     sent = 0;
     total = f.size;
+    ran = true;
     phase = 'sending';
     askAbort = false;
     sending = new AbortController();
@@ -294,6 +303,8 @@
   description={`В пространство «${spaceName}»${userName ? ` пользователя ${userName}` : ''}: архив экспорта (.zip) или zip папки с заметками .md. Отчёты переносятся только импортом из WebUI.`}
   submit="Импортировать"
   {busy}
+  canSubmit={!!file}
+  dirty={unsent}
   {error}
   onsubmit={() => {
     void start(false);
@@ -322,6 +333,7 @@
             file = e.currentTarget.files?.[0] ?? null;
             result = null;
             error = '';
+            ran = false;
           }}
         />
       </label>

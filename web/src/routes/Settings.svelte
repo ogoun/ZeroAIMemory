@@ -110,7 +110,13 @@
       danger: true,
       run: async () => {
         await saveTpl(null);
-        if (tplError) throw new Error(tplError);
+        // отказ — одной строкой в окне (окно открыто), не ещё и на странице: иначе программа
+        // чтения прочла бы его дважды
+        if (tplError) {
+          const m = tplError;
+          tplError = '';
+          throw new Error(m);
+        }
       },
       refocus: () => document.querySelector('[aria-label="Текст шаблона"]'),
     };
