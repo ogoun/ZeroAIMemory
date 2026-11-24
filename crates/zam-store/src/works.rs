@@ -469,8 +469,8 @@ pub async fn finish(
 
 /// Запись принятого элемента итога (пробы, кандидаты) — в **той же транзакции**, что закрытие
 /// работы ([`finish_claimed`]): работу сняли, она истекла или закрыта другим итогом — не
-/// записано ничего. Варианты добавляют виды работ (задачи 4 и 7 плана M7.3); без фичи
-/// `test-hooks` перечисление пока пусто.
+/// записано ничего. Варианты добавляют виды работ (задачи 4 и 7 плана M7.3): кандидаты в Rules —
+/// [`ItemWrite::Rule`] и отказ исполнителя [`ItemWrite::RuleSkip`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ItemWrite {
     /// Тестовый вид `echo` (фича `test-hooks`): строка `proposals` типа [`ECHO_PROPOSAL_TYPE`]
@@ -481,6 +481,31 @@ pub enum ItemWrite {
         text: String,
         /// `agent` | `model`.
         author_kind: &'static str,
+        author: String,
+        session: Option<String>,
+    },
+    /// Кандидат в Rules — принятый элемент работы вида `rules` (§6.7 п. 3, задача 7 плана):
+    /// строка `proposals` типа `rule` (`proposed`, `payload {path, content}`, `targets` —
+    /// источник, ключ отсева — по ссылке источника, [`crate::proposals::key_source`]). Повтор по
+    /// ключу или предел открытых кандидатов к моменту записи — строки нет (WARN).
+    Rule {
+        target: String,
+        rev: i64,
+        path: String,
+        content: String,
+        reason: String,
+        author_kind: crate::proposals::ProposalAuthor,
+        author: String,
+        session: Option<String>,
+    },
+    /// Отказ исполнителя от элемента работы вида `rules` (`{n, skip: "почему"}`): строка
+    /// `skipped` с ключом по ссылке и ревизии ([`crate::proposals::key_source_rev`]) — источник
+    /// предлагается снова только в новой ревизии; человеку не показывается.
+    RuleSkip {
+        target: String,
+        rev: i64,
+        why: String,
+        author_kind: crate::proposals::ProposalAuthor,
         author: String,
         session: Option<String>,
     },
@@ -519,6 +544,75 @@ fn apply_write(t: &rusqlite::Transaction<'_>, w: &Work, x: &ItemWrite) -> Result
                     fmt_ts(now()),
                 ],
             )?;
+            Ok(())
+        }
+        ItemWrite::Rule {
+            ref target,
+            rev,
+            ref path,
+            ref content,
+            ref reason,
+            author_kind,
+            ref author,
+            ref session,
+        } => {
+            use crate::proposals::{self as pr, InsertOutcome, NewProposal, ProposalStatus};
+            let p = NewProposal {
+                space: w.space_id,
+                ptype: ProposalType::Rule,
+                status: ProposalStatus::Proposed,
+                targets: vec![pr::SourceRef {
+                    target: target.clone(),
+                    rev,
+                }],
+                payload: serde_json::json!({"path": path, "content": content}),
+                reason: Some(reason.clone()),
+                basis: vec![target.clone()],
+                dedup_key: Some(pr::key_source(ProposalType::Rule, target)),
+                author_kind,
+                author: Some(author.clone()),
+                work_id: Some(w.id),
+                session_id: session.clone(),
+            };
+            match pr::insert_tx(t, &p)? {
+                InsertOutcome::Inserted(_) => {}
+                InsertOutcome::Existing(id) => {
+                    tracing::warn!(work = %w.id, %target, proposal = %id, "кандидат в Rules: у источника уже есть предложение — не записан");
+                }
+                InsertOutcome::Full => {
+                    tracing::warn!(work = %w.id, %target, "кандидат в Rules: открытых кандидатов — предел, не записан");
+                }
+            }
+            Ok(())
+        }
+        ItemWrite::RuleSkip {
+            ref target,
+            rev,
+            ref why,
+            author_kind,
+            ref author,
+            ref session,
+        } => {
+            use crate::proposals::{self as pr, NewProposal, ProposalStatus};
+            let p = NewProposal {
+                space: w.space_id,
+                ptype: ProposalType::Rule,
+                status: ProposalStatus::Skipped,
+                targets: vec![pr::SourceRef {
+                    target: target.clone(),
+                    rev,
+                }],
+                payload: serde_json::json!({}),
+                reason: Some(why.clone()),
+                basis: Vec::new(),
+                dedup_key: Some(pr::key_source_rev(ProposalType::Rule, target, rev)),
+                author_kind,
+                author: Some(author.clone()),
+                work_id: Some(w.id),
+                session_id: session.clone(),
+            };
+            // повтор по ключу (та же ревизия) — без второй строки
+            pr::insert_tx(t, &p)?;
             Ok(())
         }
     }

@@ -189,7 +189,7 @@ pub async fn create(
     let path = NodePath::parse(&req.path)?;
     let key = idempotency_key(&headers)?;
     let sc = space_scope(&st, &p, &headers, &req.space, Mode::Write).await?;
-    let (node, content, created) = match req.kind {
+    let note = match req.kind {
         Kind::Folder => {
             if req.content.is_some() || req.l0.is_some() {
                 return Err(ApiError::BadRequest("у папки нет content и l0".into()));
@@ -199,45 +199,76 @@ pub async fn create(
                     "Idempotency-Key — только у заметок (kind: note)".into(),
                 ));
             }
-            (
-                create_folder(&sc.db, sc.space.id, path).await?,
-                String::new(),
-                true,
-            )
+            let node = create_folder(&sc.db, sc.space.id, path).await?;
+            after_create(&st, &sc);
+            let v = node_reply(&st, &p, &sc.db, sc.space.id, &node, "", None).await?;
+            return Ok((StatusCode::CREATED, Json(v)));
         }
-        Kind::Note => {
-            let content = req.content.unwrap_or_default();
-            check_size(&st, &content)?;
-            let attrib = attribution(&p, &headers, req.message)?;
-            let n = NewNote {
-                space_id: sc.space.id,
-                path,
-                content: content.clone(),
-                l0: req.l0,
-                attrib,
-            };
-            let (node, created) = create_note_keyed(&sc.db, n, key).await?;
-            (node, content, created)
-        }
+        Kind::Note => NoteReq {
+            path,
+            content: req.content.unwrap_or_default(),
+            l0: req.l0,
+            message: req.message,
+            key,
+        },
     };
-    // повтор по `Idempotency-Key` (M6 §16 п. 19) — 200 и узел в текущем виде, без уведомлений
-    if !created {
-        let (_, text) = node_content(&sc.db, node.id, Some(node.current_rev)).await?;
-        return Ok((
-            StatusCode::OK,
-            Json(node_reply(&st, &p, &sc.db, sc.space.id, &node, &text, None).await?),
-        ));
-    }
+    let (_, status, v) = create_note_in(&st, &p, &headers, &sc, note).await?;
+    Ok((status, Json(v)))
+}
+
+/// Новая заметка запроса ([`create_note_in`]).
+pub(crate) struct NoteReq {
+    pub path: NodePath,
+    pub content: String,
+    pub l0: Option<String>,
+    pub message: Option<String>,
+    pub key: Option<String>,
+}
+
+/// Уведомления после создания узла: свёртка рендера пространства, индексатор, конвейер
+/// документов.
+fn after_create(st: &AppState, sc: &crate::api::scope::MemScope) {
     st.render_gen.bump_space(sc.owner, sc.space.id);
     st.index.notify();
     st.docs.notify();
-    let mut v = node_reply(&st, &p, &sc.db, sc.space.id, &node, &content, None).await?;
+}
+
+/// Создание заметки в пространстве `sc` — код `POST /nodes` (заметка WebUI) и принятия кандидата
+/// в Rules (`api::proposals::accept`, M7.3 §6.7 п. 4: «тем же кодом, что заметка из WebUI»):
+/// предел размера, авторство запроса (`message` — сообщение ревизии), `Idempotency-Key`,
+/// уведомления, ответ `Node` с `warnings`. Узел, статус (201; повтор по ключу — 200) и ответ.
+pub(crate) async fn create_note_in(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    sc: &crate::api::scope::MemScope,
+    req: NoteReq,
+) -> Result<(Node, StatusCode, Value), ApiError> {
+    let content = req.content;
+    check_size(st, &content)?;
+    let attrib = attribution(p, headers, req.message)?;
+    let n = NewNote {
+        space_id: sc.space.id,
+        path: req.path,
+        content: content.clone(),
+        l0: req.l0,
+        attrib,
+    };
+    let (node, created) = create_note_keyed(&sc.db, n, req.key).await?;
+    // повтор по `Idempotency-Key` (M6 §16 п. 19) — 200 и узел в текущем виде, без уведомлений
+    if !created {
+        let (_, text) = node_content(&sc.db, node.id, Some(node.current_rev)).await?;
+        let v = node_reply(st, p, &sc.db, sc.space.id, &node, &text, None).await?;
+        return Ok((node, StatusCode::OK, v));
+    }
+    after_create(st, sc);
+    let mut v = node_reply(st, p, &sc.db, sc.space.id, &node, &content, None).await?;
     // создание по токену: базы нет — метка `‹secret›` значения не хранит (решение
     // координатора по задаче 6 M7.1)
-    if agent_view::masks(&p) {
+    if agent_view::masks(p) {
         secret_restore::attach_kept(&mut v, secret_restore::marks_in(&content));
     }
-    Ok((StatusCode::CREATED, Json(v)))
+    Ok((node, StatusCode::CREATED, v))
 }
 
 /// Ревизия из `If-Match`: `3`, `"3"` или `W/"3"`.

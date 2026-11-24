@@ -18,6 +18,7 @@ pub mod read;
 pub mod refs;
 pub mod release;
 pub mod report;
+pub mod rules;
 pub mod search;
 pub mod session_snapshot;
 pub mod sessions;

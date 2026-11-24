@@ -21,6 +21,7 @@ pub mod index;
 pub mod insights;
 pub mod nodes;
 pub mod previews;
+pub mod proposals;
 pub mod questions;
 pub mod read;
 pub mod read_focus;
@@ -266,6 +267,17 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
         .route("/api/v1/works/run", post(works::run))
         .route("/api/v1/works/{id}/result", post(works::result))
         .route("/api/v1/works/{id}/release", post(works::release))
+        // кандидаты в Rules (M7.3 §6.7): предложения человеку, не память — заметку создаёт
+        // только принятие человеком (`accept`, тем же кодом, что заметка WebUI)
+        .route(
+            "/api/v1/proposals",
+            get(proposals::list).post(proposals::create),
+        )
+        .route("/api/v1/proposals/counts", get(proposals::counts))
+        .route("/api/v1/proposals/{id}", get(proposals::get))
+        .route("/api/v1/proposals/{id}/accept", post(proposals::accept))
+        .route("/api/v1/proposals/{id}/decline", post(proposals::decline))
+        .route("/api/v1/proposals/{id}/withdraw", post(proposals::withdraw))
         .route("/api/v1/spaces", get(spaces::list))
         .route("/api/v1/spaces/{space}/tree", get(spaces::tree))
         // число записей разделов (M7 §5.3): чтение, не запись памяти

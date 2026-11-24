@@ -342,11 +342,14 @@ pub async fn prepare(db: &Db, mut w: Work, budget: usize) -> Result<Option<Prepa
     if w.items.is_empty() {
         return Ok(None);
     }
-    let cands: Vec<(usize, Candidate)> = w
-        .items
-        .iter()
-        .map(|i| (i.n, Candidate::from_item(i)))
+    // контекст вида (у `rules` — действующие заметки Rules) — запись `n="0"` перед элементами:
+    // данные, итога для неё нет (элемента `n = 0` в работе нет)
+    let mut cands: Vec<(usize, Candidate)> = kinds::context(w.kind, db, w.space_id)
+        .await?
+        .map(|c| (0, c))
+        .into_iter()
         .collect();
+    cands.extend(w.items.iter().map(|i| (i.n, Candidate::from_item(i))));
     let (text, payload, rest) = package::render_numbered(&w, &cands, w.kind, Lang::Ru, budget);
     if !rest.is_empty() {
         // хвост сверх бюджета — в следующую работу
@@ -616,6 +619,8 @@ pub async fn accept(
                 rejected.push(reject(Some(n), Some(it), "skip — строка с причиной"));
             } else {
                 skip.push(json!({"n": n, "target": it.target, "rev": it.rev, "why": why}));
+                // у `rules` отказ — ещё и строка `skipped` (отсев до новой ревизии, §6.7 п. 3)
+                writes.extend(kinds::skip_writes(w.kind, ctx, it, why));
             }
             continue;
         }

@@ -729,7 +729,8 @@ pub async fn run_payload(
         return Err(CallError::new(class));
     }
     let Scanned { payload, dropped } = second_scan(payload)?;
-    if payload.items.is_empty() {
+    // только контекст вида (`n = 0`, заметки Rules) без элементов работы — запроса нет
+    if payload.items.iter().all(|i| i.n == 0) {
         return Ok(ModelOutcome {
             json: Value::Null,
             dropped,

@@ -79,6 +79,7 @@
 | `agent_text_masked` | M7 §4.3.1–4.3.2 | Выдача агенту по токену — с `‹secret›` вместо значений секретов: тексты заметок и записей (`/read` — L1, L2, `section`, `range`, фокус, дифф `since_rev`; `GET /nodes` и `/entries`, ревизии и дифф истории, поле `diff` ответа 409), заголовки, `frontmatter`, поиск (`expand=section`, карточки), подсказки `/recall`, выжимки кэша, индекс `GET /file-refs`, 409 `term-conflict`, итог задания импорта, предпросмотр текста и листа, экспорт архива (опись `secrets_masked: true` — только если маска что-то заменила); флаги командной строки — только внутри кода Markdown. В тексте для правки текущей ревизии (L2 узла, поля `title`, `body`, `data`, `tags`, `area` записи журнала) — метки `‹secret-T-N›` (T — объект, ревизия и версия сканера, N — сквозной номер маски объекта); запись агента (`PUT`/`PATCH` узла, `PATCH` записи журнала, замещение) возвращает значения только у `‹secret-T-N›` — по меткам этого объекта и любой его ревизии; `‹secret›` и прочая метка записываются как есть (литерал, значение не восстанавливается) с предупреждением `secret_mark_kept`; значение, которое в итоге не покрыто находкой сканера, — 422 `secret_context_changed`; замещение с метками без ревизии старой записи — 428 (поле `supersedes_rev`). Сессии WebUI — исходник; раскрытие Vault и файлы `GET /blobs/…` — как есть (раздел «Секреты в выдаче агенту» ниже). Сервер без флага отдаёт токену исходник. |
 | `works` | M7.3 §6.1–§6.3 | Внутренние работы памяти: настройки исполнителя `works` в `GET/PATCH /auth/settings` и `/admin/users/{id}/settings` (`mode`, `kinds` — `{<вид>: режим}`, `null` в `PATCH` снимает вид; `model` — `{protocol, vault: "v:<id>", model, auth, max_tokens, token_field, body_extra, pinned}`, `confirm_url` подтверждения адреса; `limits`, `check: on|off`, `pause {class, since, from?, to?}` — пишет только сервер; `effective: {<вид>: {mode, reason}}`, причины `disabled`, `model_access_off`, `no_model`, `paused`), `warnings` ответа `PATCH`; `POST /works/model/test`, `GET /works/calls`; очередь `GET /works`, `GET /works/usage`, `POST /works/run`, `POST /works/{id}/result`, `POST /works/{id}/release`; пакет `POST /recall {event: "work"}`, строка работ дайджеста; MCP — событие `work` у `memory_recall`, вид `work` у `memory_log` (`required` — `["kind"]`); `zam work` (раздел «Внутренние работы» ниже). Сервер без флага — 400 на событие `work`, 404 на `/works*`. |
 | `memory_check` | M7 §6.4–§6.5 | Ночная проверка памяти: пробы (`probes`, ссылка `x:`), прогоны и вердикт к базе — `GET /check/status`, `GET /check/runs?limit=`, `GET /check/runs/{id}`, `POST /check/run` (ручной прогон: человек или токен `rw`, 202 `{run}`; идёт — 409 `/problems/check-running`; `[works] enabled = false` — 409 `/problems/works-disabled`), `POST /check/accept {run}` («Принять как норму» — только сессия WebUI, токен — 403; не последний ночной прогон эпизода — 409 `/problems/check-accept-not-latest`), `GET /check/probes?kind=&status=&split=`; строка дайджеста `session_start` при регрессии; ключ конфигурации `[works] check`, настройка пользователя `works.check`. Раздел «Ночная проверка памяти» ниже. Сервер без флага маршрутов `/check` не знает (404). |
+| `proposals` | M7.3 §6.7 | Кандидаты в Rules (предложения человеку, ссылка `o:`): `POST /proposals {type: "rule", path, content, reason, basis?}` (токен `rw`; 201 `{proposal: "o:<id>"}`, тот же путь и текст — 200 `existing: true`; открытых 50 — 409 `/problems/proposals-full`), `GET /proposals?type=&status=&author=me`, `GET /proposals/counts` → `{rules}`, `GET /proposals/{id}` (с `rules_tokens {now, after}`), `POST /proposals/{id}/accept {path?, content?}` и `/decline {note?}` (только сессия WebUI, токен — 403), `/withdraw` (автор-агент); поле `candidate` у MCP `memory_write`; `detail` 403 записи агента в Rules — с подсказкой `candidate`; вид работы `rules`; `zam rules`. Раздел «Кандидаты в Rules» ниже. Сервер без флага — 404 на `/proposals*`, поле `candidate` MCP не знает (запись в Rules — 403). |
 
 Правило для разработки сервера: задача, которая вводит возможность или ключ конфигурации,
 добавляет строку в `FEATURES` (`crates/zam-server/src/api/health.rs`) и строку в эту таблицу;
@@ -772,3 +773,55 @@ CLI `zam`, свой клиент) получает значения, похож�
   (цель — первая работа строки), в том числе у вызова из MCP.
 - **CLI** `zam work status | next [--kind K] [--budget N] | put <файл.json> [--key K] | release
   j:<id>`; сервер без флага — код 1 «нужен zam-server 0.0.16-m7.3 или новее».
+
+## Кандидаты в Rules (`proposals`)
+
+С 0.0.16-m7.3 (M7.3 §6.7, флаг `proposals`). Rules пишет человек; агент **предлагает** правило, а
+человек принимает или отклоняет его в WebUI. Предложение `o:<id>` — служебный объект (строка
+`proposals`, не запись памяти): `memory_read` его не читает, в экспорт и архив пространства оно
+не входит, само ничего не применяет. Ответы токену — с маской `‹secret›`, человеку — исходник.
+
+- **`POST /proposals {type: "rule", path, content, reason, basis?, session_id?}`** — спонтанный
+  кандидат, только токен `rw` (токен `ro` и сессия WebUI — 403). `path` — путь заметки Rules
+  (`rules:/<путь>` или путь; другое пространство — 400). Проверка — та же, что у элемента работы
+  вида `rules`: `content` до 200 токенов (счётчик выдачи), без маски `‹secret›`, URL и блоков кода
+  (огороженных и отступом — по разбору Markdown; вложенный список и однострочный код — можно) —
+  иначе 422; `reason` — 20..=2000 символов (422); путь занят — 409 `code: path_taken` (`path`,
+  `node`); почти-дубль заметки Rules (тот же нормализованный заголовок или dense-косинус не ниже
+  `insights.dedup_threshold`) — 409 `code: rule_duplicate` (`similar: [{ref, path, reason, score}]`);
+  `basis` — до 20 ссылок (`i:<id>`, `n:<id>`, `file:<путь>`, `commit:<sha>`). Ответ 201
+  `{proposal: "o:<id>", status: "proposed", existing: false}`; тот же путь и текст — 200 с прежним
+  `o:` и его статусом (`existing: true`); открытых кандидатов 50 — 409 `/problems/proposals-full`.
+  Автор — сессия запроса (`X-Zam-Session`, `session_id`), если есть.
+- **`GET /proposals?type=&status=&author=&limit=`** → `{proposals: [{id: "o:<id>", type, status,
+  space, path, content, reason, basis, targets: [{ref, rev}], author_kind, author, work, session,
+  shell, created_at, decided_at, decided_by, decision_note, result_ref}]}` — новые первыми; `type`
+  — `rule` (по умолчанию, иное — 400), `status` — `proposed | accepted | declined | withdrawn |
+  stale | skipped` (без него — все, кроме `skipped`: отказ исполнителя человеку не показывается),
+  `author` — `me` (агенты пользователя, то же, что `agent`) | `agent` | `model`; `limit` 1..=200
+  (50). `shell` — в тексте есть команды shell (`$ …`, `cmd /c`, `powershell`): пометка WebUI.
+- **`GET /proposals/counts`** → `{rules}` — открытых кандидатов (метка дерева «кандидаты: N»).
+- **`GET /proposals/{id}`** (`o:<id>` или id) — карточка и `rules_tokens {now, after}` (оценка Rules
+  в дайджесте сейчас и с кандидатом, токенов), `sources: [{ref, rev, current_rev?, kind?, title?,
+  live}]` — источники и основание.
+- **`POST /proposals/{id}/accept {path?, content?}`** — только сессия WebUI (токен — 403): путь и
+  текст можно поправить (маска секрета — 422); заметка Rules создаётся тем же кодом, что заметка
+  WebUI (автор — человек, сообщение ревизии — «из предложения o:<id> (model:<имя> | сессия <id>)»);
+  путь занят — 409 `code: path_taken`; не `proposed` — 409 `code: not_open`. Ответ `{proposal,
+  note}`; предложение `accepted`, `result_ref: "n:<id>"`; аудит `proposal.accept {id, type,
+  result}` без текста.
+- **`POST /proposals/{id}/decline {note?}`** — только сессия WebUI: `declined` (источник работы
+  больше не предлагается ни в какой ревизии); аудит `proposal.decline {id, type}`.
+- **`POST /proposals/{id}/withdraw`** — автор отзывает своё: токен `rw` пользователя и предложение
+  агента (`author_kind = agent`); человеку и предложению модели — 403.
+- **403 записи в Rules** по токену без `rules.agent_write`: тип прежний (`about:blank`), `detail` —
+  «… предложите правило: memory_write {path: "rules:/<путь>", content, candidate: {reason}} …».
+- **MCP**: поле `candidate {reason, basis?}` у `memory_write` с `path: "rules:/<путь>"` и
+  `content` → `POST /proposals` (без `base_rev`, `ops`, `l0`).
+- **Вид работы `rules`** (внутренние работы, флаг `works`): источники — действующие insight
+  `decision` с `certainty = axiom` и `gotcha | pattern` с `useful ≥ 2` или `opened ≥ 3` из
+  Knowledge и решений (без записей участников); элемент итога — `{n, rule: {path, title, content},
+  reason}` (та же проверка), отказ `{n, skip}` — строка `skipped` (до новой ревизии источника);
+  запись пакета `n="0"` — действующие заметки Rules (итога для неё нет).
+- **CLI** `zam rules candidate <путь> --file F --reason R [--basis ID]…`, `zam rules candidates
+  [--status S]`; сервер без флага — код 1 «обновите zam-server до 0.0.16-m7.3 или новее».

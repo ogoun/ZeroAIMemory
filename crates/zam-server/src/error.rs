@@ -110,6 +110,10 @@ pub enum ApiError {
     /// захватившей её (`running`), — работа снята, истекла, закрыта или захвачена другой сессией.
     #[error("{0}")]
     WorkNotClaimed(String),
+    /// 409 `/problems/proposals-full` (M7.3 §6.7 п. 2): открытых кандидатов в Rules у
+    /// пользователя — предел (`zam_store::proposals::PROPOSALS_OPEN_MAX`).
+    #[error("{0}")]
+    ProposalsFull(String),
     /// 409 `/problems/backup-running` (M7 §5.6): копия в процессе сервера уже идёт — со страницы
     /// «Копии» или по расписанию (один замок); тело несёт `running {started_at, by}`.
     #[error("копия уже идёт ({}): дождитесь её конца", backup_by_text(.0.by))]
@@ -298,6 +302,9 @@ impl ApiError {
                 "/problems/work-not-claimed",
                 "Conflict",
             ),
+            ApiError::ProposalsFull(_) => {
+                (StatusCode::CONFLICT, "/problems/proposals-full", "Conflict")
+            }
             ApiError::BackupRunning(_) => {
                 (StatusCode::CONFLICT, "/problems/backup-running", "Conflict")
             }

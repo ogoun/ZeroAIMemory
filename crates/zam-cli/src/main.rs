@@ -288,6 +288,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: WorkCmd,
     },
+    /// Кандидаты в Rules: предложить правило (решает человек в WebUI), свои кандидаты
+    Rules {
+        #[command(subcommand)]
+        cmd: RulesCmd,
+    },
     /// Словарь домена: список терминов «имя — определение» или карточка по имени или псевдониму
     Glossary {
         /// Имя или псевдоним термина (без него — весь список)
@@ -1086,6 +1091,52 @@ fn work(c: WorkCmd) -> Result<(), CliError> {
             w::put(&cmd::connect(&common)?, &file, key.as_deref())
         }
         WorkCmd::Release { work, common } => w::release(&cmd::connect(&common)?, &work),
+    }
+}
+
+/// `zam rules` (M7.3 §6.7 п. 2).
+#[derive(Subcommand)]
+enum RulesCmd {
+    /// Предложить правило для Rules: текст из файла (до 200 токенов, без URL и блоков кода);
+    /// принимает или отклоняет человек
+    Candidate {
+        /// Путь заметки Rules (rules:/<путь> или путь)
+        path: String,
+        /// Файл с текстом правила
+        #[arg(long)]
+        file: PathBuf,
+        /// Почему это правило для всех проектов (20–2000 символов)
+        #[arg(long)]
+        reason: String,
+        /// Ссылка основания (i:<id>, n:<id>, …); можно несколько раз
+        #[arg(long)]
+        basis: Vec<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Свои кандидаты в Rules (без --status — все, кроме отказов исполнителя)
+    Candidates {
+        /// Статус: proposed, accepted, declined, withdrawn
+        #[arg(long)]
+        status: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+}
+
+fn rules(c: RulesCmd) -> Result<(), CliError> {
+    use cmd::rules as r;
+    match c {
+        RulesCmd::Candidate {
+            path,
+            file,
+            reason,
+            basis,
+            common,
+        } => r::candidate(&cmd::connect(&common)?, &path, &file, &reason, &basis),
+        RulesCmd::Candidates { status, common } => {
+            r::candidates(&cmd::connect(&common)?, status.as_deref())
+        }
     }
 }
 
@@ -2415,6 +2466,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
         Cmd::Question { cmd } => question(cmd),
         Cmd::Idea { cmd } => idea(cmd),
         Cmd::Work { cmd } => work(cmd),
+        Cmd::Rules { cmd } => rules(cmd),
         Cmd::Cache { cmd } => cache(cmd),
         Cmd::Sessions { cmd } => sessions(cmd),
         Cmd::Check { cmd } => check(cmd),

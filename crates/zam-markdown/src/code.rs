@@ -4,9 +4,29 @@
 //! флагов сканера); здесь — сегментация предложений ([`crate::split_sentences`]: внутри кода
 //! границ нет) и маска прозы ([`prose_mask`], M6.6 §6.1: имена и псевдонимы терминов в коде не
 //! ищутся). Блоки с отступом в 4 пробела кодом не считаются.
+//!
+//! Исключение — [`has_code_block`] (M7.3 §6.7 п. 3, кандидат в Rules): «есть ли в тексте блок
+//! кода» решает разбор comrak по правилам CommonMark (огороженный блок и блок отступом — только
+//! после пустой строки и вне списка), а не построчное определение выше: вложенный список и
+//! продолжение строки с четырьмя пробелами — не блок.
 
+use comrak::nodes::NodeValue;
+use comrak::{Arena, parse_document};
 use zam_secrets::code::code_spans_of;
 pub(crate) use zam_secrets::code::{Line, code_spans, fence_of, fenced_lines, lines_of};
+
+use crate::options::comrak_options;
+
+/// Есть ли в Markdown `src` блок кода — огороженный (```` ``` ````, `~~~`) или отступом
+/// (CommonMark: 4 пробела после пустой строки, вне элемента списка) на любой глубине (цитата,
+/// элемент списка); разбор — comrak с [`comrak_options`] (frontmatter — не блок). Инлайн-код
+/// `` `…` `` — не блок. [`crate::Doc`] из [`crate::parse`] блоков кода не отдаёт.
+pub fn has_code_block(src: &str) -> bool {
+    let arena = Arena::new();
+    let root = parse_document(&arena, src, &comrak_options());
+    root.descendants()
+        .any(|n| matches!(n.data().value, NodeValue::CodeBlock(_)))
+}
 
 /// Проза `text` без кода (M6.6 §6.1): блоки в ограждениях (```` ``` ````, `~~~`, вместе со
 /// строками ограждений; незакрытый — до конца текста) и инлайн-код `` `…` `` заменены пробелами
@@ -135,6 +155,30 @@ mod tests {
         assert_eq!(prose_mask_prefix("a ``b` c"), format!("a {}", sp(6)));
         assert_eq!(prose_mask_prefix("a\n```\nb"), "a\n   \n ");
         assert_eq!(prose_mask_prefix("проза"), "проза");
+    }
+
+    /// M7.3 §6.7 п. 3: блок кода — огороженный (и в цитате, в элементе списка) и отступом после
+    /// пустой строки; вложенный список с четырьмя пробелами, продолжение строки отступом и
+    /// однострочный код в обратных кавычках — не блок; frontmatter — не блок.
+    #[test]
+    fn has_code_block_cases() {
+        for (src, want) in [
+            ("Правило.\n\n```sh\nrm -rf /\n```\n", true),
+            ("~~~\nкод\n~~~", true),
+            ("```\nнезакрытый", true),
+            ("Текст.\n\n    let x = 1;\n", true),
+            ("> цитата\n>\n> ```\n> код\n> ```\n", true),
+            ("- пункт\n\n  ```\n  код\n  ```\n", true),
+            ("- пункт\n    - вложенный пункт\n    - ещё\n", false),
+            ("1. шаг\n    1. подшаг\n", false),
+            ("Абзац, который\n    продолжается с отступом.\n", false),
+            ("Запускай `cargo test` перед коммитом.", false),
+            ("Используй ``a `b` c`` как есть.", false),
+            ("---\ntags: [a]\n---\nПравило без кода.", false),
+            ("", false),
+        ] {
+            assert_eq!(has_code_block(src), want, "{src:?}");
+        }
     }
 
     /// Круг правок 5 задачи 5 M7.1: маска прозы (имена терминов в коде не ищутся) и сегментация

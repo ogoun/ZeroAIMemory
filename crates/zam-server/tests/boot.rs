@@ -223,6 +223,10 @@ async fn revoked_admin_tokens_do_not_issue_new_initial_token() {
     for t in st.system.list_tokens(admin.id).await.unwrap() {
         st.system.revoke_token(t.id).await.unwrap();
     }
+    // штатная остановка перед пересборкой на том же каталоге — как в
+    // `first_run_creates_admin_and_token_once`: шаги старта ночного исполнителя держат клон
+    // состояния (и лок каталога), `shutdown` их дожидается
+    st.shutdown().await;
     drop((app, st));
     let (_, st, rep) = build(cfg_in(d), Some("pw".into())).await.unwrap();
     assert!(rep.initial_token.is_none());
