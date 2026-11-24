@@ -15,6 +15,10 @@
 //!   (`target_gone`, [`retire_gone`]) при следующем прогоне; изменённая цель пробу не снимает.
 //! - **Ссылки целей** — `<буква>:<id>` (`n:` заметки, `i:` insight, буквы журналов —
 //!   `zam_store::EntryKind::ref_letter`), ревизия — на момент пробы.
+//! - **Источники вида работы `probes`** ([`probe_sources`], [`source_text`]; задача 4 плана
+//!   M7.3): insight, термины и заметки пространства без активной пробы, все ревизии — владельца
+//!   базы; принятые пробы итога пишет закрытие работы (`crate::works::ItemWrite::Probe`) той же
+//!   [`insert_probe`]-проверкой в своей транзакции.
 use std::collections::HashSet;
 
 use jiff::Timestamp;
@@ -244,7 +248,9 @@ fn active_questions(c: &Connection, space: &str) -> Result<HashSet<String>, Stor
     Ok(out)
 }
 
-fn insert_tx(c: &Connection, p: &NewProbe) -> Result<InsertOutcome, StoreError> {
+/// Запись пробы в транзакции вызывающего (повтор вопроса — `Duplicate`, предел — `Full`): общая
+/// для [`insert_probe`] и записи принятых проб внутренней работы (`crate::works`).
+pub(crate) fn insert_tx(c: &Connection, p: &NewProbe) -> Result<InsertOutcome, StoreError> {
     let space = space_col(p.space);
     if active_questions(c, &space)?.contains(&normalize_query(&p.question)) {
         return Ok(InsertOutcome::Duplicate);
@@ -396,14 +402,227 @@ pub async fn retire_probe(db: &Db, id: Id, reason: &str) -> Result<bool, StoreEr
 /// `nightly`, ручной — с начала суток UTC по `manual`. Снятые после записи тоже считаются.
 pub async fn new_probes_since(db: &Db, origin: &str, since: Timestamp) -> Result<u32, StoreError> {
     let origin = origin.to_string();
+    db.read(move |c| new_since_tx(c, &origin, since)).await
+}
+
+/// [`new_probes_since`] в соединении вызывающего (сверка предела при записи принятых проб в
+/// транзакции закрытия работы).
+pub(crate) fn new_since_tx(
+    c: &Connection,
+    origin: &str,
+    since: Timestamp,
+) -> Result<u32, StoreError> {
+    let n: i64 = c.query_row(
+        "SELECT count(*) FROM probes p JOIN works w ON w.id = p.work_id
+         WHERE p.kind = 'probe' AND w.origin = ?1 AND p.created_at >= ?2",
+        params![origin, fmt_ts(since)],
+        |r| r.get(0),
+    )?;
+    Ok(u32::try_from(n).unwrap_or(u32::MAX))
+}
+
+/// Активных проб с целью в базе (предел [`PROBES_MAX`]).
+pub async fn active_targeted(db: &Db) -> Result<u32, StoreError> {
+    db.read(active_with_target).await
+}
+
+/// Есть ли у активной пробы пространства `space` та же нормализованная строка вопроса
+/// ([`crate::normalize_query`]) — повтор, который [`insert_probe`] не запишет.
+pub async fn question_taken(db: &Db, space: Id, question: &str) -> Result<bool, StoreError> {
+    let q = normalize_query(question);
+    db.read(move |c| Ok(active_questions(c, &space.to_string())?.contains(&q)))
+        .await
+}
+
+// ---------- источники проб вида работы `probes` (§6.4 п. 2, задача 4 плана M7.3) ----------
+
+/// Запись-кандидат пробы вида работы `probes`: insight, термин или заметка пространства.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeSource {
+    pub id: Id,
+    /// Ссылка: `i:<id>` (insight), `t:<id>` (термин), `n:<id>` (заметка).
+    pub target: String,
+    /// Текущая ревизия записи.
+    pub rev: i64,
+    /// `insight` | `term` | `note`.
+    pub kind: String,
+    /// Слой сборщика: `insight:<data.kind>` (без вида — `insight`), `note`, `term`.
+    pub layer: String,
+}
+
+/// Заголовок (у записи — `title`, у заметки — «первый H1 (путь)», без H1 — путь) и текст
+/// источника пробы: у insight — тело, у термина — определение и тело, у заметки — текст текущей
+/// ревизии без frontmatter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceText {
+    pub title: String,
+    pub text: String,
+}
+
+/// Ссылки целей активных проб базы (любого вида и ревизии: изменённая цель пробу не снимает —
+/// вопрос о той же записи).
+fn probed_refs(c: &Connection) -> Result<HashSet<String>, StoreError> {
+    let mut st = c.prepare_cached(
+        "SELECT targets FROM probes WHERE status = 'active' AND kind != 'negative'",
+    )?;
+    let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+    let mut out = HashSet::new();
+    for t in rows {
+        if let Ok(ts) = serde_json::from_str::<Vec<ProbeTarget>>(&t?) {
+            out.extend(ts.into_iter().map(|t| t.target));
+        }
+    }
+    Ok(out)
+}
+
+/// Источники проб пространства `space` базы владельца `owner` (§6.4 п. 2, §6 «Общее»): живые
+/// insight (кроме замещённых и отозванных) и термины, заметки; без записей, к которым приложил
+/// руку участник общего решения (автор **любой** ревизии — не владелец; ревизии без `user_id` —
+/// владельца), без исключённых из индекса (их поиск не находит — проба ничего не меряет) и без
+/// записей с активной пробой. Задачи, вопросы, идеи, changelog, выпуски и отчёты не берутся
+/// никогда. Порядок — по id (порядок слоёв задаёт сборщик сервера).
+pub async fn probe_sources(db: &Db, owner: Id, space: Id) -> Result<Vec<ProbeSource>, StoreError> {
     db.read(move |c| {
-        let n: i64 = c.query_row(
-            "SELECT count(*) FROM probes p JOIN works w ON w.id = p.work_id
-             WHERE p.kind = 'probe' AND w.origin = ?1 AND p.created_at >= ?2",
-            params![origin, fmt_ts(since)],
-            |r| r.get(0),
+        let probed = probed_refs(c)?;
+        let mut out = Vec::new();
+        {
+            let mut st = c.prepare_cached(
+                "SELECT e.id, e.kind, e.current_rev, json_extract(e.data, '$.kind') FROM entries e
+                 WHERE e.space_id = ?1 AND e.deleted_at IS NULL AND e.kind IN ('insight', 'term')
+                   AND (e.status IS NULL OR e.status NOT IN ('superseded', 'retracted'))
+                   AND e.index_state != 'excluded'
+                   AND (e.user_id IS NULL OR e.user_id = ?2)
+                   AND NOT EXISTS (SELECT 1 FROM entry_revisions r WHERE r.entry_id = e.id
+                                   AND r.user_id IS NOT NULL AND r.user_id != ?2)
+                 ORDER BY e.id",
+            )?;
+            let rows = st.query_map(params![space, owner], |r| {
+                Ok((
+                    r.get::<_, Id>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Option<String>>(3).unwrap_or(None),
+                ))
+            })?;
+            for row in rows {
+                let (id, kind, rev, data_kind) = row?;
+                // буква ссылки — по виду записи, как у `owner_entries` (ревью r1, M8)
+                let Some(letter) = EntryKind::parse(&kind).map(EntryKind::ref_letter) else {
+                    continue;
+                };
+                let layer = if kind == "term" {
+                    "term".to_string()
+                } else {
+                    match data_kind.as_deref().map(str::trim) {
+                        Some(k) if !k.is_empty() => format!("insight:{k}"),
+                        _ => "insight".to_string(),
+                    }
+                };
+                let target = format!("{letter}:{id}");
+                if probed.contains(&target) {
+                    continue;
+                }
+                out.push(ProbeSource {
+                    id,
+                    target,
+                    rev,
+                    kind,
+                    layer,
+                });
+            }
+        }
+        let mut st = c.prepare_cached(
+            "SELECT n.id, n.current_rev FROM nodes n
+             WHERE n.space_id = ?1 AND n.kind = 'note' AND n.deleted_at IS NULL
+               AND n.index_state != 'excluded'
+               AND NOT EXISTS (SELECT 1 FROM revisions r WHERE r.node_id = n.id
+                               AND r.user_id IS NOT NULL AND r.user_id != ?2)
+             ORDER BY n.id",
         )?;
-        Ok(u32::try_from(n).unwrap_or(u32::MAX))
+        let rows = st.query_map(params![space, owner], |r| {
+            Ok((r.get::<_, Id>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (id, rev) = row?;
+            let target = format!("n:{id}");
+            if probed.contains(&target) {
+                continue;
+            }
+            out.push(ProbeSource {
+                id,
+                target,
+                rev,
+                kind: "note".into(),
+                layer: "note".into(),
+            });
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// Текст заметки без frontmatter и первый заголовок первого уровня — разбором Markdown
+/// ([`zam_markdown::parse`], как у чанков и секций; ревью r2 задачи 4, N4): ATX `# …` и setext
+/// `…` + `===`; строка кода с отступом и заголовок в блоке кода — не заголовок.
+fn note_text_h1(content: &str) -> (&str, Option<String>) {
+    let doc = zam_markdown::parse(content);
+    let h1 = doc
+        .headings
+        .iter()
+        .find(|h| h.level == 1)
+        .map(|h| h.text.trim().to_string())
+        .filter(|h| !h.is_empty());
+    (content.get(doc.body_start..).unwrap_or(content), h1)
+}
+
+/// Заголовок и текст источника `src` в его ревизии; запись удалена или исправлена (ревизия
+/// другая) — `None`. Заголовок заметки — её первый H1 и путь («H1 (путь)»; без H1 — путь):
+/// человеческий заголовок заметки — H1, и пересказ его проверка пробы ловит (ревью r1, M5).
+pub async fn source_text(db: &Db, src: &ProbeSource) -> Result<Option<SourceText>, StoreError> {
+    let src = src.clone();
+    db.read(move |c| {
+        if src.kind == "note" {
+            let row: Option<(String, String)> = c
+                .query_row(
+                    "SELECT n.path, r.content FROM nodes n
+                     JOIN revisions r ON r.node_id = n.id AND r.rev = n.current_rev
+                     WHERE n.id = ?1 AND n.deleted_at IS NULL AND n.current_rev = ?2",
+                    params![src.id, src.rev],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            return Ok(row.map(|(path, content)| {
+                let (text, h1) = note_text_h1(&content);
+                let text = text.trim();
+                let title = match h1 {
+                    Some(h) => format!("{h} ({path})"),
+                    None => path,
+                };
+                SourceText {
+                    title,
+                    text: text.to_string(),
+                }
+            }));
+        }
+        let row: Option<(String, String, Option<String>)> = c
+            .query_row(
+                "SELECT title, body, json_extract(data, '$.definition') FROM entries
+                 WHERE id = ?1 AND deleted_at IS NULL AND current_rev = ?2",
+                params![src.id, src.rev],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2).unwrap_or(None))),
+            )
+            .optional()?;
+        Ok(row.map(|(title, body, definition)| {
+            let body = body.trim();
+            let text = match definition.as_deref().map(str::trim) {
+                Some(d) if !d.is_empty() && src.kind == "term" && !body.is_empty() => {
+                    format!("{d}\n{body}")
+                }
+                Some(d) if !d.is_empty() && src.kind == "term" => d.to_string(),
+                _ => body.to_string(),
+            };
+            SourceText { title, text }
+        }))
     })
     .await
 }

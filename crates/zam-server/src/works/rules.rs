@@ -542,12 +542,14 @@ fn source_kind(ik: &str, axiom: bool, space: SpaceKind) -> bool {
 
 /// Кандидаты вида `rules` пространства Rules `space` пользователя `user` (§6.7 п. 3, см.
 /// модуль): детерминированно (пространства — Knowledge, затем решения; записи — старые первыми),
-/// не больше `limit` и свободных мест до предела открытых кандидатов.
+/// не больше `limit` и свободных мест до предела открытых кандидатов, без пар `exclude` —
+/// отправленных в пакетах этого запуска.
 pub async fn collect(
     ctx: &NightCtx,
     user: Id,
     space: Id,
     limit: usize,
+    exclude: &HashSet<(String, i64)>,
 ) -> Result<Vec<Candidate>, StoreError> {
     let db = ctx.st().users.get(user).await?;
     if rules_space(&db).await? != space {
@@ -562,7 +564,10 @@ pub async fn collect(
     // отсев принятых — строками `proposals` (ключ по источнику, отзыв автором не в счёт), а не
     // `accepted_refs`: принятый элемент, чью строку закрытие не записало (предел, повтор), и
     // отозванный автором источник снова кандидаты (ревью r1, Minor 5–6)
-    let skip = store::excluded_refs(&db, WorkKind::Rules).await?;
+    let mut skip = store::excluded_refs(&db, WorkKind::Rules).await?;
+    // отправленное в пакетах этого запуска (ночь, сутки ручных запусков) — до `limit`, как у
+    // `probes` (`zam_store::works::offered_refs`, решение координатора 80)
+    skip.extend(exclude.iter().cloned());
     let mut out = Vec::new();
     for (src, src_kind) in source_spaces(&db).await? {
         if out.len() >= limit || ctx.stopping() {
@@ -756,9 +761,15 @@ fn author_of(a: &Author) -> (ProposalAuthor, String, Option<String>) {
 }
 
 /// Проверка элемента итога `{n, rule: {path, title?, content}, reason, target?}` — та же, что у
-/// спонтанного кандидата ([`check_candidate`]); принятый — [`ItemWrite::Rule`] (запись — в
-/// транзакции закрытия работы).
-pub async fn accept(ctx: &ItemCtx<'_>, n: usize, item: &Value) -> Result<Vec<ItemWrite>, Reject> {
+/// спонтанного кандидата ([`check_candidate`]); `prior` — записи принятых раньше элементов этого
+/// итога (тот же путь — отказ, место до предела — вместе с ними); принятый — [`ItemWrite::Rule`]
+/// (запись — в транзакции закрытия работы).
+pub async fn accept(
+    ctx: &ItemCtx<'_>,
+    n: usize,
+    item: &Value,
+    prior: &[ItemWrite],
+) -> Result<Vec<ItemWrite>, Reject> {
     let Some(it) = ctx.work.item(n) else {
         return Err(Reject::new("нет элемента с таким n в пакете"));
     };
@@ -792,7 +803,23 @@ pub async fn accept(ctx: &ItemCtx<'_>, n: usize, item: &Value) -> Result<Vec<Ite
     // запись, которой не будет, — отказ с причиной уже здесь (ревью r1, Minor 6); гонка между
     // проверкой и закрытием работы — предупреждение итога (`zam_store::works::finish_claimed`)
     let store_failed = |e: StoreError| Reject::new(RuleError::from(e).reason());
-    if pr::counts(ctx.db).await.map_err(store_failed)?.rules >= pr::PROPOSALS_OPEN_MAX {
+    // принятые раньше кандидаты этого итога (`prior`): тот же путь — повтор внутри итога, место —
+    // вместе с ними
+    let earlier: Vec<&str> = prior
+        .iter()
+        .filter_map(|x| match x {
+            ItemWrite::Rule { path, .. } => Some(path.as_str()),
+            _ => None,
+        })
+        .collect();
+    if earlier.contains(&c.path.as_str()) {
+        return Err(Reject::new(format!(
+            "путь rules:/{} уже у другого элемента этого итога — предложите другой путь",
+            c.path
+        )));
+    }
+    let open = pr::counts(ctx.db).await.map_err(store_failed)?.rules as usize;
+    if open + earlier.len() >= pr::PROPOSALS_OPEN_MAX as usize {
         return Err(Reject::new(format!(
             "открытых кандидатов в Rules — {}: новый не записывается, пока человек не решит по \
              прежним",

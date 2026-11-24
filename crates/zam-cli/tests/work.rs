@@ -49,8 +49,17 @@ impl Srv {
                 let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();
                 let u = st.system.create_user("Анна", false).await.unwrap();
                 let (_, t) = st.system.issue_token(u.id, "t", Access::Rw).await.unwrap();
+                // режим агента у тестового вида `echo`; настоящие виды — `off` (их сборщики
+                // ставили бы свои работы)
                 st.system
-                    .set_user_settings(u.id, vec![("works.mode".into(), json!("agent"))])
+                    .set_user_settings(
+                        u.id,
+                        vec![
+                            ("works.mode".into(), json!("agent")),
+                            ("works.kind.probes".into(), json!("off")),
+                            ("works.kind.rules".into(), json!("off")),
+                        ],
+                    )
                     .await
                     .unwrap();
                 st.user_flags.invalidate(u.id);

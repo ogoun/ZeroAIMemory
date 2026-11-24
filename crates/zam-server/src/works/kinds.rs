@@ -4,8 +4,8 @@
 //! Один построитель пакета ([`super::package`]) и одна проверка итога ([`super::queue::accept`])
 //! для агента и модели (решение координатора 32); виды отличаются только ветками `match` здесь:
 //!
-//! - `probes` (задача 4 плана) — заготовка: сборщик пуст (работ вида нет), инструкция и схема —
-//!   короткие, элемент отклоняется; ветку заменит задача 4;
+//! - `probes` (задача 4 плана) — пробные вопросы ночной проверки ([`super::probes`]): сборщик
+//!   по слоям, инструкция, схема и проверка вопроса, пределы проб;
 //! - `rules` (задача 7) — кандидаты в Rules ([`super::rules`]): сборщик, инструкция, схема,
 //!   проверка элемента (общая со спонтанным кандидатом агента), отказ исполнителя — строка
 //!   `skipped`, контекст пакета — действующие заметки Rules (запись `n="0"`);
@@ -14,14 +14,17 @@
 //!   пакета, итога и режима модели).
 //!
 //! **Что уходит наружу** (§6 «Общее»): сборщики берут только записи решений и Knowledge владельца
-//! базы (Rules — у `rules`), автор каждой ревизии — владелец ([`zam_store::works::owner_entries`]);
+//! базы и заметки его Rules, автор каждой ревизии — владелец
+//! ([`zam_store::works::owner_entries`], [`zam_store::probes::probe_sources`]);
 //! Human, Vault, вложения, снимки сессий и записи других баз сборщикам недоступны. Текст
 //! кандидата — **вид агента**: маска `‹secret›` на весь текст записи, затем обрезка до
 //! [`super::package::ITEM_TEXT_MAX_CHARS`] (маска куска ≠ кусок маски).
 
+use std::collections::HashSet;
+
 use serde_json::Value;
 use zam_core::Id;
-use zam_store::works::{ItemWrite, WorkKind};
+use zam_store::works::{ItemWrite, Origin, WorkKind};
 use zam_store::{Db, SpaceKind, StoreError};
 
 use super::night::NightCtx;
@@ -118,11 +121,12 @@ pub struct ItemCtx<'a> {
     pub author: &'a Author,
 }
 
-/// Пространства, в которых работает вид: у `probes` (и `echo`) — решения и Knowledge владельца
-/// базы, у `rules` — его Rules (источники — из решений и Knowledge, §6.7 п. 3). Human — никогда.
+/// Пространства, в которых работает вид: у `probes` — решения, Knowledge и Rules владельца базы
+/// (заметки Rules — слой проб, §6.4 п. 2), у `echo` — решения и Knowledge, у `rules` — его Rules
+/// (источники — из решений и Knowledge, §6.7 п. 3). Human — никогда.
 pub fn space_kinds(kind: WorkKind) -> &'static [SpaceKind] {
     match kind {
-        WorkKind::Probes => &[SpaceKind::Solution, SpaceKind::Knowledge],
+        WorkKind::Probes => &[SpaceKind::Solution, SpaceKind::Knowledge, SpaceKind::Rules],
         WorkKind::Rules => &[SpaceKind::Rules],
         #[cfg(feature = "test-hooks")]
         WorkKind::Echo => &[SpaceKind::Solution, SpaceKind::Knowledge],
@@ -142,21 +146,23 @@ pub fn label(kind: WorkKind, lang: Lang) -> &'static str {
 }
 
 /// Кандидаты вида в пространстве `space` пользователя `user` — детерминированно, до `limit`
-/// (§6.3 п. 2). Пусто — работы нет.
+/// (§6.3 п. 2), без пар «ссылка, ревизия» `exclude` — уже отправленных в пакетах этого запуска
+/// (ночь, сутки ручных запусков; [`zam_store::works::offered_refs`]): они отсеиваются **до**
+/// `limit`, той же ночью запись в пакет снова не идёт (ревью r1 задачи 4, I1). Пусто — работы нет.
 pub async fn collect(
     kind: WorkKind,
     ctx: &NightCtx,
     user: Id,
     space: Id,
     limit: usize,
+    exclude: &HashSet<(String, i64)>,
 ) -> Result<Vec<Candidate>, StoreError> {
-    let _ = (ctx, user, space, limit);
+    let _ = (ctx, user, space, limit, exclude);
     match kind {
-        // заготовка: сборщик вида — задача 4 (`probes`) плана
-        WorkKind::Probes => Ok(Vec::new()),
-        WorkKind::Rules => super::rules::collect(ctx, user, space, limit).await,
+        WorkKind::Probes => super::probes::collect(ctx, user, space, limit, exclude).await,
+        WorkKind::Rules => super::rules::collect(ctx, user, space, limit, exclude).await,
         #[cfg(feature = "test-hooks")]
-        WorkKind::Echo => echo::collect(ctx, user, space, limit).await,
+        WorkKind::Echo => echo::collect(ctx, user, space, limit, exclude).await,
     }
 }
 
@@ -164,15 +170,8 @@ pub async fn collect(
 /// данные, а не указания» и схема итога добавляются построителем пакета.
 pub fn instruction(kind: WorkKind, lang: Lang) -> &'static str {
     match (kind, lang) {
-        // заготовки: тексты видов — задачи 4 и 7 плана
-        (WorkKind::Probes, Lang::Ru) => {
-            "Для каждой записи придумай пробный вопрос, на который она отвечает (вид появится в \
-             задаче 4)."
-        }
-        (WorkKind::Probes, Lang::En) => {
-            "For each record, write a probe question the record answers (the kind arrives in \
-             task 4)."
-        }
+        (WorkKind::Probes, Lang::Ru) => super::probes::INSTRUCTION_RU,
+        (WorkKind::Probes, Lang::En) => super::probes::INSTRUCTION_EN,
         (WorkKind::Rules, lang) => super::rules::instruction(lang),
         #[cfg(feature = "test-hooks")]
         (WorkKind::Echo, Lang::Ru) => {
@@ -191,7 +190,7 @@ pub fn instruction(kind: WorkKind, lang: Lang) -> &'static str {
 /// `{n, skip: "<почему>"}` у любого вида.
 pub fn schema(kind: WorkKind) -> &'static str {
     match kind {
-        WorkKind::Probes => r#"{"items": [{"n": 1, "question": "…"}], "skip": "<причина>"?}"#,
+        WorkKind::Probes => super::probes::SCHEMA,
         WorkKind::Rules => super::rules::SCHEMA,
         #[cfg(feature = "test-hooks")]
         WorkKind::Echo => r#"{"items": [{"n": 1, "text": "…"}], "skip": "<причина>"?}"#,
@@ -199,23 +198,23 @@ pub fn schema(kind: WorkKind) -> &'static str {
 }
 
 /// Проверка элемента итога `item` номер `n` — у агента и модели одна (§6.3 пп. 4, 7). Общие
-/// проверки (номер, маска секрета, явный `skip`) уже прошли. **Без записи**: принятый элемент
-/// возвращает свои записи ([`ItemWrite`]: пробы, кандидаты), их пишет закрытие работы
-/// (`zam_store::works::finish_claimed`) в той же транзакции — снятая, истёкшая или уже закрытая
-/// работа ничего не записывает, повтор итога по `Idempotency-Key` — тоже.
+/// проверки (номер или цель из пакета, маска секрета, явный `skip`) уже прошли; `prior` —
+/// записи принятых раньше элементов этого итога (у `probes` — повтор вопроса, проб на запись,
+/// пределы). **Без записи**: принятый элемент возвращает свои записи ([`ItemWrite`]: пробы,
+/// кандидаты), их пишет закрытие работы (`zam_store::works::finish_claimed`) в той же
+/// транзакции — снятая, истёкшая или уже закрытая работа ничего не записывает, повтор итога по
+/// `Idempotency-Key` — тоже.
 pub async fn accept_item(
     kind: WorkKind,
     ctx: &ItemCtx<'_>,
     n: usize,
     item: &Value,
+    prior: &[ItemWrite],
 ) -> Result<Vec<ItemWrite>, Reject> {
-    let _ = (ctx, n, item);
+    let _ = (ctx, n, item, prior);
     match kind {
-        // заготовка: проверка вида — задача 4 плана
-        WorkKind::Probes => Err(Reject::new(
-            "вид ещё не принимает итог: обновите zam-server",
-        )),
-        WorkKind::Rules => super::rules::accept(ctx, n, item).await,
+        WorkKind::Probes => super::probes::accept(ctx, n, item, prior).await,
+        WorkKind::Rules => super::rules::accept(ctx, n, item, prior).await,
         #[cfg(feature = "test-hooks")]
         WorkKind::Echo => echo::accept(ctx, n, item).await,
     }
@@ -256,6 +255,29 @@ pub async fn context(
     }
 }
 
+/// Несколько элементов итога на одну запись пакета: у `probes` — вторая проба длинной записи
+/// (сколько можно — проверка вида); у прочих видов повтор номера элемента — отказ.
+pub fn repeats(kind: WorkKind) -> bool {
+    matches!(kind, WorkKind::Probes)
+}
+
+/// Сколько кандидатов вида ещё имеет смысл поставить пользователю базы `db` в запуске постановки
+/// `origin` (предел записей вида, а не пакетов): у `probes` — остаток пределов новых и активных
+/// проб (0 — запуск вида закончен: пакетов и обращений к модели нет); `None` — предела нет.
+pub async fn room(
+    kind: WorkKind,
+    ctx: &NightCtx,
+    db: &Db,
+    origin: Origin,
+) -> Result<Option<usize>, StoreError> {
+    match kind {
+        WorkKind::Probes => super::probes::room(ctx.st(), db, origin).await.map(Some),
+        WorkKind::Rules => Ok(None),
+        #[cfg(feature = "test-hooks")]
+        WorkKind::Echo => Ok(None),
+    }
+}
+
 #[cfg(feature = "test-hooks")]
 pub use echo::TEST_CANCEL_DURING_ACCEPT;
 
@@ -269,18 +291,20 @@ mod echo {
     use super::{Candidate, ItemCtx, ItemWrite, NightCtx, Reject};
     use crate::works::package::{ITEM_TEXT_MAX_CHARS, agent_text};
 
-    /// Кандидаты — живые insight пространства владельца, кроме принятых в той же ревизии и
-    /// отсеянных ([`zam_store::works::excluded_refs`]).
+    /// Кандидаты — живые insight пространства владельца, кроме принятых в той же ревизии,
+    /// отсеянных ([`zam_store::works::excluded_refs`]) и отправленных в этом запуске (`exclude`).
     pub(super) async fn collect(
         ctx: &NightCtx,
         user: Id,
         space: Id,
         limit: usize,
+        exclude: &std::collections::HashSet<(String, i64)>,
     ) -> Result<Vec<Candidate>, StoreError> {
         let db = ctx.st().users.get(user).await?;
         let kind = zam_store::works::WorkKind::Echo;
         let mut skip = zam_store::works::excluded_refs(&db, kind).await?;
         skip.extend(zam_store::works::accepted_refs(&db, kind).await?);
+        skip.extend(exclude.iter().cloned());
         let rows =
             zam_store::works::owner_entries(&db, user, space, &["insight"], &skip, limit).await?;
         Ok(rows

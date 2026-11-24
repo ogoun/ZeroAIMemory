@@ -89,15 +89,21 @@ async fn patch(a: &Api, body: Value) -> Resp {
     a.adm(Method::PATCH, SETTINGS, Some(body), None).await
 }
 
-/// Общий режим исполнителя администратора.
+/// Общий режим исполнителя администратора; настоящие виды (`probes`, `rules`) — `off`: тесты
+/// файла — на виде `echo`, а сборщики настоящих видов ставили бы свои работы (задача 4).
 async fn set_mode(a: &Api, mode: &str) {
     ok(
-        &patch(a, json!({"works": {"mode": mode}})).await,
+        &patch(
+            a,
+            json!({"works": {"mode": mode, "kinds": {"probes": "off", "rules": "off"}}}),
+        )
+        .await,
         StatusCode::OK,
     );
 }
 
-/// Подключение к подставной модели (запись личного Vault) и режим `model`.
+/// Подключение к подставной модели (запись личного Vault) и режим `model` (настоящие виды —
+/// `off`, как у [`set_mode`]).
 async fn connect(a: &Api, m: &MockModel) {
     let r = a
         .t(
@@ -112,8 +118,9 @@ async fn connect(a: &Api, m: &MockModel) {
     ok(&r, StatusCode::CREATED);
     let r = patch(
         a,
-        json!({"works": {"mode": "model", "model": {"protocol": "openai", "vault": "llm",
-               "model": "mock-model", "max_tokens": 4000}}}),
+        json!({"works": {"mode": "model", "kinds": {"probes": "off", "rules": "off"},
+               "model": {"protocol": "openai", "vault": "llm", "model": "mock-model",
+                         "max_tokens": 4000}}}),
     )
     .await;
     ok(&r, StatusCode::OK);
@@ -1189,7 +1196,11 @@ async fn manual_limits_separate_from_night() {
         c.works.batch_records = 1;
     })
     .await;
-    insight(&a, "knowledge", "Пределы", "текст").await;
+    // по записи на пакет: отправленная этой ночью (сутками ручных) запись в тот же запуск снова
+    // не идёт (ревью r1 задачи 4, I1)
+    for i in 0..4 {
+        insight(&a, "knowledge", &format!("Пределы {i}"), "текст").await;
+    }
     connect(&a, &m).await;
     night_in_window(&a).await;
     assert_eq!(m.count(), 4);
@@ -1202,6 +1213,16 @@ async fn manual_limits_separate_from_night() {
     let ws = echo_works(&a).await;
     assert_eq!(ws.iter().filter(|w| w.origin == Origin::Manual).count(), 4);
     assert_eq!(ws.iter().filter(|w| w.origin == Origin::Nightly).count(), 4);
+    // в каждом запуске — четыре разные записи: отправленное в нём снова не ставится (ревью r2
+    // задачи 4, N5 — ручная ветка отсева тоже)
+    for origin in [Origin::Nightly, Origin::Manual] {
+        let targets: std::collections::HashSet<String> = ws
+            .iter()
+            .filter(|w| w.origin == origin)
+            .map(|w| w.items[0].target.clone())
+            .collect();
+        assert_eq!(targets.len(), 4, "{origin:?}: {ws:?}");
+    }
     let r = a
         .adm(Method::POST, RUN, Some(json!({"kind": "echo"})), None)
         .await;
@@ -1401,7 +1422,13 @@ async fn secret_dropped_stays_excluded_after_skip() {
             space,
             mode: WorkMode::Model,
             origin: Origin::Nightly,
-            night: Some(zam_store::time::utc_today()),
+            // работа прошлой ночи, оставшаяся в очереди: этой ночью она выполняется первой и её
+            // записи — «отправлены этой ночью» (обращение с `work_calls.run` этой ночи, решение 80)
+            night: Some(
+                zam_store::time::utc_today()
+                    .checked_sub(jiff::Span::new().days(2))
+                    .unwrap(),
+            ),
             items: vec![
                 item(1, &clean, "текст".into()),
                 item(2, &leaky, format!("токен деплоя {s} в CI")),
@@ -1425,10 +1452,26 @@ async fn secret_dropped_stays_excluded_after_skip() {
         .await
         .unwrap();
     assert!(excluded.contains(&(leaky.clone(), 1)), "{excluded:?}");
-    // следующая постановка — без записи с ключом
+    // следующая постановка (другая ночь — отсева «отправлено этой ночью» нет: решение
+    // координатора 80) — чистая запись снова кандидат, запись с ключом — нет
+    let next = zam_server::works::kinds::collect(
+        WorkKind::Echo,
+        &ctx(&a),
+        a.st.admin_id,
+        space,
+        10,
+        &std::collections::HashSet::new(),
+    )
+    .await
+    .unwrap();
+    let next: Vec<String> = next.into_iter().map(|c| c.target).collect();
+    assert!(next.contains(&clean), "{next:?}");
+    assert!(!next.contains(&leaky), "{next:?}");
+    // та же ночь: обе — уже отправлены (работа выполнена этой ночью), новых пакетов нет
+    let before = m.count();
     night_in_window(&a).await;
+    assert_eq!(m.count(), before);
     let ws = echo_works(&a).await;
-    assert!(ws.len() > 1, "{ws:?}");
     for w in &ws[..ws.len() - 1] {
         assert!(w.items.iter().all(|i| i.target != leaky), "{w:?}");
     }
@@ -1449,8 +1492,9 @@ async fn works_run_token_403() {
     assert!(echo_works(&a).await.is_empty());
 }
 
-/// Решение 76: `[works] enabled = false` — ручной запуск и проверка подключения — 409
-/// `/problems/works-disabled`, ни одного запроса к модели (`POST /check/run` — задача 5).
+/// Решение 76: `[works] enabled = false` — ручной запуск, проверка подключения и ручной прогон
+/// проверки памяти (`POST /check/run`, человеку и токену) — 409 `/problems/works-disabled`, ни
+/// одного запроса к модели.
 #[tokio::test]
 async fn works_disabled_manual_409() {
     let _g = SERIAL.lock().await;
@@ -1466,6 +1510,10 @@ async fn works_disabled_manual_409() {
     let r = a
         .adm(Method::POST, "/api/v1/works/model/test", None, None)
         .await;
+    problem(&r, StatusCode::CONFLICT, "works-disabled");
+    let r = a.adm(Method::POST, "/api/v1/check/run", None, None).await;
+    problem(&r, StatusCode::CONFLICT, "works-disabled");
+    let r = a.t(Method::POST, "/api/v1/check/run", None).await;
     problem(&r, StatusCode::CONFLICT, "works-disabled");
     assert_eq!(m.count(), 0);
 }

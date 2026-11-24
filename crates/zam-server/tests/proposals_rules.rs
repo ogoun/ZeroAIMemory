@@ -82,13 +82,14 @@ async fn space_id(a: &Api, kind: zam_store::SpaceKind) -> Id {
         .id
 }
 
-/// Режим исполнителя администратора.
+/// Режим исполнителя администратора: тесты файла — про вид `rules`, прочие виды (`probes`,
+/// тестовый `echo`) — `off`, их сборщики ставили бы свои работы (слияние с задачей 4).
 async fn set_mode(a: &Api, mode: &str) {
     let r = a
         .adm(
             Method::PATCH,
             "/api/v1/auth/settings",
-            Some(json!({"works": {"mode": mode}})),
+            Some(json!({"works": {"mode": mode, "kinds": {"probes": "off", "echo": "off"}}})),
             None,
         )
         .await;
@@ -1580,8 +1581,9 @@ async fn rules_secret_dropped_not_reoffered() {
             Method::PATCH,
             "/api/v1/auth/settings",
             Some(
-                json!({"works": {"mode": "model", "model": {"protocol": "openai",
-                "vault": "llm", "model": "mock-model", "max_tokens": 4000}}}),
+                json!({"works": {"mode": "model", "kinds": {"probes": "off", "echo": "off"},
+                "model": {"protocol": "openai", "vault": "llm", "model": "mock-model",
+                "max_tokens": 4000}}}),
             ),
             None,
         )
@@ -1645,6 +1647,7 @@ async fn rules_secret_dropped_not_reoffered() {
         a.st.admin_id,
         rules,
         10,
+        &std::collections::HashSet::new(),
     )
     .await
     .unwrap();

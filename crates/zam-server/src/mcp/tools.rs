@@ -514,7 +514,7 @@ fn log_data_schema() -> Value {
         // итог внутренней работы (M7.3 §6.3 п. 4)
         "work": {"type": "string", "description": "work: j:<id> работы из пакета memory_recall event=work"},
         "items": {"type": "array", "items": {"type": "object"}, "description":
-            "work: итог по элементам пакета [{n, …}] по его схеме; отказ от элемента — {n, skip: причина}"},
+            "work: итог по элементам пакета [{n | target, …}] по его схеме; отказ от элемента — {n | target, skip: причина}"},
         "skip": {"type": "string", "description": "work: отказ от всей работы — причина, без items"},
     }})
 }
