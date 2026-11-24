@@ -561,45 +561,18 @@ pub async fn probe_sources(db: &Db, owner: Id, space: Id) -> Result<Vec<ProbeSou
     .await
 }
 
-/// Текст заметки без frontmatter (`---` … `---` в начале, после BOM).
-fn strip_frontmatter(src: &str) -> &str {
-    let s = src.strip_prefix('\u{feff}').unwrap_or(src);
-    let Some(rest) = s
-        .strip_prefix("---\n")
-        .or_else(|| s.strip_prefix("---\r\n"))
-    else {
-        return s;
-    };
-    let mut at = 0;
-    for line in rest.split_inclusive('\n') {
-        at += line.len();
-        if line.trim_end_matches(['\r', '\n']) == "---" {
-            return &rest[at..];
-        }
-    }
-    s
-}
-
-/// Первый заголовок первого уровня (`# …`) текста заметки вне блоков кода; нет — `None`.
-fn first_h1(text: &str) -> Option<&str> {
-    let mut fence = false;
-    for line in text.lines() {
-        let t = line.trim_start();
-        if t.starts_with("```") || t.starts_with("~~~") {
-            fence = !fence;
-            continue;
-        }
-        if fence {
-            continue;
-        }
-        if let Some(h) = t.strip_prefix("# ") {
-            let h = h.trim().trim_end_matches('#').trim();
-            if !h.is_empty() {
-                return Some(h);
-            }
-        }
-    }
-    None
+/// Текст заметки без frontmatter и первый заголовок первого уровня — разбором Markdown
+/// ([`zam_markdown::parse`], как у чанков и секций; ревью r2 задачи 4, N4): ATX `# …` и setext
+/// `…` + `===`; строка кода с отступом и заголовок в блоке кода — не заголовок.
+fn note_text_h1(content: &str) -> (&str, Option<String>) {
+    let doc = zam_markdown::parse(content);
+    let h1 = doc
+        .headings
+        .iter()
+        .find(|h| h.level == 1)
+        .map(|h| h.text.trim().to_string())
+        .filter(|h| !h.is_empty());
+    (content.get(doc.body_start..).unwrap_or(content), h1)
 }
 
 /// Заголовок и текст источника `src` в его ревизии; запись удалена или исправлена (ревизия
@@ -619,8 +592,9 @@ pub async fn source_text(db: &Db, src: &ProbeSource) -> Result<Option<SourceText
                 )
                 .optional()?;
             return Ok(row.map(|(path, content)| {
-                let text = strip_frontmatter(&content).trim();
-                let title = match first_h1(text) {
+                let (text, h1) = note_text_h1(&content);
+                let text = text.trim();
+                let title = match h1 {
                     Some(h) => format!("{h} ({path})"),
                     None => path,
                 };

@@ -1213,6 +1213,16 @@ async fn manual_limits_separate_from_night() {
     let ws = echo_works(&a).await;
     assert_eq!(ws.iter().filter(|w| w.origin == Origin::Manual).count(), 4);
     assert_eq!(ws.iter().filter(|w| w.origin == Origin::Nightly).count(), 4);
+    // в каждом запуске — четыре разные записи: отправленное в нём снова не ставится (ревью r2
+    // задачи 4, N5 — ручная ветка отсева тоже)
+    for origin in [Origin::Nightly, Origin::Manual] {
+        let targets: std::collections::HashSet<String> = ws
+            .iter()
+            .filter(|w| w.origin == origin)
+            .map(|w| w.items[0].target.clone())
+            .collect();
+        assert_eq!(targets.len(), 4, "{origin:?}: {ws:?}");
+    }
     let r = a
         .adm(Method::POST, RUN, Some(json!({"kind": "echo"})), None)
         .await;
@@ -1412,8 +1422,8 @@ async fn secret_dropped_stays_excluded_after_skip() {
             space,
             mode: WorkMode::Model,
             origin: Origin::Nightly,
-            // работа прошлой ночи: отправленное этой ночью той же ночью снова не идёт (ревью r1
-            // задачи 4, I1), а тест — о следующей постановке
+            // работа прошлой ночи, оставшаяся в очереди: этой ночью она выполняется первой и её
+            // записи — «отправлены этой ночью» (обращение с `work_calls.run` этой ночи, решение 80)
             night: Some(
                 zam_store::time::utc_today()
                     .checked_sub(jiff::Span::new().days(2))
@@ -1442,10 +1452,26 @@ async fn secret_dropped_stays_excluded_after_skip() {
         .await
         .unwrap();
     assert!(excluded.contains(&(leaky.clone(), 1)), "{excluded:?}");
-    // следующая постановка — без записи с ключом
+    // следующая постановка (другая ночь — отсева «отправлено этой ночью» нет: решение
+    // координатора 80) — чистая запись снова кандидат, запись с ключом — нет
+    let next = zam_server::works::kinds::collect(
+        WorkKind::Echo,
+        &ctx(&a),
+        a.st.admin_id,
+        space,
+        10,
+        &std::collections::HashSet::new(),
+    )
+    .await
+    .unwrap();
+    let next: Vec<String> = next.into_iter().map(|c| c.target).collect();
+    assert!(next.contains(&clean), "{next:?}");
+    assert!(!next.contains(&leaky), "{next:?}");
+    // та же ночь: обе — уже отправлены (работа выполнена этой ночью), новых пакетов нет
+    let before = m.count();
     night_in_window(&a).await;
+    assert_eq!(m.count(), before);
     let ws = echo_works(&a).await;
-    assert!(ws.len() > 1, "{ws:?}");
     for w in &ws[..ws.len() - 1] {
         assert!(w.items.iter().all(|i| i.target != leaky), "{w:?}");
     }

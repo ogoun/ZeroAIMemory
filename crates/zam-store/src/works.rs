@@ -961,32 +961,39 @@ pub async fn accepted_refs(db: &Db, kind: WorkKind) -> Result<HashSet<(String, i
 }
 
 /// Пары «ссылка, ревизия» кандидатов, уже отправленных в пакетах вида в этом запуске
-/// постановки (ревью r1 задачи 4, I1; решение координатора): ночью — `items` работ вида с
-/// `origin = nightly` той же ночи `night`, у ручного запуска (`night` нет) — работ `origin`
-/// с `since` (сутки UTC); **любое** состояние работы (без итога, отклонённые проверкой,
-/// `failed`, снятые). Той же ночью (теми же сутками ручных запусков) их сборщик снова не берёт;
-/// следующей — они снова кандидаты. Из базы, а не из памяти цикла: перезапуск посреди ночи отсев
-/// не снимает. Хвост пакета сверх бюджета снят с работы до выдачи (`set_items`) — он не
-/// отправлялся и сюда не входит.
+/// постановки (решение координатора 80): ночью — `items` работ вида с `origin = nightly` той же
+/// ночи `night`, у ручного запуска (`night` нет) — работ `origin` с `since` (сутки UTC); и
+/// работ вида с обращением к модели этого запуска (`work_calls.run = run`: работа прошлой ночи,
+/// возвращённая в очередь и выполненная сейчас, — ревью r2 задачи 4, N2); **любое** состояние
+/// работы (без итога, отклонённые проверкой, `failed`, снятые). Той же ночью (теми же сутками
+/// ручных запусков) их сборщик снова не берёт; следующей — они снова кандидаты. Из базы, а не из
+/// памяти цикла: перезапуск посреди ночи отсев не снимает. Хвост пакета сверх бюджета снят с
+/// работы до выдачи (`set_items`) — он не отправлялся и сюда не входит.
 pub async fn offered_refs(
     db: &Db,
     kind: WorkKind,
     origin: Origin,
     night: Option<civil::Date>,
     since: Timestamp,
+    run: Option<&str>,
 ) -> Result<HashSet<(String, i64)>, StoreError> {
+    let run = run.map(str::to_string);
     db.read(move |c| {
         let mut st = c.prepare_cached(
             "SELECT items FROM works
-             WHERE kind = ?1 AND origin = ?2
-               AND (CASE WHEN ?3 IS NOT NULL THEN night = ?3 ELSE created_at >= ?4 END)",
+             WHERE kind = ?1
+               AND ((origin = ?2
+                     AND (CASE WHEN ?3 IS NOT NULL THEN night = ?3 ELSE created_at >= ?4 END))
+                    OR (?5 IS NOT NULL AND id IN (SELECT work_id FROM work_calls
+                                                  WHERE run = ?5 AND work_id IS NOT NULL)))",
         )?;
         let rows = st.query_map(
             params![
                 kind.as_str(),
                 origin.as_str(),
                 night.map(|d| d.to_string()),
-                fmt_ts(since)
+                fmt_ts(since),
+                run
             ],
             |r| r.get::<_, String>(0),
         )?;

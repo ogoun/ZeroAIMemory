@@ -1317,15 +1317,30 @@ async fn probes_offered_not_reoffered_same_night() {
     )
     .unwrap();
     let dbx = db(&a).await;
-    let tonight = store::offered_refs(&dbx, WorkKind::Probes, Origin::Nightly, Some(d), start)
-        .await
-        .unwrap();
+    let run = |d: civil::Date| format!("night:{d}");
+    let tonight = store::offered_refs(
+        &dbx,
+        WorkKind::Probes,
+        Origin::Nightly,
+        Some(d),
+        start,
+        Some(&run(d)),
+    )
+    .await
+    .unwrap();
     let all: HashSet<(String, i64)> = [&r1, &r2, &r3].iter().map(|t| ((*t).clone(), 1)).collect();
     assert_eq!(tonight, all);
     let other = d.tomorrow().unwrap();
-    let later = store::offered_refs(&dbx, WorkKind::Probes, Origin::Nightly, Some(other), start)
-        .await
-        .unwrap();
+    let later = store::offered_refs(
+        &dbx,
+        WorkKind::Probes,
+        Origin::Nightly,
+        Some(other),
+        start,
+        Some(&run(other)),
+    )
+    .await
+    .unwrap();
     assert!(later.is_empty(), "{later:?}");
     let kn = space(&a, SpaceKind::Knowledge).await;
     let c = ctx(&a);
@@ -1344,8 +1359,61 @@ async fn probes_offered_not_reoffered_same_night() {
     assert!(none_left.is_empty(), "{none_left:?}");
 }
 
+/// Ревью r2, N2: «отправлено этой ночью» — и работа прошлой ночи, возвращённая в очередь и
+/// выполненная моделью этой ночью (обращение с `work_calls.run` этой ночи): записи, о которых
+/// модель промолчала, в ту же ночь второй раз не уходят.
+#[tokio::test]
+async fn probes_requeued_last_night_counts_as_offered() {
+    let _g = SERIAL.lock().await;
+    let m = MockModel::start();
+    m.set_default(MockReply::chat("{\"items\": []}"));
+    let a = server("requeued-offered", night_now).await;
+    let r1 = insight(&a, "knowledge", "Первая запись", "текст").await;
+    let r2 = insight(&a, "knowledge", "Вторая запись", "текст").await;
+    model_mode(&a, &m, &a.token, None).await;
+    let wc = &a.st.cfg.works;
+    let (d, _, _) = zam_server::schedule::night_window(
+        zam_store::time::now(),
+        wc.at_hm(),
+        &wc.time_zone(),
+        wc.window_min,
+    )
+    .unwrap();
+    let item = |n: usize, target: &str| WorkItem {
+        n,
+        target: target.to_string(),
+        rev: 1,
+        kind: "insight".into(),
+        title: "Запись".into(),
+        text: "текст".into(),
+        signals: Vec::new(),
+    };
+    // работа прошлой ночи, оставшаяся в очереди (пауза, стоп): этой ночью она идёт первой
+    let old = store::enqueue(
+        &db(&a).await,
+        NewWork {
+            kind: WorkKind::Probes,
+            space: space(&a, SpaceKind::Knowledge).await,
+            mode: WorkMode::Model,
+            origin: Origin::Nightly,
+            night: Some(d.yesterday().unwrap()),
+            items: vec![item(1, &r1), item(2, &r2)],
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    night_in_window(&a).await;
+    assert_eq!(m.count(), 1, "только работа прошлой ночи");
+    let ws = probe_works(&a).await;
+    assert_eq!(ws.len(), 1, "{ws:?}");
+    assert_eq!(ws[0].id, old.id);
+    assert_eq!(ws[0].state, WorkState::Done);
+}
+
 /// Ревью r1, M5: заголовок заметки для пакета и проверки — её первый H1 и путь: пересказ H1
-/// отклоняется «пересказ заголовка».
+/// отклоняется «пересказ заголовка». Ревью r2, N4: заголовок — разбором Markdown: строка кода с
+/// отступом — не заголовок, setext-заголовок (`===`) — заголовок.
 #[tokio::test]
 async fn probes_note_title_includes_heading() {
     let _g = SERIAL.lock().await;
@@ -1359,12 +1427,29 @@ async fn probes_note_title_includes_heading() {
         "---\ntags: [ops]\n---\n# Восстановление базы из резервной копии сервера\n\nШаги и проверка.\n",
     )
     .await;
+    let setext = note_by(
+        &a,
+        Some(&a.token),
+        "knowledge",
+        "kb/restore.md",
+        "    # строка кода с отступом\n\nВосстановление из архива\n===\n\nШаги.\n",
+    )
+    .await;
     night_of(&a, day(23)).await;
     let w = probe_works(&a).await.remove(0);
+    let title = |t: &str| {
+        w.items
+            .iter()
+            .find(|i| i.target == t)
+            .unwrap()
+            .title
+            .clone()
+    };
     assert_eq!(
-        w.items[0].title,
+        title(&n),
         "Восстановление базы из резервной копии сервера (kb/backup.md)"
     );
+    assert_eq!(title(&setext), "Восстановление из архива (kb/restore.md)");
     let resp = answer(
         &a,
         S1,
@@ -1540,7 +1625,8 @@ async fn probes_parallel_results_once() {
         .filter(|p| p.work_id.is_some())
         .count();
     assert_eq!(mine, 2);
-    // две работы у предела: 38 готовых + 2 принятых = 40, ещё по вопросу в каждой — параллельно
+    // две работы у предела: 37 готовых + 2 принятых = 39, по вопросу в каждой работе —
+    // параллельно, записано ровно до 40
     for g in [G1, G2] {
         ok(&register(&a, &a.token, g).await, StatusCode::CREATED);
         insight(&a, g, &format!("Запись {g}"), "текст").await;
