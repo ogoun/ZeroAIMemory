@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import {
   BOARD_MIN,
   BP_DESKTOP,
+  BP_FULL_LABELS,
   BP_NARROW,
   BP_TABLET,
   BP_WIDE,
@@ -49,7 +50,7 @@ function widths(text: string) {
 }
 
 test('media_widths_from_layout', () => {
-  const media = new Set([BP_NARROW, BP_TABLET, BP_DESKTOP, BP_WIDE].flatMap(pair));
+  const media = new Set([BP_NARROW, BP_TABLET, BP_DESKTOP, BP_WIDE, BP_FULL_LABELS].flatMap(pair));
   const container = new Set([SPLIT_MIN, BOARD_MIN].flatMap(pair));
   const bad: string[] = [];
   const sheets = files(['.svelte', '.css']);

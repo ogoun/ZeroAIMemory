@@ -77,6 +77,11 @@ export const PAGES: MobilePage[] = [
   { name: 'кэш', path: () => '#/cache' },
   { name: 'аккаунт', path: () => '#/account', as: 'user' },
   { name: 'мои-решения', path: () => '#/my/solutions', as: 'user' },
+  // страницы M7.3 (задача 8, §6.9): «Внутренние работы» (очередь и журнал отправок — карточками на
+  // телефоне), «Проверка памяти», «Кандидаты в Rules» с открытым кандидатом
+  { name: 'внутренние-работы', path: () => '#/works' },
+  { name: 'проверка-памяти', path: () => '#/check' },
+  { name: 'кандидаты-в-rules', path: (c) => `#/proposals/${c.env('E2E_PROPOSAL_FORMS')}` },
   { name: 'журнал', path: (c) => `#/u/${c.user}/s/${c.solution}/j/glossary` },
 ];
 

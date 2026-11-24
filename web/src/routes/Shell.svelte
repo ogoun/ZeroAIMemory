@@ -9,6 +9,10 @@
   // Классы ширины (M7.2, §5.1, `layout.ts`): телефон — ☰, заголовок раздела, поиск и меню
   // аккаунта в шапке, разделы и дерево — в выдвижной панели; планшет — разделы в шапке короткими
   // подписями, дерево — в панели; настольный — дерево постоянное (260 px до 1279, 300 px дальше).
+  // M7.3 (§6.9): разделы «Проверка» (точка при открытой регрессии ночной проверки) и «Кандидаты N»
+  // (открытые кандидаты в Rules); «Внутренние работы» — в меню аккаунта телефона и рядом с логином
+  // на планшете и компьютере (меню аккаунта там нет, §5.1 п. 3), с точкой, пока исполнитель на
+  // паузе; три страницы — ленивыми чанками.
   import { onMount, tick, untrack } from 'svelte';
   import DocView from '../components/DocView.svelte';
   import AccountMenu from '../components/AccountMenu.svelte';
@@ -37,8 +41,9 @@
     type Space,
     type User,
   } from '../lib/api';
+  import { attention, refreshAttention } from '../lib/attention.svelte';
   import { countDescription, countHint, formatCount, openLabel } from '../lib/counts';
-  import { counts } from '../lib/counts.svelte';
+  import { counts, proposalCounts } from '../lib/counts.svelte';
   import { JOURNAL_TITLE, journalsOf } from '../lib/journals';
   import { current, go, href, listen, routeUser, type Route } from '../lib/router';
   import { revealSelected, viewport } from '../lib/viewport.svelte';
@@ -110,6 +115,8 @@
     normalize(current());
     route = current();
     loadUsers();
+    // точки «Проверка» и «Внутренние работы» (M7.3 §6.9): статус проверки и пауза исполнителя
+    void refreshAttention();
     return listen((r) => {
       if (!normalize(r)) return;
       const wasAdmin = isAdmin(route);
@@ -258,9 +265,15 @@
       agentsetup: 'Подключение агента',
       cache: 'Кэш выжимок',
       sessions: 'Сессии',
+      works: 'Внутренние работы',
+      check: 'Проверка памяти',
+      proposals: 'Кандидаты в Rules',
     };
     return titles[r.name] ?? 'Заметки';
   });
+
+  /** Открытых кандидатов в Rules своего пользователя («Кандидаты N», §6.7 п. 5). */
+  let candidates = $derived(proposalCounts.get(me.user_id, 'rules')?.rules ?? 0);
 
   /** Имена пользователей для баннера перенарезки администратора. */
   let userNames = $derived(Object.fromEntries(users.map((u) => [u.id, u.name])));
@@ -276,7 +289,8 @@
 
 <!-- Разделы: в шапке (на планшете — короткие подписи) или строками в панели телефона -->
 {#snippet sections(rows: boolean)}
-  <nav class="topnav" class:rows aria-label="Разделы">
+  <!-- разделов больше, чем влезает в шапку планшета: текущий — в видимой части полосы (M7.3) -->
+  <nav class="topnav" class:rows aria-label="Разделы" use:revealSelected={route.name}>
     <a href={href({ name: 'home', user: me.user_id })} aria-current={routeUser(route) ? 'page' : undefined}>Заметки</a>
     {#if admin}
       <a href={href({ name: 'index' })} aria-current={route.name === 'index' ? 'page' : undefined}>Индекс</a>
@@ -297,7 +311,41 @@
       aria-label="Кэш выжимок"><span class="long">Кэш выжимок</span><span class="short" aria-hidden="true">Кэш</span></a
     >
     <a href={href({ name: 'sessions' })} aria-current={route.name === 'sessions' ? 'page' : undefined}>Сессии</a>
+    <!-- M7.3 (§6.9 пп. 2–3): точка при открытой регрессии, число открытых кандидатов — вне имени
+         ссылки (описание для чтения с экрана — `aria-describedby`, как у чисел полосы журналов) -->
+    <a
+      href={href({ name: 'check' })}
+      aria-current={route.name === 'check' ? 'page' : undefined}
+      aria-describedby={attention.regression ? 'nav-check-dot' : undefined}
+      >Проверка{#if attention.regression}<span class="dot" aria-hidden="true" data-testid="check-dot"></span>{/if}</a
+    >
+    {#if attention.regression}<span id="nav-check-dot" hidden>ночная проверка: ухудшение поиска</span>{/if}
+    <a
+      href={href({ name: 'proposals', proposal: null })}
+      aria-current={route.name === 'proposals' ? 'page' : undefined}
+      aria-describedby={candidates ? 'nav-candidates' : undefined}
+      >Кандидаты{#if candidates}<span class="nav-num" aria-hidden="true" data-testid="candidates-count">{formatCount(candidates)}</span>{/if}</a
+    >
+    {#if candidates}<span id="nav-candidates" hidden>кандидатов в Rules ждут решения: {formatCount(candidates)}</span>{/if}
   </nav>
+{/snippet}
+
+<!-- «Внутренние работы» с точкой паузы исполнителя (§6.2 п. 5): у логина (планшет — «Работы») -->
+{#snippet worksLink()}
+  <a
+    class="works-link"
+    href={href({ name: 'works' })}
+    aria-current={route.name === 'works' ? 'page' : undefined}
+    aria-label="Внутренние работы"
+    aria-describedby={attention.pause ? 'works-dot' : undefined}
+    title="Внутренние работы"
+    >Работы{#if attention.pause}<span
+        class="dot"
+        aria-hidden="true"
+        data-testid="works-dot"
+      ></span>{/if}</a
+  >
+  {#if attention.pause}<span id="works-dot" hidden>исполнитель внутренних работ на паузе</span>{/if}
 {/snippet}
 
 <div class="shell" class:drawer-open={drawer}>
@@ -325,9 +373,10 @@
     </button>
     {#if phone}
       <!-- меню аккаунта телефона: логин и «Выйти» (§5.1 п. 3) -->
-      <AccountMenu login={me.login} {onlogout} closeKey={nav} />
+      <AccountMenu login={me.login} {onlogout} closeKey={nav} paused={!!attention.pause} />
     {:else}
       <span class="who">
+        {@render worksLink()}
         <span class="muted login">{me.login}</span>
         <button type="button" onclick={onlogout}>Выйти</button>
       </span>
@@ -573,6 +622,38 @@
           <LazyFail error={e} />
         {/await}
       </div>
+    {:else if route.name === 'works'}
+      <!-- «Внутренние работы», «Проверка памяти», «Кандидаты в Rules» (M7.3 §6.9) — ленивыми чанками -->
+      <div class="admin">
+        {#await import('./Works.svelte')}
+          <p class="muted">Загрузка…</p>
+        {:then { default: Works }}
+          <Works {me} {onexpired} />
+        {:catch e}
+          <LazyFail error={e} />
+        {/await}
+      </div>
+    {:else if route.name === 'check'}
+      <div class="admin">
+        {#await import('./Check.svelte')}
+          <p class="muted">Загрузка…</p>
+        {:then { default: Check }}
+          <Check {me} {onexpired} />
+        {:catch e}
+          <LazyFail error={e} />
+        {/await}
+      </div>
+    {:else if route.name === 'proposals'}
+      <!-- «список — карточка», как журналы: ширина страницы журнала -->
+      <div class="journal-page">
+        {#await import('./Proposals.svelte')}
+          <p class="muted">Загрузка…</p>
+        {:then { default: Proposals }}
+          <Proposals {me} proposal={route.proposal} {onexpired} />
+        {:catch e}
+          <LazyFail error={e} />
+        {/await}
+      </div>
     {:else if route.name === 'mysolutions'}
       <div class="admin">
         <Solutions mine {onexpired} />
@@ -733,6 +814,43 @@
     align-items: center;
     gap: 8px;
   }
+  /* «Внутренние работы» у логина (M7.3 §6.9 п. 1) — подписью «Работы» (имя ссылки — полное): шапка
+     с разделами «Проверка» и «Кандидаты» иначе не помещается и на 1440 px */
+  .works-link {
+    display: inline-flex;
+    align-items: center;
+    padding: 6px 8px;
+    border-radius: 6px;
+    color: var(--muted);
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .works-link:hover {
+    background: var(--hover);
+  }
+  .works-link[aria-current='page'] {
+    color: var(--text);
+    background: var(--selected);
+  }
+  /* точка внимания (регрессия, пауза) и число кандидатов — у подписи раздела */
+  .dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin-left: 5px;
+    border-radius: 50%;
+    background: var(--danger);
+    vertical-align: middle;
+  }
+  .nav-num {
+    margin-left: 5px;
+    padding: 0 6px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    background: var(--accent);
+    color: var(--accent-text);
+  }
   .drawer-toggle {
     flex: none;
     display: none;
@@ -860,13 +978,25 @@
       min-width: 44px;
     }
     .drawer-toggle,
-    .search-btn {
+    .search-btn,
+    .works-link {
       min-width: 44px;
       min-height: 44px;
     }
     /* зазор полосы при касании — `--touch-gap` */
     .strip-over {
       margin-left: calc(-12px - var(--num-w) - var(--touch-gap));
+    }
+  }
+
+  /* до 1439 (BP_FULL_LABELS, layout.ts): длинные разделы — короткими подписями (имя ссылки —
+     полное): с M7.3 в шапке ещё «Проверка» и «Кандидаты N», полные подписи помещаются с 1440 px */
+  @media (max-width: 1439px) {
+    .topnav:not(.rows) .long {
+      display: none;
+    }
+    .topnav:not(.rows) .short {
+      display: inline;
     }
   }
 
@@ -903,12 +1033,6 @@
     .topnav:not(.rows) a {
       padding: 6px;
       font-size: 14px;
-    }
-    .topnav:not(.rows) .long {
-      display: none;
-    }
-    .topnav:not(.rows) .short {
-      display: inline;
     }
     .login {
       display: none;

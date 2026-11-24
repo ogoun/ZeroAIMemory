@@ -1,6 +1,8 @@
 // Клиент REST API. Пути относительные: разрешаются от <base href>, который подставляет сервер.
 import { ApiError, apiError } from './apiError';
 import { changesCounts } from './counts';
+// только тип: REST страниц M7.3 — ленивый модуль `worksApi.ts`, в стартовую загрузку он не идёт
+import type { WorksSettings } from './worksApi';
 
 export interface User {
   id: string;
@@ -1112,6 +1114,10 @@ export interface EntryQuery {
   /** Корзина вида `kind` (`deleted=only`, M7 §5.9 п. 3): удалённые записи, новые удаления первыми;
    * права — как у восстановления (`ro` — 403). */
   deleted?: boolean;
+  /** Только `kind: insight`: «шумные» (`noisy=1`, M7.3 §6.6 п. 3) — показано ≥ 10 и ни одного
+   * открытия за окно `max(now − 30 сут, opened_since)`, «полезно» нет за всё время; в ответе —
+   * `opened_since`. */
+  noisy?: boolean;
   cursor?: string | null;
   limit?: number;
 }
@@ -1133,9 +1139,11 @@ export function listEntries(user: string, space: string, f: EntryQuery) {
   if (f.topLevel) p.set('top_level', '1');
   if (f.parent) p.set('parent', f.parent);
   if (f.deleted) p.set('deleted', 'only');
+  if (f.noisy) p.set('noisy', '1');
   if (f.cursor) p.set('cursor', f.cursor);
   if (f.limit) p.set('limit', String(f.limit));
-  return call<{ items: Entry[]; next_cursor: string | null }>(
+  // `opened_since` — только у ленты `noisy=1`: начало учёта открытий (`null` — неизвестно)
+  return call<{ items: Entry[]; next_cursor: string | null; opened_since?: string | null }>(
     'GET',
     `spaces/${q(space)}/entries?${p}`,
     undefined,
@@ -1758,6 +1766,8 @@ export type IdeasMode = 'review' | 'propose';
 export interface UserSettings {
   hooks: HookFlags;
   ideas: { proactive: boolean; mode?: IdeasMode };
+  /** Исполнитель внутренних работ (M7.3 §6.1 п. 2; страница «Внутренние работы», `worksApi.ts`). */
+  works?: WorksSettings;
 }
 
 /** Свои настройки (`own`) или пользователя `userId` (администратор). */
@@ -1947,6 +1957,8 @@ export const rulesHeavyText = (r: RulesStatus): string =>
 
 export interface UsageCounts {
   shown: number;
+  /** Сессий, открывших запись после её подсказки (M7.3 §6.6, признак `usage_opened`). */
+  opened: number;
   useful: number;
   useless: number;
 }
@@ -1954,6 +1966,18 @@ export interface UsageCounts {
 /** Оценка полезности записи; из WebUI сервер пишет источник `webui`. */
 export const entryFeedback = (user: string, id: string, value: 'useful' | 'useless') =>
   call<void>('POST', `entries/${q(id)}/feedback`, { value }, user);
+
+// ---- кандидаты в Rules: число для дерева и шапки (M7.3 §6.7 п. 5) ----
+// Остальной REST страниц «Внутренние работы», «Проверка памяти» и «Кандидаты в Rules» —
+// `worksApi.ts` (ленивый чанк страниц); здесь — только то, что нужно оболочке при старте.
+
+/** Открытых кандидатов в Rules своего пользователя (`GET /proposals/counts`). */
+export interface ProposalCounts {
+  rules: number;
+}
+
+/** Число открытых кандидатов в Rules (метка дерева «кандидаты: N», «Кандидаты N» в шапке). */
+export const proposalCounts = () => call<ProposalCounts>('GET', 'proposals/counts');
 
 // ---- понятные сообщения об ошибках (RFC 9457) ----
 

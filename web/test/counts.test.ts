@@ -53,6 +53,9 @@ test('changes_counts_rule', () => {
     ['POST', 'cache/01ABC/promote'],
     // очистка карты кода — журнал «Код» пустеет (ревью r1, M1)
     ['DELETE', 'code?solution=0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e12'],
+    // решение по кандидату в Rules (M7.3 §6.7 пп. 4–5): «кандидаты: N» и заметки Rules
+    ['POST', 'proposals/o:01ABC/accept'],
+    ['POST', 'proposals/01ABC/decline'],
   ];
   for (const [m, p] of yes) assert.equal(changesCounts(m, p), true, `${m} ${p}`);
   const no: [string, string][] = [
@@ -69,6 +72,8 @@ test('changes_counts_rule', () => {
     ['POST', 'blobs'],
     ['POST', 'search'],
     ['POST', 'render'],
+    ['GET', 'proposals/counts'],
+    ['POST', 'proposals/o:01ABC/withdraw'],
   ];
   for (const [m, p] of no) assert.equal(changesCounts(m, p), false, `${m} ${p}`);
 });

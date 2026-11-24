@@ -125,7 +125,8 @@ test('пользователь: вход, обязательная смена п
   await expect(tree).toContainText('Моя память');
   await expect(tree).toContainText(name);
   const nav = page.getByRole('navigation', { name: 'Разделы' });
-  await expect(nav.getByRole('link')).toHaveText(['Заметки', /Мои решения/, 'Аккаунт', /Подключение агента/, /Кэш выжимок/, 'Сессии']);
+  // M7.3 (§6.9): «Проверка» и «Кандидаты» — у пользователя тоже (своя память)
+  await expect(nav.getByRole('link')).toHaveText(['Заметки', /Мои решения/, 'Аккаунт', /Подключение агента/, /Кэш выжимок/, 'Сессии', 'Проверка', /^Кандидаты/]);
   await expect(page.getByRole('link', { name: 'Администрирование' })).toHaveCount(0);
   await expect(page.getByRole('link', { name: 'Индекс' })).toHaveCount(0);
   // прямой адрес раздела администратора — возврат к своим заметкам

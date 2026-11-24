@@ -140,7 +140,7 @@ test.describe('телефон, сенсорный ввод', () => {
     await expect(page.getByRole('button', { name: 'Скрыть дерево' })).toHaveAttribute('aria-expanded', 'true');
     // в панели — «Разделы» строками по 44 px, затем дерево
     const sections = sidebar(page).getByRole('navigation', { name: 'Разделы' });
-    for (const name of ['Заметки', 'Индекс', 'Администрирование', 'Подключение агента', 'Кэш выжимок', 'Сессии']) {
+    for (const name of ['Заметки', 'Индекс', 'Администрирование', 'Подключение агента', 'Кэш выжимок', 'Сессии', 'Проверка', 'Кандидаты']) {
       await expect(sections.getByRole('link', { name, exact: true })).toBeVisible();
     }
     await minTarget(sections.getByRole('link'), 44);
@@ -481,7 +481,7 @@ test.describe('телефон, сенсорный ввод', () => {
       area: string | null;
       certainty: string | null;
       data: { kind?: string };
-      usage?: { shown: number; useful: number; useless: number };
+      usage?: { shown: number; opened?: number; useful: number; useless: number };
     };
     const all = await api<{ items: Row[] }>('GET', `spaces/${SOLUTION_GUID}/entries?kind=insight&limit=100`);
     expect(all.items.length).toBeGreaterThan(2);
@@ -496,8 +496,9 @@ test.describe('телефон, сенсорный ввод', () => {
     const meta = table.locator(`tr[data-entry="${x.id}"]`).getByTestId('row-meta');
     if (x.data.kind) await expect(meta).toContainText(x.data.kind);
     if (x.area) await expect(meta).toContainText(x.area);
-    const u = x.usage ?? { shown: 0, useful: 0, useless: 0 };
-    await expect(meta).toContainText(`показы ${u.shown} / ${u.useful} / ${u.useless}`);
+    // M7.3 (§6.6 п. 3): счётчики — «показано / открыто / полезно / бесполезно»
+    const u = x.usage ?? { shown: 0, opened: 0, useful: 0, useless: 0 };
+    await expect(meta).toContainText(`показано ${u.shown} / ${u.opened ?? 0} / ${u.useful} / ${u.useless}`);
     expect(await noHorizontalScroll(page)).toBe(true);
     await page.screenshot({ path: `${screens}phone-insights.png`, fullPage: true });
     // открытая запись — карточка вместо таблицы, «← Insights» — таблица прежняя
@@ -563,7 +564,8 @@ test.describe('телефон, сенсорный ввод', () => {
       'Вид',
       'Статус',
       'Область',
-      'Показы / полезно / бесполезно',
+      // M7.3 (§6.6 п. 3): «открыто» — сессий агента, открывших запись после подсказки
+      'Показано / открыто / полезно / бесполезно',
       'Изменено',
     ]);
     await expect(dt.getByTestId('row-meta')).toHaveCount(0);
@@ -741,7 +743,8 @@ test.describe('планшет, сенсорный ввод', () => {
     await expect(sections.getByRole('link', { name: 'Администрирование' })).toHaveText('Админ', { useInnerText: true });
     await expect(sections.getByRole('link', { name: 'Сессии' })).toBeVisible();
     await minTarget(sections.getByRole('link'), 44);
-    expect(await minGap(sections.getByRole('link'), 8)).toBe(5);
+    // восемь разделов (M7.3 §6.9: «Проверка» и «Кандидаты») — семь зазоров
+    expect(await minGap(sections.getByRole('link'), 8)).toBe(7);
     await expect(page.getByRole('button', { name: 'Выйти' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Меню аккаунта' })).toHaveCount(0);
     // дерево — выдвижная панель, в ней только дерево

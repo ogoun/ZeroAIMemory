@@ -35,7 +35,7 @@
   import { JOURNAL_TITLE, journalsOf } from '../lib/journals';
   import { go, href, routeUser, type Journal, type Route } from '../lib/router';
   import { NOTES_HINT, countDescription, countHint, formatCount, notesLabel, openLabel } from '../lib/counts';
-  import { counts } from '../lib/counts.svelte';
+  import { counts, proposalCounts } from '../lib/counts.svelte';
   import IndexBadge from './IndexBadge.svelte';
   import LazyFail from './LazyFail.svelte';
 
@@ -571,6 +571,16 @@
           <span class="tag heavy" title={rulesHeavyText(rules[uid]!)}>много правил</span>
         {/if}
       </button>
+      {#if s.kind === 'rules' && uid === ownId}
+        <!-- кандидаты в Rules своего пользователя (M7.3 §6.7 п. 5) — как «запросы: N» у решений;
+             число — из того же кэша, что «Кандидаты N» шапки -->
+        {@const pc = proposalCounts.get(uid, 'rules')?.rules ?? 0}
+        {#if pc > 0}
+          <a class="tag pending" href={href({ name: 'proposals', proposal: null })} title="Кандидаты в Rules ждут решения">
+            кандидаты: {formatCount(pc)}
+          </a>
+        {/if}
+      {/if}
       {#if c}
         <span class="num" class:zero={c.notes === 0} data-count="notes" aria-hidden="true" title={NOTES_HINT}>{formatCount(c.notes)}</span>
         <span id={countId(uid, ref)} hidden>{notesLabel(c.notes)}</span>
