@@ -31,8 +31,9 @@
   //   выключены. Enter в однострочном поле и Ctrl+Enter (⌘+Enter) в многострочном — отправка.
   // - Фокус при открытии — на поле `[data-autofocus]` (`data-select` — ещё и выделить текст), иначе
   //   на первом поле; у окна-подтверждения без полей (`confirm`) — на «Отмена», если действие
-  //   `danger` (наименее разрушительное, как у `alertdialog` WAI-ARIA APG: Enter не удаляет сразу),
-  //   иначе на основной кнопке. Tab — по кругу внутри окна (ловушка фокуса bits-ui). При закрытии
+  //   `danger` (наименее разрушительное, как у `alertdialog` WAI-ARIA APG: Enter не удаляет сразу)
+  //   или `cautious` (не разрушительное, но рискованное — основная кнопка не красная: «Подтвердить
+  //   адрес» подключения модели, финальное ревью M7.3, Minor 10), иначе на основной кнопке. Tab — по кругу внутри окна (ловушка фокуса bits-ui). При закрытии
   //   фокус — туда, куда скажет владелец (`refocus`), иначе на элемент, открывший окно; если фокус
   //   уже ушёл сам (карточка созданной записи) — не трогать.
   // - Несохранённое (`dirty()`): Esc, щелчок по фону, «Отмена», «✕» и системная «Назад» на телефоне
@@ -64,6 +65,9 @@
     /** Подпись основной кнопки. */
     submit: string;
     danger?: boolean;
+    /** Подтверждение рискованного, но не разрушительного действия: фокус при открытии — на
+     * «Отмена» (как у `danger`), основная кнопка — обычная. */
+    cautious?: boolean;
     busy?: boolean;
     /** Основное действие доступно (импорт без файла — нет): кнопка выключена, без `aria-busy`. */
     canSubmit?: boolean;
@@ -95,6 +99,7 @@
     subject,
     submit,
     danger = false,
+    cautious = false,
     busy = false,
     canSubmit = true,
     error = '',
@@ -301,7 +306,7 @@
     const c = content;
     if (!c) return;
     let t: HTMLElement | null = null;
-    if (confirm) t = c.querySelector<HTMLElement>(danger ? '[data-fd="cancel"]' : '[data-fd="submit"]');
+    if (confirm) t = c.querySelector<HTMLElement>(danger || cautious ? '[data-fd="cancel"]' : '[data-fd="submit"]');
     // полей ещё нет (чанк формы в пути) — видимая основная кнопка: на телефоне — в шапке
     else t = firstField() ?? [...c.querySelectorAll<HTMLElement>('button[type="submit"]')].find((b) => b.getClientRects().length > 0) ?? null;
     t?.focus();

@@ -208,6 +208,24 @@ impl ApiError {
         }
     }
 
+    /// Конфликт с машинным кодом `code` и расширениями `extra` (поля тела problem рядом с
+    /// `detail`): один помощник для маршрутов внутренних работ (финальное ревью M7.3, Minor 6).
+    pub fn conflict_code(
+        code: &str,
+        detail: impl Into<String>,
+        extra: &[(&str, Value)],
+    ) -> ApiError {
+        let mut m = Map::new();
+        m.insert("code".into(), json!(code));
+        for (k, v) in extra {
+            m.insert((*k).to_string(), v.clone());
+        }
+        ApiError::Conflict {
+            detail: detail.into(),
+            extra: m,
+        }
+    }
+
     fn parts(&self) -> (StatusCode, &'static str, &'static str) {
         match self {
             ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, "about:blank", "Bad Request"),

@@ -220,6 +220,27 @@ pub async fn accept_item(
     }
 }
 
+/// Принятый элемент в итоге работы (`result.accepted[].item`) — по записям, которые он даёт
+/// ([`accept_item`]): только проверенные поля вида, в том виде, в каком они будут записаны
+/// (финальное ревью M7.3, Minor 3): у `probes` — `{question}`, у `rules` — `{rule: {path,
+/// content}, reason}` (путь нормализован, заголовок `title` — уже в `content`), у `echo` —
+/// `{text}`. Лишние поля элемента (ответ модели — до 4 МиБ, тело агента — до предела REST) в базу
+/// и в `GET /works` не идут; цель и ревизия — поля самой строки итога (`target`, `rev`).
+pub fn kept_item(rows: &[ItemWrite]) -> Value {
+    match rows.first() {
+        Some(ItemWrite::Probe { probe, .. }) => serde_json::json!({"question": probe.question}),
+        Some(ItemWrite::Rule {
+            path,
+            content,
+            reason,
+            ..
+        }) => serde_json::json!({"rule": {"path": path, "content": content}, "reason": reason}),
+        #[cfg(feature = "test-hooks")]
+        Some(ItemWrite::Echo { text, .. }) => serde_json::json!({"text": text}),
+        Some(ItemWrite::RuleSkip { .. }) | None => serde_json::json!({}),
+    }
+}
+
 /// Записи отказа исполнителя от элемента `{n, skip: "почему"}` (§6.3 п. 4): у `rules` — строка
 /// `proposals` со статусом `skipped` (отсев до новой ревизии источника, §6.7 п. 3); у прочих
 /// видов отказ остаётся только в итоге работы (`result.skip`). Пишет закрытие работы в той же

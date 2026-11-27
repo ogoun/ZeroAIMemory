@@ -1998,14 +1998,16 @@ async fn wait_requests(m: &MockModel, n: usize) {
 }
 
 /// Режим и пауза сверяются перед **каждым** обращением (§6.2 п. 7; ревью r1 Important 2):
-/// человек выключил режим, пока шла первая попытка (`500` с задержкой), — повтора нет,
-/// `blocked`.
+/// человек выключил режим, пока шла первая попытка (`500`), — повтора нет, `blocked`. Ответ
+/// первой попытки модель держит, пока тест его не отпустит **после** `PATCH` режима (условие, а не
+/// задержка 600 мс: под нагрузкой `PATCH` мог не успеть — финальное ревью M7.3, Minor 9).
 #[tokio::test]
 async fn mode_rechecked_before_retry() {
     let m = MockModel::start();
     let a = server("mode-recheck", |_| {}).await;
     connect(&a, &m).await;
-    m.push(MockReply::json(500, json!({"error": "временно"})).delay(Duration::from_millis(600)));
+    let gate = common::mock_model::Gate::new();
+    m.push(MockReply::json(500, json!({"error": "временно"})).held(&gate));
     let (c, user) = (ctx(&a), a.st.admin_id);
     let h = tokio::spawn(async move {
         exec::run_payload(&c, user, manual(), payload(&["з"]), WorkKind::Probes, None).await
@@ -2015,9 +2017,11 @@ async fn mode_rechecked_before_retry() {
         &patch(&a, json!({"works": {"mode": "agent"}})).await,
         StatusCode::OK,
     );
+    // режим уже выключен — только теперь первая попытка получает свой `500`
+    gate.open();
     let e = h.await.unwrap().unwrap_err();
     assert_eq!(e.class, CallClass::Blocked);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // `run_payload` закончился — новых запросов от него быть не может
     assert_eq!(m.count(), 1, "после выключения режима запросов нет");
 }
 
@@ -2271,7 +2275,8 @@ async fn run_key_isolation() {
 }
 
 /// `model_access = "off"` — обращений нет (ревью r1 Minor 4): `run_payload` — `blocked`,
-/// проверка подключения — 409.
+/// проверка подключения — 409 `/problems/works-disabled`, тот же вид, что при `[works] enabled =
+/// false` (финальное ревью M7.3, Minor 5), причина — в `detail`.
 #[tokio::test]
 async fn model_access_off_zero_requests() {
     let m = MockModel::start();
@@ -2286,8 +2291,15 @@ async fn model_access_off_zero_requests() {
         CallClass::Blocked
     );
     let r = a.adm(Method::POST, TEST, None, None).await;
-    ok(&r, StatusCode::CONFLICT);
-    assert_eq!(r.json()["code"], "works_disabled");
+    common::api::problem(&r, StatusCode::CONFLICT, "works-disabled");
+    assert!(
+        r.json()["detail"]
+            .as_str()
+            .unwrap()
+            .contains("model_access"),
+        "{}",
+        r.text()
+    );
     assert_eq!(m.count(), 0);
 }
 

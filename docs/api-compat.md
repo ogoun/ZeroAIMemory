@@ -77,8 +77,8 @@
 | `backup_api` | M7 §5.6 п. 1 | Копии из WebUI, только сессии администратора (токену и пользователю — 403): `GET /admin/backups` — каталог копий, расписание, идущая копия `running`, итог `last_run` и готовые копии по описи; `POST /admin/backups` → 202 — копия в процессе сервера под одним замком с автокопией (занято — 409 `/problems/backup-running`); `DELETE /admin/backups/{name}` — только готовая копия каталога копий по имени-шаблону (иначе 404); `GET /index/status?only=backup` → `{backup}` (раздел «Копии из WebUI» ниже). Скачивания и восстановления копии через API нет. Сервер без флага на маршруты отвечает 404, а `only=backup` — 400. |
 | `entries_trash` | M7 §5.9 п. 3 | Корзина любого журнала: `GET /spaces/{space}/entries?kind=<вид>&deleted=only` — удалённые записи вида, новые удаления первыми; права — как у восстановления этого вида: у отчётов — прежние (владелец решения в своей сессии WebUI), у прочих — право записи пространства, как у `DELETE` и `POST /entries/{id}/restore` (токен `ro` и участник `ro` — 403) (раздел «Корзина журналов» ниже). Сервер без флага на `deleted=only` с видом не `report` отвечает 400. |
 | `agent_text_masked` | M7 §4.3.1–4.3.2 | Выдача агенту по токену — с `‹secret›` вместо значений секретов: тексты заметок и записей (`/read` — L1, L2, `section`, `range`, фокус, дифф `since_rev`; `GET /nodes` и `/entries`, ревизии и дифф истории, поле `diff` ответа 409), заголовки, `frontmatter`, поиск (`expand=section`, карточки), подсказки `/recall`, выжимки кэша, индекс `GET /file-refs`, 409 `term-conflict`, итог задания импорта, предпросмотр текста и листа, экспорт архива (опись `secrets_masked: true` — только если маска что-то заменила); флаги командной строки — только внутри кода Markdown. В тексте для правки текущей ревизии (L2 узла, поля `title`, `body`, `data`, `tags`, `area` записи журнала) — метки `‹secret-T-N›` (T — объект, ревизия и версия сканера, N — сквозной номер маски объекта); запись агента (`PUT`/`PATCH` узла, `PATCH` записи журнала, замещение) возвращает значения только у `‹secret-T-N›` — по меткам этого объекта и любой его ревизии; `‹secret›` и прочая метка записываются как есть (литерал, значение не восстанавливается) с предупреждением `secret_mark_kept`; значение, которое в итоге не покрыто находкой сканера, — 422 `secret_context_changed`; замещение с метками без ревизии старой записи — 428 (поле `supersedes_rev`). Сессии WebUI — исходник; раскрытие Vault и файлы `GET /blobs/…` — как есть (раздел «Секреты в выдаче агенту» ниже). Сервер без флага отдаёт токену исходник. |
-| `works` | M7 §6.1–§6.3 | Внутренние работы памяти: настройки исполнителя `works` в `GET/PATCH /auth/settings` и `/admin/users/{id}/settings` (`mode`, `kinds` — `{<вид>: режим}`, `null` в `PATCH` снимает вид; `model` — `{protocol, vault: "v:<id>", model, auth, max_tokens, token_field, body_extra, pinned, host, external}` (`host`, `external` — только в ответе: класс «вне LAN» закреплённого адреса без DNS при чтении, на паузе `vault_changed` — по «стал»), `confirm_url` подтверждения адреса; `limits`, `check: on|off`, `pause {class, since, from?, to?}` — пишет только сервер; `effective: {<вид>: {mode, reason}}`, причины `disabled`, `model_access_off`, `no_model`, `paused`), `warnings` ответа `PATCH`; `POST /works/model/test`, `GET /works/calls`; очередь `GET /works`, `GET /works/usage`, `POST /works/run`, `POST /works/{id}/result`, `POST /works/{id}/release`; пакет `POST /recall {event: "work"}`, строка работ дайджеста; MCP — событие `work` у `memory_recall`, вид `work` у `memory_log` (`required` — `["kind"]`); `zam work` (раздел «Внутренние работы» ниже). Сервер без флага — 400 на событие `work`, 404 на `/works*`. |
-| `memory_check` | M7 §6.4–§6.5 | Ночная проверка памяти: пробы (`probes`, ссылка `x:`), прогоны и вердикт к базе — `GET /check/status`, `GET /check/runs?limit=&trigger=&status=` (фильтр повода `nightly|manual` и статуса — с 0.0.16-m7.3, задача 8, ревью r1), `GET /check/runs/{id}`, `POST /check/run` (ручной прогон: человек или токен `rw`, 202 `{run}`; идёт — 409 `/problems/check-running`; `[works] enabled = false` — 409 `/problems/works-disabled`), `POST /check/accept {run}` («Принять как норму» — только сессия WebUI, токен — 403; не последний ночной прогон эпизода — 409 `/problems/check-accept-not-latest`), `GET /check/probes?kind=&status=&split=`; строка дайджеста `session_start` при регрессии; ключ конфигурации `[works] check`, настройка пользователя `works.check`. Раздел «Ночная проверка памяти» ниже. Сервер без флага маршрутов `/check` не знает (404). |
+| `works` | M7.3 §6.1–§6.3 | Внутренние работы памяти: настройки исполнителя `works` в `GET/PATCH /auth/settings` и `/admin/users/{id}/settings` (`mode`, `kinds` — `{<вид>: режим}`, `null` в `PATCH` снимает вид; `model` — `{protocol, vault: "v:<id>", model, auth, max_tokens, token_field, body_extra, pinned, host, external}` (`host`, `external` — только в ответе: класс «вне LAN» закреплённого адреса без DNS при чтении, на паузе `vault_changed` — по «стал»), `confirm_url` подтверждения адреса; `limits`, `check: on|off`, `pause {class, since, from?, to?}` — пишет только сервер; `effective: {<вид>: {mode, reason}}`, причины `disabled`, `model_access_off`, `no_model`, `paused`), `warnings` ответа `PATCH`; `POST /works/model/test`, `GET /works/calls`; очередь `GET /works`, `GET /works/usage`, `POST /works/run`, `POST /works/{id}/result`, `POST /works/{id}/release`; пакет `POST /recall {event: "work"}`, строка работ дайджеста; MCP — событие `work` у `memory_recall`, вид `work` у `memory_log` (`required` — `["kind"]`); `zam work` (раздел «Внутренние работы» ниже). Сервер без флага — 400 на событие `work`, 404 на `/works*`. |
+| `memory_check` | M7.3 §6.4–§6.5 | Ночная проверка памяти: пробы (`probes`, ссылка `x:`), прогоны и вердикт к базе — `GET /check/status`, `GET /check/runs?limit=&trigger=&status=` (фильтр повода `nightly|manual` и статуса — с 0.0.16-m7.3, задача 8, ревью r1), `GET /check/runs/{id}`, `POST /check/run` (ручной прогон: человек или токен `rw`, 202 `{run}`; идёт — 409 `/problems/check-running`; `[works] enabled = false` — 409 `/problems/works-disabled`), `POST /check/accept {run}` («Принять как норму» — только сессия WebUI, токен — 403; не последний ночной прогон эпизода — 409 `/problems/check-accept-not-latest`), `GET /check/probes?kind=&status=&split=`; строка дайджеста `session_start` при регрессии; ключ конфигурации `[works] check`, настройка пользователя `works.check`. Раздел «Ночная проверка памяти» ниже. Сервер без флага маршрутов `/check` не знает (404). |
 | `proposals` | M7.3 §6.7 | Кандидаты в Rules (предложения человеку, ссылка `o:`): `POST /proposals {type: "rule", path, content, reason, basis?}` (токен `rw`; 201 `{proposal: "o:<id>"}`, тот же путь и текст — 200 `existing: true`; открытых 50 — 409 `/problems/proposals-full`), `GET /proposals?type=&status=&author=me`, `GET /proposals/counts` → `{rules}`, `GET /proposals/{id}` (с `rules_tokens {now, after}`), `POST /proposals/{id}/accept {path?, content?}` и `/decline {note?}` (только сессия WebUI, токен — 403), `/withdraw` (автор-агент); поле `candidate` у MCP `memory_write`; `detail` 403 записи агента в Rules — с подсказкой `candidate`; вид работы `rules`; `zam rules`. Раздел «Кандидаты в Rules» ниже. Сервер без флага — 404 на `/proposals*`, поле `candidate` MCP не знает (запись в Rules — 403). |
 | `usage_opened` | M7.3 §6.6 | «Агент открыл подсказку»: чтение узла или записи по токену явной сессией (`POST /read` — любой уровень, секция, фокус; `GET /entries/{id}`; `GET /nodes/{id}` и `GET /nodes/by-path`) после показа этой цели подсказкой `/recall` той же сессии в той же эпохе — одно открытие на сессию и цель; поле `opened` в `usage {shown, opened, useful, useless}` у `GET /entries/{id}` и insight ленты; «шумные» — `GET /spaces/{space}/entries?kind=insight&noisy=1` с полем ответа `opened_since`; `zam insight show` — «показы · открыто · полезно · бесполезно» (раздел «Открытие подсказок» ниже). Сервер без флага отдаёт `usage` без `opened`, а параметр `noisy` молча пропускает (лента целиком) — клиент шлёт его только с флагом. |
 | `space_counts_steps` | M7.3 §6.14 п. 10 | Поле `task_steps` ответа `GET /spaces/{space}/counts` — число шагов планов (подзадач `part_of`) среди `journals.tasks`, по правилу фильтра `top_level=1` (задача на цикле `part_of` — верхнего уровня): задачи верхнего уровня — `journals.tasks − task_steps` (раздел «Число записей разделов» ниже). Сервер без флага поля не отдаёт. |
@@ -352,7 +352,7 @@ recall.timeout_ms)` (`recall.max_timeout_ms` по умолчанию — 2000), 
 
 ## Ночная проверка памяти (`memory_check`)
 
-С 0.0.16-m7.3 (M7 §6.4–§6.5, флаг `memory_check`). Сервер ночью (окно `[works] at`/`tz`, до
+С 0.0.16-m7.3 (M7.3 §6.4–§6.5, флаг `memory_check`). Сервер ночью (окно `[works] at`/`tz`, до
 работ) прогоняет пробы каждой базы тем же поиском и подсказками, что у агента, без учёта
 выданного, и сравнивает с базой прежних ночей. Токену — вопросы проб с маской `‹secret›`,
 сессии WebUI — исходник.
@@ -365,7 +365,9 @@ recall.timeout_ms)` (`recall.max_timeout_ms` по умолчанию — 2000), 
   p95}` (`hit_*` — часть `test`); `failing` — до 20 проваленных проб `{probe, question, kind,
   split, target, rank, advice, advice_text, neighbor?}` (у посторонних — `shown`); `advice` —
   `[{code, text}]`; `probes` — `{active, by_kind, by_split}`; `check` — `{server: nightly|off,
-  user: on|off}`.
+  user: on|off, reason}` (`reason` — почему сервер ночью не проверяет: `disabled` — `[works]
+  enabled = false`, `check_off` — `[works] check = "off"`; проверка идёт — `null`); та же форма —
+  в `GET /works/usage`.
 - **Вердикт** (`verdict`) — `{kind: baseline|ok|regression|changed|degraded, flags: [{name:
   hit_search|hit_prompt|negatives_shown|p95|lost_steady|degraded, value?, median?, delta_pp?,
   lost?, steady?}], after_update, after_update_version?, few, episode?, base_n, base_of: 5,
@@ -733,6 +735,39 @@ CLI `zam`, свой клиент) получает значения, похож�
   400); `effective` — `{<вид>: {mode, reason}}`, причина `off`: `disabled`, `model_access_off`,
   `no_model`, `paused`. Ответ `PATCH` подключения вне LAN — `warnings: ["works_model_external:
   <хост>"]`. Режим `model` без подключения или при `model_access = "off"` — 422.
+- **`POST /works/model/test[?user=]`** — проверка подключения: фиксированный запрос без данных
+  памяти, строка журнала отправок `kind: "test"`; только человек (сессия WebUI; администратор —
+  `?user=` или `X-Zam-User`; токену — 403). Ответ 200 `{ok, ms, class?, hint?, thinking?}`: `ok` —
+  модель ответила JSON; `ms` — длительность (`null` — ответа не было); `class` — класс ошибки
+  (таблица классов §6.2 п. 5: `auth`, `not_found`, `blocked`, `vault`, `limit`, `aborted`, …;
+  у `auth` и `not_found` — ещё и пауза); `hint` — подсказка; `thinking: true` — у модели
+  включены размышления (совет `body_extra`). Успешная проверка снимает паузу (кроме
+  `vault_changed`). Отказы без обращения: `[works] enabled = false` или `model_access = "off"` —
+  409 `/problems/works-disabled` (один тип, причина — в `detail`; с финальной правки M7.3 —
+  прежде у `model_access = "off"` был `code: works_disabled`); пауза `vault_changed` или адрес
+  записи, изменённый после сохранения, — 409 `code: vault_changed` с полными адресами `{was,
+  now}` (подтверждение — `PATCH works.model {confirm_url}`); у пользователя уже идёт обращение к
+  модели — 409 `code: model_busy`; нет подключения `works.model` — 422.
+- **`GET /works/calls?days=&user=`** → `{days, calls: [{ts, work: "j:<id>" | null, kind, host,
+  model, input_tokens, output_tokens, estimated, ms, outcome, http_status, external, items,
+  run}]}` — журнал отправок, новые первыми, не больше 1000 строк, **без текста** пакета и
+  ответа; `days` — 1..=180 (7), иначе 400; права — как у проверки подключения (токену — 403).
+  `kind` — вид работы или `test`; `estimated` — токены оценены (поставщик не вернул `usage`);
+  `outcome` — `ok`, класс ошибки, `aborted` (запрос ушёл, ответа нет — остановка сервера) или
+  `internal` (сбой сервера без отправки); `ms` — `null`, если ответа не было (`aborted`,
+  `internal`, отказ до отправки — `limit`, `blocked`, `unavailable` без соединения; WebUI
+  показывает «—», а не 0); `http_status` — код ответа модели или `null`; `items` — элементов
+  пакета (у `test` — `null`); `run` — `night:<дата>` | `manual:<id>` (у `test` — `null`).
+  Хранение — 180 суток.
+- **Аудит подключённой модели и решений человека** (`system.db`, `GET /admin/audit`; от имени того,
+  кто действовал — человека или `system`): `user.settings.update {key, from, to}` у `works.*`
+  (подключение — без ключа); `works.model.external {host}` — сохранено подключение вне LAN;
+  `works.model.key_use {vault: "v:<id>", host, test?}` — ключ ушёл модели (раз за ночь, за ручной
+  запуск и у каждой проверки — `test: true`; строка не записалась — обращение с ключом не
+  уходит); `works.model.paused {class}`; `works.model.vault_changed {from, to}` — хосты «был →
+  стал»; `works.model.pause_cleared {class, by: save | test, from?, to?}`; `check.accept {run,
+  verdict}` — «Принять как норму»; `proposal.accept {id, type, result}` и `proposal.decline {id,
+  type}` — решения по кандидатам в Rules (без текста). Неизвестные действия клиент пропускает.
 - **`GET /works?state=&kind=&limit=&user=`** → `{works: [{id: "j:<id>", kind, space, mode, origin,
   night, state, items: [{n, target, rev, kind, title}], claimed_session, claimed_until, attempts,
   created_at, started_at, finished_at, result, error_class}], modes: {<вид>: {mode, reason}},
@@ -742,8 +777,12 @@ CLI `zam`, свой клиент) получает значения, похож�
   чужого пользователя — только администратору (иначе 403), без него — пользователь запроса
   (`X-Zam-User` администратора).
 - **`GET /works/usage?user=`** → `{day: {tokens, limit}, month: {tokens, limit}, ceiling: {daily,
-  monthly}, last_night, night: {at, tz, window_min}, modes, paused?}` — расход модели по журналу
-  отправок, сутки и месяц UTC.
+  monthly}, last_night, night: {at, tz, window_min}, modes, check: {server, user, reason},
+  paused?}` — расход модели по журналу отправок, сутки и месяц UTC; `limit` — те же пределы, по
+  которым сервер отказывает (`works.limits`, не выше `ceiling`); `check` — как у `GET
+  /check/status` (`server: off` — ночной проверки нет, выключатель пользователя не действует).
+- **Срок хранения**: закрытые работы (`done`, `cancelled`, `failed`, `expired`) удаляются через
+  365 суток от `finished_at` (уход за базой); столько же итоги работ отсеивают кандидатов вида.
 - **`POST /works/run {kind, space?}`** — ручной запуск, только сессия WebUI (токену — 403); `space`
   — `knowledge`, `rules`, GUID решения или id пространства. `[works] enabled = false` — 409
   `/problems/works-disabled` (тот же ответ у `POST /works/model/test`); режим вида `off` — 409
@@ -774,10 +813,16 @@ CLI `zam`, свой клиент) получает значения, похож�
   reason}`; `{n, skip: "<почему>"}` — отказ от элемента; `skip` без `items` — работа
   `cancelled` (поставится снова следующей ночью). Запись, уже бывшая в пакете вида этой ночью
   (у ручных запусков — этих суток UTC) с любым исходом, в тот же запуск снова не ставится. Ответ — `{work, state, accepted: [n], rejected: [{n,
-  target, reason}], skipped: [n], skip: [{n, target, why}], skip_reason}`; текст с маской
-  `‹secret›`/`‹secret-…›` — отказ элемента; тело не по схеме — 400. Записи принятого (пробы,
-  кандидаты) и закрытие работы — одна транзакция: снятая или закрытая работа ничего не
-  записывает. Итоги одной работы принимаются по одному (ждущий — до 30 с, затем 409 `code:
+  target, reason}], skipped: [n], skip: [{n, target, why}], skip_reason, warnings?}`; текст с
+  маской `‹secret›`/`‹secret-…›` — отказ элемента; тело не по схеме — 400. Записи принятого
+  (пробы, кандидаты) и закрытие работы — одна транзакция: снятая или закрытая работа ничего не
+  записывает. Принятый элемент, чью запись закрытие не сделало (между проверкой и закрытием
+  исчерпан предел новых или активных проб, тот же вопрос уже записан, у источника появилось
+  предложение, открытых кандидатов — предел), остаётся в `accepted` и получает строку `warnings`
+  «`<ref>`: … не записан(а) — …» (у проб — с финальной правки M7.3). В итоге работы (`result` у
+  `GET /works`) принятый элемент хранится только проверенными полями вида: `item` — `{question}`
+  у `probes`, `{rule: {path, content}, reason}` у `rules` (путь нормализован, `title` — уже в
+  `content`); лишние поля элемента не сохраняются. Итоги одной работы принимаются по одному (ждущий — до 30 с, затем 409 `code:
   result_in_progress`). Повтор с тем же `Idempotency-Key` и тем же телом — прежний ответ без
   повторной записи (и пока первый ещё идёт — после него); тот же ключ с другим телом — 422
   `/problems/idempotency-mismatch`; другой ключ после итога — 409.
@@ -824,7 +869,10 @@ CLI `zam`, свой клиент) получает значения, похож�
   — `rule` (по умолчанию, иное — 400), `status` — `proposed | accepted | declined | withdrawn |
   stale | skipped` (без него — все, кроме `skipped`: отказ исполнителя человеку не показывается),
   `author` — `me` (агенты пользователя, то же, что `agent`) | `agent` | `model`; `limit` 1..=200
-  (50). `shell` — в тексте есть команды shell (`$ …`, `cmd /c`, `powershell`): пометка WebUI.
+  (50). `shell` — в тексте есть команды shell (приглашение `$ …`/`PS> …`, `cmd /c`, `powershell`,
+  `bash -c`, конвейер в оболочку `curl … | sh`, `iwr … | iex`, `curl`, `wget`,
+  `iex`/`Invoke-Expression`, `rm -rf`, `chmod +x`, `sudo`, … — и внутри однострочного кода):
+  пометка WebUI, не отказ — решает человек.
 - **`GET /proposals/counts`** → `{rules}` — открытых кандидатов (метка дерева «кандидаты: N»).
 - **`GET /proposals/{id}`** (`o:<id>` или id) — карточка и `rules_tokens {now, after}` (оценка Rules
   в дайджесте сейчас и с кандидатом, токенов), `sources: [{ref, rev, current_rev?, kind?, title?,

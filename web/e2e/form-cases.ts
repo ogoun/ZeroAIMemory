@@ -40,7 +40,8 @@ export interface FormCase {
   after: 'card' | 'notice' | 'none';
   /** Окно-подтверждение без полей. */
   confirm?: boolean;
-  /** Подтверждение необратимого: фокус — на «Отмена». */
+  /** Подтверждение необратимого или рискованного (`danger` и `cautious` каркаса): фокус — на
+   * «Отмена», Enter ничего не делает. */
   danger?: boolean;
   as?: 'admin' | 'user';
   /** Снимки «до» (0.0.15): `aria-label` прежней формы в карточке — на виду ли она. */
@@ -447,7 +448,15 @@ export const FORM_CASES: FormCase[] = [
     route: { method: 'PATCH', url: SETTINGS },
     after: 'notice',
     confirm: true,
+    // фокус — на «Отмена» (`cautious`; финальное ревью M7.3, Minor 10): Enter не подтверждает
+    // новый адрес подключения
+    danger: true,
     added: true,
+    kept: async (p) => {
+      // пауза на месте: «Подтвердить адрес» по-прежнему на странице
+      await expect(p.getByTestId('works-pause')).toBeVisible();
+      await expect(p.getByRole('button', { name: 'Подтвердить адрес', exact: true })).toBeVisible();
+    },
   },
   {
     // ревью r1 задачи 8, Minor 7: подключение убирается из интерфейса — опасное подтверждение

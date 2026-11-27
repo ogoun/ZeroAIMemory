@@ -6,7 +6,8 @@
 //!   verdict, flags, metrics, compared_with} | null, running: {run} | null, trend: [до 30: run,
 //!   date, trigger, status, verdict, hit_search, hit_prompt (test), negatives_shown, p95],
 //!   failing: [до 20: probe, question, target, rank, advice, advice_text, neighbor?], advice:
-//!   [{code, text}], probes: {active, by_kind, by_split}, check: {server, user}}`; вердикт —
+//!   [{code, text}], probes: {active, by_kind, by_split}, check: {server, user, reason}}`
+//!   ([`check_json`]: `reason` — `disabled` | `check_off` | `null`); вердикт —
 //!   `{kind, flags, after_update, after_update_version?, few, episode?, base_n, base_of: 5,
 //!   changed?, compared_with?}`.
 //! - `GET /check/runs?limit=&trigger=&status=` (1..=365, 30) → `{items}` — прогоны, новые первыми;
@@ -42,6 +43,7 @@ use crate::auth::{Client, Principal};
 use crate::check::{StartError, run as check_run};
 use crate::config::CheckMode;
 use crate::error::ApiError;
+use crate::works::settings::UserWorks;
 
 /// Прогонов в `trend` статуса.
 pub const TREND_MAX: usize = 30;
@@ -164,7 +166,6 @@ pub async fn status(
     let last = runs.iter().find(|r| r.status != RunStatus::Running);
     let counts = zam_store::probes::probe_counts(&db).await?;
     let works = crate::works::settings::load(&st.system, user).await?;
-    let server_check = st.cfg.works.enabled && st.cfg.works.check == CheckMode::Nightly;
     let last_json = last.map(|r| {
         let mut o = run_json(&p, r, false);
         o["compared_with"] = r
@@ -193,11 +194,28 @@ pub async fn status(
             "by_kind": counts_json(&counts.by_kind),
             "by_split": counts_json(&counts.by_split),
         },
-        "check": {
-            "server": if server_check { "nightly" } else { "off" },
-            "user": if works.check { "on" } else { "off" },
-        },
+        "check": check_json(&st.cfg.works, &works),
     })))
+}
+
+/// Ночная проверка сервера и пользователя: `{server: nightly | off, user: on | off, reason}`;
+/// `reason` — почему сервер её не проводит: `disabled` (`[works] enabled = false`), `check_off`
+/// (`[works] check = "off"`), иначе `null`. Одна форма у `GET /check/status` и
+/// `GET /works/usage` (выключатель «Ночная проверка моей памяти»; финальное ревью M7.3,
+/// Minor 12).
+pub(crate) fn check_json(cfg: &crate::config::WorksSection, works: &UserWorks) -> Value {
+    let reason = if !cfg.enabled {
+        Some("disabled")
+    } else if cfg.check != CheckMode::Nightly {
+        Some("check_off")
+    } else {
+        None
+    };
+    json!({
+        "server": if reason.is_none() { "nightly" } else { "off" },
+        "user": if works.check { "on" } else { "off" },
+        "reason": reason,
+    })
 }
 
 #[derive(Deserialize)]

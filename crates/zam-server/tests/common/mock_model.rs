@@ -23,6 +23,26 @@ pub struct MockReply {
     pub body: String,
     /// Задержка перед ответом (таймаут клиента).
     pub delay: Duration,
+    /// Ответ ждёт, пока тест его не «отпустит» ([`Gate::open`]): условие вместо задержки по
+    /// времени — тест делает своё (например, `PATCH` режима) и только потом отпускает ответ
+    /// (финальное ревью M7.3, Minor 9).
+    pub gate: Option<Gate>,
+}
+
+/// Ручное «отпускание» ответа подставной модели ([`MockReply::held`]); открыть можно и до того,
+/// как запрос пришёл (разрешение сохраняется).
+#[derive(Debug, Clone, Default)]
+pub struct Gate(Arc<tokio::sync::Notify>);
+
+impl Gate {
+    pub fn new() -> Gate {
+        Gate::default()
+    }
+
+    /// Отпустить ответ.
+    pub fn open(&self) {
+        self.0.notify_one();
+    }
 }
 
 impl MockReply {
@@ -33,6 +53,7 @@ impl MockReply {
             headers: vec![("content-type".into(), "application/json".into())],
             body: body.to_string(),
             delay: Duration::ZERO,
+            gate: None,
         }
     }
 
@@ -105,6 +126,12 @@ impl MockReply {
 
     pub fn delay(mut self, d: Duration) -> MockReply {
         self.delay = d;
+        self
+    }
+
+    /// Ответ — только после [`Gate::open`].
+    pub fn held(mut self, g: &Gate) -> MockReply {
+        self.gate = Some(g.clone());
         self
     }
 }
@@ -254,6 +281,9 @@ async fn handle(State(st): State<Arc<Shared>>, req: Request) -> Response {
         let next = st.queue.lock().unwrap().pop_front();
         next.unwrap_or_else(|| st.default.lock().unwrap().clone())
     };
+    if let Some(g) = &reply.gate {
+        g.0.notified().await;
+    }
     if !reply.delay.is_zero() {
         tokio::time::sleep(reply.delay).await;
     }

@@ -9,7 +9,8 @@
   // пауза — причина,
   // подсказка и у `vault_changed` «был → стал» с «Подтвердить адрес» (окно-подтверждение, шлёт
   // `confirm_url` = «стал»; 409 — новые «был → стал» в том же окне); ночь — время в поясе сервера
-  // и местное, окно, итог последней ночи по видам и выключатель ночной проверки; очередь работ и
+  // и местное, окно, итог последней ночи по видам и выключатель ночной проверки (неактивен с
+  // причиной, если сервер её не проводит — `usage.check`); очередь работ и
   // «Запустить сейчас» (окно-подтверждение; у модели — опрос очереди, пока работа идёт); журнал
   // отправок (метаданные, без текста); токены суток и месяца к пределам. Таблицы — `.table-wrap`,
   // на телефоне — карточки (§5.1). Свой пользователь (блок администратора — M7.4, §6.13).
@@ -38,6 +39,7 @@
     type WorksUsage,
   } from '../lib/worksApi';
   import {
+    CALL_NO_MS_HINT,
     KIND_SHORT,
     KIND_TITLE,
     MODE_NOTE,
@@ -50,7 +52,10 @@
     WORK_KINDS,
     addressView,
     bodyExtraText,
+    callDurationText,
+    callMsText,
     callTokensText,
+    checkOffText,
     nightText,
     num,
     outcomeText,
@@ -631,10 +636,23 @@
       <p class="muted small">Ночных работ ещё не было.</p>
     {/if}
     {#if settings}
+      <!-- сервер ночную проверку не проводит (`[works] check = off` или `enabled = false`):
+           выключатель неактивен с причиной — включённая галочка не обещает проверку, которой не
+           будет (финальное ревью M7.3, Minor 12) -->
+      {@const serverOff = u.check?.server === 'off'}
       <label class="opt">
-        <input type="checkbox" checked={settings.check === 'on'} onchange={(e) => setCheck(e.currentTarget.checked)} />
+        <input
+          type="checkbox"
+          checked={settings.check === 'on'}
+          disabled={serverOff}
+          aria-describedby={serverOff ? 'works-check-off' : undefined}
+          onchange={(e) => setCheck(e.currentTarget.checked)}
+        />
         Ночная проверка моей памяти
       </label>
+      {#if serverOff}
+        <p class="muted small" id="works-check-off" data-testid="works-check-off">{checkOffText(u.check.reason)}</p>
+      {/if}
       <Notice text={nightNotice} />
       {#if nightError}<p class="error" role="alert">{nightError}</p>{/if}
     {/if}
@@ -735,7 +753,7 @@
         <li class="card" data-call={c.kind}>
           <div class="card-head"><b>{KIND_SHORT[c.kind] ?? c.kind}</b> <span>{outcomeText(c.outcome, c.http_status)}</span></div>
           <div class="small">{localTime(c.ts)} · {c.model} · {c.host}{c.external ? ' · вне LAN' : ''}</div>
-          <div class="small">токены {callTokensText(c)} · {num(c.ms)} мс{c.items != null ? ` · записей ${c.items}` : ''}</div>
+          <div class="small">токены {callTokensText(c)} · {callDurationText(c.ms)}{c.items != null ? ` · записей ${c.items}` : ''}</div>
         </li>
       {/each}
     </ul>
@@ -751,7 +769,8 @@
               <td>{c.model}</td>
               <td>{c.host}{#if c.external}<span class="tag ext-tag">вне LAN</span>{/if}</td>
               <td class="num">{callTokensText(c)}</td>
-              <td class="num">{num(c.ms)}</td>
+              <!-- длительности нет — ответа не было: «—» с подсказкой, а не «0» (финальное ревью M7.3, Minor 2) -->
+              <td class="num" data-testid="call-ms" title={c.ms == null ? CALL_NO_MS_HINT : undefined}>{callMsText(c.ms)}</td>
               <td>{outcomeText(c.outcome, c.http_status)}</td>
             </tr>
           {/each}
@@ -838,9 +857,13 @@
   {/snippet}
 </FormDialog>
 
+<!-- фокус по умолчанию — на «Отмена» (`cautious`, как у опасных подтверждений, APG alertdialog):
+     Enter не отправляет ключ и пакеты на новый адрес без сверки «был / стал» (финальное ревью M7.3,
+     Minor 10) -->
 <FormDialog
   open={confirmOpen}
   confirm
+  cautious
   title="Подтвердить новый адрес подключения?"
   description="После подтверждения сервер будет отправлять пакеты работ и ключ на новый адрес. Если адрес меняли не вы — отмените и верните прежний адрес в записи Vault."
   submit="Подтвердить адрес"

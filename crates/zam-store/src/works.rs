@@ -16,7 +16,8 @@
 //! ([`enqueue`] — `None`): долг не копится. `items` — кандидаты пакета ([`WorkItem`]: ссылка и
 //! ревизия, вид, заголовок, текст вида агента, сигналы); `result` — итог (принято, отклонено с
 //! причинами, явные `skip` исполнителя, пропущено); `result_key` — `Idempotency-Key` принятого
-//! итога. Время — `crate::time::now()` (в тестах — замороженные часы).
+//! итога. Время — `crate::time::now()` (в тестах — замороженные часы). Закрытые работы хранятся
+//! [`RETENTION_DAYS`] суток от `finished_at` ([`gc`], воркер обслуживания).
 
 use std::collections::{HashMap, HashSet};
 
@@ -112,6 +113,10 @@ pub const STALE: &str = "stale";
 /// [`accepted_refs`]): чтение итогов не растёт без предела; отсев старше — снова отбирается и, если
 /// повод остался, отсеивается заново.
 pub const REFS_HORIZON_DAYS: i64 = 365;
+/// Срок хранения закрытой работы (`done`, `cancelled`, `failed`, `expired`), суток от
+/// `finished_at` ([`gc`], воркер обслуживания; финальное ревью M7.3, Minor 4) — тот же, что
+/// горизонт отсева [`REFS_HORIZON_DAYS`]: работа старше в отсев уже не входит, хранить её незачем.
+pub const RETENTION_DAYS: i64 = REFS_HORIZON_DAYS;
 /// `part` отметки показа строки внутренних работ дайджеста в `session_seen` (§6.3 п. 5): цель —
 /// первая работа строки (`target_kind = entry`, id работы), ревизия не используется (1) — важен
 /// сам факт показа: строка — раз за сессию (любая эпоха). Подсказки записей
@@ -478,7 +483,8 @@ pub enum ItemWrite {
     /// работы. При записи ещё раз, в транзакции, сверяются предел новых проб постановки работы
     /// (`works.origin`) с момента `since` — не больше `cap` — и [`crate::probes::insert_probe`]
     /// (повтор вопроса, предел активных): проверка элемента шла до транзакции, а итоги разных
-    /// работ пользователя принимаются параллельно. Не прошедшая сверку проба не пишется (WARN).
+    /// работ пользователя принимаются параллельно. Не прошедшая сверку проба не пишется (WARN и
+    /// предупреждение итога `warnings`, как у [`ItemWrite::Rule`]; финальное ревью M7.3, Minor 1).
     Probe {
         probe: crate::probes::NewProbe,
         since: Timestamp,
@@ -527,8 +533,9 @@ pub enum ItemWrite {
 pub const ECHO_PROPOSAL_TYPE: &str = "echo";
 
 /// Одна запись принятого элемента работы `w` (транзакция закрытия). `Some` — предупреждение:
-/// запись не сделана (у источника уже есть предложение, открытых кандидатов — предел), оно уходит
-/// в итог работы (`result.warnings`, ревью r1 задачи 7, Minor 6).
+/// запись не сделана (у источника уже есть предложение, открытых кандидатов — предел; проба —
+/// предел новых или активных проб, повтор вопроса), оно уходит в итог работы (`result.warnings`,
+/// ревью r1 задачи 7, Minor 6; у проб — финальное ревью M7.3, Minor 1).
 fn apply_write(
     t: &rusqlite::Transaction<'_>,
     w: &Work,
@@ -541,23 +548,39 @@ fn apply_write(
             since,
             cap,
         } => {
+            use crate::probes::InsertOutcome;
+            // цель пробы — элемент пакета: предупреждение называет его, как у кандидата в Rules
+            let target = probe.targets.first().map_or("", |x| x.target.as_str());
             let made = crate::probes::new_since_tx(t, w.origin.as_str(), since)?;
             if made >= cap {
                 tracing::warn!(work = %w.id, made, cap, "внутренние работы: предел новых проб исчерпан при записи — проба не записана");
-                return Ok(None);
+                return Ok(Some(format!(
+                    "{target}: проба не записана — предел новых проб ({cap}) исчерпан к закрытию \
+                     работы; запись получит пробу позже"
+                )));
             }
             let p = crate::probes::NewProbe {
                 space: Some(w.space_id),
                 work_id: Some(w.id),
                 ..probe.clone()
             };
-            match crate::probes::insert_tx(t, &p)? {
-                crate::probes::InsertOutcome::Inserted(_) => {}
-                o => {
-                    tracing::warn!(work = %w.id, outcome = ?o, "внутренние работы: проба не записана");
+            Ok(match crate::probes::insert_tx(t, &p)? {
+                InsertOutcome::Inserted(_) => None,
+                InsertOutcome::Duplicate => {
+                    tracing::warn!(work = %w.id, %target, "внутренние работы: проба не записана — такой вопрос уже есть");
+                    Some(format!(
+                        "{target}: проба не записана — повтор: такой вопрос уже есть у активной \
+                         пробы пространства"
+                    ))
                 }
-            }
-            Ok(None)
+                InsertOutcome::Full => {
+                    tracing::warn!(work = %w.id, %target, "внутренние работы: проба не записана — активных проб предел");
+                    Some(format!(
+                        "{target}: проба не записана — активных проб {} (предел)",
+                        crate::probes::PROBES_MAX
+                    ))
+                }
+            })
         }
         #[cfg(feature = "test-hooks")]
         ItemWrite::Echo {
@@ -668,8 +691,8 @@ fn apply_write(
 #[derive(Debug, Clone, PartialEq)]
 pub enum Closed {
     /// Работа закрыта итогом, записи принятого — в той же транзакции; `warnings` — записи,
-    /// которые не сделаны (повтор предложения, предел открытых кандидатов), они же — в
-    /// `result.warnings` и `result.response.warnings`.
+    /// которые не сделаны (повтор предложения, предел открытых кандидатов, проба сверх предела
+    /// или с повтором вопроса), они же — в `result.warnings` и `result.response.warnings`.
     Closed { warnings: Vec<String> },
     /// Работа уже закрыта итогом с этим `Idempotency-Key`: прежний `result` (сверку тела и
     /// прежний ответ берёт вызывающий), ничего не записано.
@@ -874,6 +897,23 @@ pub async fn expire(db: &Db, at: Timestamp) -> Result<u64, StoreError> {
                     claimed_until = NULL
              WHERE mode = 'agent' AND state = 'running' AND claimed_until <= ?1",
             [now_s],
+        )?;
+        Ok(n as u64)
+    })
+    .await
+}
+
+/// Срок хранения работ ([`RETENTION_DAYS`], воркер обслуживания): удаляет **закрытые** работы
+/// (`done`, `cancelled`, `failed`, `expired`), законченные раньше `before`; незакрытые не трогает
+/// при любом возрасте. Внешних ключей на `works` нет: пробы и предложения со ссылкой на работу
+/// (`work_id`) и строки журнала отправок остаются. Число удалённых.
+pub async fn gc(db: &Db, before: Timestamp) -> Result<u64, StoreError> {
+    db.write(move |t| {
+        let n = t.execute(
+            "DELETE FROM works
+             WHERE state IN ('done', 'cancelled', 'failed', 'expired')
+               AND finished_at IS NOT NULL AND finished_at < ?1",
+            [fmt_ts(before)],
         )?;
         Ok(n as u64)
     })
@@ -1129,7 +1169,8 @@ pub async fn offered_refs(
 }
 
 /// Итоги (`result`) работ вида в состояниях `states`, закрытых за последние
-/// [`REFS_HORIZON_DAYS`] суток, с состоянием работы.
+/// [`REFS_HORIZON_DAYS`] суток (индекс `works_finished (kind, finished_at)`; старше — удаляет уход
+/// за базой, [`gc`]), с состоянием работы.
 async fn item_results(
     db: &Db,
     kind: WorkKind,

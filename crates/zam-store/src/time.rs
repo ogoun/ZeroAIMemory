@@ -45,6 +45,15 @@ pub fn day_start_utc(t: Timestamp) -> Timestamp {
         .map_or(t, |d| d.timestamp())
 }
 
+/// Начало месяца UTC момента `t` (первое число, 00:00 UTC): месяц расхода токенов подключённой
+/// модели (M7.3 §6.2 п. 7) — одно определение для отказа сервера и показа в WebUI (финальное
+/// ревью M7.3, Minor 6).
+pub fn month_start_utc(t: Timestamp) -> Timestamp {
+    let d = t.to_zoned(jiff::tz::TimeZone::UTC).date().first_of_month();
+    d.to_zoned(jiff::tz::TimeZone::UTC)
+        .map_or(t, |z| z.timestamp())
+}
+
 /// Форматирует момент времени для хранения в TEXT-колонке.
 pub fn fmt_ts(ts: Timestamp) -> String {
     ts.strftime("%Y-%m-%dT%H:%M:%S.%6fZ").to_string()
@@ -137,6 +146,25 @@ mod tests {
         assert_eq!(fmt_ts(day_start_utc(t)), "2026-10-18T00:00:00.000000Z");
         let t: Timestamp = "2026-10-18T00:00:00Z".parse().unwrap();
         assert_eq!(day_start_utc(t), t);
+    }
+
+    /// Начало месяца UTC — первое число, а не начало суток (M7.3, ревью r1 задачи 2, Minor 4:
+    /// граница месяца).
+    #[test]
+    fn month_start_is_first_of_month() {
+        let t = |s: &str| s.parse::<Timestamp>().unwrap();
+        assert_eq!(
+            month_start_utc(t("2026-11-23T10:00:00Z")),
+            t("2026-11-01T00:00:00Z")
+        );
+        assert_eq!(
+            month_start_utc(t("2026-12-01T00:00:00Z")),
+            t("2026-12-01T00:00:00Z")
+        );
+        assert_eq!(
+            month_start_utc(t("2026-03-31T23:59:59Z")),
+            t("2026-03-01T00:00:00Z")
+        );
     }
 
     #[test]

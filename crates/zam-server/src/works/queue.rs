@@ -28,7 +28,8 @@
 //!   номера — только у вида с несколькими элементами на запись, [`super::kinds::repeats`]);
 //!   элементы пакета без итога — `skipped`; элементы, выброшенные вторым сканом, — отклонены с
 //!   `secret_in_payload`. `skip` без элементов — работа `cancelled`: сборщик поставит её снова
-//!   следующей ночью.
+//!   следующей ночью. Принятый элемент хранится в итоге только проверенными полями вида
+//!   ([`super::kinds::kept_item`]), а не как прислан.
 //! - **Предел записей вида** ([`super::kinds::room`]; у `probes` — остаток пределов проб, у
 //!   агента — за вычетом поставленного в этом проходе): постановка берёт кандидатов не больше
 //!   остатка, исчерпан — запуск вида кончен.
@@ -697,8 +698,11 @@ pub async fn accept(
         }
         match kinds::accept_item(w.kind, ctx, n, item, &writes).await {
             Ok(rows) => {
+                // в итог — только проверенные поля вида, а не присланный элемент как есть
+                // (финальное ревью M7.3, Minor 3)
+                let kept = kinds::kept_item(&rows);
                 writes.extend(rows);
-                accepted.push(json!({"n": n, "target": it.target, "rev": it.rev, "item": item}));
+                accepted.push(json!({"n": n, "target": it.target, "rev": it.rev, "item": kept}));
             }
             Err(Reject { reason }) => rejected.push(reject(Some(n), Some(it), &reason)),
         }

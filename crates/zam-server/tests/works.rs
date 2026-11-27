@@ -512,8 +512,11 @@ async fn work_result_partial_and_rejects_with_reasons() {
     // итог не по схеме — 400, работа по-прежнему у сессии
     let r = put_result(&a, S1, &work, json!({"items": {"n": 1}}), None).await;
     ok(&r, StatusCode::BAD_REQUEST);
+    // лишнее поле элемента (мусор исполнителя) в итог работы не идёт (финальное ревью M7.3,
+    // Minor 3)
+    let junk = "мусор ".repeat(2000);
     let body = json!({"items": [
-        {"n": 1, "text": "Один"},
+        {"n": 1, "text": "Один", "target": refs[0], "junk": junk, "more": {"x": [1, 2, 3]}},
         {"n": 2, "text": ""},
         {"n": 9, "text": "лишний"},
         {"n": 3, "skip": "вопроса здесь нет"},
@@ -540,7 +543,9 @@ async fn work_result_partial_and_rejects_with_reasons() {
     assert_eq!(w.state, WorkState::Done);
     let res = w.result.unwrap();
     assert_eq!(res["accepted"][0]["target"], refs[0].as_str());
-    assert_eq!(res["accepted"][0]["item"]["text"], "Один");
+    // принятый элемент — только проверенные поля вида (у `echo` — `text`)
+    assert_eq!(res["accepted"][0]["item"], json!({"text": "Один"}), "{res}");
+    assert!(!res.to_string().contains("мусор"), "{res}");
     assert_eq!(res["author_kind"], "agent");
     assert_eq!(res["author"], S1);
 }
@@ -1475,6 +1480,197 @@ async fn secret_dropped_stays_excluded_after_skip() {
     for w in &ws[..ws.len() - 1] {
         assert!(w.items.iter().all(|i| i.target != leaky), "{w:?}");
     }
+}
+
+/// Финальное ревью M7.3, Minor 4 (решение координатора): закрытые работы (`done`, `cancelled`,
+/// `failed`, `expired`) старше `RETENTION_DAYS` (365 суток от `finished_at`) удаляет уход за
+/// базой (`maintenance::gc_works`), незакрытая работа остаётся при любом возрасте; отсев по итогам
+/// (`excluded_refs`, `accepted_refs`) читает только этот срок — итог 366 суток назад ничего не
+/// отсеивает, 364 — отсеивает.
+#[tokio::test]
+async fn works_retention_and_refs_horizon() {
+    let _g = SERIAL.lock().await;
+    let a = server("retention", |_| {}).await;
+    let dbx = db(&a).await;
+    let space = zam_store::list_spaces(&dbx)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.kind == zam_store::SpaceKind::Knowledge)
+        .unwrap()
+        .id;
+    let now = zam_store::time::now();
+    let day = SignedDuration::from_hours(24);
+    assert_eq!(store::RETENTION_DAYS, store::REFS_HORIZON_DAYS);
+    assert_eq!(
+        zam_server::maintenance::WORKS_TTL,
+        day * store::RETENTION_DAYS as i32
+    );
+    // работа вида `echo` пространства, закрытая `age` суток назад состоянием `state`: принят
+    // элемент `acc`, отклонён вторым сканом `rej`
+    let closed = |state: WorkState, age: i64, acc: String, rej: String| {
+        let dbx = dbx.clone();
+        async move {
+            let w = store::enqueue(
+                &dbx,
+                NewWork {
+                    kind: WorkKind::Echo,
+                    space,
+                    mode: WorkMode::Model,
+                    origin: Origin::Manual,
+                    night: None,
+                    items: vec![WorkItem {
+                        n: 1,
+                        target: acc.clone(),
+                        rev: 1,
+                        kind: "insight".into(),
+                        title: "т".into(),
+                        text: "т".into(),
+                        signals: Vec::new(),
+                    }],
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let result = json!({
+                "accepted": [{"n": 1, "target": acc, "rev": 1, "item": {"text": "т"}}],
+                "rejected": [{"n": 2, "target": rej, "rev": 1, "reason": store::SECRET_IN_PAYLOAD}],
+            });
+            assert!(
+                store::finish(&dbx, w.id, state, result, None)
+                    .await
+                    .unwrap()
+            );
+            let at = zam_store::time::fmt_ts(now - day * age as i32);
+            let id = w.id;
+            dbx.write(move |t| {
+                t.execute(
+                    "UPDATE works SET finished_at = ?2 WHERE id = ?1",
+                    rusqlite::params![id, at],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            w.id
+        }
+    };
+    let r = |s: &str| format!("i:{}-{s}", Id::new());
+    let (old_acc, old_rej, new_acc, new_rej) = (r("oa"), r("or"), r("na"), r("nr"));
+    let old = closed(WorkState::Done, 366, old_acc.clone(), old_rej.clone()).await;
+    let fresh = closed(WorkState::Done, 364, new_acc.clone(), new_rej.clone()).await;
+    let old_failed = closed(WorkState::Failed, 400, r("fa"), r("fr")).await;
+    let old_cancelled = closed(WorkState::Cancelled, 400, r("ca"), r("cr")).await;
+    // отсев — только итоги не старше горизонта
+    let excluded = store::excluded_refs(&dbx, WorkKind::Echo).await.unwrap();
+    assert!(excluded.contains(&(new_rej.clone(), 1)), "{excluded:?}");
+    assert!(!excluded.contains(&(old_rej.clone(), 1)), "{excluded:?}");
+    let accepted = store::accepted_refs(&dbx, WorkKind::Echo).await.unwrap();
+    assert!(accepted.contains(&(new_acc.clone(), 1)), "{accepted:?}");
+    assert!(!accepted.contains(&(old_acc.clone(), 1)), "{accepted:?}");
+    // незакрытая работа старше срока (дата правится SQL) уходом не удаляется
+    let open = store::enqueue(
+        &dbx,
+        NewWork {
+            kind: WorkKind::Echo,
+            space,
+            mode: WorkMode::Agent,
+            origin: Origin::Manual,
+            night: None,
+            items: Vec::new(),
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let (id, at) = (open.id, zam_store::time::fmt_ts(now - day * 500));
+    dbx.write(move |t| {
+        t.execute(
+            "UPDATE works SET created_at = ?2, finished_at = ?2 WHERE id = ?1",
+            rusqlite::params![id, at],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    // уход за базой: закрытые старше 365 суток — удалены, свежая и незакрытая — на месте
+    assert_eq!(zam_server::maintenance::gc_works(&a.st, now).await, 3);
+    for gone in [old, old_failed, old_cancelled] {
+        assert!(store::get(&dbx, gone).await.unwrap().is_none(), "{gone}");
+    }
+    assert!(store::get(&dbx, fresh).await.unwrap().is_some());
+    assert_eq!(
+        store::get(&dbx, open.id).await.unwrap().unwrap().state,
+        WorkState::Queued
+    );
+    // повторный проход — ничего
+    assert_eq!(zam_server::maintenance::gc_works(&a.st, now).await, 0);
+}
+
+/// Финальное ревью M7.3, Minor 12: `GET /works/usage` несёт ночную проверку сервера и
+/// пользователя `check {server, user, reason}` — ту же, что `GET /check/status`: проверка идёт —
+/// `nightly`; `[works] check = "off"` — `off` с причиной `check_off`; `enabled = false` — `off` с
+/// причиной `disabled`. Minor 6: пределы `usage` — те же, по которым сервер отказывает
+/// (`works.limits` ниже потолка снижает предел, выше — нет).
+#[tokio::test]
+async fn usage_check_state_and_limits() {
+    let _g = SERIAL.lock().await;
+    // тестовый сервер — с `check = "off"` (`common::cfg_in`): «идёт» — явно `nightly` (окно ночи
+    // — через 6 ч, проверка в тесте не запускается)
+    for (name, tweak, server_mode, reason) in [
+        (
+            "usage-nightly",
+            (|c: &mut ServerConfig| c.works.check = zam_server::config::CheckMode::Nightly)
+                as fn(&mut ServerConfig),
+            "nightly",
+            Value::Null,
+        ),
+        (
+            "usage-check-off",
+            |c: &mut ServerConfig| c.works.check = zam_server::config::CheckMode::Off,
+            "off",
+            json!("check_off"),
+        ),
+        (
+            "usage-disabled",
+            |c: &mut ServerConfig| {
+                c.works.check = zam_server::config::CheckMode::Nightly;
+                c.works.enabled = false;
+            },
+            "off",
+            json!("disabled"),
+        ),
+    ] {
+        let a = server(name, tweak).await;
+        let usage = a.adm(Method::GET, "/api/v1/works/usage", None, None).await;
+        ok(&usage, StatusCode::OK);
+        let want = json!({"server": server_mode, "user": "on", "reason": reason});
+        assert_eq!(usage.json()["check"], want, "{name}: {}", usage.text());
+        let status = a.adm(Method::GET, "/api/v1/check/status", None, None).await;
+        ok(&status, StatusCode::OK);
+        assert_eq!(status.json()["check"], want, "{name}: {}", status.text());
+    }
+    // пределы: свои `works.limits` ниже потолка — действуют, потолок — `ceiling` (выше потолка
+    // `PATCH` не примет — 422; «минимум из двух» — модульный тест `token_limits_min_of_two`)
+    let a = server("usage-limits", |c| {
+        c.works.max_daily_tokens = 1000;
+        c.works.max_monthly_tokens = 5000;
+    })
+    .await;
+    ok(
+        &patch(
+            &a,
+            json!({"works": {"limits": {"daily_tokens": 400, "monthly_tokens": 5000}}}),
+        )
+        .await,
+        StatusCode::OK,
+    );
+    let usage = a.adm(Method::GET, "/api/v1/works/usage", None, None).await;
+    let v = usage.json();
+    assert_eq!(v["day"]["limit"], 400, "{v}");
+    assert_eq!(v["month"]["limit"], 5000, "{v}");
+    assert_eq!(v["ceiling"], json!({"daily": 1000, "monthly": 5000}), "{v}");
 }
 
 /// §6.3 п. 2: ручной запуск — только человек: токену 403 и ни одного запроса к модели.

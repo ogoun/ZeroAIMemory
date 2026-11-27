@@ -427,9 +427,21 @@ pub(crate) async fn journal(db: &zam_store::Db, row: CallRow) {
     }
 }
 
+/// Действующие пределы токенов пользователя на сутки и месяц UTC (§6.2 п. 7): потолки `[works]`,
+/// сниженные его `works.limits`. Одна функция для отказа сервера ([`fits_limits`]) и показа в
+/// WebUI (`GET /works/usage`; финальное ревью M7.3, Minor 6).
+pub(crate) fn token_limits(works: &UserWorks, s: &WorksSection) -> (u64, u64) {
+    let (mut daily, mut monthly) = (s.max_daily_tokens, s.max_monthly_tokens);
+    if let Some(l) = works.limits {
+        daily = daily.min(l.daily_tokens);
+        monthly = monthly.min(l.monthly_tokens);
+    }
+    (daily, monthly)
+}
+
 /// Пределы токенов (§6.2 п. 7): оценка «вход (счётчик выдачи) + `max_tokens`» помещается в
-/// остаток суток и месяца UTC пользователя (`works.limits`, не выше потолков `[works]`); расход
-/// — сумма по журналу отправок.
+/// остаток суток и месяца UTC пользователя ([`token_limits`]); расход — сумма по журналу
+/// отправок с начала суток и месяца UTC (`zam_store::time::day_start_utc`, `month_start_utc`).
 pub(crate) async fn fits_limits(
     db: &zam_store::Db,
     works: &UserWorks,
@@ -437,29 +449,18 @@ pub(crate) async fn fits_limits(
     now: Timestamp,
     estimate: u64,
 ) -> Result<bool, zam_store::StoreError> {
-    let (mut daily, mut monthly) = (s.max_daily_tokens, s.max_monthly_tokens);
-    if let Some(l) = works.limits {
-        daily = daily.min(l.daily_tokens);
-        monthly = monthly.min(l.monthly_tokens);
-    }
+    let (daily, monthly) = token_limits(works, s);
     if daily == 0 || monthly == 0 {
         return Ok(false);
     }
     let day = zam_store::time::day_start_utc(now);
-    let month = month_start_utc(now);
+    let month = zam_store::time::month_start_utc(now);
     let spent_day = work_calls::tokens_since(db, day).await?;
     if spent_day.saturating_add(estimate) > daily {
         return Ok(false);
     }
     let spent_month = work_calls::tokens_since(db, month).await?;
     Ok(spent_month.saturating_add(estimate) <= monthly)
-}
-
-/// Начало месяца UTC момента `t`.
-fn month_start_utc(t: Timestamp) -> Timestamp {
-    let d = t.to_zoned(jiff::tz::TimeZone::UTC).date().first_of_month();
-    d.to_zoned(jiff::tz::TimeZone::UTC)
-        .map_or(t, |z| z.timestamp())
 }
 
 /// Оценка расхода обращения: вход счётчиком выдачи + предел ответа.
@@ -883,6 +884,25 @@ mod tests {
         format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5")
     }
 
+    /// Действующие пределы — меньший из потолка `[works]` и своего `works.limits` по каждому
+    /// окну; без своих — потолки (одна функция у отказа и у `GET /works/usage`, финальное ревью
+    /// M7.3, Minor 6).
+    #[test]
+    fn token_limits_min_of_two() {
+        let s = WorksSection {
+            max_daily_tokens: 1000,
+            max_monthly_tokens: 5000,
+            ..WorksSection::default()
+        };
+        let mut u = UserWorks::default();
+        assert_eq!(token_limits(&u, &s), (1000, 5000));
+        u.limits = Some(settings::Limits {
+            daily_tokens: 400,
+            monthly_tokens: 9000,
+        });
+        assert_eq!(token_limits(&u, &s), (400, 5000));
+    }
+
     /// Блок `json`, объект в тексте, строки со скобками, `<think>`, не объект, нет объекта.
     #[test]
     fn extract_json_cases() {
@@ -980,23 +1000,5 @@ mod tests {
             CallClass::SecretInPayload
         );
         assert_eq!(p.system(), "инструкция\n\n{}");
-    }
-
-    /// Начало месяца UTC — первое число, а не начало суток (ревью r1 Minor 4: граница месяца).
-    #[test]
-    fn month_start_is_first_of_month() {
-        let t = |s: &str| s.parse::<Timestamp>().unwrap();
-        assert_eq!(
-            month_start_utc(t("2026-11-23T10:00:00Z")),
-            t("2026-11-01T00:00:00Z")
-        );
-        assert_eq!(
-            month_start_utc(t("2026-12-01T00:00:00Z")),
-            t("2026-12-01T00:00:00Z")
-        );
-        assert_eq!(
-            month_start_utc(t("2026-03-31T23:59:59Z")),
-            t("2026-03-01T00:00:00Z")
-        );
     }
 }

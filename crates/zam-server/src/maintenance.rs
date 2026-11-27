@@ -8,8 +8,9 @@
 //! — нет; снимки сессий (M6 §8а) старше `snapshot.keep_days` от `taken_at` удаляются
 //! ([`gc_snapshots`]); журнал отправок подключённой модели (`work_calls`, M7.3) — 180 суток от
 //! `ts` ([`gc_work_calls`]); прогоны ночной проверки памяти (`check_runs` с их `check_results`,
-//! M7.3) — 365 суток от `started_at` ([`gc_check_runs`]). Работает и без модели (в отличие от
-//! воркера индексации).
+//! M7.3) — 365 суток от `started_at` ([`gc_check_runs`]); закрытые внутренние работы (`works`,
+//! M7.3) — 365 суток от `finished_at` ([`gc_works`]: столько же итоги работ читает отсев
+//! кандидатов). Работает и без модели (в отличие от воркера индексации).
 //!
 //! Автокопии (M6 §12б.4): раз в [`BACKUP_TICK`] — решение [`crate::backup::schedule::tick`]
 //! по `[backup]`; копию снимает тот же код, что `zam-server backup` (в блокирующем потоке),
@@ -38,6 +39,11 @@ pub const SESSION_TTL: SignedDuration = SignedDuration::from_hours(24 * 30);
 pub const WORK_CALLS_TTL: SignedDuration = SignedDuration::from_hours(24 * 180);
 /// Срок хранения прогона ночной проверки памяти от `started_at` (M7.3 §6.5 п. 7).
 pub const CHECK_RUNS_TTL: SignedDuration = SignedDuration::from_hours(24 * 365);
+/// Срок хранения закрытой внутренней работы от `finished_at` (M7.3 §6.3 п. 1; финальное ревью
+/// M7.3, Minor 4): горизонт отсева кандидатов по итогам работ
+/// ([`zam_store::works::RETENTION_DAYS`]).
+pub const WORKS_TTL: SignedDuration =
+    SignedDuration::from_hours(24 * zam_store::works::RETENTION_DAYS);
 /// Период прохода обслуживания.
 pub const PERIOD: Duration = Duration::from_secs(24 * 60 * 60);
 /// Задержка первого прохода после старта: не мешать прогреву и перенарезке при открытии,
@@ -86,6 +92,7 @@ impl Maintenance {
                 gc_sessions_in(&system, &users, zam_store::time::now()).await;
                 gc_work_calls_in(&system, &users, zam_store::time::now()).await;
                 gc_check_runs_in(&system, &users, zam_store::time::now()).await;
+                gc_works_in(&system, &users, zam_store::time::now()).await;
                 gc_cache_in(&system, &users, &cache, zam_store::time::now()).await;
                 gc_snapshots_in(&system, &users, keep_days, zam_store::time::now()).await;
             }
@@ -215,6 +222,41 @@ async fn gc_check_runs_in(system: &SystemStore, users: &UserDbs, now: Timestamp)
             }
             Err(e) => {
                 tracing::warn!(user = %u.id, error = %e, "обслуживание: прогоны проверки памяти не очищены")
+            }
+        }
+    }
+    total
+}
+
+/// Один проход срока хранения закрытых внутренних работ ([`WORKS_TTL`] от `finished_at`, M7.3)
+/// на момент `now` по всем базам; число удалённых работ.
+pub async fn gc_works(st: &AppState, now: Timestamp) -> u64 {
+    gc_works_in(&st.system, &st.users, now).await
+}
+
+async fn gc_works_in(system: &SystemStore, users: &UserDbs, now: Timestamp) -> u64 {
+    let list = match system.list_users().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "обслуживание: список пользователей недоступен");
+            return 0;
+        }
+    };
+    let cutoff = now - WORKS_TTL;
+    let mut total = 0;
+    for u in list {
+        let r = match users.get(u.id).await {
+            Ok(db) => zam_store::works::gc(&db, cutoff).await,
+            Err(e) => Err(e),
+        };
+        match r {
+            Ok(0) => {}
+            Ok(n) => {
+                tracing::info!(user = %u.id, deleted = n, "обслуживание: удалены старые внутренние работы");
+                total += n;
+            }
+            Err(e) => {
+                tracing::warn!(user = %u.id, error = %e, "обслуживание: внутренние работы не очищены")
             }
         }
     }

@@ -5,7 +5,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  CALL_NO_MS_HINT,
   addressView,
+  callDurationText,
+  callMsText,
+  checkOffText,
+  num,
   pinnedHost,
   pinnedUrl,
   nextSlot,
@@ -123,6 +128,34 @@ test('works_journal_and_result_texts', () => {
   );
   assert.equal(workResultText({ accepted: [], skip_reason: 'нечего спросить' }), 'принято 0 · отказ от работы: нечего спросить');
   assert.equal(workResultText(null), '');
+  // принятое, которое закрытие работы не записало (предел, повтор), — видно (финальное ревью
+  // M7.3, Minor 1): «принято» без пометки было бы неправдой
+  assert.equal(
+    workResultText({ accepted: [{ n: 1 }, { n: 2 }], rejected: [], warnings: ['i:1: проба не записана — предел'] }),
+    'принято 2 · не записано 1',
+  );
+});
+
+test('works_journal_duration_none', () => {
+  // финальное ревью M7.3, Minor 2: строка без длительности (`aborted`, `internal`, `limit`, …) —
+  // «—» с подсказкой, а не «0 мс»
+  assert.equal(callMsText(null), '—');
+  assert.equal(callMsText(undefined), '—');
+  assert.equal(callMsText(0), '0');
+  assert.equal(callMsText(1234), num(1234));
+  assert.equal(callDurationText(null), `— (${CALL_NO_MS_HINT})`);
+  assert.equal(callDurationText(85), `${num(85)} мс`);
+  assert.match(CALL_NO_MS_HINT, /ответа не было/);
+});
+
+test('works_check_server_off_texts', () => {
+  // финальное ревью M7.3, Minor 12: выключатель «Ночная проверка моей памяти» при проверке,
+  // выключенной на сервере, — с причиной
+  assert.match(checkOffText('check_off'), /^На сервере ночная проверка выключена администратором/);
+  assert.match(checkOffText('check_off'), /«Проверка памяти»/);
+  assert.match(checkOffText('disabled'), /внутренние работы выключены/);
+  assert.doesNotMatch(checkOffText('disabled'), /ручной прогон/);
+  assert.match(checkOffText(null), /ночная проверка выключена/);
 });
 
 test('works_proposal_texts', () => {
