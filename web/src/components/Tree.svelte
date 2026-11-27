@@ -628,6 +628,7 @@
           {#each js as j (j)}
             {@const n = c?.journals[j]}
             {@const oq = j === 'questions' ? (c?.open.questions ?? 0) : 0}
+            {@const steps = j === 'tasks' ? (c?.task_steps ?? 0) : 0}
             <li>
               <div class="tree-row" class:selected={isJournal(uid, ref, j)} style:--depth={depth + 1}>
                 <span class="twisty"></span>
@@ -641,8 +642,8 @@
                 </a>
                 {#if n !== undefined}
                   {#if oq > 0}<span class="tag open" aria-hidden="true">{openLabel(oq)}</span>{/if}
-                  <span class="num" class:zero={n === 0} data-count={j} aria-hidden="true" title={countHint(j)}>{formatCount(n)}</span>
-                  <span id={countId(uid, ref, j)} hidden>{countDescription(j, n, oq)}</span>
+                  <span class="num" class:zero={n === 0} data-count={j} aria-hidden="true" title={countHint(j, n, steps)}>{formatCount(n)}</span>
+                  <span id={countId(uid, ref, j)} hidden>{countDescription(j, n, oq, steps)}</span>
                 {/if}
               </div>
             </li>

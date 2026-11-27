@@ -125,6 +125,8 @@ fn health_features_documented() {
         "works",
         // «агент открыл подсказку»: `usage.opened`, лента `noisy=1` (задача 6 M7.3)
         "usage_opened",
+        // шаги планов `task_steps` в `GET /spaces/{space}/counts` (задача 10c M7.3)
+        "space_counts_steps",
     ] {
         assert!(built.contains(f), "{f}");
     }

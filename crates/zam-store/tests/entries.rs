@@ -1764,9 +1764,10 @@ async fn space_counts_live_journals_open_and_notes() {
 }
 
 /// Цена [`space_counts`] на решении с 2 000 живых записей (по 500 insight, changelog, задач и
-/// вопросов), 80 записями в корзине и 200 заметками (план задачи 4 M7.2, шаг 4): медиана и
-/// наибольшее из 20 чтений — в журнал этапа. Запуск: `cargo test -p zam-store --test entries
-/// space_counts_2000_cost --release -- --ignored --nocapture`.
+/// вопросов), 80 записями в корзине и 200 заметками (план задачи 4 M7.2, шаг 4); с задачи 10c
+/// M7.3 — и 400 шагов планов: задачи с 101-й — `part_of` одной из первых 100 (`task_steps`):
+/// медиана и наибольшее из 20 чтений — в журнал этапа. Запуск: `cargo test -p zam-store --test
+/// entries space_counts_2000_cost --release -- --ignored --nocapture`.
 #[tokio::test]
 #[ignore = "замер для журнала этапа"]
 async fn space_counts_2000_cost() {
@@ -1774,6 +1775,7 @@ async fn space_counts_2000_cost() {
     let (sol, _) = create_solution(&db, "g-space-counts-2000", "Решение")
         .await
         .unwrap();
+    let mut tasks = Vec::new();
     for i in 0..2_080 {
         let title = format!("Запись {i}");
         let e = match i % 4 {
@@ -1785,7 +1787,27 @@ async fn space_counts_2000_cost() {
         let id = add(&db, e).await;
         if i >= 2_000 {
             delete_entry(&db, id, None, &agent()).await.unwrap();
+        } else if i % 4 == 2 {
+            tasks.push(id);
         }
+    }
+    // шаги планов: задачи с 101-й — `part_of` одной из первых 100
+    use zam_store::GraphStore as _;
+    let e = |id| zam_core::TargetRef {
+        kind: TargetKind::Entry,
+        id,
+    };
+    for (k, step) in tasks.iter().enumerate().skip(100) {
+        db.add_edge(
+            zam_store::NewEdge {
+                src: e(*step),
+                dst: e(tasks[k % 100]),
+                kind: zam_store::EdgeType::PartOf,
+            },
+            &agent(),
+        )
+        .await
+        .unwrap();
     }
     for i in 0..200 {
         note(&db, sol.id, &format!("заметка-{i}")).await;
@@ -1800,14 +1822,15 @@ async fn space_counts_2000_cost() {
                 c.journals["insights"],
                 c.journals["tasks"],
                 c.open_tasks,
-                c.notes
+                c.notes,
+                c.task_steps
             ),
-            (500, 500, 500, 200)
+            (500, 500, 500, 200, 400)
         );
     }
     times.sort();
     println!(
-        "space_counts 2000 записей, 80 в корзине, 200 заметок: медиана {:?}, наибольшее {:?}",
+        "space_counts 2000 записей, 80 в корзине, 200 заметок, 400 шагов: медиана {:?}, наибольшее {:?}",
         times[times.len() / 2],
         times[times.len() - 1]
     );

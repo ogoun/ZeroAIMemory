@@ -12,7 +12,7 @@ use zam_store::{
     Attribution, AuthorKind, DataDir, Db, EdgeType, EntryFilter, EntryKind, EntryPatch,
     EntryStatus, GraphStore, IdeaPriority, NewEdge, NewEntry, OpenTask, SpaceKind, StoreError,
     claim_task, count_by_status, create_entry, create_solution, delete_entry, list_entries,
-    list_spaces, open_tasks, task_tree, update_entry,
+    list_spaces, open_tasks, space_counts, task_tree, update_entry,
 };
 
 fn datadir(name: &str) -> DataDir {
@@ -236,6 +236,68 @@ async fn task_tree_space_order_and_deleted() {
     // в Knowledge шаг — верхнего уровня: ребро ведёт в другое пространство
     let kt = task_tree(&db, kn).await.unwrap();
     assert!(kt.parent.is_empty() && kt.nodes.contains_key(&t_kn));
+}
+
+/// `task_steps` [`space_counts`] (M7.3 §6.14 п. 10) — число подзадач дерева [`task_tree`] того же
+/// пространства: два родителя — один шаг, вложенный шаг — шаг, задачи цикла `part_of` — верхнего
+/// уровня (а задача, ведущая в цикл, — шаг), удалённое ребро, удалённая задача и рёбра в другое
+/// пространство (в обе стороны) не в счёт; у Knowledge с ребром наружу — 0.
+#[tokio::test]
+async fn space_counts_task_steps_match_tree() {
+    let (db, sol, kn) = setup("task-steps").await;
+    let p = task(&db, sol, "Общая", json!({})).await;
+    let q = task(&db, sol, "Вторая общая", json!({})).await;
+    let s = futures_steps(&db, sol, 4).await;
+    for x in &s {
+        part_of(&db, *x, p).await;
+    }
+    part_of(&db, s[1], q).await;
+    let nested = task(&db, sol, "Шаг шага", json!({})).await;
+    part_of(&db, nested, s[0]).await;
+    let mut c: Vec<Id> = Vec::new();
+    for t in ["Цикл А", "Цикл Б", "Ведёт в цикл"] {
+        c.push(task(&db, sol, t, json!({})).await);
+    }
+    part_of(&db, c[0], c[1]).await;
+    part_of(&db, c[1], c[0]).await;
+    part_of(&db, c[2], c[0]).await;
+    let loose = task(&db, sol, "Отвязанная", json!({})).await;
+    let gone = part_of(&db, loose, p).await;
+    db.remove_edge(gone, &agent()).await.unwrap();
+    delete_entry(&db, s[3], None, &agent()).await.unwrap();
+    let k = task(&db, kn, "Задача Knowledge", json!({})).await;
+    part_of(&db, k, p).await;
+    let out = task(&db, sol, "Шаг задачи Knowledge", json!({})).await;
+    part_of(&db, out, k).await;
+
+    let spaces = list_spaces(&db).await.unwrap();
+    let space = |id: Id| spaces.iter().find(|x| x.id == id).unwrap();
+    let tree = task_tree(&db, sol).await.unwrap();
+    let c_sol = space_counts(&db, space(sol), true).await.unwrap();
+    // s0, s1 (два родителя), s2, шаг шага, c2 (ведёт в цикл)
+    assert_eq!(c_sol.task_steps, 5);
+    assert_eq!(
+        usize::try_from(c_sol.task_steps).unwrap(),
+        tree.parent.len()
+    );
+    // задачи доски верхнего уровня — число журнала без шагов
+    let top = count_by_status(
+        &db,
+        EntryFilter {
+            space_id: sol,
+            kind: Some(EntryKind::Task),
+            except_ids: tree.subtask_ids(),
+            limit: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let top: u64 = top.iter().map(|(_, v)| u64::try_from(*v).unwrap()).sum();
+    assert_eq!(top + c_sol.task_steps, c_sol.journals["tasks"]);
+    let c_kn = space_counts(&db, space(kn), true).await.unwrap();
+    assert_eq!(c_kn.task_steps, 0);
+    assert_eq!(task_tree(&db, kn).await.unwrap().parent.len(), 0);
 }
 
 /// `n` задач «Шаг i» пространства `space` по порядку создания.

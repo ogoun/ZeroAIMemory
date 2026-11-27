@@ -296,6 +296,9 @@ export interface SpaceCounts {
   open: { questions: number; tasks: number };
   /** Живые заметки без папок. */
   notes: number;
+  /** Шаги планов — подзадачи `part_of` среди `journals.tasks` (без них — задачи верхнего уровня доски,
+   * `top_level=1`); признак `space_counts_steps` (M7.3 §6.14 п. 10). Старый сервер поля не отдаёт. */
+  task_steps?: number;
 }
 export const spaceCounts = (user: string, space: string) =>
   call<SpaceCounts>('GET', `spaces/${q(space)}/counts`, undefined, user);

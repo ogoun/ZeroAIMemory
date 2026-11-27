@@ -4,7 +4,7 @@
 // (пре-флайт N3). Формы — `plural.ts` (N17). Логика кэша — `CountsCache` (хранилище, запрос, часы
 // и отложенный вызов подставляются); экземпляр на рунах с подписками — `counts.svelte.ts`.
 // Модуль без runtime-импортов, кроме `.ts`: его читает `node --test` (`web/test/counts.test.ts`).
-import { plural, RECORD_FORMS, type Forms } from './plural.ts';
+import { plural, PLAN_STEP_FORMS, RECORD_FORMS, TASK_FORMS, type Forms } from './plural.ts';
 import type { Journal } from './router';
 
 const NUM = new Intl.NumberFormat('ru-RU');
@@ -27,16 +27,28 @@ export const countLabel = (journal: Journal, n: number): string =>
 /** Метка открытых вопросов: «открыто 2». */
 export const openLabel = (n: number): string => `открыто ${formatCount(n)}`;
 
-/** Описание журнала целиком: «3 записи», у «Вопросов» с открытыми — «3 записи, открыто 1». */
-export const countDescription = (journal: Journal, n: number, open = 0): string =>
-  open > 0 ? `${countLabel(journal, n)}, ${openLabel(open)}` : countLabel(journal, n);
+/** Число «Задач» с шагами планов (M7.3, спецификация §6.14 п. 10, задача 10c): «109 записей: 37
+ * задач и 72 шага планов» — число журнала считает все записи, доска по умолчанию — задачи без
+ * шагов (`task_steps` ответа `GET /spaces/{space}/counts`). Шагов нет — `null`. */
+export const tasksSplit = (n: number, steps: number): string | null =>
+  steps > 0 ? `${countLabel('tasks', n)}: ${label(Math.max(0, n - steps), TASK_FORMS)} и ${label(steps, PLAN_STEP_FORMS)}` : null;
+
+/** Описание журнала целиком: «3 записи», у «Вопросов» с открытыми — «3 записи, открыто 1», у
+ * «Задач» с шагами планов (`steps`) — «109 записей: 37 задач и 72 шага планов». */
+export const countDescription = (journal: Journal, n: number, open = 0, steps = 0): string => {
+  const split = journal === 'tasks' ? tasksSplit(n, steps) : null;
+  if (split) return split;
+  return open > 0 ? `${countLabel(journal, n)}, ${openLabel(open)}` : countLabel(journal, n);
+};
 
 /** Описание числа заметок пространства: «4 заметки». */
 export const notesLabel = (n: number): string => label(n, NOTE_FORMS);
 
-/** Подсказка (`title`) у числа журнала. */
-export const countHint = (journal: Journal): string =>
-  journal === 'code' ? 'файлов в карте кода' : 'всего записей, без корзины';
+/** Подсказка (`title`) у числа журнала; у «Задач» с шагами планов — «109 записей: 37 задач и 72
+ * шага планов» (`n` — число журнала, `steps` — шаги). */
+export const countHint = (journal: Journal, n = 0, steps = 0): string =>
+  (journal === 'tasks' ? tasksSplit(n, steps) : null) ??
+  (journal === 'code' ? 'файлов в карте кода' : 'всего записей, без корзины');
 
 /** Подсказка у числа заметок пространства. */
 export const NOTES_HINT = 'заметок, без папок и корзины';

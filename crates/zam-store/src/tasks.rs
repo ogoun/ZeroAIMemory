@@ -712,6 +712,22 @@ impl TaskTree {
     }
 }
 
+/// Число подзадач по рёбрам `edges` — парам `(подзадача, родитель)` между живыми задачами одного
+/// пространства (M7.3 §6.14 п. 10, `task_steps` [`crate::space_counts`]): то же правило, что у
+/// [`TaskTree::build`] — повторы не в счёт, рёбра задач на циклах `part_of` (и петли) не
+/// учитываются, — то есть `TaskTree::build(…).parent.len()` без чтения самих задач.
+pub(crate) fn subtask_count(edges: &[(Id, Id)]) -> usize {
+    let mut seen: HashSet<(Id, Id)> = HashSet::new();
+    let mut adj: HashMap<Id, Vec<Id>> = HashMap::new();
+    for &(s, p) in edges {
+        if seen.insert((s, p)) {
+            adj.entry(s).or_default().push(p);
+        }
+    }
+    let cyclic = on_cycles(&adj);
+    adj.keys().filter(|s| !cyclic.contains(*s)).count()
+}
+
 /// Задачи на циклах графа `adj` (задача → её родители): компоненты сильной связности больше
 /// одной вершины и петли — алгоритм Тарьяна с явным стеком (глубина графа стек потока не
 /// расходует), O(V + E).
@@ -913,6 +929,46 @@ mod tests {
         cycle.push((t[0], t[n - 1]));
         let tree = TaskTree::build(nodes, &cycle);
         assert!(tree.parent.is_empty() && tree.children.is_empty());
+    }
+
+    /// `subtask_count` (число `task_steps`, M7.3 §6.14 п. 10) равен числу подзадач дерева
+    /// [`TaskTree::build`] на тех же рёбрах: циклы разной длины, петли, повторы, два родителя,
+    /// цепочки — 200 псевдослучайных графов (детерминированный ЛКГ) и графы тестов выше.
+    #[test]
+    fn subtask_count_matches_tree() {
+        let (t, nodes) = tasks(17);
+        let fixed: Vec<Vec<(Id, Id)>> = vec![
+            vec![],
+            vec![
+                (t[3], t[0]),
+                (t[1], t[0]),
+                (t[1], t[4]),
+                (t[2], t[0]),
+                (t[3], t[0]),
+            ],
+            vec![(t[0], t[1]), (t[1], t[0]), (t[15], t[0]), (t[2], t[2])],
+            (5..15)
+                .map(|i| (t[i], t[if i == 14 { 5 } else { i + 1 }]))
+                .chain([(t[16], t[5]), (t[4], t[16])])
+                .collect(),
+        ];
+        for edges in &fixed {
+            let tree = TaskTree::build(nodes.clone(), edges);
+            assert_eq!(subtask_count(edges), tree.parent.len(), "{edges:?}");
+        }
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = |m: usize| {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            usize::try_from(x >> 33).unwrap() % m
+        };
+        for _ in 0..200 {
+            let n = 2 + next(15);
+            let edges: Vec<(Id, Id)> = (0..next(3 * n)).map(|_| (t[next(n)], t[next(n)])).collect();
+            let tree = TaskTree::build(nodes.clone(), &edges);
+            assert_eq!(subtask_count(&edges), tree.parent.len(), "{edges:?}");
+        }
     }
 
     /// Сводка по статусам прямых подзадач и последняя активность — наибольшее `updated_at`.

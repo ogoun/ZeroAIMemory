@@ -589,6 +589,7 @@
             {#each journalsOf(journalSpace?.kind ?? '') as j (j)}
               {@const n = journalCounts?.journals[j]}
               {@const oq = j === 'questions' ? (journalCounts?.open.questions ?? 0) : 0}
+              {@const steps = j === 'tasks' ? (journalCounts?.task_steps ?? 0) : 0}
               {@const ow = stripOver[j]?.width}
               {@const w = n === undefined ? undefined : ow ? `${ow}px` : `${formatCount(n).length}ch`}
               <!-- число и «открыто N» — отдельный элемент поверх правого поля ссылки (вне её имени и
@@ -603,10 +604,10 @@
               >
               {#if n !== undefined}
                 <span class="strip-over" style:--num-w={w} bind:contentRect={stripOver[j]} aria-hidden="true">
-                  <span class="strip-num" class:zero={n === 0} data-count={j} title={countHint(j)}>{formatCount(n)}</span>
+                  <span class="strip-num" class:zero={n === 0} data-count={j} title={countHint(j, n, steps)}>{formatCount(n)}</span>
                   {#if oq > 0}<span class="tag open">{openLabel(oq)}</span>{/if}
                 </span>
-                <span id="strip-count-{j}" hidden>{countDescription(j, n, oq)}</span>
+                <span id="strip-count-{j}" hidden>{countDescription(j, n, oq, steps)}</span>
               {/if}
             {/each}
           </nav>
