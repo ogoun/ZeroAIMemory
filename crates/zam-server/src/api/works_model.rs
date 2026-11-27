@@ -8,24 +8,26 @@
 //!   `vault_changed` (и при адресе записи Vault, изменённом после сохранения) — 409 «адрес
 //!   изменён: был <хост> → стал <хост> — подтвердите» `{code: vault_changed, was, now}` **без
 //!   обращения** (подтверждение — `PATCH works.model {confirm_url}`); `[works] enabled =
-//!   false` — 409 `/problems/works-disabled` (как у ручных запусков, решение 76; задача 3),
-//!   `model_access = "off"` — 409 `code: works_disabled`; у пользователя уже идёт обращение —
-//!   409; нет подключения `works.model` — 422.
+//!   false` и `model_access = "off"` — 409 `/problems/works-disabled` (один вид, как у ручных
+//!   запусков, решение 76; причина — в `detail`; финальное ревью M7.3, Minor 5); у пользователя
+//!   уже идёт обращение — 409 `code: model_busy`; нет подключения `works.model` — 422.
 //! - `GET /works/calls?days=&user=` → `{days, calls: […]}`: метаданные обращений за `days`
 //!   суток (1..=180, по умолчанию 7; не больше [`CALLS_LIMIT`] строк, новые первыми) — без
 //!   текста пакета и ответа.
 //!
-//! `?user=` — только администратору (пользователь сервера); пользователь — только свой
-//! (`?user=` чужой — 403).
+//! Пользователь запроса — как у очереди ([`super::works::works_user`]: `?user=` чужого — только
+//! администратору, без него — пользователь запроса, у администратора — `X-Zam-User` или он сам),
+//! но только человеку: по токену — 403.
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
+use axum::http::HeaderMap;
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use zam_core::Id;
 use zam_store::work_calls::{self, CallRow};
 
-use super::{parse_id, query};
+use super::query;
 use crate::app::AppState;
 use crate::auth::{Client, Principal};
 use crate::error::ApiError;
@@ -49,34 +51,18 @@ pub struct CallsQuery {
     days: Option<u32>,
 }
 
-/// Пользователь запроса: свой (у администратора — его пользователь или `?user=`); токен — 403.
-async fn target_user(st: &AppState, p: &Principal, user: Option<&str>) -> Result<Id, ApiError> {
-    match (p, user) {
-        (Principal::Token(_), _) => Err(ApiError::Forbidden),
-        (Principal::User { user_id, .. }, None) => Ok(*user_id),
-        (Principal::User { user_id, .. }, Some(u)) => {
-            if parse_id(u)? == *user_id {
-                Ok(*user_id)
-            } else {
-                Err(ApiError::Forbidden)
-            }
-        }
-        (Principal::Admin { .. }, None) => Ok(st.admin_id),
-        (Principal::Admin { .. }, Some(u)) => {
-            let id = parse_id(u)?;
-            st.system.get_user(id).await?.ok_or(ApiError::NotFound)?;
-            Ok(id)
-        }
+/// Пользователь запроса — только человеку (токен — 403), выбор пользователя — тот же, что у
+/// очереди ([`super::works::works_user`]; финальное ревью M7.3, Minor 6: одна политика).
+async fn target_user(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    user: Option<&str>,
+) -> Result<Id, ApiError> {
+    if !p.is_human() {
+        return Err(ApiError::Forbidden);
     }
-}
-
-fn conflict(code: &str, detail: String, extra: &[(&str, Value)]) -> ApiError {
-    let mut m = Map::new();
-    m.insert("code".into(), json!(code));
-    for (k, v) in extra {
-        m.insert((*k).to_string(), v.clone());
-    }
-    ApiError::Conflict { detail, extra: m }
+    super::works::works_user(st, p, headers, user).await
 }
 
 /// `POST /works/model/test[?user=]` → `{ok, ms, class?, hint?, thinking?}`.
@@ -84,10 +70,11 @@ pub async fn test(
     State(st): State<AppState>,
     client: Client,
     p: Principal,
+    headers: HeaderMap,
     q: Result<Query<UserQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let q = query(q)?;
-    let user = target_user(&st, &p, q.user.as_deref()).await?;
+    let user = target_user(&st, &p, &headers, q.user.as_deref()).await?;
     // общий выключатель — тот же ответ, что у ручных запусков (решение координатора 76)
     if !st.cfg.works.enabled {
         return Err(ApiError::WorksDisabled(
@@ -98,10 +85,12 @@ pub async fn test(
     let ip = client.ip.to_string();
     match conn::test_connection(&ctx, user, &p.actor(), Some(&ip)).await {
         Ok(out) => Ok(Json(out.to_json())),
-        Err(TestRefusal::Disabled(why)) => Err(conflict("works_disabled", why.into(), &[])),
-        Err(TestRefusal::Busy) => Err(conflict(
+        // `model_access = "off"` — тот же вид, что `enabled = false` (финальное ревью M7.3,
+        // Minor 5): клиент разбирает один тип проблемы, причина — в `detail`
+        Err(TestRefusal::Disabled(why)) => Err(ApiError::WorksDisabled(why.into())),
+        Err(TestRefusal::Busy) => Err(ApiError::conflict_code(
             "model_busy",
-            "у пользователя уже идёт обращение к модели — повторите позже".into(),
+            "у пользователя уже идёт обращение к модели — повторите позже",
             &[],
         )),
         Err(TestRefusal::NoConnection) => Err(ApiError::Unprocessable(
@@ -109,7 +98,7 @@ pub async fn test(
              модель)"
                 .into(),
         )),
-        Err(TestRefusal::VaultChanged { was, now }) => Err(conflict(
+        Err(TestRefusal::VaultChanged { was, now }) => Err(ApiError::conflict_code(
             "vault_changed",
             format!(
                 "адрес изменён: был {was} → стал {now} — подтвердите: сохраните подключение с \
@@ -144,10 +133,11 @@ fn call_json(c: &CallRow) -> Value {
 pub async fn calls(
     State(st): State<AppState>,
     p: Principal,
+    headers: HeaderMap,
     q: Result<Query<CallsQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let q = query(q)?;
-    let user = target_user(&st, &p, q.user.as_deref()).await?;
+    let user = target_user(&st, &p, &headers, q.user.as_deref()).await?;
     let days = q.days.unwrap_or(CALLS_DAYS_DEFAULT);
     if !(1..=CALLS_DAYS_MAX).contains(&days) {
         return Err(ApiError::BadRequest(format!(

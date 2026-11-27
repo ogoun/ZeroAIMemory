@@ -9,8 +9,10 @@
 //!   администратору (как `GET /works/calls`); без него — пользователь запроса (`X-Zam-User`
 //!   администратора).
 //! - `GET /works/usage?user=` → `{day: {tokens, limit}, month: {tokens, limit}, ceiling,
-//!   last_night, night, modes, paused?}` — расход токенов модели суток и месяца UTC по журналу
-//!   отправок, пределы.
+//!   last_night, night, modes, check: {server, user, reason}, paused?}` — расход токенов модели
+//!   суток и месяца UTC по журналу отправок, пределы ([`crate::works::exec::token_limits`] — те
+//!   же, по которым сервер отказывает), ночная проверка сервера и пользователя (как у
+//!   `GET /check/status`).
 //! - `POST /works/run {kind, space?}` — ручной запуск вида (§6.3 п. 2), **только человек**
 //!   (токену — 403); `[works] enabled = false` — 409 `/problems/works-disabled` (решение 76);
 //!   действующий режим вида `off` — 409 `code: works_off` с причиной; предел ручных запусков
@@ -189,10 +191,11 @@ pub struct UserQuery {
 }
 
 /// Пользователь очереди: `?user=` — чужой только администратору (токену и сессии пользователя —
-/// свой id или 403, как `GET /works/calls`); без него — пользователь запроса ([`crate::auth::
-/// target_user`]: владелец токена, пользователь сессии, у администратора — `X-Zam-User` или он
-/// сам). Несуществующий — 404.
-async fn works_user(
+/// свой id или 403); без него — пользователь запроса ([`crate::auth::target_user`]: владелец
+/// токена, пользователь сессии, у администратора — `X-Zam-User` или он сам). Несуществующий —
+/// 404. Та же функция у подключённой модели (`api::works_model`, там токену — 403 до неё;
+/// финальное ревью M7.3, Minor 6).
+pub(crate) async fn works_user(
     st: &AppState,
     p: &Principal,
     headers: &HeaderMap,
@@ -254,14 +257,7 @@ pub async fn list(
     Ok(Json(out))
 }
 
-/// Начало месяца UTC момента `t`.
-fn month_start(t: jiff::Timestamp) -> jiff::Timestamp {
-    let d = t.to_zoned(jiff::tz::TimeZone::UTC).date().first_of_month();
-    d.to_zoned(jiff::tz::TimeZone::UTC)
-        .map_or(t, |z| z.timestamp())
-}
-
-/// `GET /works/usage?user=` → `{day, month, ceiling, last_night, night, modes, paused?}`.
+/// `GET /works/usage?user=` → `{day, month, ceiling, last_night, night, modes, check, paused?}`.
 pub async fn usage(
     State(st): State<AppState>,
     p: Principal,
@@ -273,14 +269,12 @@ pub async fn usage(
     let db = st.users.get(user).await?;
     let now = zam_store::time::now();
     let day = zam_store::work_calls::tokens_since(&db, zam_store::time::day_start_utc(now)).await?;
-    let month = zam_store::work_calls::tokens_since(&db, month_start(now)).await?;
+    let month =
+        zam_store::work_calls::tokens_since(&db, zam_store::time::month_start_utc(now)).await?;
     let u = settings::load(&st.system, user).await?;
     let cfg = &st.cfg.works;
-    let (mut daily, mut monthly) = (cfg.max_daily_tokens, cfg.max_monthly_tokens);
-    if let Some(l) = u.limits {
-        daily = daily.min(l.daily_tokens);
-        monthly = monthly.min(l.monthly_tokens);
-    }
+    // те же пределы, по которым сервер отказывает (финальное ревью M7.3, Minor 6)
+    let (daily, monthly) = crate::works::exec::token_limits(&u, cfg);
     let last = store::last_night(&db).await?;
     let mut out = json!({
         "day": {"tokens": day, "limit": daily},
@@ -289,6 +283,9 @@ pub async fn usage(
         "last_night": last.map(|d| d.to_string()),
         "night": {"at": cfg.at, "tz": cfg.tz, "window_min": cfg.window_min},
         "modes": modes_json(&u, &st),
+        // ночная проверка сервера и пользователя — для выключателя «Ночная проверка моей памяти»
+        // (финальное ревью M7.3, Minor 12; та же форма, что у `GET /check/status`)
+        "check": super::check::check_json(cfg, &u),
     });
     if let Some(pz) = paused_json(&p, &u) {
         out["paused"] = pz;
@@ -329,12 +326,6 @@ async fn run_space(db: &zam_store::Db, kind: WorkKind, raw: &str) -> Result<Id, 
         })
 }
 
-fn conflict(code: &str, detail: String) -> ApiError {
-    let mut extra = Map::new();
-    extra.insert("code".into(), json!(code));
-    ApiError::Conflict { detail, extra }
-}
-
 /// `POST /works/run {kind, space?}` → 200 (агент) или 202 (модель).
 pub async fn run(
     State(st): State<AppState>,
@@ -360,28 +351,27 @@ pub async fn run(
     let u = settings::load(&st.system, user).await?;
     let (mode, why) = settings::effective_mode(kind, &u, &st.cfg.works);
     if mode == WorksMode::Off {
-        let mut extra = Map::new();
-        extra.insert("code".into(), json!("works_off"));
-        extra.insert("reason".into(), json!(why));
-        return Err(ApiError::Conflict {
-            detail: format!(
+        return Err(ApiError::conflict_code(
+            "works_off",
+            format!(
                 "режим вида {} — off ({}): выберите agent или model в настройках",
                 kind.as_str(),
                 why.unwrap_or("выбран")
             ),
-            extra,
-        });
+            &[("reason", json!(why))],
+        ));
     }
     let run = Id::new();
     let plan = Plan::manual(user, kind, only, run);
     if queue::packages_left(&db, &plan).await? == 0 {
-        return Err(conflict(
+        return Err(ApiError::conflict_code(
             "manual_limit",
             format!(
                 "ручных запусков вида {} за сутки UTC — не больше {} пакетов",
                 kind.as_str(),
                 queue::PACKAGES_PER_RUN
             ),
+            &[],
         ));
     }
     if mode == WorksMode::Agent {
@@ -436,9 +426,10 @@ impl Finishing {
                 f.guard = Some(g);
                 Ok(f)
             }
-            Err(_) => Err(conflict(
+            Err(_) => Err(ApiError::conflict_code(
                 "result_in_progress",
                 format!("итог работы j:{id} ещё принимается — повторите позже"),
+                &[],
             )),
         }
     }
@@ -621,12 +612,13 @@ pub async fn release(
     let _lock = Finishing::take(id).await?;
     let w = store::get(&db, id).await?.ok_or(ApiError::NotFound)?;
     if w.mode == WorkMode::Model {
-        return Err(conflict(
+        return Err(ApiError::conflict_code(
             "model_work",
             format!(
                 "работу j:{id} выполняет подключённая модель на сервере — вернуть её в очередь \
                  нельзя"
             ),
+            &[],
         ));
     }
     if w.state != WorkState::Running {

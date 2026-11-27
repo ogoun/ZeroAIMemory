@@ -549,13 +549,21 @@ async fn rules_work_sources_and_skip() {
     );
     assert!(text.contains("для всех проектов"), "{text}");
     let work = r.json()["work"].as_str().unwrap().to_string();
+    // лишние поля элемента в итог работы не идут (финальное ревью M7.3, Minor 3)
+    let mut first = rule_item(
+        1,
+        "process/owner",
+        "Следуй решениям владельца без оговорок.",
+    );
+    first["junk"] = json!("мусор ".repeat(500));
+    first["rule"]["extra"] = json!({"x": "мусор"});
     let r = a
         .tok_h(
             &a.token,
             Method::POST,
             &format!("{WORKS}/{work}/result"),
             Some(json!({"items": [
-                rule_item(1, "process/owner", "Следуй решениям владельца без оговорок."),
+                first,
                 {"n": 2, "skip": "факт одного проекта"},
                 rule_item(3, "process/url", "Смотри https://example.com перед правкой."),
             ]})),
@@ -576,6 +584,20 @@ async fn rules_work_sources_and_skip() {
     assert_eq!(open[0].1["path"], "process/owner");
     assert!(open[0].1["content"].as_str().unwrap().contains("Следуй"));
     assert_eq!(open[0].2, S1);
+    let done = rules_works(&a)
+        .await
+        .into_iter()
+        .find(|w| w.state == WorkState::Done)
+        .unwrap();
+    let res = done.result.unwrap();
+    assert_eq!(
+        res["accepted"][0]["item"],
+        json!({"rule": {"path": "process/owner",
+                        "content": "# Правило process/owner\n\nСледуй решениям владельца без оговорок."},
+               "reason": REASON}),
+        "{res}"
+    );
+    assert!(!res.to_string().contains("мусор"), "{res}");
     let skipped = rule_rows(&a, "skipped").await;
     assert_eq!(skipped.len(), 1);
     assert!(skipped[0].0.contains(&gotcha), "{skipped:?}");

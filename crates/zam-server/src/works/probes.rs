@@ -29,7 +29,8 @@
 //!   ночных работ и [`PROBES_PER_DAY_MANUAL`] за сутки UTC у ручных (`works.origin`,
 //!   [`zam_store::probes::new_probes_since`]): ручной запуск днём не съедает ночь; активных —
 //!   [`zam_store::probes::PROBES_MAX`]. При записи (транзакция закрытия работы) пределы и повтор
-//!   сверяются ещё раз ([`zam_store::works::ItemWrite::Probe`]).
+//!   сверяются ещё раз ([`zam_store::works::ItemWrite::Probe`]): не записанная проба — строка
+//!   `warnings` итога и ответа исполнителю (финальное ревью M7.3, Minor 1).
 //! - **Принятая проба** — строка `probes` вида `probe`: цель — `[{ref, rev}]` элемента пакета,
 //!   часть — [`zam_search::eval::probe_split`] по цели, `overlap`, автор — сессия агента или
 //!   `model:<имя модели>`, работа. Знания не меняются.

@@ -301,6 +301,7 @@ async fn migrate_v26_to_v27_new_tables_only() {
     for (index, table) in [
         ("works_open", "works"),
         ("works_night", "works"),
+        ("works_finished", "works"),
         ("work_calls_ts", "work_calls"),
         ("work_calls_run", "work_calls"),
         ("probes_active", "probes"),

@@ -1555,12 +1555,19 @@ async fn probes_write_rechecks_in_transaction() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        closed,
-        store::Closed::Closed {
-            warnings: Vec::new()
-        }
+    // проба не записана — предупреждение итога, как у кандидата в Rules (финальное ревью M7.3,
+    // Minor 1): «принято» без пробы неправдиво
+    let store::Closed::Closed { warnings } = closed else {
+        panic!("{closed:?}");
+    };
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].starts_with(&format!("{r}: проба не записана"))
+            && warnings[0].contains("повтор"),
+        "{warnings:?}"
     );
+    let w1_result = store::get(&dbx, w1).await.unwrap().unwrap().result.unwrap();
+    assert_eq!(w1_result["warnings"], json!(warnings), "{w1_result}");
     let same: Vec<Probe> = probes_of(&dbx)
         .await
         .into_iter()
@@ -1587,11 +1594,14 @@ async fn probes_write_rechecks_in_transaction() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        closed,
-        store::Closed::Closed {
-            warnings: Vec::new()
-        }
+    let store::Closed::Closed { warnings } = closed else {
+        panic!("{closed:?}");
+    };
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].starts_with(&format!("{r}: проба не записана"))
+            && warnings[0].contains("предел"),
+        "{warnings:?}"
     );
     let ps = probes_of(&dbx).await;
     assert!(ps.iter().all(|p| p.question != q2), "{ps:?}");
@@ -1656,7 +1666,11 @@ async fn probes_parallel_results_once() {
         answer_in(&a, "probes-parallel-2", Some(G2), item(4)),
     );
     let took = |v: &Value| v["accepted"].as_array().unwrap().len();
+    // принятый элемент, чья проба не записалась при закрытии (предел ночи), — с предупреждением
+    // итога (финальное ревью M7.3, Minor 1): «принято» без предупреждений — ровно одна проба
+    let warned = |v: &Value| v["warnings"].as_array().map_or(0, Vec::len);
     assert!(took(&x) + took(&y) >= 1, "{x} {y}");
+    assert_eq!(took(&x) + took(&y) - warned(&x) - warned(&y), 1, "{x} {y}");
     assert_eq!(made(&a, Origin::Nightly).await, PROBES_PER_NIGHT);
 }
 
