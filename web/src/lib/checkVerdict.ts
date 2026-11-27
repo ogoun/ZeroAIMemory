@@ -130,7 +130,9 @@ export interface CheckStatus {
   failing: FailingProbe[];
   advice: { code: string; text: string }[];
   probes: { active: number; by_kind: Record<string, number>; by_split: Record<string, number> };
-  check: { server: 'nightly' | 'off'; user: 'on' | 'off' };
+  /** `reason` — почему сервер ночную проверку не проводит (`disabled` | `check_off`, иначе
+   * `null`); подставленные ответы e2e его могут не нести. */
+  check: { server: 'nightly' | 'off'; user: 'on' | 'off'; reason?: string | null };
 }
 
 const MINUS = '−';

@@ -175,6 +175,10 @@ export interface WorksUsage {
   last_night: string | null;
   night: { at: string; tz: string; window_min: number };
   modes: Record<string, { mode: WorksMode; reason: string | null }>;
+  /** Ночная проверка сервера и пользователя (как `check` у `GET /check/status`): `server = off` —
+   * администратор её выключил (`reason`: `disabled` | `check_off`), выключатель пользователя не
+   * действует. */
+  check: { server: 'nightly' | 'off'; user: 'on' | 'off'; reason: string | null };
   paused?: WorksPause;
 }
 export const worksUsage = () => call<WorksUsage>('GET', 'works/usage');
@@ -197,7 +201,9 @@ export interface WorkCall {
   input_tokens: number;
   output_tokens: number;
   estimated: boolean;
-  ms: number;
+  /** Длительность, мс; `null` — ответа не было (`aborted`, `internal`, отказ до отправки:
+   * `limit`, `unavailable` без соединения, …): показывается «—», а не 0. */
+  ms: number | null;
   outcome: string;
   http_status: number | null;
   external: boolean;
@@ -251,7 +257,8 @@ export interface Proposal {
   author: string | null;
   work: string | null;
   session: string | null;
-  /** В тексте есть команды shell (`$ …`, `cmd /c`, `powershell`). */
+  /** В тексте есть команды shell (`$ …`, `cmd /c`, `powershell`, конвейер `curl … | sh`, `iex`,
+   * `rm -rf`, `chmod +x`, `sudo`, …; эвристика сервера `works::rules::has_shell`). */
   shell: boolean;
   created_at: string;
   decided_at: string | null;

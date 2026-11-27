@@ -49,6 +49,15 @@ export function reasonText(reason: string | null | undefined): string {
   }
 }
 
+/** Ночная проверка выключена на сервере (`check.server = off` у `GET /works/usage`): почему
+ * выключатель «Ночная проверка моей памяти» не действует (финальное ревью M7.3, Minor 12). */
+export function checkOffText(reason: string | null | undefined): string {
+  if (reason === 'disabled') {
+    return 'На сервере внутренние работы выключены администратором — ночной проверки нет, выключатель не действует.';
+  }
+  return 'На сервере ночная проверка выключена администратором — выключатель не действует; ручной прогон — на странице «Проверка памяти».';
+}
+
 /** Пауза исполнителя (§6.2 п. 5): что случилось. */
 export const PAUSE_TITLE: Record<string, string> = {
   auth: 'модель не приняла ключ (HTTP 401/403)',
@@ -387,6 +396,17 @@ export function outcomeText(outcome: string, http: number | null | undefined): s
 export const callTokensText = (c: { input_tokens: number; output_tokens: number; estimated: boolean }): string =>
   `${c.estimated ? '≈ ' : ''}${num(c.input_tokens)} → ${num(c.output_tokens)}`;
 
+/** Подсказка к «—» в журнале отправок: длительности нет — ответа модели не было. */
+export const CALL_NO_MS_HINT = 'ответа не было: обращение оборвано, отказано до отправки или сбой сервера';
+
+/** Длительность строки журнала для столбца «мс»: число или «—», если ответа не было (`ms: null` у
+ * `aborted`, `internal`, `limit`, …) — не «0» (финальное ревью M7.3, Minor 2). */
+export const callMsText = (ms: number | null | undefined): string => (ms == null ? '—' : num(ms));
+
+/** Длительность с единицей (карточка журнала на телефоне): «1 234 мс» или «— (ответа не было: …)». */
+export const callDurationText = (ms: number | null | undefined): string =>
+  ms == null ? `— (${CALL_NO_MS_HINT})` : `${num(ms)} мс`;
+
 // ---- работы очереди (§6.3) ----
 
 export const STATE_TEXT: Record<string, string> = {
@@ -400,12 +420,14 @@ export const STATE_TEXT: Record<string, string> = {
 
 export const ORIGIN_TEXT: Record<string, string> = { nightly: 'ночь', manual: 'вручную' };
 
-/** Итог работы (`result`): «принято 3 · отклонено 1 · отказ 1 · без итога 2». */
+/** Итог работы (`result`): «принято 3 · не записано 1 · отклонено 1 · отказ 1 · без итога 2»;
+ * «не записано» — принятое, которое закрытие работы не записало (`warnings`: предел, повтор). */
 export function workResultText(result: unknown): string {
   if (!result || typeof result !== 'object') return '';
   const r = result as Record<string, unknown>;
   const n = (k: string) => (Array.isArray(r[k]) ? (r[k] as unknown[]).length : 0);
   const parts = [`принято ${n('accepted')}`];
+  if (n('warnings')) parts.push(`не записано ${n('warnings')}`);
   if (n('rejected')) parts.push(`отклонено ${n('rejected')}`);
   if (n('skip')) parts.push(`отказ ${n('skip')}`);
   if (n('skipped')) parts.push(`без итога ${n('skipped')}`);

@@ -150,12 +150,63 @@ test('works_settings_and_connection_test', async ({ page }) => {
   await expect(page.getByTestId('works-effective-rules')).toHaveText('действует: агент');
   // ночь — время в поясе сервера и местное, окно
   await expect(page.getByTestId('works-night')).toHaveText(/^\d\d:\d\d UTC \(у вас \d\d:\d\d\), окно 2 ч$/);
-  // итог выключателя ночной проверки — у него же, в разделе «Ночь» (ревью r1, Minor 8)
+  // сервер e2e — с `[works] check = "off"` (global-setup): выключатель неактивен с причиной, а не
+  // обещает проверку, которой не будет (финальное ревью M7.3, Minor 12)
   const night = page.getByRole('region', { name: 'Ночь' });
+  await expect(night.getByLabel('Ночная проверка моей памяти')).toBeDisabled();
+  await expect(night.getByTestId('works-check-off')).toContainText('На сервере ночная проверка выключена администратором');
+  // сервер проводит проверку (ответ `usage` подставлен) — выключатель действует; его итог — у него
+  // же, в разделе «Ночь» (ревью r1, Minor 8)
+  await page.route(/\/api\/v1\/works\/usage$/, async (r) => {
+    const resp = await r.fetch();
+    const j = (await resp.json()) as { check: Record<string, unknown> };
+    j.check = { ...j.check, server: 'nightly', reason: null };
+    return r.fulfill({ response: resp, json: j });
+  });
+  await page.reload();
+  await expect(night.getByTestId('works-check-off')).toHaveCount(0);
   await night.getByLabel('Ночная проверка моей памяти').uncheck();
   await expect(night.getByRole('status')).toContainText('Ночная проверка вашей памяти выключена');
   await night.getByLabel('Ночная проверка моей памяти').check();
   await expect(night.getByRole('status')).toContainText('Ночная проверка вашей памяти включена');
+  await page.unroute(/\/api\/v1\/works\/usage$/);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('works_journal_no_duration_dash', async ({ page }) => {
+  // финальное ревью M7.3, Minor 2: строки журнала без длительности (`aborted`, `internal`,
+  // `limit`, `unavailable` без соединения — `ms: null`) — «—» с подсказкой, а не «0 мс»; строки
+  // подставлены (оборванный вызов на сервере e2e не подготовить без остановки сервера)
+  const problems = watch(page);
+  const row = (outcome: string, ms: number | null) => ({
+    ts: new Date().toISOString(),
+    work: null,
+    kind: 'probes',
+    host: '127.0.0.1:9',
+    model: 'e2e-mock',
+    input_tokens: 10,
+    output_tokens: 0,
+    estimated: true,
+    ms,
+    outcome,
+    http_status: null,
+    external: false,
+    items: 1,
+    run: 'manual:e2e',
+  });
+  await page.route(/\/api\/v1\/works\/calls(\?.*)?$/, (r) =>
+    r.fulfill({ json: { days: 7, calls: [row('aborted', null), row('internal', null), row('ok', 85)] } }),
+  );
+  await open(page);
+  const journal = page.getByRole('table', { name: 'Журнал отправок' });
+  const ms = journal.getByTestId('call-ms');
+  await expect(ms).toHaveCount(3);
+  await expect(ms.nth(0)).toHaveText('—');
+  await expect(ms.nth(0)).toHaveAttribute('title', /ответа не было/);
+  await expect(ms.nth(1)).toHaveText('—');
+  await expect(ms.nth(2)).toHaveText('85');
+  await expect(ms.nth(2)).not.toHaveAttribute('title', /.+/);
+  await page.unroute(/\/api\/v1\/works\/calls(\?.*)?$/);
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
@@ -336,6 +387,10 @@ test('works_pause_dot_and_confirm_address', async ({ page }) => {
   await setUrl('/v3');
   await page.getByRole('button', { name: 'Подтвердить адрес', exact: true }).click();
   const d = dialog(page, 'Подтвердить новый адрес подключения?');
+  // фокус — на «Отмена» (финальное ревью M7.3, Minor 10): Enter не отправляет ключ и пакеты на
+  // новый адрес без сверки «был / стал»; основная кнопка — не красная
+  await expect(d.getByRole('button', { name: 'Отмена', exact: true })).toBeFocused();
+  await expect(d.getByRole('button', { name: 'Подтвердить адрес', exact: true })).not.toHaveClass(/danger/);
   // адреса — моноширинно, каждый своей строкой (ревью r1, Minor 2)
   await expect(d.getByTestId('works-confirm-was')).toHaveText(`${mock()}/v1`);
   await expect(d.getByTestId('works-confirm-now')).toHaveText(`${mock()}/v2`);
