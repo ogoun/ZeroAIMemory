@@ -32,5 +32,9 @@
   { "name": "GraphView (локальный граф связей, вид «Граф»)", "path": "dist/assets/GraphView-*.js", "gzip": true, "limit": "6 KB" },
   { "name": "FormDialog (окно формы, общий чанк — грузится при старте)", "path": "dist/assets/FormDialog-*.js", "gzip": true, "limit": "3.25 KB" },
   { "name": "InsightNew (окно «Новый insight», по нажатию)", "path": "dist/assets/InsightNew-*.js", "gzip": true, "limit": "2.45 KB" },
+  { "name": "Works (страница «Внутренние работы», M7.3)", "path": "dist/assets/Works-*.js", "gzip": true, "limit": "11.3 KB" },
+  { "name": "Check (страница «Проверка памяти», M7.3)", "path": "dist/assets/Check-*.js", "gzip": true, "limit": "7 KB" },
+  { "name": "Proposals (страница «Кандидаты в Rules», M7.3)", "path": "dist/assets/Proposals-*.js", "gzip": true, "limit": "5.45 KB" },
+  { "name": "worksText (тексты страниц M7.3, общий ленивый чанк Works и Proposals)", "path": "dist/assets/worksText-*.js", "gzip": true, "limit": "5.25 KB" },
   { "name": "pdf.worker", "path": "dist/pdfjs/pdf.worker-*.min.js", "gzip": true, "limit": "400 KB" }
 ]

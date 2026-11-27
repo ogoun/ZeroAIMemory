@@ -630,6 +630,87 @@ async fn check_accept_only_latest_episode_run() {
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 }
 
+/// Задача 8, ревью r1 (Minor 9): `GET /check/runs?trigger=&status=` — фильтр повода и статуса:
+/// последний законченный ночной прогон находится одним запросом, сколько бы ручных ни шло после
+/// него (правило точки «Проверка» WebUI — как у строки дайджеста); неизвестное значение — 400.
+#[tokio::test]
+async fn check_runs_filter_trigger_status() {
+    let _serial = SERIAL.lock().await;
+    let _reset = Reset;
+    quick();
+    let (a, _) = fixture("check-runs-filter", 2, |_| {}).await;
+    let nightly = night(&a, &day(1)).await["run"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for _ in 0..2 {
+        // слот прогона освобождается чуть позже записи статуса — повтор при 409 `check-running`
+        let t0 = Instant::now();
+        let r = loop {
+            let r = a.t(Method::POST, "/api/v1/check/run", None).await;
+            if r.status != StatusCode::CONFLICT || t0.elapsed() > Duration::from_secs(30) {
+                break r;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        ok(&r, StatusCode::ACCEPTED);
+        let run: Id = r.json()["run"].as_str().unwrap().parse().unwrap();
+        let db = a.st.users.get(a.st.admin_id).await.unwrap();
+        // строка прогона появляется не сразу после 202 — ждать законченную
+        let t0 = Instant::now();
+        loop {
+            let r = zam_store::check::get_run(&db, run).await.unwrap();
+            if r.is_some_and(|r| r.status != zam_store::check::RunStatus::Running) {
+                break;
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(30),
+                "ручной прогон не закончился"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    let list = |q: &'static str| {
+        let a = &a;
+        async move {
+            let r = a
+                .t(Method::GET, &format!("/api/v1/check/runs?{q}"), None)
+                .await;
+            ok(&r, StatusCode::OK);
+            r.json()["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| {
+                    (
+                        x["run"].as_str().unwrap().to_string(),
+                        x["trigger"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    // без фильтра последний — ручной; с фильтром — ночной
+    assert_eq!(list("limit=1").await[0].1, "manual");
+    assert_eq!(
+        list("trigger=nightly&status=done&limit=1").await,
+        [(nightly.clone(), "nightly".to_string())]
+    );
+    let manual = list("trigger=manual").await;
+    assert_eq!(manual.len(), 2, "{manual:?}");
+    assert!(manual.iter().all(|(_, t)| t == "manual"));
+    let running = list("status=running").await;
+    assert!(running.is_empty(), "{running:?}");
+    let done = list("status=done").await;
+    assert_eq!(done.len(), 3, "{done:?}");
+    for q in ["trigger=night", "status=finished"] {
+        let r = a
+            .t(Method::GET, &format!("/api/v1/check/runs?{q}"), None)
+            .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{q}");
+    }
+}
+
 /// §6.5 п. 4: смена отпечатка (режим Qdrant в конфигурации) — `changed` с тем, что сменилось, без
 /// флагов и строки; дальше база копится по новому отпечатку. Смена модели — тест с моделью ниже;
 /// реранкер у сервера без эмбеддера берётся из прошлого прогона (ревью r1, Important 1), его смена

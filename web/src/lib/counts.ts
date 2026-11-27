@@ -57,12 +57,14 @@ export const NOTES_HINT = 'заметок, без папок и корзины';
  * записи журналов (создание, правка, удаление, восстановление, замещение, отзыв, ответ на
  * вопрос, решения по идее), заметки и папки (создание, удаление, восстановление), Vault
  * (создание, удаление, перенос), очистка карты кода (`DELETE code?solution=`), перенос выжимки
- * кэша в память. Правка текста заметки, вложения, захват задачи и оценка записи числа не меняют.
- * Применяет `request` (`api.ts`). */
+ * кэша в память, решение по кандидату в Rules (M7.3 §6.7 пп. 4–5: «Принять» создаёт заметку
+ * Rules, оба решения меняют «кандидаты: N»). Правка текста заметки, вложения, захват задачи и
+ * оценка записи числа не меняют. Применяет `request` (`api.ts`). */
 export function changesCounts(method: string, path: string): boolean {
   if (method === 'GET') return false;
   const p = path.split('?')[0];
   if (p === 'code') return method === 'DELETE';
+  if (/^proposals\/[^/]+\/(accept|decline)$/.test(p)) return true;
   if (/^spaces\/[^/]+\/(entries|vault)$/.test(p)) return method === 'POST';
   if (/^entries\/[^/]+$/.test(p)) return method === 'PATCH' || method === 'DELETE';
   if (/^entries\/[^/]+\/(restore|supersede|retract|answer|decide|adopt|review|propose)$/.test(p)) return true;

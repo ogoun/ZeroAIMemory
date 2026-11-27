@@ -9,7 +9,10 @@
 //!   [{code, text}], probes: {active, by_kind, by_split}, check: {server, user}}`; вердикт —
 //!   `{kind, flags, after_update, after_update_version?, few, episode?, base_n, base_of: 5,
 //!   changed?, compared_with?}`.
-//! - `GET /check/runs?limit=` (1..=365, 30) → `{items}` — прогоны, новые первыми.
+//! - `GET /check/runs?limit=&trigger=&status=` (1..=365, 30) → `{items}` — прогоны, новые первыми;
+//!   `trigger` — `nightly | manual`, `status` — `running | done | skipped | timeout | failed`
+//!   (последний законченный ночной прогон — `?trigger=nightly&status=done&limit=1`: по нему WebUI
+//!   решает, открыта ли регрессия, как строка дайджеста; задача 8, ревью r1).
 //! - `GET /check/runs/{id}` → прогон и `results` по пробам (вопрос, вид, часть, ранги, время).
 //! - `POST /check/run` (человек или токен `rw`; `ro` — 403) → 202 `{run, status: "running"}`:
 //!   ручной прогон учтённым запуском раннера; у пользователя уже идёт прогон — 409
@@ -30,7 +33,7 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use zam_core::Id;
-use zam_store::check::{AcceptOutcome, CheckRun, RunStatus};
+use zam_store::check::{AcceptOutcome, CheckRun, RunStatus, Trigger};
 use zam_store::probes::{Probe, ProbeFilter, ProbeKind, Split};
 
 use super::{json_body, parse_id, query};
@@ -200,6 +203,8 @@ pub async fn status(
 #[derive(Deserialize)]
 pub struct RunsQuery {
     limit: Option<usize>,
+    trigger: Option<String>,
+    status: Option<String>,
 }
 
 /// `GET /check/runs?limit=`.
@@ -216,9 +221,27 @@ pub async fn runs(
             "limit: от 1 до {RUNS_LIMIT_MAX}"
         )));
     }
+    let trigger = match q
+        .trigger
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        None => None,
+        Some(s) => Some(
+            Trigger::parse(s)
+                .ok_or_else(|| ApiError::BadRequest("trigger: nightly | manual".into()))?,
+        ),
+    };
+    let status = match q.status.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => None,
+        Some(s) => Some(RunStatus::parse(s).ok_or_else(|| {
+            ApiError::BadRequest("status: running | done | skipped | timeout | failed".into())
+        })?),
+    };
     let user = user_of(&st, &p, &headers).await?;
     let db = db_of(&st, user).await?;
-    let runs = zam_store::check::runs(&db, limit).await?;
+    let runs = zam_store::check::runs_of(&db, trigger, status, limit).await?;
     Ok(Json(json!({
         "items": runs.iter().map(|r| run_json(&p, r, false)).collect::<Vec<_>>(),
     })))

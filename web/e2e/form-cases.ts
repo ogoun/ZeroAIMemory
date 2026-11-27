@@ -7,13 +7,16 @@
 //
 // Строки задачи 10a — Задачи, Insights, Идеи (ядро); задачи 10b — Словарь, Вопросы, ленты Changelog
 // и Releases, окна дерева, вложений, истории, отчётов и кэша, администрирование, импорт, копии и
-// индекс. Задачи дописывают свои строки — перед последним элементом массива (не в хвост:
-// параллельные задачи иначе правят одну строку). Данные строк — `E2E_FORMS_*` (наполнение —
-// `seedForms` в `forms.spec.ts`) и `E2E_*` global-setup.
+// индекс; задачи 8 — страницы M7.3 (подключение модели, «Подтвердить адрес», «Отключить модель»,
+// «Запустить сейчас», «Принять как норму», «Принять» и «Отклонить» кандидата). Задачи дописывают
+// свои строки — перед последним элементом массива (не в хвост: параллельные задачи иначе правят
+// одну строку). Данные строк — `E2E_FORMS_*` (наполнение — `seedForms` в `forms.spec.ts`) и `E2E_*`
+// global-setup.
 import { expect, type Locator, type Page } from '@playwright/test';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { IDEAS_GUID } from './seed';
+import { checkFixture, runsReply } from './seed-internal';
 import type { PageCtx } from './mobile-pages';
 
 export interface FormCase {
@@ -123,6 +126,42 @@ async function accessOf(p: Page, k: string): Promise<void> {
 
 /** Строка пользователя форм в таблице «Пользователи». */
 const userRow = (p: Page) => p.locator(`tr[data-user="${process.env.E2E_FORMS_USER}"]`);
+
+// ---- страницы M7.3 (задача 8): «Внутренние работы», «Проверка памяти», «Кандидаты в Rules» ----
+
+/** Настройки пользователя (`GET/PATCH /auth/settings`): исполнитель внутренних работ — `works`. */
+const SETTINGS = /\/api\/v1\/auth\/settings$/;
+
+/** Перейти на страницу приложения из открытой: страница монтируется заново и читает подменённые
+ * `page.route` ответы; запомненная кнопка, открывшая окно, — из того же документа. */
+async function goHash(p: Page, hash: string, heading: string): Promise<void> {
+  await p.evaluate((h) => (location.hash = h), hash);
+  await expect(p.getByRole('heading', { name: heading, exact: true })).toBeVisible();
+}
+
+/** Подменить `works` в `GET /auth/settings` (прочее — настоящий ответ сервера). Нужное состояние
+ * (пауза `vault_changed`, режим «агент») на сервере e2e не подготовить без настоящей модели или
+ * правки чужих сценариев; отправку окна строки форм не делают — подмены хватает. */
+async function mockWorks(p: Page, patch: (w: Record<string, unknown>) => Record<string, unknown>): Promise<void> {
+  await p.route(SETTINGS, async (route) => {
+    if (route.request().method() !== 'GET') return route.fallback();
+    const resp = await route.fetch();
+    const body = (await resp.json()) as { works?: Record<string, unknown> };
+    return route.fulfill({ response: resp, json: { ...body, works: patch(body.works ?? {}) } });
+  });
+}
+
+/** Подключение для подмены паузы: запись Vault «модель в LAN» (`seed-internal.ts`). */
+const mockModel = () => ({
+  protocol: 'openai',
+  vault: `v:${process.env.E2E_VAULT_LAN}`,
+  model: 'e2e-mock',
+  auth: 'none',
+  max_tokens: 4000,
+  token_field: 'auto',
+  body_extra: {},
+  pinned: { scheme: 'http', host: '127.0.0.1', port: 9, path: '/v1' },
+});
 
 export const FORM_CASES: FormCase[] = [
   // ---- Задачи (задача 10a) ----
@@ -377,6 +416,115 @@ export const FORM_CASES: FormCase[] = [
     route: PATCH_ENTRY,
     after: 'notice',
     inline: { scope: (p) => p.getByRole('form', { name: 'Правка идеи' }), submit: 'Сохранить', focus: true },
+  },
+  // ---- страницы M7.3 (задача 8): подключение модели, «Подтвердить адрес», «Отключить модель»,
+  // «Запустить сейчас», «Принять как норму», «Принять» и «Отклонить» кандидата ----
+  {
+    id: 'works-model',
+    name: 'Подключение модели',
+    page: () => '#/works',
+    open: (p) => p.getByRole('button', { name: /^(Подключить модель|Изменить подключение)$/ }).click(),
+    first: 'Запись Vault',
+    fill: (p) => type(p, 'Подключение модели', 'Имя модели', `e2e-forms-${stamp()}`),
+    route: { method: 'PATCH', url: SETTINGS },
+    after: 'notice',
+    added: true,
+  },
+  {
+    id: 'works-confirm-address',
+    name: 'Подтвердить адрес',
+    dialog: 'Подтвердить новый адрес подключения?',
+    page: (c) => `#/u/${c.user}`,
+    open: async (p) => {
+      await mockWorks(p, (w) => ({
+        ...w,
+        model: w.model ?? mockModel(),
+        pause: { class: 'vault_changed', since: new Date().toISOString(), from: 'http://127.0.0.1:9/v1', to: 'http://127.0.0.1:9/v2' },
+      }));
+      await goHash(p, '#/works', 'Внутренние работы');
+      await press(p, 'Подтвердить адрес');
+    },
+    route: { method: 'PATCH', url: SETTINGS },
+    after: 'notice',
+    confirm: true,
+    added: true,
+  },
+  {
+    // ревью r1 задачи 8, Minor 7: подключение убирается из интерфейса — опасное подтверждение
+    id: 'works-disconnect',
+    name: 'Отключить модель',
+    dialog: 'Отключить модель?',
+    page: (c) => `#/u/${c.user}`,
+    open: async (p) => {
+      await mockWorks(p, (w) => ({ ...w, model: w.model ?? mockModel() }));
+      await goHash(p, '#/works', 'Внутренние работы');
+      await press(p, 'Отключить модель');
+    },
+    route: { method: 'PATCH', url: SETTINGS },
+    after: 'notice',
+    confirm: true,
+    danger: true,
+    added: true,
+    kept: async (p) => {
+      // подключение на месте: сводка и кнопка «Отключить модель» видны
+      await expect(p.getByRole('button', { name: 'Отключить модель', exact: true })).toBeVisible();
+      await expect(p.getByRole('button', { name: 'Изменить подключение', exact: true })).toBeVisible();
+    },
+  },
+  {
+    id: 'works-run',
+    name: 'Запустить сейчас',
+    dialog: 'Запустить «Пробы ночной проверки» сейчас?',
+    page: (c) => `#/u/${c.user}`,
+    open: async (p) => {
+      await mockWorks(p, (w) => ({ ...w, effective: { ...(w.effective as object), probes: { mode: 'agent', reason: null } } }));
+      await goHash(p, '#/works', 'Внутренние работы');
+      await press(p, 'Запустить сейчас: Пробы ночной проверки');
+    },
+    route: { method: 'POST', url: /\/api\/v1\/works\/run$/ },
+    after: 'notice',
+    confirm: true,
+    added: true,
+  },
+  {
+    id: 'check-accept',
+    name: 'Принять как норму',
+    dialog: 'Принять как норму?',
+    page: (c) => `#/u/${c.user}`,
+    open: async (p) => {
+      // эпизод регрессии — подстановкой (решение 66): на release-сборке его не подготовить
+      const f = checkFixture();
+      await p.route(/\/api\/v1\/check\/status$/, (route) => route.fulfill({ json: f.status }));
+      await p.route(/\/api\/v1\/check\/runs(\?.*)?$/, (route) => route.fulfill({ json: runsReply(route.request().url(), f.runs) }));
+      await goHash(p, '#/check', 'Проверка памяти');
+      await press(p, 'Принять как норму');
+    },
+    route: { method: 'POST', url: /\/api\/v1\/check\/accept$/ },
+    after: 'notice',
+    confirm: true,
+    added: true,
+  },
+  {
+    id: 'proposal-accept',
+    name: 'Принять кандидата',
+    page: (c) => `#/proposals/${c.env('E2E_PROPOSAL_FORMS')}`,
+    open: (p) => pressIn(p, 'Карточка кандидата', 'Принять'),
+    first: 'Путь в Rules',
+    fill: (p) => type(p, 'Принять кандидата', 'Текст правила', `Перед правкой окна формы проверяй его на телефоне и планшете ${stamp()}.`),
+    route: { method: 'POST', url: /\/api\/v1\/proposals\/[^/?]+\/accept$/ },
+    after: 'notice',
+    added: true,
+  },
+  {
+    id: 'proposal-decline',
+    name: 'Отклонить кандидата',
+    page: (c) => `#/proposals/${c.env('E2E_PROPOSAL_FORMS')}`,
+    open: (p) => pressIn(p, 'Карточка кандидата', 'Отклонить'),
+    first: 'Причина',
+    fill: (p) => type(p, 'Отклонить кандидата', 'Причина', 'правило уже есть в другом виде'),
+    route: { method: 'POST', url: /\/api\/v1\/proposals\/[^/?]+\/decline$/ },
+    after: 'notice',
+    added: true,
   },
   // ---- Словарь (задача 10b): «Новый термин» и «Отозвать» — окна, правка — в карточке ----
   {

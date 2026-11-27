@@ -322,6 +322,34 @@ pub async fn runs(db: &Db, limit: usize) -> Result<Vec<CheckRun>, StoreError> {
     .await
 }
 
+/// Прогоны повода `trigger` и статуса `status` (`None` — любые), новые первыми, не больше
+/// `limit`: `GET /check/runs?trigger=&status=` (WebUI ищет последний законченный ночной прогон
+/// независимо от числа ручных — задача 8 M7.3, ревью r1).
+pub async fn runs_of(
+    db: &Db,
+    trigger: Option<Trigger>,
+    status: Option<RunStatus>,
+    limit: usize,
+) -> Result<Vec<CheckRun>, StoreError> {
+    db.read(move |c| {
+        let mut st = c.prepare_cached(&format!(
+            "SELECT {COLS} FROM check_runs
+             WHERE (?2 IS NULL OR trigger_kind = ?2) AND (?3 IS NULL OR status = ?3)
+             ORDER BY started_at DESC, rowid DESC LIMIT ?1"
+        ))?;
+        let rows = st.query_map(
+            params![
+                i64::try_from(limit).unwrap_or(i64::MAX),
+                trigger.map(Trigger::as_str),
+                status.map(RunStatus::as_str)
+            ],
+            row,
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    })
+    .await
+}
+
 /// Последние законченные (`done`) ночные прогоны, новые первыми, не больше `limit`.
 pub async fn nightly_done(db: &Db, limit: usize) -> Result<Vec<CheckRun>, StoreError> {
     db.read(move |c| nightly_done_in(c, limit)).await

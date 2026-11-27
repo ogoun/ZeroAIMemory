@@ -8,6 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { request } from '@playwright/test';
 import { seed, seedCliReport, seedCodeKnowledge, seedCodeMap, seedIdeas, seedJournals, seedReports, type AdminCall } from './seed';
 import { seedDocs } from './seed-docs';
+import { startMockModel } from './mock-model';
+import { seedInternal } from './seed-internal';
 import { ADMIN_STATE } from './session';
 
 const repo = fileURLToPath(new URL('../../', import.meta.url));
@@ -75,6 +77,14 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     : `${repo}target/deps/linux-x64/pdfium/libpdfium.so`;
   if (existsSync(pdfium)) env.ZAM_DOCS__PDFIUM_DYLIB = pdfium;
   else console.warn(`нет ${pdfium} (cargo xtask fetch-deps): PDF-вложения не индексируются`);
+  // Внутренние работы (M7.3 §6.9, решения 65 и 67): подставная модель — на 127.0.0.1 (петлю
+  // разрешает администратор); ночная проверка выключена, окно ночи — через 12 ч UTC: ночные работы
+  // и ночной прогон не меняют «последний прогон» и журнал отправок посреди сценариев (ручные
+  // `POST /check/run` и `POST /works/run` от этого не зависят)
+  env.ZAM_WORKS__ALLOW_LOOPBACK = 'true';
+  env.ZAM_WORKS__CHECK = 'off';
+  env.ZAM_WORKS__AT = new Date(Date.now() + 12 * 3_600_000).toISOString().slice(11, 16);
+  const mock = await startMockModel();
   const base = `http://${lanIp()}:${port}/`;
   const child = spawn(exe, ['serve', '--bind', `0.0.0.0:${port}`, '--data-dir', data], {
     env,
@@ -130,6 +140,8 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     // журнал «Идеи» (M5.7): своё общее решение, идеи человека и агента, вопрос-предложение, Knowledge;
     // разборы агента (M6.5): отклонённая, возвращённая, в плане с историей
     const ideas = await seedIdeas(base, token, admin);
+    // страницы M7.3: записи Vault подключения модели, кандидат в Rules для окон форм
+    const internal = await seedInternal(base, token, mock.url);
     await rc.storageState({ path: ADMIN_STATE });
     await rc.dispose();
     process.env.E2E_BASE_URL = base;
@@ -173,9 +185,15 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     process.env.E2E_IDEA_RETURNED = ideas.returned;
     process.env.E2E_IDEA_DECLINED = ideas.declined;
     process.env.E2E_IDEA_BASIS_TASK = ideas.basisTask;
+    process.env.E2E_MOCK_MODEL = mock.url;
+    process.env.E2E_VAULT_LAN = internal.vaultLan;
+    process.env.E2E_VAULT_EXT = internal.vaultExt;
+    process.env.E2E_VAULT_MOVE = internal.vaultMove;
+    process.env.E2E_PROPOSAL_FORMS = internal.proposalForms;
   } catch (e) {
     child.kill();
     log.end();
+    await mock.close();
     throw e;
   }
 
@@ -185,5 +203,6 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
       await new Promise((r) => child.once('exit', r));
     }
     log.end();
+    await mock.close();
   };
 }

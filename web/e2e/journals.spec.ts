@@ -964,3 +964,75 @@ test('journal_trash_ro_member_403', async ({ page, browser }) => {
     await m.ctx.close();
   }
 });
+
+// ---- «Шумные» и счётчик «открыто» в Insights (M7.3, спецификация §6.6 п. 3; задача 8) ----
+//
+// Показ — подсказка к ошибке (`/recall post_tool`, триггер `error_regex`) в сессии агента, открытие —
+// чтение записи по токену той же сессией после показа (`GET /entries/{id}` с `X-Zam-Session`).
+// Фильтр — на сервере (лента `noisy=1`, решение 68): показано ≥ 10 и ни одного открытия за окно
+// `max(now − 30 сут, opened_since)`; учёт открытий в e2e начался с запуска сервера — строка
+// «данные об открытии копятся с <дата>».
+
+/** Десять показов записи подсказкой: каждый — в своей сессии агента. */
+async function shownTimes(guid: string, pattern: string, n: number, tag: string): Promise<string[]> {
+  const sessions: string[] = [];
+  for (let i = 1; i <= n; i++) {
+    const s = `e2e-noisy-${tag}-${i}-${Date.now().toString(36)}`;
+    await agentApi('POST', 'recall', { event: 'post_tool', error: `ошибка сборки: ${pattern}`, solution: guid, timeout_ms: 2000 }, { 'X-Zam-Session': s });
+    sessions.push(s);
+  }
+  return sessions;
+}
+
+test('insights_noisy_filter', async ({ page }) => {
+  test.setTimeout(120_000);
+  const problems = watch(page);
+  const guid = await newSolution('шумные');
+  const stamp = Date.now().toString(36);
+  const insight = (title: string, pattern: string) =>
+    agentApi<Rec>('POST', `spaces/${guid}/entries`, {
+      kind: 'insight',
+      title,
+      body: `${title}: подсказка к ошибке сборки.`,
+      data: { kind: 'gotcha' },
+      triggers: [{ type: 'error_regex', pattern }],
+      force: true,
+    });
+  const noisy = await insight('Шумная подсказка E2E', `noisyalpha${stamp}`);
+  const opened = await insight('Открытая подсказка E2E', `noisybeta${stamp}`);
+  await shownTimes(guid, `noisyalpha${stamp}`, 10, 'a');
+  const sessions = await shownTimes(guid, `noisybeta${stamp}`, 10, 'b');
+  // агент открыл вторую после её подсказки — в той же сессии
+  await agentApi('GET', `entries/${opened.id}`, undefined, { 'X-Zam-Session': sessions[0] });
+  type Usage = { usage: { shown: number; opened: number; useful: number; useless: number } };
+  expect((await agentApi<Usage>('GET', `entries/${noisy.id}`)).usage).toEqual({ shown: 10, opened: 0, useful: 0, useless: 0 });
+  expect((await agentApi<Usage>('GET', `entries/${opened.id}`)).usage).toEqual({ shown: 10, opened: 1, useful: 0, useless: 0 });
+
+  const c = await pageCtx(page);
+  await page.goto(`${base()}#/u/${c.user}/s/${guid}/j/insights`);
+  const table = page.getByRole('table', { name: 'Insights' });
+  await expect(table.getByRole('columnheader', { name: 'Показано / открыто / полезно / бесполезно' })).toBeVisible();
+  await expect(table.locator(`tr[data-entry="${noisy.id}"] td.usage`)).toHaveText('10 / 0 / 0 / 0');
+  await expect(table.locator(`tr[data-entry="${opened.id}"] td.usage`)).toHaveText('10 / 1 / 0 / 0');
+  // «Шумные» — с 10 показами без открытия есть, с одним открытием — нет
+  const lists: string[] = [];
+  page.on('request', (r) => {
+    const u = new URL(r.url());
+    if (u.pathname.endsWith(`/spaces/${guid}/entries`)) lists.push(u.searchParams.get('noisy') ?? '');
+  });
+  await page.getByLabel('Шумные', { exact: true }).check();
+  await expect(table.locator(`tr[data-entry="${noisy.id}"]`)).toBeVisible();
+  await expect(table.locator(`tr[data-entry="${opened.id}"]`)).toHaveCount(0);
+  expect(lists).toContain('1');
+  // первые 30 суток учёта открытий — предупреждение с датой начала
+  await expect(page.getByTestId('noisy-note')).toContainText('Данные об открытии копятся с');
+  // карточка — «показано · открыто · полезно · бесполезно»
+  await table.locator(`tr[data-entry="${noisy.id}"] button`).first().click();
+  await expect(page.getByRole('article', { name: 'Карточка insight' }).getByTestId('usage')).toHaveText(
+    'показано 10 · открыто 0 · полезно 0 · бесполезно 0',
+  );
+  // фильтр снят — обе снова в ленте
+  await page.getByLabel('Шумные', { exact: true }).uncheck();
+  await expect(table.locator(`tr[data-entry="${opened.id}"]`)).toBeVisible();
+  expect(problems, problems.join('\n')).toEqual([]);
+});

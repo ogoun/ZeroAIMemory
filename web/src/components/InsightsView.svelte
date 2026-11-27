@@ -3,8 +3,12 @@
   // записи — замещение, отзыв, пересмотр, смена статуса надёжности (причина и доказательство
   // theorem человеку необязательны), триггеры, цепочка замещения, связи. Сессия WebUI — человек
   // (author_kind = human). Правка идёт с ревизией открытой записи (If-Match, §11.3): запись
-  // изменилась — 409, карточка перечитывается. Столбец «показы / полезно / бесполезно» и
-  // кнопки оценки (`POST /entries/{id}/feedback`, источник `webui`, §10.5).
+  // изменилась — 409, карточка перечитывается. Столбец «показано / открыто / полезно / бесполезно»
+  // и кнопки оценки (`POST /entries/{id}/feedback`, источник `webui`, §10.5); «открыто» — сессий
+  // агента, открывших запись после её подсказки (M7.3 §6.6). Фильтр «Шумные» (M7.3 §6.6 п. 3,
+  // решение 68) — на сервере, лента `noisy=1`: показано ≥ 10 и ни одного открытия за окно
+  // `max(now − 30 сут, opened_since)`, «полезно» нет за всё время; первые 30 суток учёта открытий —
+  // строка «данные об открытии копятся с <дата>».
   // Узкие экраны (M7.2, спецификация §5.2 п. 3): таблица и карточка — `JournalSplit` (рядом или
   // карточка вместо таблицы); в области журнала уже 720 px таблица остаётся таблицей (те же строки
   // и ячейки), столбцы «Вид», «Область», «Показы», «Изменено» скрыты, их значения — строкой под
@@ -72,6 +76,7 @@
   import { BP_TABLET } from '../lib/layout';
   import { go, href } from '../lib/router';
   import { observeWidth } from '../lib/viewport.svelte';
+  import { localTime } from '../lib/time';
   import { supersedeData } from '../lib/adrData';
 
   interface Props {
@@ -100,6 +105,10 @@
   let fTag = $state('');
   /** Только решения человека (`decided_by=human`, M4.5 §5). */
   let fHuman = $state(false);
+  /** «Шумные» (`noisy=1`, M7.3 §6.6 п. 3). */
+  let fNoisy = $state(false);
+  /** Начало учёта открытий (`opened_since` ленты `noisy=1`); `null` — не известно. */
+  let openedSince = $state<string | null>(null);
   let refs = $state<RefsByTarget>(new Map());
   let seq = 0;
   /** Ширина области журнала (CSS px); уже 720 px — компактная таблица (§5.2 п. 3). */
@@ -318,6 +327,8 @@
       fArea = '';
       fTag = '';
       fHuman = false;
+      fNoisy = false;
+      openedSince = null;
       trash = false;
       listNotice = '';
       load(u, s, true);
@@ -355,10 +366,12 @@
         tag: fTag.trim() || undefined,
         dataKind: fKind || (fHuman ? 'decision' : undefined),
         decidedBy: fHuman ? 'human' : undefined,
+        noisy: fNoisy || undefined,
         cursor: reset ? null : next,
         limit: PAGE,
       });
       if (my !== seq) return;
+      if (fNoisy) openedSince = r.opened_since ?? null;
       items = reset ? r.items : [...items, ...r.items];
       next = r.next_cursor;
     } catch (e) {
@@ -441,7 +454,12 @@
     return { items: [...before.reverse(), e, ...after], cut: { before: cb, after: ca } };
   }
 
-  const usageText = (u: UsageCounts | undefined) => (u ? `${u.shown} / ${u.useful} / ${u.useless}` : '—');
+  const usageText = (u: UsageCounts | undefined) =>
+    u ? `${u.shown} / ${u.opened ?? 0} / ${u.useful} / ${u.useless}` : '—';
+
+  /** Учёт открытий моложе 30 суток: фильтр «Шумные» неполон (§6.6 п. 3). */
+  const OPENED_YOUNG_MS = 30 * 86_400_000;
+  let openedYoung = $derived(!!openedSince && Date.now() - new Date(openedSince).getTime() < OPENED_YOUNG_MS);
 
   /** Оценка полезности: событие `usage` в базе записи, счётчики — перечитать. */
   async function rate(value: 'useful' | 'useless') {
@@ -853,12 +871,23 @@
   <label class="row">
     <input type="checkbox" bind:checked={fHuman} onchange={reloadList} aria-label="Решения человека" /> Решения человека
   </label>
+  <label class="row" title="Показано подсказками не меньше 10 раз за 30 суток, ни одного открытия агентом и ни одной оценки «полезно»: кандидат отключить триггер или переписать запись">
+    <input type="checkbox" bind:checked={fNoisy} onchange={reloadList} aria-label="Шумные" /> Шумные
+  </label>
   <button type="submit">Применить</button>
 {/snippet}
 
 {#snippet liveTable()}
   <div bind:this={listEl}><Notice text={listNotice} /></div>
   {#if error}<p class="error" role="alert">{error}</p>{/if}
+  {#if fNoisy}
+    <p class="muted small noisy-note" data-testid="noisy-note">
+      Шумные — показано подсказками не меньше 10 раз и ни разу не открыто агентом за 30 суток, «полезно» не отмечено ни
+      разу.{#if openedYoung && openedSince}<span class="warn-inline">
+          Данные об открытии копятся с {localTime(openedSince, { dateStyle: 'long' })}: первые 30 суток фильтр неполон.</span
+        >{/if}
+    </p>
+  {/if}
 
   <div class="table-wrap">
     <table aria-label="Insights">
@@ -867,7 +896,7 @@
           <th>Надёжность</th><th>Заголовок</th>{#if !compact}<th>Вид</th>{/if}<th>Статус</th>
           {#if !compact}
             <th>Область</th>
-            <th title="Показы подсказками / полезно / бесполезно">Показы / полезно / бесполезно</th><th>Изменено</th>
+            <th title="Показано подсказками / открыто агентом / полезно / бесполезно">Показано / открыто / полезно / бесполезно</th><th>Изменено</th>
           {/if}
         </tr>
       </thead>
@@ -884,7 +913,7 @@
               {#if compact}
                 <!-- скрытые столбцы — строкой под заголовком -->
                 <div class="muted small row-meta" data-testid="row-meta">
-                  {[dataStr(e.data, 'kind'), e.area ?? '', `показы ${usageText(e.usage)}`, fmtTime(e.updated_at)].filter(Boolean).join(' · ')}
+                  {[dataStr(e.data, 'kind'), e.area ?? '', `показано ${usageText(e.usage)}`, fmtTime(e.updated_at)].filter(Boolean).join(' · ')}
                 </div>
               {/if}
             </td>
@@ -900,7 +929,7 @@
       </tbody>
     </table>
   </div>
-  {#if !loading && items.length === 0 && !error}<p class="muted">Записей нет.</p>{/if}
+  {#if !loading && items.length === 0 && !error}<p class="muted">{fNoisy ? 'Шумных записей нет.' : 'Записей нет.'}</p>{/if}
   {#if loading}<p class="muted">Загрузка…</p>{/if}
   {#if next}
     <button type="button" class="more" aria-disabled={loading} aria-busy={loading} onclick={more}>Показать ещё</button>
@@ -947,7 +976,7 @@
       </div>
       <div class="row rate" role="group" aria-label="Оценка полезности">
         <span class="muted small" data-testid="usage">
-          показы {c.usage?.shown ?? 0} · полезно {c.usage?.useful ?? 0} · бесполезно {c.usage?.useless ?? 0}
+          показано {c.usage?.shown ?? 0} · открыто {c.usage?.opened ?? 0} · полезно {c.usage?.useful ?? 0} · бесполезно {c.usage?.useless ?? 0}
         </span>
         <button type="button" onclick={() => rate('useful')} disabled={busy}>Полезно</button>
         <button type="button" onclick={() => rate('useless')} disabled={busy}>Бесполезно</button>
@@ -1323,6 +1352,17 @@
   }
   .small {
     font-size: 12px;
+  }
+  /* строка фильтра «Шумные» и предупреждение «данные об открытии копятся с …» (M7.3 §6.6 п. 3) */
+  .noisy-note {
+    margin: 6px 0;
+  }
+  .warn-inline {
+    margin-left: 4px;
+    padding: 0 4px;
+    border-radius: 4px;
+    background: var(--warn-bg);
+    color: var(--warn-text);
   }
   /* «×» триггера — прежний кегль: общее `button.small-btn` (app.css) задаёт 12 px */
   .small-btn {
