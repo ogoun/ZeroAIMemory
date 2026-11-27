@@ -7140,6 +7140,65 @@ N)» — форма раскрылась под кнопкой, её низ — 
 - `backup-run-phone`, `reindex-phone`, `reindex-full-phone` — окна-подтверждения во всю ширину:
   «Снять копию» (синяя, фокус), «Запустить» (синяя / красная у полной, у полной фокус — «Отмена»).
 
+### M7.3 · Финальное ревью и волна правок
+
+Финальное ревью ветки `7e15b5a5..3dc60d0e` (отчёт — `final-review.md` каталога SDD волны): «With
+fixes», Critical 0, Important 0, Minor 12. Решения координатора (`fix-wave-brief.md`): исправить
+все 12 одной волной. Worktree `.tmp/m73/wt-fix`, ветка `m7.3-fix` от `3dc60d0e`, сборка
+`target\m73-fix` (release для e2e — `target\m73-fix-rel`: параллельно с прогонами, без замка
+каталога сборки).
+
+- **1 — проба «принято», которой нет.** `ItemWrite::Probe` (`zam_store::works::apply_write`) при
+  исчерпанном к закрытию пределе новых проб, повторе вопроса (`Duplicate`) и пределе активных
+  (`Full`) возвращает предупреждение «`<ref>`: проба не записана — …» — общий механизм
+  `Closed::Closed {warnings}` (`result.warnings`, `result.response.warnings`, ответ итога), как у
+  кандидатов в Rules. WebUI: «принято N · не записано K» (`workResultText`).
+- **2 — «0 мс» в журнале отправок.** `WorkCall.ms: number | null`; столбец «мс» — «—» с подсказкой
+  `title` «ответа не было…» (`callMsText`, `CALL_NO_MS_HINT`), карточка телефона —
+  `callDurationText`.
+- **3 — итог хранит элемент как есть.** `kinds::kept_item(rows)` — элемент итога по записям,
+  которые он даёт: `{question}` у `probes`, `{rule: {path, content}, reason}` у `rules` (путь
+  нормализован, `title` — в `content`), `{text}` у `echo`; `queue::accept` кладёт его вместо
+  присланного JSON.
+- **4 — срок хранения `works`.** `zam_store::works::gc` (закрытые `done`, `cancelled`, `failed`,
+  `expired` с `finished_at` раньше среза), `RETENTION_DAYS = REFS_HORIZON_DAYS = 365`,
+  `maintenance::gc_works` (`WORKS_TTL`) в проходе обслуживания рядом с `work_calls` и
+  `check_runs`; индекс `works_finished (kind, finished_at)` — в 0027 (не выпущена; как
+  `work_calls_run`). **[решение исполнителя]** «Считать отсев один раз на запуск вида» не сделано:
+  после срока хранения и п. 3 объём разбора ограничен годом итогов вида (≲ 1,5 тыс. небольших
+  строк), а вынос отсева из сборщиков меняет их общий вход (`kinds::collect` зовут тесты и
+  постановка) — лучше сделать вместе с рекомендацией 4 ревью (одно место «отсеянных ссылок» для
+  M7.5).
+- **5 — один вид «выключено».** `POST /works/model/test` при `model_access = "off"` —
+  `ApiError::WorksDisabled` (`/problems/works-disabled`, причина в `detail`).
+- **6 — дубли.** `works::exec::token_limits` — пределы и у отказа (`fits_limits`), и у `GET
+  /works/usage`; `zam_store::time::month_start_utc` (тест перенесён в `time.rs`); выбор
+  пользователя — `api::works::works_user` у обоих маршрутов модели (токену — 403 до него;
+  администратор без `?user=` теперь получает `X-Zam-User`, как у очереди); `ApiError::conflict_code`
+  вместо двух местных `conflict` (и `works_off`).
+- **7 — api-compat.** Пункты `POST /works/model/test` (тело ответа, 409 `works-disabled`,
+  `vault_changed {was, now}`, `model_busy`, 422), `GET /works/calls` (`{days, calls}`, `days`
+  1..=180, исходы с `aborted` и `internal`, `ms = null`), аудит `works.model.*`, `check.accept`,
+  `proposal.accept`/`decline`; `memory_check` — «M7.3 §6.4–§6.5»; `warnings` у проб и поля
+  принятого элемента; срок хранения работ; `check` у `usage` и `check/status`; пометка `shell`.
+- **8 — ТЗ §6.3 и комментарий 0027.** `work_calls.run`, индекс `work_calls_run`, исход `internal`,
+  `ms` без ответа; индекс `works_finished` и срок хранения `works`.
+- **9 — тайминг.** `MockReply::held(&Gate)` (подставная модель держит ответ до `Gate::open`):
+  `mode_rechecked_before_retry` отпускает `500` только после `PATCH` режима; задержка 600 мс и
+  сон 100 мс убраны.
+- **10 — фокус «Подтвердить адрес».** Признак каркаса `cautious` у `FormDialog` (фокус на
+  «Отмена», кнопка не красная); у строки перечня форм `works-confirm-address` — `danger` и `kept`
+  (Enter на «Отмена» — `PATCH` нет, пауза на месте); ожидание фокуса — в
+  `works_pause_dot_and_confirm_address`.
+- **11 — пометка «команды shell».** `rules::has_shell`: приглашение `$ `/`PS> `, конвейер в
+  оболочку после `|` (кроме `||` и строк таблиц Markdown), фразы на границе слов (`cmd /c`,
+  `powershell`, `pwsh`, `bash -c`, `curl`, `wget`, `iwr`, `irm`, `iex`, `Invoke-Expression`,
+  `-EncodedCommand`, `rm -rf`, `chmod +x`, `sudo`, `rd /s`, …), в том числе внутри однострочного
+  кода; тест `shell_cases` — 20 «да» и 8 «нет».
+- **12 — выключатель ночной проверки.** `api::check::check_json` — `{server, user, reason}` у
+  `GET /check/status` и `GET /works/usage` (`reason`: `disabled` | `check_off`); «Ночная проверка
+  моей памяти» неактивна с причиной (`checkOffText`), если сервер её не проводит.
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия
