@@ -7,11 +7,16 @@
 //! базе пространства, и сервер считает его тем же чтением, что `GET /spaces/{space}/vault`
 //! зрителя.
 //!
-//! Цена — четыре чтения в одном снимке базы по существующим индексам (без миграций): виды — по
+//! Шаги планов (M7.3 §6.14 п. 10, `task_steps`) — подзадачи `part_of` среди задач: число задач
+//! верхнего уровня доски WebUI — `tasks − task_steps`, правило — как у фильтра `top_level=1`
+//! ([`crate::TaskTree`]: задача на цикле `part_of` — верхнего уровня).
+//!
+//! Цена — пять чтений в одном снимке базы по существующим индексам (без миграций): виды — по
 //! `space_id` частичного индекса живых записей `(space_id, kind, …)` с группировкой в порядке
 //! индекса, открытые вопросы и задачи — по `(space_id, kind)` того же индекса, заметки — по
-//! частичному индексу живых узлов, снимок карты кода — по первичному ключу (планы — модульный
-//! тест `queries_use_indexes`).
+//! частичному индексу живых узлов, снимок карты кода — по первичному ключу, рёбра `part_of` задач —
+//! по `entries_feed`, `edges_src` и первичному ключу родителя (планы — модульный тест
+//! `queries_use_indexes`).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -77,6 +82,9 @@ pub struct SpaceCounts {
     pub open_tasks: u64,
     /// Живые заметки пространства, без папок.
     pub notes: u64,
+    /// Шаги планов: живые задачи с учтённым родителем `part_of` (подзадачи, M7.3 §6.14 п. 10) —
+    /// входят в `journals["tasks"]`; у пространства без журналов — 0.
+    pub task_steps: u64,
 }
 
 /// Живые записи пространства по видам (`?1` — пространство).
@@ -99,6 +107,20 @@ const NOTES_SQL: &str = "SELECT count(*) FROM nodes
 /// Файлы снимка карты кода решения (`?1` — GUID).
 const CODE_SQL: &str = "SELECT files FROM code_snapshots WHERE solution_guid = ?1";
 
+/// Рёбра `part_of` между живыми задачами пространства (`?1`): подзадача → родитель (то же условие,
+/// что у [`crate::task_tree`]: ребро живое, оба конца — живые задачи этого пространства). Порядок
+/// соединения задан `CROSS JOIN` (задачи пространства → их рёбра → родитель по ключу): без него
+/// планировщик без статистики начинает с рёбер `edges_dst (dst_kind=?)` — всех рёбер на записи базы
+/// — и ищет задачу диапазоном `entries_feed` на каждое ребро.
+const STEPS_SQL: &str = "SELECT g.src_id, g.dst_id
+     FROM entries t INDEXED BY entries_feed
+     CROSS JOIN edges g INDEXED BY edges_src
+     CROSS JOIN entries p
+     WHERE t.space_id = ?1 AND t.kind = 'task' AND t.deleted_at IS NULL
+       AND g.src_kind = 'entry' AND g.src_id = t.id AND g.type = 'part_of'
+       AND g.dst_kind = 'entry' AND g.deleted_at IS NULL
+       AND p.id = g.dst_id AND p.space_id = ?1 AND p.kind = 'task' AND p.deleted_at IS NULL";
+
 /// Число строк из `count(*)` (отрицательного не бывает).
 fn n(v: i64) -> u64 {
     u64::try_from(v).unwrap_or(0)
@@ -106,7 +128,8 @@ fn n(v: i64) -> u64 {
 
 /// Число записей разделов пространства `space` его базы `db` (спецификация M7 §5.3 п. 1):
 /// журналы WebUI вида пространства (у решения — все, кроме Vault; у Knowledge — без Changelog,
-/// Releases, Отчётов и Кода; у Rules и Human — нет), открытые вопросы и задачи, заметки.
+/// Releases, Отчётов и Кода; у Rules и Human — нет), открытые вопросы и задачи, заметки, шаги
+/// планов среди задач (M7.3 §6.14 п. 10).
 /// `with_reports` — с журналом отчётов (сессия WebUI); токену отчёт не виден нигде (M5.5 §7) —
 /// ключа `reports` нет. У пространства без журналов открытых вопросов и задач — 0.
 pub async fn space_counts(
@@ -154,6 +177,11 @@ pub async fn space_counts(
             .query_row(params![id], |r| Ok((n(r.get(0)?), n(r.get(1)?))))?;
         out.open_questions = q;
         out.open_tasks = t;
+        let edges: Vec<(Id, Id)> = tx
+            .prepare_cached(STEPS_SQL)?
+            .query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        out.task_steps = u64::try_from(crate::tasks::subtask_count(&edges)).unwrap_or(u64::MAX);
         Ok(out)
     })
     .await
@@ -226,10 +254,33 @@ mod tests {
                 && l.ends_with("(solution_guid=?)")),
             "{code:?}"
         );
+        // шаги планов: задачи — по `entries_feed`, рёбра — по `edges_src`, родитель — по ключу
+        let steps = plan(&c, STEPS_SQL);
+        for want in [
+            "SEARCH t USING INDEX entries_feed (space_id=? AND kind=?)",
+            "SEARCH g USING INDEX edges_src (src_kind=? AND src_id=?)",
+        ] {
+            assert!(steps.iter().any(|l| l == want), "{want}: {steps:?}");
+        }
+        assert!(
+            steps.iter().any(
+                |l| l.starts_with("SEARCH p USING INDEX sqlite_autoindex_entries")
+                    && l.ends_with("(id=?)")
+            ),
+            "{steps:?}"
+        );
         // планы — в журнал этапа (`--nocapture`)
-        println!("kinds: {kinds:?}\nopen: {open:?}\nnotes: {notes:?}\ncode: {code:?}");
+        println!(
+            "kinds: {kinds:?}\nopen: {open:?}\nnotes: {notes:?}\ncode: {code:?}\nsteps: {steps:?}"
+        );
         // `SCAN CONSTANT ROW` — внешний `SELECT` подзапросов без таблицы, не просмотр
-        for l in kinds.iter().chain(&open).chain(&notes).chain(&code) {
+        for l in kinds
+            .iter()
+            .chain(&open)
+            .chain(&notes)
+            .chain(&code)
+            .chain(&steps)
+        {
             assert!(
                 !l.starts_with("SCAN") || l == "SCAN CONSTANT ROW",
                 "полный просмотр: {l}"

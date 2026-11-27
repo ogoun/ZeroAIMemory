@@ -81,6 +81,7 @@
 | `memory_check` | M7 §6.4–§6.5 | Ночная проверка памяти: пробы (`probes`, ссылка `x:`), прогоны и вердикт к базе — `GET /check/status`, `GET /check/runs?limit=`, `GET /check/runs/{id}`, `POST /check/run` (ручной прогон: человек или токен `rw`, 202 `{run}`; идёт — 409 `/problems/check-running`; `[works] enabled = false` — 409 `/problems/works-disabled`), `POST /check/accept {run}` («Принять как норму» — только сессия WebUI, токен — 403; не последний ночной прогон эпизода — 409 `/problems/check-accept-not-latest`), `GET /check/probes?kind=&status=&split=`; строка дайджеста `session_start` при регрессии; ключ конфигурации `[works] check`, настройка пользователя `works.check`. Раздел «Ночная проверка памяти» ниже. Сервер без флага маршрутов `/check` не знает (404). |
 | `proposals` | M7.3 §6.7 | Кандидаты в Rules (предложения человеку, ссылка `o:`): `POST /proposals {type: "rule", path, content, reason, basis?}` (токен `rw`; 201 `{proposal: "o:<id>"}`, тот же путь и текст — 200 `existing: true`; открытых 50 — 409 `/problems/proposals-full`), `GET /proposals?type=&status=&author=me`, `GET /proposals/counts` → `{rules}`, `GET /proposals/{id}` (с `rules_tokens {now, after}`), `POST /proposals/{id}/accept {path?, content?}` и `/decline {note?}` (только сессия WebUI, токен — 403), `/withdraw` (автор-агент); поле `candidate` у MCP `memory_write`; `detail` 403 записи агента в Rules — с подсказкой `candidate`; вид работы `rules`; `zam rules`. Раздел «Кандидаты в Rules» ниже. Сервер без флага — 404 на `/proposals*`, поле `candidate` MCP не знает (запись в Rules — 403). |
 | `usage_opened` | M7.3 §6.6 | «Агент открыл подсказку»: чтение узла или записи по токену явной сессией (`POST /read` — любой уровень, секция, фокус; `GET /entries/{id}`; `GET /nodes/{id}` и `GET /nodes/by-path`) после показа этой цели подсказкой `/recall` той же сессии в той же эпохе — одно открытие на сессию и цель; поле `opened` в `usage {shown, opened, useful, useless}` у `GET /entries/{id}` и insight ленты; «шумные» — `GET /spaces/{space}/entries?kind=insight&noisy=1` с полем ответа `opened_since`; `zam insight show` — «показы · открыто · полезно · бесполезно» (раздел «Открытие подсказок» ниже). Сервер без флага отдаёт `usage` без `opened`, а параметр `noisy` молча пропускает (лента целиком) — клиент шлёт его только с флагом. |
+| `space_counts_steps` | M7.3 §6.14 п. 10 | Поле `task_steps` ответа `GET /spaces/{space}/counts` — число шагов планов (подзадач `part_of`) среди `journals.tasks`, по правилу фильтра `top_level=1` (задача на цикле `part_of` — верхнего уровня): задачи верхнего уровня — `journals.tasks − task_steps` (раздел «Число записей разделов» ниже). Сервер без флага поля не отдаёт. |
 
 Правило для разработки сервера: задача, которая вводит возможность или ключ конфигурации,
 добавляет строку в `FEATURES` (`crates/zam-server/src/api/health.rs`) и строку в эту таблицу;
@@ -264,6 +265,12 @@ recall.timeout_ms)` (`recall.max_timeout_ms` по умолчанию — 2000), 
 - **`open`** — `questions`: вопросы `open`; `tasks`: задачи `open`, `in_progress`, `blocked`
   (подзадачи тоже). У Rules и Human — нули.
 - **`notes`** — живые заметки пространства без папок.
+- **`task_steps`** (признак `space_counts_steps`, M7.3 §6.14 п. 10) — шаги планов: живые задачи
+  пространства с учтённым родителем `part_of` — живой задачей того же пространства, как у фильтра
+  `top_level=1` ленты и счётчиков (`GET …/entries/counts?kind=task&top_level=1` в сумме даёт
+  `journals.tasks − task_steps`; задача на цикле `part_of` любой длины — верхнего уровня). WebUI
+  пишет это в подсказке числа «Задач»: «109 записей: 37 задач и 72 шага планов». У пространства без
+  журналов — 0.
 - **Права** — чтение пространства, как у ленты: участнику — только пространство решения (личные
   пространства владельца по id — 404), ожидание, отклонение и отзыв доступа — 403
   `/problems/solution-access`; Human токену — 404. Токену ключа `reports` нет: отчёт агенту не
@@ -271,7 +278,8 @@ recall.timeout_ms)` (`recall.max_timeout_ms` по умолчанию — 2000), 
 - **Цена** — четыре чтения в одном снимке базы по существующим индексам (`count(*) … GROUP BY
   kind` по частичному индексу живых записей, открытые — по `(space_id, kind)`, заметки — по
   частичному индексу живых узлов, снимок карты кода — по первичному ключу) и чтение Vault, как у
-  `GET …/vault`. Миграций нет.
+  `GET …/vault`; с `space_counts_steps` — пятое чтение в том же снимке: рёбра `part_of` задач
+  пространства (`entries_feed`, `edges_src`, первичный ключ родителя). Миграций нет.
 - MCP и `zam` маршрут не используют; WebUI встроен в сервер той же версии и признак не
   проверяет. Сервер без признака на маршрут отвечает 404.
 

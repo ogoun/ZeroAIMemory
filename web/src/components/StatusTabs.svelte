@@ -6,11 +6,16 @@
   // вторую строку, а не прокручиваются: переход к любому статусу — одно касание. Общий компонент
   // вкладок ARIA: прежние вкладки «Кода», документа, «Идей» и таблиц на него в волне M7.2 не
   // переводятся.
-  /** Вкладка: статус, подпись и число записей статуса (сервер; нет — без числа). */
+  /** Вкладка: статус, подпись и число записей статуса (сервер; нет — без числа); `extra` — короткая
+   * добавка к числу («+18», шаги планов доски задач, M7.3 §6.14 п. 10), `extraName` — её продолжение
+   * имени для чтения с экрана (« и 18 шагов планов»), `extraHint` — подсказка вкладки. */
   export interface StatusTab {
     id: string;
     title: string;
     count?: number;
+    extra?: string;
+    extraName?: string;
+    extraHint?: string;
   }
 </script>
 
@@ -39,7 +44,8 @@
   /** Вкладка в порядке Tab: выбранная, а если выбранной нет — первая. */
   let focusable = $derived(tabs.some((t) => t.id === selected) ? selected : (tabs[0]?.id ?? ''));
 
-  const nameOf = (t: StatusTab) => (t.count === undefined ? t.title : `${t.title}, ${countText(t.count, noun)}`);
+  const nameOf = (t: StatusTab) =>
+    t.count === undefined ? t.title : `${t.title}, ${countText(t.count, noun)}${t.extra ? (t.extraName ?? '') : ''}`;
 
   /** Клавиатура tablist (`lib/tabs.ts`): ←/→ по кругу, Home, End; выбор следует за фокусом. */
   const onkeydown = (e: KeyboardEvent, i: number) => onTabKey(e, i, tabs.length, els, (j) => onselect(tabs[j].id));
@@ -55,11 +61,12 @@
       aria-selected={selected === t.id}
       aria-controls={`${uid}-panel`}
       aria-label={nameOf(t)}
+      title={t.extra ? t.extraHint : undefined}
       tabindex={focusable === t.id ? 0 : -1}
       data-status={t.id}
       onclick={() => onselect(t.id)}
       onkeydown={(e) => onkeydown(e, i)}
-      >{t.title}{#if t.count !== undefined}{' '}<span class="count">{t.count}</span>{/if}</button
+      >{t.title}{#if t.count !== undefined}{' '}<span class="count">{t.count}</span>{#if t.extra}{' '}<span class="extra">{t.extra}</span>{/if}{/if}</button
     >
   {/each}
 </div>
@@ -97,6 +104,11 @@
   }
   [aria-selected='true'] .count {
     color: inherit;
+  }
+  .extra {
+    color: var(--muted);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
   }
   .status-panel:focus-visible {
     outline: 2px solid var(--accent);

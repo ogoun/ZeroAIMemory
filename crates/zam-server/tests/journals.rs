@@ -1139,10 +1139,95 @@ async fn space_counts_by_journal() {
     let h = get_ok_as(a, me, "/api/v1/spaces/human/counts").await;
     assert_eq!(
         h,
-        json!({"journals": {}, "open": {"questions": 0, "tasks": 0}, "notes": 1})
+        json!({"journals": {}, "open": {"questions": 0, "tasks": 0}, "notes": 1, "task_steps": 0})
     );
     let r = get_as(a, me, "/api/v1/spaces/nope/counts").await;
     assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.text());
+}
+
+/// Связь `part_of` `step → parent` токеном `tok`; id ребра.
+async fn part_of(a: &Api, tok: &str, step: &str, parent: &str) -> String {
+    let r = a
+        .tok(
+            tok,
+            Method::POST,
+            "/api/v1/edges",
+            Some(json!({"src": format!("e:{step}"), "type": "part_of", "dst": format!("e:{parent}")})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    id_of(&r.json())
+}
+
+/// Сумма `GET …/entries/counts?kind=task&top_level=1` — задачи верхнего уровня доски.
+async fn top_level_tasks(a: &Api, who: Who<'_>, space: &str) -> u64 {
+    let c = get_ok_as(
+        a,
+        who,
+        &format!("/api/v1/spaces/{space}/entries/counts?kind=task&top_level=1"),
+    )
+    .await;
+    c.as_object()
+        .unwrap_or_else(|| panic!("{c}"))
+        .values()
+        .map(|v| v.as_u64().unwrap())
+        .sum()
+}
+
+/// Шаги планов (M7.3 §6.14 п. 10, признак `space_counts_steps`): `task_steps` — подзадачи
+/// `part_of` среди `journals.tasks` по правилу `top_level=1` — число журнала без шагов равно сумме
+/// счётчиков доски верхнего уровня; два родителя — один шаг; удалённое ребро — снова верхний
+/// уровень; у токена — те же числа; у Knowledge без рёбер и у Human — 0.
+#[tokio::test]
+async fn space_counts_task_steps() {
+    let w = counts_world("task-steps").await;
+    let (a, tok, me) = (&w.a, w.o.tok.as_str(), Who::Web(&w.o.web));
+    let uri = format!("/api/v1/spaces/{G}/counts");
+    assert_eq!(get_ok_as(a, me, &uri).await["task_steps"], 0);
+    let tasks = get_ok_as(
+        a,
+        Who::Tok(tok),
+        &format!("/api/v1/spaces/{G}/entries?kind=task"),
+    )
+    .await;
+    let ids: Vec<String> = tasks["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(id_of)
+        .collect();
+    assert_eq!(ids.len(), 4);
+    part_of(a, tok, &ids[1], &ids[0]).await;
+    part_of(a, tok, &ids[2], &ids[0]).await;
+    let second = part_of(a, tok, &ids[2], &ids[1]).await;
+    for who in [me, Who::Tok(tok)] {
+        let c = get_ok_as(a, who, &uri).await;
+        assert_eq!(c["task_steps"], 2, "{c}");
+        assert_eq!(
+            top_level_tasks(a, who, G).await + 2,
+            c["journals"]["tasks"].as_u64().unwrap(),
+            "{c}"
+        );
+    }
+    // снятое ребро — у шага остался другой родитель; снят и он — задача снова верхнего уровня
+    let r = a
+        .tok(
+            tok,
+            Method::DELETE,
+            &format!("/api/v1/edges/{second}"),
+            None,
+        )
+        .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    assert_eq!(get_ok_as(a, me, &uri).await["task_steps"], 2);
+    assert_eq!(
+        get_ok_as(a, me, "/api/v1/spaces/knowledge/counts").await["task_steps"],
+        0
+    );
+    assert_eq!(
+        get_ok_as(a, me, "/api/v1/spaces/human/counts").await["task_steps"],
+        0
+    );
 }
 
 /// Токену отчёты не видны нигде (M5.5 §7): ключа `reports` нет, прочие числа — как у его лент;

@@ -8,10 +8,12 @@ import {
   VISIBLE_REFRESH_MS,
   changesCounts,
   countDescription,
+  countHint,
   countLabel,
   formatCount,
   notesLabel,
   openLabel,
+  tasksSplit,
   type CountsSlot,
 } from '../src/lib/counts.ts';
 
@@ -30,6 +32,25 @@ test('count_label_ru', () => {
   assert.equal(countDescription('questions', 3, 1), '3 записи, открыто 1');
   assert.equal(countDescription('questions', 3, 0), '3 записи');
   assert.equal(countDescription('ideas', 122), '122 записи');
+});
+
+test('count_tasks_split_steps', () => {
+  // «Задачи» с шагами планов (M7.3, §6.14 п. 10): число журнала — все записи, подсказка и описание
+  // делят его на задачи доски и шаги (`task_steps` ответа сервера)
+  assert.equal(tasksSplit(109, 72), '109 записей: 37 задач и 72 шага планов');
+  assert.equal(tasksSplit(3, 1), '3 записи: 2 задачи и 1 шаг плана');
+  assert.equal(tasksSplit(5, 0), null);
+  assert.equal(countDescription('tasks', 109, 0, 72), '109 записей: 37 задач и 72 шага планов');
+  assert.equal(countHint('tasks', 109, 72), '109 записей: 37 задач и 72 шага планов');
+  // без шагов (и у старого сервера без `task_steps`) — прежние подсказка и описание
+  assert.equal(countDescription('tasks', 5), '5 записей');
+  assert.equal(countHint('tasks', 5), 'всего записей, без корзины');
+  assert.equal(countHint('tasks'), 'всего записей, без корзины');
+  // шаги бывают только у «Задач»
+  assert.equal(countDescription('ideas', 4, 0, 2), '4 записи');
+  assert.equal(countHint('code', 3, 2), 'файлов в карте кода');
+  // разряды — как у числа журнала (неразрывный пробел)
+  assert.equal(tasksSplit(1234, 1000), '1 234 записи: 234 задачи и 1 000 шагов планов');
 });
 
 test('changes_counts_rule', () => {
