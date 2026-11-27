@@ -2,7 +2,7 @@
 // Вкладка доски задач по умолчанию (M7.2, спецификация §5.2 п. 1, решение 18).
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { TASK_COLUMNS, boardSummary, boardTab, stepCounts, stepsHint, stepsName, stepsTag } from '../src/lib/taskBoard.ts';
+import { TASK_COLUMNS, boardSummary, boardTab, listStepsText, stepCounts, stepsHint, stepsName, stepsTag } from '../src/lib/taskBoard.ts';
 
 test('board_tab_default', () => {
   // по умолчанию — «в работе»; нет задач в работе — «открыт» (даже если и открытых нет)
@@ -44,14 +44,17 @@ test('board_steps_counts', () => {
 
 test('board_steps_summary', () => {
   const c = stepCounts(TOP, ALL);
-  assert.deepEqual(boardSummary(c, 'folded'), {
-    lead: '37 задач · 72 шага планов внутри них —',
-    action: 'показать на доске',
-  });
-  assert.deepEqual(boardSummary(c, 'shown'), { lead: '37 задач · показаны и 72 шага планов —', action: 'свернуть' });
+  // тире перед кнопкой ставит разметка (скрытым от чтения с экрана): текст — описание кнопки
+  assert.deepEqual(boardSummary(c, 'folded'), { lead: '37 задач · 72 шага планов внутри них', action: 'показать на доске' });
+  assert.deepEqual(boardSummary(c, 'shown'), { lead: '37 задач · показаны и 72 шага планов', action: 'свернуть' });
   // одна задача — «внутри неё»; 21 задача — «внутри них»; склонение шагов
-  assert.equal(boardSummary(stepCounts({ open: 1 }, { open: 2 }), 'folded')?.lead, '1 задача · 1 шаг плана внутри неё —');
-  assert.equal(boardSummary(stepCounts({ open: 21 }, { open: 24 }), 'folded')?.lead, '21 задача · 3 шага планов внутри них —');
+  assert.equal(boardSummary(stepCounts({ open: 1 }, { open: 2 }), 'folded')?.lead, '1 задача · 1 шаг плана внутри неё');
+  assert.equal(boardSummary(stepCounts({ open: 21 }, { open: 24 }), 'folded')?.lead, '21 задача · 3 шага планов внутри них');
+  // причастие — в согласии с числом шагов: 1 и 21 — «показан», 2–4 и 5+ — «показаны» (ревью r1, Minor 1)
+  assert.equal(boardSummary(stepCounts({ open: 5 }, { open: 6 }), 'shown')?.lead, '5 задач · показан и 1 шаг плана');
+  assert.equal(boardSummary(stepCounts({ open: 5 }, { open: 26 }), 'shown')?.lead, '5 задач · показан и 21 шаг плана');
+  assert.equal(boardSummary(stepCounts({ open: 5 }, { open: 7 }), 'shown')?.lead, '5 задач · показаны и 2 шага планов');
+  assert.equal(boardSummary(stepCounts({ open: 5 }, { open: 16 }), 'shown')?.lead, '5 задач · показаны и 11 шагов планов');
   // шагов нет — строки нет (числа и так сходятся)
   const none = stepCounts({ open: 5, done: 2 }, { open: 5, done: 2 });
   assert.equal(boardSummary(none, 'folded'), null);
@@ -68,8 +71,19 @@ test('board_steps_summary', () => {
 test('board_steps_tag', () => {
   assert.deepEqual([0, 1, 2, 18, 52].map(stepsTag), ['', '+1 шаг', '+2 шага', '+18 шагов', '+52 шага']);
   assert.deepEqual([0, 1, 18].map(stepsName), ['', ' и 1 шаг плана', ' и 18 шагов планов']);
-  assert.equal(
-    stepsHint(18, 'открыт'),
-    'Ещё 18 шагов планов со статусом «открыт» — внутри общих задач, на доске свёрнуты; «Подзадачи на доске» — показать',
-  );
+  const tail = '«Подзадачи на доске» — показать';
+  assert.equal(stepsHint(18, 'открыт'), `Ещё 18 шагов планов со статусом «открыт» — внутри общих задач, на доске свёрнуты; ${tail}`);
+  // 1 и 21 — «свёрнут», 3 — «свёрнуты» (ревью r1, Minor 1)
+  assert.equal(stepsHint(1, 'снят'), `Ещё 1 шаг плана со статусом «снят» — внутри общих задач, на доске свёрнут; ${tail}`);
+  assert.equal(stepsHint(21, 'открыт'), `Ещё 21 шаг плана со статусом «открыт» — внутри общих задач, на доске свёрнут; ${tail}`);
+  assert.equal(stepsHint(3, 'выполнен'), `Ещё 3 шага планов со статусом «выполнен» — внутри общих задач, на доске свёрнуты; ${tail}`);
+});
+
+test('board_list_steps_text', () => {
+  // свёрнутые шаги статуса в списке колонки или вкладки (ревью r1, Minor 2–3)
+  assert.equal(listStepsText(2, true), 'Задач нет — 2 шага планов этого статуса внутри общих задач');
+  assert.equal(listStepsText(1, true), 'Задач нет — 1 шаг плана этого статуса внутри общих задач');
+  assert.equal(listStepsText(4, false), 'Ещё 4 шага планов этого статуса — внутри общих задач');
+  assert.equal(listStepsText(0, true), '');
+  assert.equal(listStepsText(0, false), '');
 });

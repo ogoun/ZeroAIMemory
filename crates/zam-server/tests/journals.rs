@@ -1176,8 +1176,9 @@ async fn top_level_tasks(a: &Api, who: Who<'_>, space: &str) -> u64 {
 
 /// Шаги планов (M7.3 §6.14 п. 10, признак `space_counts_steps`): `task_steps` — подзадачи
 /// `part_of` среди `journals.tasks` по правилу `top_level=1` — число журнала без шагов равно сумме
-/// счётчиков доски верхнего уровня; два родителя — один шаг; удалённое ребро — снова верхний
-/// уровень; у токена — те же числа; у Knowledge без рёбер и у Human — 0.
+/// счётчиков доски верхнего уровня; два родителя — один шаг; снято одно из двух рёбер — шаг
+/// остаётся, сняты оба — задача снова верхнего уровня; у токена — те же числа; у Knowledge без
+/// рёбер и у Human — 0.
 #[tokio::test]
 async fn space_counts_task_steps() {
     let w = counts_world("task-steps").await;
@@ -1198,7 +1199,7 @@ async fn space_counts_task_steps() {
         .collect();
     assert_eq!(ids.len(), 4);
     part_of(a, tok, &ids[1], &ids[0]).await;
-    part_of(a, tok, &ids[2], &ids[0]).await;
+    let first = part_of(a, tok, &ids[2], &ids[0]).await;
     let second = part_of(a, tok, &ids[2], &ids[1]).await;
     for who in [me, Who::Tok(tok)] {
         let c = get_ok_as(a, who, &uri).await;
@@ -1209,17 +1210,21 @@ async fn space_counts_task_steps() {
             "{c}"
         );
     }
-    // снятое ребро — у шага остался другой родитель; снят и он — задача снова верхнего уровня
-    let r = a
-        .tok(
-            tok,
-            Method::DELETE,
-            &format!("/api/v1/edges/{second}"),
-            None,
-        )
-        .await;
-    assert!(r.status.is_success(), "{}", r.text());
-    assert_eq!(get_ok_as(a, me, &uri).await["task_steps"], 2);
+    // снятое ребро — у шага остался другой родитель (шагов по-прежнему 2); снят и он — задача
+    // снова верхнего уровня (шаг один), числа доски сходятся с журналом
+    for (edge, steps) in [(second, 2), (first, 1)] {
+        let r = a
+            .tok(tok, Method::DELETE, &format!("/api/v1/edges/{edge}"), None)
+            .await;
+        assert!(r.status.is_success(), "{}", r.text());
+        let c = get_ok_as(a, me, &uri).await;
+        assert_eq!(c["task_steps"], steps, "{c}");
+        assert_eq!(
+            top_level_tasks(a, me, G).await + steps,
+            c["journals"]["tasks"].as_u64().unwrap(),
+            "{c}"
+        );
+    }
     assert_eq!(
         get_ok_as(a, me, "/api/v1/spaces/knowledge/counts").await["task_steps"],
         0

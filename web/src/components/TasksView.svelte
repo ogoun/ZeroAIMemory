@@ -30,7 +30,9 @@
   // `entries/counts` (верхний уровень и все записи, с «Из идей»), шаги — разность (`taskBoard.ts`).
   // Над доской — строка «37 задач · 72 шага планов внутри них — показать на доске» (кнопка — тот же
   // переключатель «Подзадачи на доске»; включён — «… показаны и 72 шага планов — свернуть», «Из
-  // идей» — что показано); у колонок и вкладок, пока шаги свёрнуты, — «+K шагов» с подсказкой.
+  // идей» — что показано); у колонок, пока шаги свёрнуты, — «+K шагов» с подсказкой; у вкладок узкой
+  // области — в имени и строкой в панели («Ещё N шагов планов этого статуса — внутри общих задач»;
+  // пустая — «Задач нет — N шагов … » с «Показать на доске»), не «+K» у числа (ревью r1).
   //
   // Правка и корзина (M7.2, спецификация §5.9): в карточке — «Изменить» (`EntryEdit`: заголовок,
   // текст, приоритет, кто ведёт, оценка, ссылки, теги, область; несохранённое в форме — вопрос перед
@@ -89,7 +91,7 @@
   import { BOARD_MIN } from '../lib/layout';
   import { TASK_FORMS } from '../lib/plural';
   import { go, href } from '../lib/router';
-  import { boardSummary, stepCounts, stepsHint, stepsName, stepsTag, type StatusCounts } from '../lib/taskBoard';
+  import { boardSummary, listStepsText, stepCounts, stepsHint, stepsName, stepsTag, type StatusCounts } from '../lib/taskBoard';
   import { progressText, progressValue, staleText, type ProgressOf } from '../lib/taskProgress';
   import { observeWidth } from '../lib/viewport.svelte';
 
@@ -142,7 +144,7 @@
   /** Задачи верхнего уровня и шаги планов (по статусам) — строка над доской и «+K шагов». */
   let stepsOf = $derived(stepCounts(countsTop, countsAll));
   let summary = $derived(boardSummary(stepsOf, fromIdea ? 'from_idea' : withSubtasks ? 'shown' : 'folded'));
-  /** «+K шагов» колонки или вкладки статуса `s` — пока шаги свёрнуты под общими. */
+  /** Свёрнутые шаги статуса `s` (колонка, вкладка, строка списка) — пока шаги свёрнуты под общими. */
   const foldedSteps = (s: EntryStatus): number => (flat ? 0 : (stepsOf?.byStatus[s] ?? 0));
   /** Подзадачи общих задач по id общей (`parent=<id>`, порядок шагов): строки, курсор, запрос. */
   let subs = $state<Record<string, Column>>({});
@@ -284,19 +286,18 @@
   }
 
   /** Всё заново: числа и колонки (видимые загрузит эффект выше), раскрытия подзадач — свёрнуты.
-   * `keepCounts` — числа те же (переключатель «Подзадачи на доске» фильтров не меняет: оба набора
-   * чисел уже есть) — остаются на экране, пока не придут свежие: строка над доской и её кнопка не
-   * пропадают, фокус на кнопке цел. */
+   * `keepCounts` — числа те же: переключатель «Подзадачи на доске» фильтров не меняет, оба набора
+   * чисел уже есть — они остаются и не перечитываются (ревью r1, Minor 6; не пришли — перечитать):
+   * строка над доской и её кнопка не пропадают, фокус на кнопке цел. */
   function resetBoard(keepCounts = false) {
     for (const s of TASK_COLUMNS) cseq[s] = (cseq[s] ?? 0) + 1;
     cols = emptyColumns();
     for (const id of Object.keys(sseq)) sseq[id]++;
     subs = {};
     unfolded = {};
-    if (!keepCounts) {
-      countsTop = null;
-      countsAll = null;
-    }
+    if (keepCounts && countsTop && countsAll) return;
+    countsTop = null;
+    countsAll = null;
     countsFailed = false;
     loadCounts();
   }
@@ -511,18 +512,11 @@
     return m % 60 ? `${h} ч ${m % 60} мин` : `${h} ч`;
   };
 
+  /** Вкладки узкой области: видимо — статус и число задач; свёрнутые шаги статуса — в имени для
+   * чтения с экрана и строкой в панели (`listStepsText`), а не «+K» у числа (ревью r1, Minor 3: на
+   * касании подсказки у «+K» нет, а вкладки уходили в третий ряд). */
   let tabs = $derived(
-    TASK_COLUMNS.map((s) => {
-      const k = foldedSteps(s);
-      return {
-        id: s,
-        title: capitalized(STATUS_TEXT[s]),
-        count: counts?.[s],
-        extra: k ? `+${k}` : undefined,
-        extraName: stepsName(k),
-        extraHint: stepsHint(k, STATUS_TEXT[s]),
-      };
-    }),
+    TASK_COLUMNS.map((s) => ({ id: s, title: capitalized(STATUS_TEXT[s]), count: counts?.[s], nameExtra: stepsName(foldedSteps(s)) })),
   );
 
   function toggleFromIdea() {
@@ -533,6 +527,14 @@
   function toggleSubtasks() {
     withSubtasks = !withSubtasks;
     resetBoard(true);
+  }
+
+  /** «Показать на доске» пустой вкладки: шаги на доске, а кнопка вкладки пропадает (шагов в ней
+   * больше нет) — фокус на кнопке строки над доской («свернуть»), а не на `body`. */
+  async function showStepsHere() {
+    toggleSubtasks();
+    await tick();
+    document.getElementById(`${uid}-steps-btn`)?.focus();
   }
 
   /** Адрес задачи на доске (ссылки подзадач и «часть …»): открытие — новая запись истории. */
@@ -921,10 +923,12 @@
   <!-- задачи доски и шаги планов внутри них (M7.3 §6.14 п. 10): сумма колонок и число вкладки
        «Задачи» не расходятся без объяснения; кнопка — тот же переключатель «Подзадачи на доске» -->
   {#if summary && total !== 0}
+    <!-- тире — вне описания кнопки и скрыто от чтения с экрана (ревью r1, Minor 4) -->
     <p class="steps-line muted" data-testid="task-steps-line">
       <span id="{uid}-steps-lead">{summary.lead}</span>
       {#if summary.action}
-        <button type="button" class="link" aria-describedby="{uid}-steps-lead" onclick={toggleSubtasks}>{summary.action}</button>
+        <span aria-hidden="true">—</span>
+        <button type="button" class="link" id="{uid}-steps-btn" aria-describedby="{uid}-steps-lead" onclick={toggleSubtasks}>{summary.action}</button>
       {/if}
     </p>
   {/if}
@@ -953,8 +957,23 @@
 
 {#snippet tasksOf(s: EntryStatus)}
   {@const c = cols[s]}
+  {@const k = foldedSteps(s)}
   {#if c.loading && !c.loaded}<p class="muted small">Загрузка…</p>{/if}
-  {#if board === 'tabs' && c.loaded && c.items.length === 0 && total !== 0}<p class="muted small">Задач нет.</p>{/if}
+  <!-- свёрнутые шаги статуса (ревью r1, Minor 2–3): пустой список — «Задач нет — N шагов планов
+       этого статуса внутри общих задач» (на вкладке — с «Показать на доске»), непустая вкладка —
+       «Ещё N шагов планов этого статуса — внутри общих задач» (у колонки — «+N шагов» в заголовке) -->
+  {#if c.loaded && c.items.length === 0 && total !== 0 && k}
+    <p class="muted small list-steps" data-testid="task-steps-list">
+      <span id="{uid}-steps-{s}">{listStepsText(k, true)}.</span>
+      {#if board === 'tabs'}
+        <button type="button" class="link" aria-describedby="{uid}-steps-{s}" onclick={showStepsHere}>Показать на доске</button>
+      {/if}
+    </p>
+  {:else if board === 'tabs' && c.loaded && c.items.length === 0 && total !== 0}
+    <p class="muted small">Задач нет.</p>
+  {:else if board === 'tabs' && c.loaded && k}
+    <p class="muted small list-steps" data-testid="task-steps-list">{listStepsText(k, false)}</p>
+  {/if}
   {#each c.items as t (t.id)}
     {@const claim = claimOf(t)}
     {@const staleRefs = staleOf(refs.get(entryRef('task', t.id)))}
@@ -1363,10 +1382,16 @@
     font-size: 13px;
     overflow-wrap: anywhere;
   }
-  .steps-line .link {
+  .steps-line .link,
+  .list-steps .link {
     font-size: inherit;
     text-decoration: underline;
     text-underline-offset: 2px;
+  }
+  /* шаги статуса в списке колонки или вкладки, пока свёрнуты */
+  .list-steps {
+    margin: 0 0 6px;
+    overflow-wrap: anywhere;
   }
   .task {
     display: grid;

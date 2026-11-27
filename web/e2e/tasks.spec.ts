@@ -653,6 +653,7 @@ test.describe('настольный', () => {
     const toggle = page.getByRole('button', { name: 'Подзадачи на доске' });
     await expect(toggle).toHaveAttribute('aria-pressed', 'false');
     const before = lists.length;
+    const countsBefore = counted.length;
     await toggle.click();
     await expect(toggle).toHaveAttribute('aria-pressed', 'true');
     await expect(columnOf(page, 'выполнен').getByRole('heading')).toHaveText('выполнен 9');
@@ -662,6 +663,9 @@ test.describe('настольный', () => {
     const after = lists.slice(before);
     expect(after.map((u) => u.searchParams.get('status')).sort()).toEqual(['blocked', 'done', 'dropped', 'in_progress', 'open']);
     expect(after.some((u) => u.searchParams.has('top_level') || u.searchParams.has('parent')), after.join('\n')).toBe(false);
+    // числа — все записи из уже загруженного набора без `top_level`: переключатель их не перечитывает
+    // (ревью r1 задачи 10c, Minor 6)
+    expect(counted.length).toBe(countsBefore);
     expect(counted.at(-1)?.searchParams.has('top_level')).toBe(false);
     const mark = board.locator(`[data-task="${steps[0].id}"]`).getByTestId('task-part-of');
     await expect(mark).toHaveText(`часть k:${umbrella} «Этап»`);
@@ -1530,10 +1534,14 @@ test.describe('телефон, сенсорный ввод', () => {
     const c = await pageCtx(page);
     await open(page, tasksUrl(c.user, guid));
     const tabs = tablist(page).getByRole('tab');
-    // шаги статуса — «+K» у числа вкладки и в её имени (M7.3, §6.14 п. 10)
-    await expect(tabs).toHaveText(['Открыт 1 +1', 'В работе 1 +2', 'Заблокирован 1', 'Выполнен 0 +3', 'Снят 0']);
+    // шаги статуса — в имени вкладки и строкой в её панели, у числа — нет (M7.3, §6.14 п. 10; ревью
+    // r1 задачи 10c, Minor 3)
+    await expect(tabs).toHaveText(['Открыт 1', 'В работе 1', 'Заблокирован 1', 'Выполнен 0', 'Снят 0']);
     await expect(tabOf(page, 'В работе')).toHaveAccessibleName('В работе, 1 задача и 2 шага планов');
     await expect(tabOf(page, 'В работе')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('tabpanel').getByTestId('task-steps-list')).toHaveText(
+      'Ещё 2 шага планов этого статуса — внутри общих задач',
+    );
     expect(counted.map((u) => u.searchParams.get('top_level'))).toEqual(['1', null]);
 
     // общая — во вкладке «Заблокирован» с прогрессом; шаги — касанием «Подзадачи»
@@ -1574,7 +1582,8 @@ test.describe('телефон, сенсорный ввод', () => {
     const before = counted.length;
     await page.getByRole('button', { name: 'Подзадачи на доске' }).tap();
     await expect(tabs).toHaveText(['Открыт 2', 'В работе 3', 'Заблокирован 1', 'Выполнен 3', 'Снят 0']);
-    expect(counted.slice(before).map((u) => u.searchParams.has('top_level'))).toEqual([true, false]);
+    // числа уже загружены (верхний уровень и все записи) — переключатель их не перечитывает
+    expect(counted.slice(before)).toEqual([]);
     expect(problems, problems.join('\n')).toEqual([]);
   });
 
@@ -1732,15 +1741,22 @@ async function stepsFixture(guid: string): Promise<void> {
   await partOf(await fromIdea('Идея: шаг'), i1);
 }
 
-/** Числа колонок или вкладок доски: `[число, +K]` по статусам в порядке колонок; числа ещё нет —
- * `[0, 0]`. */
+/** Числа колонок или вкладок доски: `[число, шаги]` по статусам в порядке колонок — у колонки из
+ * заголовка («открыт 3 +4 шага»), у вкладки из имени («Открыт, 3 задачи и 4 шага планов»: видимо у
+ * вкладки только число, ревью r1, Minor 3); числа ещё нет — `[0, 0]`. */
 async function boardNumbers(page: Page, mode: string): Promise<[number, number][]> {
-  const texts =
-    mode === 'columns'
-      ? await page.getByRole('group', { name: 'Доска задач' }).getByRole('region').getByRole('heading').allInnerTexts()
-      : await tablist(page).getByRole('tab').allInnerTexts();
-  return texts.map((t) => {
-    const m = /(\d+)(?:\s+\+(\d+))?/.exec(t);
+  if (mode === 'columns') {
+    const texts = await page.getByRole('group', { name: 'Доска задач' }).getByRole('region').getByRole('heading').allInnerTexts();
+    return texts.map((t) => {
+      const m = /(\d+)(?:\s+\+(\d+))?/.exec(t);
+      return m ? [Number(m[1]), Number(m[2] ?? 0)] : [0, 0];
+    });
+  }
+  const names = await tablist(page)
+    .getByRole('tab')
+    .evaluateAll((els) => els.map((e) => e.getAttribute('aria-label') ?? ''));
+  return names.map((t) => {
+    const m = /, (\d+) \S+(?: и (\d+))?/.exec(t);
     return m ? [Number(m[1]), Number(m[2] ?? 0)] : [0, 0];
   });
 }
@@ -1754,6 +1770,7 @@ for (const w of STEPS_WIDTHS) {
       const problems = watch(page);
       const guid = await newSolution(`шаги планов ${w.name}`);
       await stepsFixture(guid);
+      const counted = countRequests(page, guid);
       const c = await pageCtx(page);
       await open(page, tasksUrl(c.user, guid));
       const press = (l: Locator) => (w.touch ? l.tap() : l.click());
@@ -1778,7 +1795,8 @@ for (const w of STEPS_WIDTHS) {
       await expect(strip).toHaveAttribute('title', split);
       await expect(nav.getByRole('link', { name: 'Задачи', exact: true })).toHaveAccessibleDescription(split);
 
-      // у колонок и вкладок — «+K шагов»; сумма чисел и шагов = числу журнала
+      // у колонок — «+K шагов», у вкладок — в имени и строкой панели; сумма чисел и шагов = числу
+      // журнала
       const folded: [number, number][] = [
         [3, 4],
         [1, 1],
@@ -1796,11 +1814,20 @@ for (const w of STEPS_WIDTHS) {
           'title',
           'Ещё 3 шага планов со статусом «выполнен» — внутри общих задач, на доске свёрнуты; «Подзадачи на доске» — показать',
         );
+        // 1 шаг — «свёрнут» (ревью r1, Minor 1)
+        await expect(columnOf(page, 'снят').getByTestId('task-steps-tag')).toHaveAttribute('title', /на доске свёрнут;/);
+        // пустая колонка со свёрнутыми шагами — строка о них, а не пустота (ревью r1, Minor 2)
+        await expect(columnOf(page, 'заблокирован').getByTestId('task-steps-list')).toHaveText(
+          'Задач нет — 1 шаг плана этого статуса внутри общих задач.',
+        );
       } else {
-        await expect(tablist(page).getByRole('tab')).toHaveText(['Открыт 3 +4', 'В работе 1 +1', 'Заблокирован 0 +1', 'Выполнен 1 +3', 'Снят 0 +1']);
+        // видимо у вкладки — только число задач; шаги — в имени и строкой панели (ревью r1, Minor 3)
+        await expect(tablist(page).getByRole('tab')).toHaveText(['Открыт 3', 'В работе 1', 'Заблокирован 0', 'Выполнен 1', 'Снят 0']);
         await expect(tabOf(page, 'Открыт')).toHaveAccessibleName('Открыт, 3 задачи и 4 шага планов');
         await expect(tabOf(page, 'Заблокирован')).toHaveAccessibleName('Заблокирован, 0 задач и 1 шаг плана');
-        await expect(tabOf(page, 'Выполнен')).toHaveAttribute('title', /^Ещё 3 шага планов со статусом «выполнен»/);
+        await expect(page.getByRole('tabpanel').getByTestId('task-steps-list')).toHaveText(
+          'Ещё 1 шаг плана этого статуса — внутри общих задач',
+        );
       }
       expect(await noHorizontalScroll(page)).toBe(true);
       await page.screenshot({ path: `${stepsScreens}tasks-board-${w.name}.png` });
@@ -1808,7 +1835,8 @@ for (const w of STEPS_WIDTHS) {
       // «показать на доске» — тот же переключатель «Подзадачи на доске»: числа = все записи
       const toggle = page.getByRole('button', { name: 'Подзадачи на доске' });
       const show = line.getByRole('button', { name: 'показать на доске' });
-      await expect(show).toHaveAccessibleDescription('5 задач · 10 шагов планов внутри них —');
+      // описание кнопки — текст строки без тире (ревью r1, Minor 4)
+      await expect(show).toHaveAccessibleDescription('5 задач · 10 шагов планов внутри них');
       // при касании — цель 44 px, как у прочих кнопок (§5.1 п. 2)
       if (w.touch) await minTarget(show, 44);
       await press(show);
@@ -1834,11 +1862,31 @@ for (const w of STEPS_WIDTHS) {
       await expect(line).toHaveText('5 задач · 10 шагов планов внутри них — показать на доске');
       await expect.poll(() => boardNumbers(page, mode)).toEqual(folded);
 
-      // переключатель панели — та же строка
+      // переключатель панели — та же строка; числа не перечитываются (ревью r1, Minor 6)
+      const countsSeen = counted.length;
       await press(toggle);
       await expect(line).toHaveText('5 задач · показаны и 10 шагов планов — свернуть');
       await press(toggle);
       await expect(line).toHaveText('5 задач · 10 шагов планов внутри них — показать на доске');
+      expect(counted.length).toBe(countsSeen);
+
+      // пустая вкладка со свёрнутыми шагами — «Задач нет — 1 шаг плана …» и «Показать на доске»:
+      // шаг — на доске, фокус — на «свернуть» строки над доской (ревью r1, Minor 2)
+      if (mode === 'tabs') {
+        await press(tabOf(page, 'Заблокирован'));
+        const panelSteps = page.getByRole('tabpanel').getByTestId('task-steps-list');
+        await expect(panelSteps).toHaveText('Задач нет — 1 шаг плана этого статуса внутри общих задач. Показать на доске');
+        const here = panelSteps.getByRole('button', { name: 'Показать на доске' });
+        await expect(here).toHaveAccessibleDescription('Задач нет — 1 шаг плана этого статуса внутри общих задач.');
+        if (w.touch) await minTarget(here, 44);
+        await page.screenshot({ path: `${stepsScreens}tasks-board-empty-tab-${w.name}.png` });
+        await press(here);
+        await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+        await expect(page.getByRole('tabpanel').getByRole('button', { name: 'План: шаг 4.1' })).toBeVisible();
+        await expect(hide).toBeFocused();
+        await press(hide);
+        await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+      }
 
       // «Из идей» — строка поясняет, что показано (без кнопки: переключатель неактивен)
       await press(page.getByRole('button', { name: 'Из идей' }));
