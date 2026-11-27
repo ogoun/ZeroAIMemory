@@ -7199,6 +7199,24 @@ fixes», Critical 0, Important 0, Minor 12. Решения координато�
   `GET /check/status` и `GET /works/usage` (`reason`: `disabled` | `check_off`); «Ночная проверка
   моей памяти» неактивна с причиной (`checkOffText`), если сервер её не проводит.
 
+RED (новые тесты на снимке базы `3dc60d0e`, `target\m73-red`): `shell_cases` — нет пометки у
+`PS> Get-ChildItem`; `probes_write_rechecks_in_transaction` — `warnings` пусты;
+`probes_parallel_results_once` — два `accepted` без предупреждений (гонка на базе случилась);
+`rules_work_sources_and_skip` — `junk` и `rule.extra` в итоге; `model_access_off_zero_requests` —
+`/problems/conflict`; `user_db::migrate_v26_to_v27_new_tables_only` — нет `works_finished`;
+`works` — не собирается (нет `RETENTION_DAYS`, `gc_works`); `worksText.test.ts` — нет экспортов;
+`mode_rechecked_before_retry` — зелёный и на базе (правка самого теста).
+
+Прогоны волны (`ZAM_REQUIRE_ML=1`): `zam-server --lib` 386 passed (2 ignored), `zam-store --lib`
+131, `works` 34, `works_model` 42, `works_probes` 17, `proposals_rules` 26, `check_run` 28 (1
+ignored), `works_night` 7, `works_settings` 7, `mcp` 84, `boot` 15, `m57_acceptance` 13,
+`m65_acceptance` 7, `zam-store` `user_db` 11, `migrate_rebuild` 11 — всё passed; clippy `-p
+zam-server -p zam-store --all-targets -D warnings` и `cargo fmt --all --check` — чисто. WebUI:
+`npm run check` — 0 ошибок, 0 предупреждений; `test:build` — 118 passed (1 skip без `dist`);
+`build`; `size-limit` — в пределах (`Works` 11,08 из 11,3 КБ, `worksText` 5,09 из 5,25,
+`FormDialog` 3,15 из 3,25, старт 95,3 из 103); e2e на release-сборке (`pdfium.dll` рядом,
+`E2E_ZAM` — свой `zam.exe`) — `works.spec` 6/6, полный `npm run e2e` — 1069 passed (16,5 мин).
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия
