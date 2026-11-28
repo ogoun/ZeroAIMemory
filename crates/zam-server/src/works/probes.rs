@@ -183,7 +183,8 @@ pub fn order(night: civil::Date, sources: Vec<ProbeSource>) -> Vec<ProbeSource> 
 }
 
 /// Кандидаты вида `probes` пространства `space` пользователя `user` в текущую ночь
-/// ([`current_night`]), до `limit`, без пар `exclude` (отправленные в этом запуске).
+/// ([`current_night`]), до `limit`, без пар `exclude` — отсева запуска (`kinds::sifted`:
+/// отправленные в этом запуске, выброшенные вторым сканом, явный `skip` исполнителя).
 pub async fn collect(
     ctx: &NightCtx,
     user: Id,
@@ -216,14 +217,12 @@ pub async fn collect_on(
     if !ok_space || limit == 0 {
         return Ok(Vec::new());
     }
-    let skip = zam_store::works::excluded_refs(&db, WorkKind::Probes).await?;
+    // отсев запуска (итоги прежних работ и отправленное этой ночью) — один раз на запуск вида,
+    // `exclude` (`kinds::sifted`, M7.5 §8.7 п. 4)
     let sources: Vec<ProbeSource> = probe_sources(&db, user, space)
         .await?
         .into_iter()
-        .filter(|s| {
-            let pair = (s.target.clone(), s.rev);
-            !skip.contains(&pair) && !exclude.contains(&pair)
-        })
+        .filter(|s| !exclude.contains(&(s.target.clone(), s.rev)))
         .collect();
     let mut out = Vec::new();
     for s in order(night, sources) {
@@ -248,6 +247,7 @@ pub async fn collect_on(
             title: t.title,
             text: agent_text(&t.text),
             signals,
+            refs: Vec::new(),
         });
     }
     Ok(out)

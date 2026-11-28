@@ -55,6 +55,7 @@ pub mod system;
 pub mod tasks;
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks;
+pub mod tidy;
 pub mod time;
 pub mod usage;
 pub mod user_db;

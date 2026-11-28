@@ -41,7 +41,7 @@ use serde_json::{Value, json};
 use zam_core::{Id, TargetKind};
 use zam_index::{VectorFilter, VectorScope};
 use zam_store::proposals::{self as pr, ProposalAuthor, ProposalType};
-use zam_store::works::{self as store, ItemWrite, WorkKind};
+use zam_store::works::{self as store, ItemWrite};
 use zam_store::{Db, NodeKind, NodePath, SpaceKind, StoreError};
 
 use super::kinds::{Author, Candidate, ItemCtx, Reject};
@@ -665,17 +665,16 @@ pub async fn collect(
     }
     // отсев принятых — строками `proposals` (ключ по источнику, отзыв автором не в счёт), а не
     // `accepted_refs`: принятый элемент, чью строку закрытие не записало (предел, повтор), и
-    // отозванный автором источник снова кандидаты (ревью r1, Minor 5–6)
-    let mut skip = store::excluded_refs(&db, WorkKind::Rules).await?;
-    // отправленное в пакетах этого запуска (ночь, сутки ручных запусков) — до `limit`, как у
-    // `probes` (`zam_store::works::offered_refs`, решение координатора 80)
-    skip.extend(exclude.iter().cloned());
+    // отозванный автором источник снова кандидаты (ревью r1, Minor 5–6); выброшенное вторым
+    // сканом и отправленное в пакетах этого запуска (ночь, сутки ручных запусков) — отсев
+    // запуска `exclude`, один раз на запуск вида (`kinds::sifted`, M7.5 §8.7 п. 4)
+    let skip = exclude;
     let mut out = Vec::new();
     for (src, src_kind) in source_spaces(&db).await? {
         if out.len() >= limit || ctx.stopping() {
             break;
         }
-        let rows = store::owner_entries(&db, user, src, &["insight"], &skip, usize::MAX).await?;
+        let rows = store::owner_entries(&db, user, src, &["insight"], skip, usize::MAX).await?;
         if rows.is_empty() {
             continue;
         }
@@ -741,6 +740,7 @@ pub async fn collect(
                 title: e.title,
                 text: agent_text(&e.body),
                 signals,
+                refs: Vec::new(),
             });
         }
     }
@@ -798,6 +798,7 @@ pub async fn context(db: &Db, rules: Id, budget: usize) -> Result<Option<Candida
         title: "Действующие заметки Rules — не повторяй их (итога для этой записи нет)".into(),
         text,
         signals: Vec::new(),
+        refs: Vec::new(),
     };
     // токены записи целиком (как она уйдёт в пакет); `shown` — строк, `full` — с L0
     let size = |shown: usize, full: &[bool]| {

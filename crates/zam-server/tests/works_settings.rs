@@ -201,7 +201,7 @@ async fn works_settings_patch_and_defaults() {
         json!({"works": {}}),
         json!({"works": {"auto": true}}),
         json!({"works": {"mode": 1}}),
-        json!({"works": {"kinds": {"tidy": "agent"}}}),
+        json!({"works": {"kinds": {"future": "agent"}}}),
         json!({"works": {"kinds": {"probes": 1}}}),
         json!({"works": {"check": true}}),
         json!({"works": {"limits": {"daily_tokens": -1, "monthly_tokens": 1}}}),

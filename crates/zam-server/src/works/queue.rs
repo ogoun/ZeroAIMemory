@@ -38,7 +38,9 @@
 //!   работах с обращением к модели этого запуска (`work_calls.run`: работа прошлой ночи,
 //!   выполненная сейчас), с любым исходом — без итога, отклонённые проверкой, `failed`, —
 //!   сборщик той же ночью не берёт (отсев до предела `limit`); следующей ночью они снова
-//!   кандидаты.
+//!   кандидаты. Отсев считается **один раз на запуск вида** ([`kinds::sifted`], M7.5 §8.7 п. 4) и
+//!   передаётся сборщику каждого пространства; у модели выполненные в запуске работы дописывают
+//!   свои записи в него же ([`kinds::Sifted::add_items`]).
 //!
 //! Правила [`NightCtx`] (задача 1): признак остановки — только `ctx.stopping()`; клон контекста в
 //! `tokio::spawn` не уносится — ручной запуск модели идёт через `NightRunner::spawn_tracked`.
@@ -228,22 +230,31 @@ pub async fn agent_batch(ctx: &NightCtx, db: &Db, plan: &Plan) -> Result<Vec<Wor
     let mut out = Vec::new();
     // кандидатов, поставленных в этом проходе: их итогов ещё нет, предел их не видит (ревью r1, M3)
     let mut queued = 0usize;
-    for space in kind_spaces(db, plan.kind, plan.only).await? {
+    let spaces: Vec<Id> = kind_spaces(db, plan.kind, plan.only)
+        .await?
+        .into_iter()
+        .filter(|s| !done_spaces.contains(s))
+        .collect();
+    if left == 0 || spaces.is_empty() {
+        return Ok(out);
+    }
+    // отсев — один раз на запуск вида (§8.7 п. 4); кандидаты пространства — только его записи,
+    // поставленное здесь в другие пространства их не задевает
+    let sifted = kinds::sifted(db, plan.kind, plan).await?;
+    // предел записей вида до прохода (у `probes` — остаток пределов проб, у `tidy` — кандидатов
+    // ночи): в проходе он меняется только поставленным здесь (`queued`)
+    let room = kinds::room(plan.kind, ctx, db, plan).await?;
+    for space in spaces {
         if left == 0 || ctx.stopping() {
             break;
         }
-        if done_spaces.contains(&space) {
-            continue;
-        }
-        // предел записей вида (у `probes` — остаток пределов проб за вычетом поставленного):
         // исчерпан — постановка кончена
-        let take = match kinds::room(plan.kind, ctx, db, plan.origin).await? {
+        let take = match room {
             Some(r) if r.saturating_sub(queued) == 0 => break,
             Some(r) => r.saturating_sub(queued).min(batch),
             None => batch,
         };
-        let offered = offered(db, plan).await?;
-        let cands = kinds::collect(plan.kind, ctx, plan.user, space, take, &offered).await?;
+        let cands = kinds::collect(plan.kind, ctx, plan.user, space, take, &sifted).await?;
         if cands.is_empty() {
             continue;
         }
@@ -271,8 +282,8 @@ pub async fn agent_batch(ctx: &NightCtx, db: &Db, plan: &Plan) -> Result<Vec<Wor
 /// Пары «ссылка, ревизия», уже отправленные в пакетах вида в этом запуске `plan` — ночью этой
 /// ночи, у ручного запуска — с начала суток UTC, и в работах с обращением к модели этого запуска
 /// (`work_calls.run`; `zam_store::works::offered_refs`, решение координатора 80): той же ночью
-/// сборщик их не берёт.
-async fn offered(db: &Db, plan: &Plan) -> Result<HashSet<(String, i64)>, StoreError> {
+/// сборщик их не берёт. Зовётся один раз на запуск вида ([`kinds::sifted`]).
+pub(super) async fn offered(db: &Db, plan: &Plan) -> Result<HashSet<(String, i64)>, StoreError> {
     let night = plan.night.filter(|_| plan.origin == Origin::Nightly);
     let run = plan.run.run();
     store::offered_refs(db, plan.kind, plan.origin, night, plan.since, Some(&run)).await
@@ -295,6 +306,9 @@ pub async fn run_model(ctx: &NightCtx, db: &Db, plan: &Plan) -> Result<(), Store
     let st = ctx.st();
     let batch = st.cfg.works.batch_records as usize;
     let mut dropped: HashSet<Id> = HashSet::new();
+    // отсев — один раз на запуск вида (§8.7 п. 4); выполненные работы запуска дописывают в него
+    // свои записи (как `offered_refs` по базе)
+    let mut sifted: Option<kinds::Sifted> = None;
     loop {
         if ctx.stopping() || plan.until.is_some_and(|u| zam_store::time::now() >= u) {
             return Ok(());
@@ -320,15 +334,17 @@ pub async fn run_model(ctx: &NightCtx, db: &Db, plan: &Plan) -> Result<(), Store
                 }
                 // предел записей вида (у `probes` — остаток пределов проб): исчерпан — запуск
                 // вида кончен, обращений к модели больше нет
-                let take = match kinds::room(plan.kind, ctx, db, plan.origin).await? {
+                let take = match kinds::room(plan.kind, ctx, db, plan).await? {
                     Some(0) => return Ok(()),
                     Some(r) => r.min(batch),
                     None => batch,
                 };
                 // отправленные этой ночью (с любым исходом) — той же ночью снова не идут
-                let offered = offered(db, plan).await?;
-                let cands =
-                    kinds::collect(plan.kind, ctx, plan.user, first, take, &offered).await?;
+                if sifted.is_none() {
+                    sifted = Some(kinds::sifted(db, plan.kind, plan).await?);
+                }
+                let s = sifted.as_ref().expect("отсев посчитан выше");
+                let cands = kinds::collect(plan.kind, ctx, plan.user, first, take, s).await?;
                 if cands.is_empty() {
                     dropped.insert(first);
                     continue;
@@ -350,8 +366,16 @@ pub async fn run_model(ctx: &NightCtx, db: &Db, plan: &Plan) -> Result<(), Store
                 }
             }
         };
-        let space = w.space_id;
-        match execute(ctx, db, plan, &works, w).await? {
+        let (space, id) = (w.space_id, w.id);
+        let step = execute(ctx, db, plan, &works, w).await?;
+        // записи выполненной работы (после снятия хвоста сверх бюджета) — отправлены в этом
+        // запуске: той же ночью снова не идут
+        if let Some(s) = sifted.as_mut()
+            && let Some(done) = store::get(db, id).await?
+        {
+            s.add_items(&done.items);
+        }
+        match step {
             Step::Next => {}
             Step::DropSpace => {
                 dropped.insert(space);
@@ -377,11 +401,12 @@ pub struct Prepared {
 
 /// [`Prepared`] работы `w`.
 pub async fn prepare(db: &Db, mut w: Work, budget: usize) -> Result<Option<Prepared>, StoreError> {
-    let refs: Vec<(String, i64)> = w.items.iter().map(|i| (i.target.clone(), i.rev)).collect();
+    // у кандидата уборки — все его записи (M7.5 §8.7): изменилась одна — элемент снимается
+    let refs: Vec<(String, i64)> = w.items.iter().flat_map(WorkItem::all_refs).collect();
     let live = store::live_refs(db, &refs).await?;
     let before = w.items.len();
     w.items
-        .retain(|i| live.contains(&(i.target.clone(), i.rev)));
+        .retain(|i| i.all_refs().iter().all(|r| live.contains(r)));
     if w.items.is_empty() {
         return Ok(None);
     }
@@ -632,12 +657,13 @@ pub async fn accept(
     let mut writes: Vec<store::ItemWrite> = Vec::new();
     let mut seen: HashSet<usize> = HashSet::new();
     for item in items {
-        // элемент — номер `n` или ссылка `target` элемента пакета (задача 4: схема `probes`)
+        // элемент — номер `n` или ссылка `target` элемента пакета (задача 4: схема `probes`); у
+        // вида, где `target` — поле итога (`tidy`: цель операции), — только `n`
         let target = item
             .get("target")
             .and_then(Value::as_str)
             .map(str::trim)
-            .filter(|t| !t.is_empty());
+            .filter(|t| !t.is_empty() && kinds::target_locates(w.kind));
         let n = item
             .get("n")
             .and_then(Value::as_u64)

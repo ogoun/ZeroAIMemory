@@ -87,6 +87,7 @@
 | `admin_works` | M7.4 §7.6 п. 2 | `GET /admin/works` — сводка внутренних работ и проверки по всем пользователям, только сессия администратора (раздел «Сводка внутренних работ» ниже). Сервер без флага на маршрут отвечает 404. |
 | `check_probes_manage` | M7.4 §7.6 п. 3 | Ручные пробы: `POST /check/probes {question, targets, space?}` (токен `rw` или сессия WebUI) и снятие `DELETE /check/probes/{id} {reason}` (только сессия WebUI, токен — 403); `zam check probes add|retire` (раздел «Ночная проверка памяти» ниже). Сервер без флага: `POST` — 405, `DELETE` — 404. |
 | `health_components` | M7.4 §7.6 п. 4 | Поле `components` ответа `GET /health`: `{qdrant: {mode, version}, onnxruntime: {version, device}}` (раздел «Версии компонентов» ниже). Сервер без флага поля не отдаёт. |
+| `tidy` | M7.5 §8.7 | Уборка памяти: вид внутренней работы `tidy` (пакет `memory_recall {event: "work", kind: "tidy"}`, итог — одна операция на кандидата), предложения `type: tidy` в `GET /proposals?type=tidy` (поля `candidate`, `signals`, `records`, `ops`, `op`, `stale`), `tidy` в `GET /proposals/counts`, «Применить» — `POST /proposals/{id}/accept {text?}` (только сессия WebUI, ревизия не та — 409 `code: stale`), «Отклонить» — `/decline` (раздел «Уборка памяти» ниже). Сервер без флага `type=tidy` отвергает (400), вида `tidy` не знает; строки `tidy` после отката пропускает с WARN. |
 
 Правило для разработки сервера: задача, которая вводит возможность или ключ конфигурации,
 добавляет строку в `FEATURES` (`crates/zam-server/src/api/health.rs`) и строку в эту таблицу;
@@ -743,7 +744,8 @@ CLI `zam`, свой клиент) получает значения, похож�
 
 - **Настройки** `works` в `GET/PATCH /auth/settings` (администратор — `/admin/users/{id}/settings`;
   токену — 403): `{mode, kinds, model, limits, check, pause, effective}`. `mode` — `off | agent |
-  model` (нет строки — `[works] default_mode`); `kinds` — `{probes|rules: режим}`, в `PATCH` —
+  model` (нет строки — `[works] default_mode`); `kinds` — `{probes|rules|tidy: режим}` (`tidy` —
+  с 0.0.18-m7.5), в `PATCH` —
   `{kinds: {<вид>: режим | null}}` (`null` снимает переопределение вида); `model` — подключение
   `{protocol: "openai", vault: "v:<id>", model, auth: "key" | "none", max_tokens, token_field,
   body_extra, pinned, host, external}` (`host` — хост закреплённого адреса, `external` — он вне LAN:
@@ -895,7 +897,8 @@ CLI `zam`, свой клиент) получает значения, похож�
   `bash -c`, конвейер в оболочку `curl … | sh`, `iwr … | iex`, `curl`, `wget`,
   `iex`/`Invoke-Expression`, `rm -rf`, `chmod +x`, `sudo`, … — и внутри однострочного кода):
   пометка WebUI, не отказ — решает человек.
-- **`GET /proposals/counts`** → `{rules}` — открытых кандидатов (метка дерева «кандидаты: N»).
+- **`GET /proposals/counts`** → `{rules, tidy}` — открытых кандидатов (метка дерева «кандидаты: N»;
+  `tidy` — с 0.0.18-m7.5, раздел «Уборка памяти»).
 - **`GET /proposals/{id}`** (`o:<id>` или id) — карточка и `rules_tokens {now, after}` (оценка Rules
   в дайджесте сейчас и с кандидатом, токенов), `sources: [{ref, rev, current_rev?, kind?, title?,
   live}]` — источники и основание; токену заметки Human и отчёты — как несуществующие (`live:
@@ -926,6 +929,54 @@ CLI `zam`, свой клиент) получает значения, похож�
   итога для неё нет).
 - **CLI** `zam rules candidate <путь> --file F --reason R [--basis ID]…`, `zam rules candidates
   [--status S]`; сервер без флага — код 1 «обновите zam-server до 0.0.16-m7.3 или новее».
+
+## Уборка памяти (`tidy`)
+
+С 0.0.18-m7.5 (M7.5 §8.7, флаг `tidy`, решения координатора 125–126). Ночью сборщик находит в
+решениях и Knowledge **владельца базы** (без записей участников общих решений и Human) кандидатов
+уборки и ставит их работой вида `tidy` (режим — `works.kind.tidy`, как у прочих видов; пакет,
+проверка и пределы — общие, раздел «Внутренние работы»). Итог исполнителя — **предложения
+человеку**: ничего не применяется само, удаления нет.
+
+- **Кандидаты** (`candidate`; при срезе до 20 за ночь на пользователя — в этом порядке):
+  `contradiction` — связь `contradicts` старше 3 суток, оба конца действующие; `probe_fail` — цель
+  пробы не нашлась ни в бюджете, ни в глубоком поиске три последних ночных прогона подряд; `stale`
+  — insight со ссылкой на файл `stale` или в `revisit` 14 суток и дольше; `near_duplicate` — пары
+  действующих insight одного пространства, вида и области с dense-косинусом в `[0,80;
+  insights.dedup_threshold)` (вектор — из кэша эмбеддингов, без инференса; порог не выше 0,80 —
+  окно пусто) или термины решения и Knowledge с общим именем; `noisy` — `shown ≥ 10`, `opened = 0`,
+  `useful = 0` за 30 суток (первые 30 суток учёта открытий — нет). Запись — не больше чем в одном
+  кандидате ночи; кандидат с предложением по тому же ключу (тип, ссылки, ревизии) не повторяется,
+  отклонённый человеком — ни в какой ревизии.
+- **Пакет** — элемент `<record n ref kind="<candidate>">`: заголовок, записи кандидата (`[ссылка ·
+  вид · rev N · …]`, заголовок, L1; `axiom — решение человека`), сигналы (`cosine`,
+  `contradicts_days`, `probe_fails`, `question`, `stale_refs`, `revisit_days`, `shown`, `opened`,
+  `useful`, `same_name`) и `ops` — допустимые операции. Элемент итога — **только по `n`** (`target`
+  — цель операции): `{n, op, …, reason}` (`reason` 20..=2000 символов):
+  `merge {keep, drop, text?}`, `retract {target}`, `revisit {target}` (только действующий insight),
+  `triggers {target, triggers}` (по правилам триггеров insight), `term {target?, title, definition,
+  aliases}` (без `target` — новый термин, с `target` — псевдонимы к нему), `append {target, text}`,
+  `keep`. Ссылки — только из кандидата; тексты — до `limits.note_max_bytes`, без маски секрета.
+  `keep` и отказ `{n, skip}` — строка `skipped` (человеку не показывается; отсев до новой ревизии).
+- **`GET /proposals?type=tidy&status=`** — карточки с полями кандидата: `candidate`, `signals:
+  [{name, value}]`, `records: [{ref, rev, kind, insight_kind, space, title, l1, status, certainty,
+  human_decision}]`, `ops`, `op` (`{op, keep?, drop?, target?, text?, triggers?, title?,
+  definition?, aliases?}`), `reason`, `stale` (запись изменилась после предложения — «Применить»
+  недоступно); токену — с маской. `POST /proposals` с `type: tidy` — 400 (предлагает только работа).
+- **«Применить»** — `POST /proposals/{id}/accept {text?}` — только сессия WebUI (токен — 403);
+  `text` — правка человеком текста `merge` или `append` (маска секрета — 422, у других операций —
+  400). Ревизии всех записей сверяются до первой операции: не та — предложение `stale`, 409 `code:
+  stale` (кандидат вернётся следующей ночью). Операция выполняется тем же кодом, что правка
+  человека в WebUI, от его имени: `merge` с текстом — `keep` замещается новой записью с этим телом
+  (`supersede`; достоверность — меньшая из `keep` и `drop`, без правки человеком не выше
+  `theorem`), `drop` отзывается «дубль i:<новая>»; без текста — `drop` отзывается «дубль i:<keep>»;
+  `retract` — отзыв, `revisit` — статус `revisit`, `triggers` — замена набора, `term` — новый
+  термин или псевдонимы, `append` — дописка. Причина ревизии — довод и «из предложения o:<id>
+  (model:<имя> | сессия <id>)». Ответ `{proposal, result, warnings?}`: `result` — ссылка итоговой
+  записи, предложение `accepted` с `result_ref`; аудит `proposal.accept {id, type, result}`.
+- **«Отклонить»** — `POST /proposals/{id}/decline {note?}`: `declined`.
+- **Откат на 0.0.17**: строки `proposals` и `works` типа `tidy` старый сервер пропускает с WARN;
+  ключ `works.kind.tidy` в настройках — снять (`PATCH {works: {kinds: {tidy: null}}}`) до отката.
 
 ## Открытие подсказок (`usage_opened`)
 
