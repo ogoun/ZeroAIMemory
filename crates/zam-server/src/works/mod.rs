@@ -15,6 +15,8 @@
 //!   вопроса и пределы проб (задача 4).
 //! - [`rules`] — вид `rules` и проверка кандидата в Rules, общая со спонтанным кандидатом агента
 //!   (задача 7).
+//! - [`server_settings`] — настройки сервера `[works]` из WebUI администратора поверх файла
+//!   конфигурации (M7.6 §9.9): действующая секция процесса [`server_settings::LiveWorks`].
 //! - [`tidy`] — вид `tidy` (M7.5 §8.7): уборка памяти — кандидаты сборщика `zam_store::tidy`,
 //!   инструкция, схема и проверка операции; итог — предложения человеку.
 
@@ -31,6 +33,7 @@ pub mod probes;
 pub mod queue;
 pub mod rules;
 pub mod schedule;
+pub mod server_settings;
 pub mod settings;
 pub mod tidy;
 

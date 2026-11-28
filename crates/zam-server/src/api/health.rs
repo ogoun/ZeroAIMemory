@@ -76,6 +76,7 @@ pub const FEATURES: &[&str] = &[
     "snapshot_m76",
     "agent_setup_local",
     "idea_adopt_token",
+    "admin_works_settings",
 ];
 
 /// Версии компонентов, которые узнаются один раз при старте (`AppState::components`).

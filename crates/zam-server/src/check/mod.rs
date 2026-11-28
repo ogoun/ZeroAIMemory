@@ -141,7 +141,7 @@ pub async fn run_night(
     user: Id,
     night: civil::Date,
 ) -> Result<Option<Id>, StoreError> {
-    let w = &ctx.st().cfg.works;
+    let w = &ctx.st().works();
     let start = crate::schedule::slot(night, w.at_hm(), &w.time_zone());
     let until = start + SignedDuration::from_mins(i64::from(w.window_min));
     nightly_for(ctx, user, night, until).await
@@ -177,7 +177,7 @@ async fn nightly_for(
     {
         return Ok(None);
     }
-    let window = SignedDuration::from_mins(i64::from(st.cfg.works.window_min));
+    let window = SignedDuration::from_mins(i64::from(st.works().window_min));
     harvest_cache(&db, until - window).await?;
     let probes = zam_store::probes::probe_counts(&db).await?;
     let with_target = probes
@@ -262,7 +262,7 @@ pub enum StartError {
 /// учтённой задачей раннера (`stop` ждёт её и снимает; прерванный прогон — `interrupted` при
 /// следующем старте); id прогона.
 pub fn start_manual(st: &AppState, user: Id) -> Result<Id, StartError> {
-    if !st.cfg.works.enabled {
+    if !st.works().enabled {
         return Err(StartError::Disabled);
     }
     let id = Id::new();

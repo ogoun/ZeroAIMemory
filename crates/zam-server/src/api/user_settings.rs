@@ -716,7 +716,7 @@ async fn check_model_address(
     let base = egress::parse_base_url(addr).map_err(|e| {
         ApiError::Unprocessable(format!("works.model.vault: data.url записи — {e}"))
     })?;
-    let mut policy = egress::Policy::of(&st.cfg.works);
+    let mut policy = egress::Policy::of(&st.works());
     if policy.access == ModelAccess::Off {
         policy.access = ModelAccess::Any;
     }
@@ -809,7 +809,7 @@ async fn settings_json(st: &AppState, user: Id) -> Result<Value, ApiError> {
         .to_json();
     v["works"] = works_settings::load(&st.system, user)
         .await?
-        .to_json(&st.cfg.works);
+        .to_json(&st.works());
     Ok(v)
 }
 
@@ -830,7 +830,7 @@ async fn apply(
     let mut edits = parse_patch(body)?;
     let current = user_flags(&st.system, user, st.cfg.ideas.default_mode).await?;
     let works_cur = works_settings::load(&st.system, user).await?;
-    let works_cfg = &st.cfg.works;
+    let works_cfg = &st.works();
     // сохранение подключения снимает паузу любого класса (§6.2 п. 5); вне LAN — предупреждение
     let (mut saved_model, mut external) = (false, None);
     for (k, v) in edits.iter_mut() {
@@ -946,7 +946,7 @@ async fn apply(
 /// работ, §6.1 п. 2).
 async fn notify_mode_change(st: &AppState, user: Id, before: &UserWorks) -> Result<(), ApiError> {
     let after = works_settings::load(&st.system, user).await?;
-    let cfg = &st.cfg.works;
+    let cfg = &st.works();
     let kinds: Vec<WorkKind> = before
         .effective(cfg)
         .into_iter()

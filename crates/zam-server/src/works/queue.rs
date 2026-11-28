@@ -143,7 +143,7 @@ async fn night_user(
     until: Timestamp,
 ) -> Result<(), StoreError> {
     let st = ctx.st();
-    let cfg = &st.cfg.works;
+    let cfg = &st.works();
     let works = settings::load(&st.system, user).await?;
     let db = st.users.get(user).await?;
     store::expire(&db, zam_store::time::now()).await?;
@@ -226,7 +226,7 @@ pub async fn agent_batch(ctx: &NightCtx, db: &Db, plan: &Plan) -> Result<Vec<Wor
         }
         _ => HashSet::new(),
     };
-    let batch = ctx.st().cfg.works.batch_records as usize;
+    let batch = ctx.st().works().batch_records as usize;
     let mut out = Vec::new();
     // кандидатов, поставленных в этом проходе: их итогов ещё нет, предел их не видит (ревью r1, M3)
     let mut queued = 0usize;
@@ -304,7 +304,7 @@ enum Step {
 /// следующем старте снова `queued`).
 pub async fn run_model(ctx: &NightCtx, db: &Db, plan: &Plan) -> Result<(), StoreError> {
     let st = ctx.st();
-    let batch = st.cfg.works.batch_records as usize;
+    let batch = st.works().batch_records as usize;
     let mut dropped: HashSet<Id> = HashSet::new();
     // отсев — один раз на запуск вида (§8.7 п. 4); выполненные работы запуска дописывают в него
     // свои записи (как `offered_refs` по базе)
@@ -315,7 +315,7 @@ pub async fn run_model(ctx: &NightCtx, db: &Db, plan: &Plan) -> Result<(), Store
         }
         // действующий режим — перед каждой работой (run_payload сверяет и перед обращением)
         let works = settings::load(&st.system, plan.user).await?;
-        if settings::effective_mode(plan.kind, &works, &st.cfg.works).0 != WorksMode::Model {
+        if settings::effective_mode(plan.kind, &works, &st.works()).0 != WorksMode::Model {
             return Ok(());
         }
         let spaces: Vec<Id> = kind_spaces(db, plan.kind, plan.only)
@@ -797,7 +797,7 @@ pub async fn on_mode_change(
     let works = settings::load(&st.system, user).await?;
     let db = st.users.get(user).await?;
     for &kind in kinds {
-        let (mode, why) = settings::effective_mode(kind, &works, &st.cfg.works);
+        let (mode, why) = settings::effective_mode(kind, &works, &st.works());
         drop_stale(&db, kind, mode, why).await?;
     }
     Ok(())
@@ -843,9 +843,7 @@ pub async fn digest_line(
     let counts: Vec<(WorkKind, u32, Id)> = store::queued_agent_counts(db, spaces)
         .await?
         .into_iter()
-        .filter(|(k, _, _)| {
-            settings::effective_mode(*k, &works, &st.cfg.works).0 == WorksMode::Agent
-        })
+        .filter(|(k, _, _)| settings::effective_mode(*k, &works, &st.works()).0 == WorksMode::Agent)
         .collect();
     if counts.is_empty() {
         return Ok(None);

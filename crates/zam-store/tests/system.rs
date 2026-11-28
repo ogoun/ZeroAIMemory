@@ -224,6 +224,39 @@ async fn settings_roundtrip() {
     );
 }
 
+/// M7.6 (решение 171): запись с проверкой прежнего значения — пишет только поверх ожидаемого
+/// (нет строки — `None`), иначе `false` и ничего не меняет; `None` в значении удаляет строку.
+#[tokio::test]
+async fn swap_setting_checks_previous() {
+    use serde_json::json;
+    let (_dd, s) = store("swap").await;
+    let v1 = json!({"rev": 1, "values": {"max_parallel": 2}});
+    assert!(s.swap_setting("w", None, Some(v1.clone())).await.unwrap());
+    // ожидали «нет строки», а она уже есть — отказ, значение прежнее
+    assert!(!s.swap_setting("w", None, Some(json!({}))).await.unwrap());
+    assert_eq!(
+        s.get_setting::<serde_json::Value>("w").await.unwrap(),
+        Some(v1.clone())
+    );
+    let v2 = json!({"rev": 2, "values": {}});
+    assert!(
+        !s.swap_setting("w", Some(v2.clone()), Some(v2.clone()))
+            .await
+            .unwrap()
+    );
+    assert!(
+        s.swap_setting("w", Some(v1), Some(v2.clone()))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        s.get_setting::<serde_json::Value>("w").await.unwrap(),
+        Some(v2.clone())
+    );
+    assert!(s.swap_setting("w", Some(v2), None).await.unwrap());
+    assert_eq!(s.get_setting::<serde_json::Value>("w").await.unwrap(), None);
+}
+
 #[tokio::test]
 async fn create_session_purges_expired() {
     let (dd, s) = store("purge").await;

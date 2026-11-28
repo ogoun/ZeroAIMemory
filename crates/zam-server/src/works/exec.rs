@@ -297,9 +297,41 @@ pub struct ModelOutcome {
 
 /// Слоты обращений к модели (§6.2 п. 7): не больше `max_parallel` на сервер, у пользователя —
 /// одно (замок держится всё выполнение пакета или проверку подключения).
+/// Предел меняет администратор без перезапуска ([`CallSlots::resize`], M7.6 §9.9): рост —
+/// новые разрешения сразу, снижение — свободные изымаются сразу, занятые — когда их вернут
+/// идущие обращения (долг [`SlotsCap::debt`]).
 pub struct CallSlots {
     server: Arc<tokio::sync::Semaphore>,
+    cap: Arc<Mutex<SlotsCap>>,
     users: Mutex<HashMap<Id, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// Действующий предел слотов сервера и долг снижения.
+#[derive(Debug, Default)]
+struct SlotsCap {
+    /// Предел `max_parallel`.
+    cap: usize,
+    /// Разрешений ещё изъять: были заняты, когда предел снизили.
+    debt: usize,
+}
+
+/// Слот обращения к модели ([`slot`]): возврат разрешения — с учётом долга снижения предела.
+pub(crate) struct ModelSlot {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    cap: Arc<Mutex<SlotsCap>>,
+}
+
+impl Drop for ModelSlot {
+    fn drop(&mut self) {
+        let Some(p) = self.permit.take() else {
+            return;
+        };
+        let mut c = self.cap.lock().unwrap_or_else(|e| e.into_inner());
+        if c.debt > 0 {
+            c.debt -= 1;
+            p.forget();
+        }
+    }
 }
 
 impl CallSlots {
@@ -307,8 +339,34 @@ impl CallSlots {
         let n = usize::try_from(max_parallel.max(1)).unwrap_or(1);
         CallSlots {
             server: Arc::new(tokio::sync::Semaphore::new(n)),
+            cap: Arc::new(Mutex::new(SlotsCap { cap: n, debt: 0 })),
             users: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Новый предел слотов сервера (`max_parallel` из WebUI администратора): со следующего
+    /// обращения; идущие обращения дорабатывают.
+    pub fn resize(&self, max_parallel: u32) {
+        let n = usize::try_from(max_parallel.max(1)).unwrap_or(1);
+        let mut c = self.cap.lock().unwrap_or_else(|e| e.into_inner());
+        if n > c.cap {
+            // рост гасит долг, остаток — новые разрешения
+            let mut add = n - c.cap;
+            let pay = add.min(c.debt);
+            c.debt -= pay;
+            add -= pay;
+            self.server.add_permits(add);
+        } else if n < c.cap {
+            let cut = c.cap - n;
+            let forgot = self.server.forget_permits(cut);
+            c.debt += cut - forgot;
+        }
+        c.cap = n;
+    }
+
+    /// Свободных слотов сервера сейчас (тесты и отладка).
+    pub fn available(&self) -> usize {
+        self.server.available_permits()
     }
 
     pub(crate) fn user(&self, user: Id) -> Arc<tokio::sync::Mutex<()>> {
@@ -470,12 +528,17 @@ pub(crate) fn estimate(conn: &ModelConn, convo: &[ChatMessage]) -> u64 {
 }
 
 /// Слот сервера (`max_parallel`); остановка сервера раньше — `None`.
-pub(crate) async fn slot(ctx: &NightCtx) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    let slots = ctx.st().model_calls.server.clone();
-    tokio::select! {
+pub(crate) async fn slot(ctx: &NightCtx) -> Option<ModelSlot> {
+    let calls = &ctx.st().model_calls;
+    let slots = calls.server.clone();
+    let permit = tokio::select! {
         p = slots.acquire_owned() => p.ok(),
         () = ctx.stopped() => None,
-    }
+    }?;
+    Some(ModelSlot {
+        permit: Some(permit),
+        cap: calls.cap.clone(),
+    })
 }
 
 /// Итог одного обращения: ответ или ошибка, длительность (есть — ответ получен) и «сбой сервера
@@ -592,13 +655,15 @@ impl Run<'_> {
     /// — пауза.
     async fn send(&mut self, convo: &[ChatMessage]) -> Result<ModelReply, CallError> {
         let st = self.ctx.st();
-        let cfg = &st.cfg.works;
-        let timeout = call_timeout(cfg);
+        let timeout = call_timeout(&st.works());
         let (mut rate_retried, mut retries) = (false, 0usize);
         loop {
             if self.ctx.stopping() {
                 return Err(CallError::new(CallClass::Aborted));
             }
+            // настройки сервера — на каждую попытку: правка администратора в WebUI (доступ,
+            // потолки) действует и на повтор (M7.6 §9.9)
+            let cfg = &st.works();
             let works = settings::load(&st.system, self.user)
                 .await
                 .map_err(|e| conn::internal("настройки исполнителя", e).error)?;
@@ -700,7 +765,7 @@ pub async fn run_payload(
         return Err(CallError::new(CallClass::Aborted));
     }
     let st = ctx.st();
-    let cfg = &st.cfg.works;
+    let cfg = &st.works();
     let lock = st.model_calls.user(user);
     let _guard = tokio::select! {
         g = lock.lock_owned() => g,
@@ -872,6 +937,38 @@ pub mod test_hooks {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// `max_parallel` без перезапуска (M7.6 §9.9): рост — разрешения сразу; снижение при занятых
+    /// слотах — свободные изымаются сразу, занятые — при возврате (долг), рост гасит долг.
+    #[tokio::test]
+    async fn call_slots_resize() {
+        let s = CallSlots::new(2);
+        let take = |s: &CallSlots| ModelSlot {
+            permit: Some(s.server.clone().try_acquire_owned().unwrap()),
+            cap: s.cap.clone(),
+        };
+        s.resize(4);
+        assert_eq!(s.available(), 4);
+        let (a, b, c) = (take(&s), take(&s), take(&s));
+        // 3 заняты, 1 свободен: снижение до 1 — свободный изъят, долг 2
+        s.resize(1);
+        assert_eq!(s.available(), 0);
+        drop(a);
+        drop(b);
+        assert_eq!(s.available(), 0, "возвращённые в долг не идут");
+        drop(c);
+        assert_eq!(s.available(), 1);
+        let d = take(&s);
+        s.resize(3);
+        assert_eq!(s.available(), 2);
+        // снижение при одном занятом гасится возвратом, рост до прежнего — без лишних
+        s.resize(1);
+        assert_eq!(s.available(), 0);
+        s.resize(2);
+        assert_eq!(s.available(), 1);
+        drop(d);
+        assert_eq!(s.available(), 2);
+    }
 
     fn item(n: usize, text: &str) -> PayloadItem {
         PayloadItem {

@@ -193,7 +193,7 @@ pub async fn prepare(
             .await);
         }
     };
-    let policy = Policy::of(&st.cfg.works);
+    let policy = Policy::of(&st.works());
     let b = base.clone();
     let route = tokio::task::spawn_blocking(move || egress::route(&b, policy))
         .await
@@ -418,7 +418,7 @@ pub async fn test_connection(
     ip: Option<&str>,
 ) -> Result<TestOutcome, TestRefusal> {
     let st = ctx.st();
-    let cfg = &st.cfg.works;
+    let cfg = &st.works();
     if !cfg.enabled {
         return Err(TestRefusal::Disabled(
             "внутренние работы выключены ([works] enabled = false)",
