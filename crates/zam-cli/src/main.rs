@@ -91,6 +91,10 @@ enum Cmd {
         /// Только отчёт, без записи
         #[arg(long)]
         dry_run: bool,
+        /// Файл с секретом (значение, похожее на ключ или пароль) не записывать — конфликт
+        /// `secrets` в отчёте, остальные пишутся: перенос чужих текстов (сервер 0.0.18-m7.5+)
+        #[arg(long)]
+        reject_secrets: bool,
         #[command(flatten)]
         common: Common,
     },
@@ -164,6 +168,10 @@ enum Cmd {
         /// подтверждение хэша (`POST /files/verified`)
         #[arg(long = "ref", value_name = "PATH")]
         refs: Vec<String>,
+        /// Не записывать, если в тексте новые значения, похожие на секреты (ключ, пароль): код 6
+        /// со списком «вид, строка» — перенос чужих текстов (сервер 0.0.18-m7.5+, иначе код 1)
+        #[arg(long)]
+        reject_secrets: bool,
         #[command(flatten)]
         common: Common,
     },
@@ -1525,6 +1533,18 @@ enum SessionsCmd {
         /// Id сессии (иначе ZAM_SESSION_ID, иначе id из журнала)
         #[arg(long)]
         session: Option<String>,
+        /// Хвост журнала, КиБ (64–16384; иначе hooks.snapshot_tail_kb, 2048): длинный журнал —
+        /// больше хвоста
+        #[arg(long, value_parser = clap::value_parser!(u32).range(64..=16384))]
+        tail_kb: Option<u32>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Снимок сессии с сервера: время, повод, конспект, запросы, файлы и команды (после
+    /// маскировки секретов); --json — ответ как есть
+    Show {
+        /// Id сессии
+        id: String,
         #[command(flatten)]
         common: Common,
     },
@@ -1557,10 +1577,16 @@ fn sessions(c: SessionsCmd) -> Result<(), CliError> {
             transcript,
             format,
             session,
+            tail_kb,
             common,
-        } => {
-            cmd::session_snapshot::run(&common, &transcript, format.as_deref(), session.as_deref())
-        }
+        } => cmd::session_snapshot::run(
+            &common,
+            &transcript,
+            format.as_deref(),
+            session.as_deref(),
+            tail_kb,
+        ),
+        SessionsCmd::Show { id, common } => cmd::session_snapshot::show(&common, &id),
     }
 }
 
@@ -2307,6 +2333,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             on_conflict,
             axioms,
             dry_run,
+            reject_secrets,
             common,
         } => cmd::transfer::import(
             &mut cmd::connect(&common)?,
@@ -2317,6 +2344,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
                 on_conflict: on_conflict.as_deref(),
                 axioms: axioms.as_deref(),
                 dry_run,
+                reject_secrets,
             },
         ),
         Cmd::Tree {
@@ -2361,6 +2389,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             base_rev,
             l0,
             refs,
+            reject_secrets,
             common,
         } => {
             let o = cmd::write::Opts {
@@ -2369,6 +2398,7 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
                 base_rev,
                 l0: l0.as_deref(),
                 refs: &refs,
+                reject_secrets,
             };
             cmd::write::run(&cmd::connect(&common)?, &target, &o)
         }

@@ -270,6 +270,9 @@ impl ToolName {
                     "l0": {"type": "string"},
                     "idempotency_key": {"type": "string", "description":
                         "повтор с тем же ключом не пишет второй раз (сбой связи); другое тело — 422"},
+                    // отказ при секрете (M7.5 §8.9 п. 5): REST то же поле
+                    "reject_secrets": {"type": "boolean", "description":
+                        "true — текст с секретом не записывается (422 со списком «вид, строка»): перенос чужих текстов"},
                     // кандидат в Rules (M7.3 §6.7 п. 2, решение координатора 52)
                     "candidate": {"type": "object", "description":
                         "кандидат в Rules вместо записи (path rules:/<путь>, content до 200 токенов, без URL и блоков кода): reason — почему правило для всех проектов (20–2000 символов), basis — ссылки; принимает человек",
@@ -1258,7 +1261,7 @@ async fn write(rest: &Rest, args: &JsonObject) -> Res {
                 return Err(Fail::Invalid("l0 задаётся только вместе с content".into()));
             }
             let id = node_id(rest, &space, &path).await?;
-            let mut body = pick(args, &["ops", "message"]);
+            let mut body = pick(args, &["ops", "message", "reject_secrets"]);
             body.insert("base_rev".into(), json!(rev));
             call_rest(
                 rest,
@@ -1272,7 +1275,7 @@ async fn write(rest: &Rest, args: &JsonObject) -> Res {
         }
         (Some(_), None, Some(rev)) => {
             let id = node_id(rest, &space, &path).await?;
-            let body = pick(args, &["content", "l0", "message"]);
+            let body = pick(args, &["content", "l0", "message", "reject_secrets"]);
             let mut extra = vec![if_match(rev)];
             extra.extend(key.iter().cloned());
             call_rest(
@@ -1286,7 +1289,7 @@ async fn write(rest: &Rest, args: &JsonObject) -> Res {
             .map_err(|e| e.hint(reread))?
         }
         (Some(_), None, None) => {
-            let mut body = pick(args, &["content", "l0", "message"]);
+            let mut body = pick(args, &["content", "l0", "message", "reject_secrets"]);
             body.insert("space".into(), json!(space));
             body.insert("path".into(), json!(path));
             body.insert("kind".into(), json!("note"));

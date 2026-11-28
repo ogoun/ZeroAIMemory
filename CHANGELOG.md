@@ -144,6 +144,70 @@
   параллельные загрузки вместе предел не превысят; ответ прежний — 422 с пределом.
   `code_map_rows` убран из `zam-store` (только помощник тестов).
 
+### Добавлено — подсказки и клиент: замечания переноса AIIndicators (M7.5, задача 6)
+
+- **`brief` применяет триггеры к заданию** (спецификация M7 §8.9 п. 2, решение координатора
+  129): раздел «Ловушки» пакета под задачу сначала берёт действующие `gotcha`/`failure` решения,
+  затем Knowledge, у которых совпал `file_glob` (пути из текста задания — слова с `/` или `\` и
+  расширением — и пути раздела «Код»; без учёта регистра) или `keyword` (текст задания, целым
+  словом или фразой); затем — найденные поиском; без повторов, предел раздела прежний (3).
+  Сопоставление — новый модуль `zam_search::triggers` (`glob_matches`, `Haystack`, `text_paths`);
+  хук `pre-tool` клиента перешёл на него без изменения поведения.
+- **Свежесть кэша триггеров** (§8.9 п. 3, решение 130): хук `prompt` (при включённом `pre_tool`)
+  сверяет `triggers.json` старше 5 минут условным `GET /triggers` параллельно своему запросу и в
+  своём сроке; `zam log insight` с `--trigger` или `--supersedes`, `zam insight supersede` и
+  `zam insight triggers` помечают кэш устаревшим (`fetched_at` — начало эпохи).
+- **`zam sessions show <id> [--json]`** (§8.9 п. 4) — снимок сессии с сервера текстом (время
+  UTC, повод, полнота, размер, конспект, запросы, файлы, команды); **`zam sessions snapshot
+  --tail-kb N`** (64–16384 КиБ, иначе `hooks.snapshot_tail_kb`).
+- **Отказ при секрете** (§8.9 п. 5, решение 132): `reject_secrets: true` в `POST /nodes`,
+  `PUT`/`PATCH /nodes/{id}` и у MCP `memory_write` — новые находки сканера (как
+  `secrets_detected`) дают 422 `/problems/secrets-detected` с `[{kind, line}]`, ничего не
+  пишется; `POST /spaces/{space}/import?reject_secrets=true` — конфликт `secrets: <вид> (строка
+  N)` на файл (текст или ревизия истории), остальные пишутся. CLI — `zam write --reject-secrets`
+  и `zam import --reject-secrets`: сервер без признака — код 1 с подсказкой, без записи.
+- **Протокол `zam guide`** (ru/en, §8.9 п. 6): `data.kind` у `changelog` обязателен (список
+  видов), `not_to_confuse` — массив строк, `memory_search` с `filters.file` — с `query`, знание о
+  файле до правки из MCP — тот же поиск, `[code] exclude` и `.gitattributes` в карте кода,
+  `reject_secrets` при переносе чужих текстов; `brief` — ловушки по триггерам, `--tail-kb` и
+  `zam sessions show`.
+
+### Изменено — подсказки и клиент (M7.5, задача 6)
+
+- **Корни решения в дайджесте** (§8.9 п. 1, решение 128): корневые заметки — раньше папок
+  (внутри — прежний порядок), предел 10 общий; срезано — строка «ZeroAIMemory: ещё N корней —
+  memory_tree» последней в разделе `### Решение`, в его бюджете.
+- **`zam sessions snapshot`**: журнал без запросов — «в журнале нет запросов — снимать нечего»,
+  код 0 без запросов к серверу (было — код 6 «снимок пуст»); id сессии, если записи с запросами
+  его не несут, — `sessionId` последней строки хвоста любого вида (`bridge-session`, `/model`).
+
+### Изменения ответа (M7.5, задача 6)
+
+- `/health`: флаги `recall_m75` и `reject_secrets` в конце `features` (`docs/api-compat.md`,
+  разделы «Пакет под задачу…» и «Отказ при секрете»).
+- `POST /recall` (`session_start`, `recovery`, `brief`): состав разделов «Решение» и «Ловушки» —
+  по правилам выше; форма ответа прежняя.
+- Новый тип problem `/problems/secrets-detected` (422, `code: secrets_detected`) — только при
+  `reject_secrets: true`; новая причина конфликта импорта `secrets: …` — только при
+  `reject_secrets=true`. MCP: поле `reject_secrets` в схеме `memory_write` (11 инструментов,
+  описания прежние).
+
+### Для разработчиков (M7.5, задача 6)
+
+- `zam-search` зависит от `globset` (крейт workspace), `zam-cli` — от `zam-search` (без новых
+  пакетов в `Cargo.lock`).
+- Тесты: `digest_root_notes_before_folders`, `digest_roots_more_line`,
+  `brief_task_matches_file_glob_from_text`, `brief_task_matches_keyword`,
+  `brief_solution_traps_before_knowledge`, `brief_trigger_traps_respect_limit`,
+  `triggers_match_same_as_pre_tool`, `prompt_refreshes_stale_triggers`,
+  `prompt_fresh_triggers_no_request`, `insight_with_triggers_marks_cache_stale`,
+  `snapshot_tail_kb_flag_range`, `snapshot_tail_kb_reads_tail`,
+  `snapshot_session_id_from_any_line`, `snapshot_no_requests_nothing_to_take`,
+  `sessions_show_prints_snapshot`, `write_reject_secrets_422_nothing_written`,
+  `import_reject_secrets_conflict_per_file`, `mcp_memory_write_reject_secrets`,
+  `reject_secrets_absent_keeps_017`, `write_reject_secrets_old_server_code_1`,
+  `write_reject_secrets_rejects_and_writes_clean`; модульные `zam_search::triggers::tests`.
+
 ## [0.0.17-m7.4] - 2026-11-28
 
 Волна M7.4 «Администрирование сервера» этапа M7 «Полировка» — четвёртая из шести (спецификация

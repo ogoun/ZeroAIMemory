@@ -60,8 +60,9 @@
 //!   Rules (текст каждой заметки, до
 //!   [`RULES_MAX`] заметок, текст — до [`RULE_L1_TOKENS`] токенов), «L1 решения» — корневые узлы
 //!   пространства решения, строка на корень — путь и L0 до [`SOLUTION_ROOT_L0_TOKENS`] (до
-//!   [`SOLUTION_ROOT_MAX`]), действующие (`active`) `gotcha`/`failure` решения и Knowledge
-//!   (M6.6 §4.1: ловушки решения — первыми, одно место из `recall.digest_entries` — самой новой
+//!   [`SOLUTION_ROOT_MAX`]; M7.5 §8.9 п. 1: корневые заметки — раньше папок, срезанные — строка
+//!   [`solution_roots_more`] последней в разделе), действующие (`active`) `gotcha`/`failure`
+//!   решения и Knowledge (M6.6 §4.1: ловушки решения — первыми, одно место из `recall.digest_entries` — самой новой
 //!   ловушке Knowledge, [`DIGEST_KNOWLEDGE_TRAPS`]; внутри области — новые первыми; строка —
 //!   заголовок, без фрагмента), записи `revisit` и последние записи
 //!   changelog решения — индексы `<ссылка> «<заголовок>» · Nt` (M6 §8; разделов — до
@@ -214,7 +215,9 @@
 //!   `recall.brief_tokens` (800); разделы: `### Правила` (L0 заметок Rules), `### Решения`
 //!   (действующие `decision` с `axiom`/`theorem` по поиску `task`, до 3), `### Термины`
 //!   (термины словаря в `task`, до 5, с определением), `### Ловушки` (действующие
-//!   `gotcha`/`failure` по поиску `task`, до 3), `### Файлы` (записи со ссылками на пути из
+//!   `gotcha`/`failure`, до 3: сначала решения, затем Knowledge, у которых совпал триггер
+//!   `file_glob` с путём `task` или раздела «Код» либо `keyword` с текстом `task` — M7.5 §8.9
+//!   п. 2, [`trigger_traps`]; затем — по поиску `task`), `### Файлы` (записи со ссылками на пути из
 //!   `task` — индекс `file_refs` решения, до 3), `### Код` (M5.6 §10: символы карты с именами
 //!   или `qual` из `task` — точные `qual` первыми, затем символы путей из `task`, до
 //!   [`BRIEF_CODE_MAX`], строка `<путь>:<line> <kind> <sig или qual>`, бюджет раздела —
@@ -1612,6 +1615,7 @@ async fn digest(
 
     // L1 решения — корневые узлы пространства решения с L0
     let mut overview: Vec<Cand> = Vec::new();
+    let mut roots_more = 0usize;
     if let Some((i, space)) = sol
         && health.alive[i]
     {
@@ -1619,7 +1623,12 @@ async fn digest(
         if let Some(r) = deadline.step(list_children(&db, space, None, 1)).await
             && let Some(nodes) = health.soft(i, r)?
         {
-            for n in nodes.into_iter().take(SOLUTION_ROOT_MAX) {
+            // корневые заметки (точка входа: обзор, статус) — раньше папок, внутри — прежний
+            // порядок; срезанное пределом — строкой «ещё N корней» (M7.5 §8.9 п. 1)
+            let (notes, folders): (Vec<_>, Vec<_>) =
+                nodes.into_iter().partition(|n| n.kind != NodeKind::Folder);
+            roots_more = (notes.len() + folders.len()).saturating_sub(SOLUTION_ROOT_MAX);
+            for n in notes.into_iter().chain(folders).take(SOLUTION_ROOT_MAX) {
                 let folder = n.kind == NodeKind::Folder;
                 let mut title = n.path.clone();
                 if folder {
@@ -1660,7 +1669,7 @@ async fn digest(
             }
         }
     }
-    sections.push((Some("### Решение"), overview));
+    sections.push((Some(SECTION_SOLUTION), overview));
 
     // действующие gotcha/failure, revisit — решение и Knowledge; changelog — решение
     let entries = st.cfg.recall.digest_entries;
@@ -1720,6 +1729,7 @@ async fn digest(
         rules_hidden,
         rules_cut,
         snapshot,
+        roots_more,
         // строку внутренних работ ставит [`recall`] — только первому `session_start` сессии
         works_line: None,
         // строку регрессии ставит [`recall_with`] на первом `session_start` сессии
@@ -1887,16 +1897,21 @@ async fn rules_l0(health: &mut Health<'_>, deadline: &mut Deadline) -> Result<Ve
         .collect())
 }
 
-/// Разделы пакета под задачу `brief` (см. модуль); `task` нет — мини-дайджест.
+/// Разделы пакета под задачу `brief` (см. модуль) и строки раздела `### Код` (`code_on` — карта
+/// не выключена у хука; [`code_brief_lines`]); `task` нет — мини-дайджест без кода. Раздел «Код»
+/// собирается до ловушек: его пути — вход триггеров `file_glob` (M7.5 §8.9 п. 2,
+/// [`trigger_traps`]); ловушки по триггерам идут до найденных поиском.
+#[allow(clippy::too_many_arguments)]
 async fn brief(
     st: &AppState,
     p: &Principal,
     headers: &HeaderMap,
     req: &RecallReq,
     task: Option<&str>,
+    code_on: bool,
     health: &mut Health<'_>,
     deadline: &mut Deadline,
-) -> Result<Vec<(Option<&'static str>, Vec<Cand>)>, ApiError> {
+) -> Result<(Vec<(Option<&'static str>, Vec<Cand>)>, Vec<String>), ApiError> {
     let targets = health.targets();
     // участнику — только пространство решения (его цель другой базы иных пространств не несёт)
     let sol = solution_space(targets);
@@ -1925,9 +1940,19 @@ async fn brief(
         };
         let tasks = task_cands(health, deadline, &insight_spaces, session.as_deref(), mark).await?;
         sections.push((Some(SECTION_TASKS), tasks));
-        return Ok(sections);
+        return Ok((sections, Vec::new()));
     };
-    let (decisions, traps) = brief_search(st, p, headers, req, task, health, deadline).await?;
+    let code = if code_on {
+        code_brief_lines(st, req, headers, task, health, deadline).await
+    } else {
+        Vec::new()
+    };
+    let code_paths: Vec<String> = code.iter().map(|(_, path)| path.clone()).collect();
+    let mut traps =
+        trigger_traps(health, deadline, &insight_spaces, sol, task, &code_paths).await?;
+    let (decisions, found) = brief_search(st, p, headers, req, task, health, deadline).await?;
+    // без повторов и в пределе раздела — при отборе ([`section_limit`], `dup`)
+    traps.extend(found);
     sections.push((Some(SECTION_DECISIONS), decisions));
     // термины — по заданию без обрезки по длине: `find_in_head` сам берёт первые
     // BRIEF_TASK_MAX_CHARS символов, а маску кода строит и за краем (ревью задачи 5, M1)
@@ -1937,7 +1962,94 @@ async fn brief(
     sections.push((Some(SECTION_TRAPS), traps));
     let files = file_cands(req, headers, task, health, deadline).await;
     sections.push((Some(SECTION_FILES), files));
-    Ok(sections)
+    Ok((sections, code.into_iter().map(|(line, _)| line).collect()))
+}
+
+/// Ловушки пакета под задачу по триггерам (M7.5 §8.9 п. 2): действующие `gotcha`/`failure`
+/// пространств `spaces` (решение `sol` и Knowledge), у которых `file_glob` совпал с путём из текста
+/// задания ([`zam_search::triggers::text_paths`]) или раздела «Код» (`code_paths`), а `keyword` —
+/// с текстом задания (целым словом или фразой); регистр путей не учитывается (ОС клиента серверу
+/// неизвестна). Ловушки решения — первыми, затем Knowledge, внутри — новые первыми; не больше
+/// [`BRIEF_ENTRIES_MAX`] (предел раздела). Сбой чтения цели — как всюду ([`Health::soft`]).
+async fn trigger_traps(
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+    spaces: &[(usize, Id)],
+    sol: Option<(usize, Id)>,
+    task: &str,
+    code_paths: &[String],
+) -> Result<Vec<Cand>, ApiError> {
+    use zam_search::triggers::{Haystack, glob_matches, text_paths};
+    let mut paths = text_paths(task);
+    for p in code_paths {
+        if !paths.contains(p) {
+            paths.push(p.clone());
+        }
+    }
+    let hay = Haystack::new(task);
+    // (цель, пространство, запись) совпавших триггеров — без повторов записи
+    let mut hits: Vec<(usize, Id, Id)> = Vec::new();
+    for &(i, space) in spaces {
+        if !health.alive[i] {
+            continue;
+        }
+        let db = health.targets()[i].db.clone();
+        let Some(r) = deadline.step(active_triggers(&db, &[space])).await else {
+            break;
+        };
+        let Some(rows) = health.soft(i, r)? else {
+            continue;
+        };
+        for t in rows {
+            if !matches!(t.insight_kind.as_str(), "gotcha" | "failure")
+                || hits.iter().any(|h| h.2 == t.entry_id)
+            {
+                continue;
+            }
+            let hit = match t.kind {
+                TriggerKind::FileGlob => glob_matches(&t.pattern, &paths, true).unwrap_or(false),
+                TriggerKind::Keyword => hay.has_keyword(&t.pattern),
+                TriggerKind::CommandRegex | TriggerKind::ErrorRegex => false,
+            };
+            if hit {
+                hits.push((i, space, t.entry_id));
+            }
+        }
+    }
+    hits.sort_by_key(|&(i, space, id)| (sol != Some((i, space)), std::cmp::Reverse(id)));
+    let mut out = Vec::new();
+    for (i, _, id) in hits {
+        if out.len() >= BRIEF_ENTRIES_MAX || !health.alive[i] {
+            continue;
+        }
+        let db = health.targets()[i].db.clone();
+        let Some(r) = deadline.step(zam_store::get_entry(&db, id)).await else {
+            break;
+        };
+        let e = match r {
+            Ok(e) => e,
+            // запись удалили между чтениями
+            Err(StoreError::NotFound) => continue,
+            Err(e) => match health.soft(i, Err::<Entry, _>(e))? {
+                Some(e) => e,
+                None => continue,
+            },
+        };
+        let kind = data_kind(&e);
+        if e.status != Some(EntryStatus::Active)
+            || e.deleted_at.is_some()
+            || !matches!(kind.as_str(), "gotcha" | "failure")
+        {
+            continue;
+        }
+        let reason = if kind == "failure" {
+            "failure"
+        } else {
+            "gotcha"
+        };
+        out.push(entry_cand(i, &e, reason, ""));
+    }
+    Ok(out)
 }
 
 /// Поиск пакета под задачу: действующие insight по `task` (`mode=brief`, балл ≥
@@ -2263,6 +2375,9 @@ struct Lines {
     rules_cut: bool,
     /// «Последнее известное состояние» — снимок сессии (M6 §8а, [`super::snapshot`]).
     snapshot: Option<super::snapshot::Shown>,
+    /// Корней решения сверх [`SOLUTION_ROOT_MAX`] (M7.5 §8.9 п. 1): строка
+    /// [`solution_roots_more`] последней в разделе `### Решение`; 0 — строки нет.
+    roots_more: usize,
     /// Строка внутренних работ (M7.3 §6.3 п. 5, [`works_line`]): после строки идей, первой из
     /// служебных строк волны M7.3.
     works_line: Option<String>,
@@ -2515,6 +2630,25 @@ fn rules_hidden_line(n: usize) -> String {
     format!("ZeroAIMemory: не показано — правил: {n} (memory_tree Rules)")
 }
 
+/// Заголовок раздела корней решения дайджеста и пакета восстановления.
+const SECTION_SOLUTION: &str = "### Решение";
+
+/// Строка раздела [`SECTION_SOLUTION`] о `n` корнях сверх [`SOLUTION_ROOT_MAX`] (M7.5 §8.9 п. 1):
+/// последний блок раздела, в его бюджете; дайджест пишет её по-русски, как прочие служебные строки
+/// (`en` — для текстов на английском, тот же смысл).
+pub fn solution_roots_more(n: usize, lang: crate::agent_setup::Lang) -> String {
+    match lang {
+        crate::agent_setup::Lang::Ru => format!(
+            "ZeroAIMemory: ещё {n} {} — memory_tree",
+            zam_core::text::plural_ru(n as u64, "корень", "корня", "корней")
+        ),
+        crate::agent_setup::Lang::En => format!(
+            "ZeroAIMemory: {n} more root{} — memory_tree",
+            if n == 1 { "" } else { "s" }
+        ),
+    }
+}
+
 /// Дайджест `session_start`: строки [`Lines`] и разделы-кандидаты.
 type Digest = (Lines, Vec<(Option<&'static str>, Vec<Cand>)>);
 
@@ -2608,7 +2742,8 @@ fn task_idents(task: &str) -> Vec<String> {
 /// `qual` из `task` (точные `qual` первыми), затем символы путей из `task`
 /// (`code_symbols_named`), до [`BRIEF_CODE_MAX`]; строка — `<путь>:<line> <kind> <sig или
 /// qual>`; вместе с заголовком — не больше `code.brief_tokens` (остаток общего бюджета
-/// соблюдает упаковка). Нет решения, карты или срок вышел — пусто; сбой чтения — WARN.
+/// соблюдает упаковка). Строка — с путём её файла (вход триггеров `file_glob` пакета, M7.5 §8.9
+/// п. 2). Нет решения, карты или срок вышел — пусто; сбой чтения — WARN.
 async fn code_brief_lines(
     st: &AppState,
     req: &RecallReq,
@@ -2616,7 +2751,7 @@ async fn code_brief_lines(
     task: &str,
     health: &mut Health<'_>,
     deadline: &mut Deadline,
-) -> Vec<String> {
+) -> Vec<(String, String)> {
     let budget = st.cfg.code.brief_tokens;
     let Some((i, guid)) = code_target(health.targets(), req, headers) else {
         return Vec::new();
@@ -2662,7 +2797,7 @@ async fn code_brief_lines(
         let cost = count_tokens(&format!("{line}\n"));
         if used + cost <= budget {
             used += cost;
-            out.push(line);
+            out.push((line, h.path.clone()));
         }
     }
     out
@@ -3347,7 +3482,7 @@ fn section_limit(
     match title {
         Some(SECTION_RULES) => RULES_MAX,
         Some(SECTION_ENVIRONMENT) => ENVIRONMENT_MAX,
-        Some("### Решение") => SOLUTION_ROOT_MAX,
+        Some(SECTION_SOLUTION) => SOLUTION_ROOT_MAX,
         Some(_) => entries,
         None if cands.iter().any(|c| c.reason == REASON_GLOSSARY) => TERM_HINTS_MAX,
         None if cands.iter().any(|c| c.reason == REASON_TASK) => TASK_HINTS_MAX,
@@ -3394,6 +3529,7 @@ fn arrange<'c>(
         rules_hidden,
         rules_cut,
         snapshot,
+        roots_more,
         mut works_line,
         check_line,
         ..
@@ -3436,6 +3572,13 @@ fn arrange<'c>(
         }
         if title == Some(SECTION_RULES) && rules_hidden > 0 {
             sec.blocks.push(rules_hidden_line(rules_hidden));
+        }
+        // корни сверх предела — строкой в конце раздела, в его бюджете (M7.5 §8.9 п. 1)
+        if title == Some(SECTION_SOLUTION) && roots_more > 0 && !cands.is_empty() {
+            sec.blocks.push(solution_roots_more(
+                roots_more,
+                crate::agent_setup::Lang::Ru,
+            ));
         }
         out.packed.push(sec);
         out.picked.push(cands);
@@ -3663,7 +3806,7 @@ fn omit_of(title: Option<&str>) -> Option<(String, String)> {
         "### Последние изменения" => {
             ("изменений", "memory_search kinds=[changelog]")
         }
-        "### Решение" => ("корней решения", "memory_tree"),
+        SECTION_SOLUTION => ("корней решения", "memory_tree"),
         SECTION_ENVIRONMENT => ("записей окружения", "memory_vault"),
         SECTION_IDEAS_REVIEW => OMIT_IDEAS_REVIEW,
         _ => return None,
@@ -4041,11 +4184,9 @@ pub(crate) async fn recall_with(
         // у субагента свой контекст: пакет повторяется (показ отмечается)
         Event::Brief => {
             let t = task.as_deref();
-            let s = brief(&st, &p, &sh, &req, t, &mut health, &mut deadline).await?;
-            if let (true, Some(t)) = (code_on, t) {
-                code_section =
-                    code_brief_lines(&st, &req, &sh, t, &mut health, &mut deadline).await;
-            }
+            let (s, code) =
+                brief(&st, &p, &sh, &req, t, code_on, &mut health, &mut deadline).await?;
+            code_section = code;
             (Lines::default(), s, true)
         }
         // пакет разбора идей повторяется: агент зовёт его сам (показ отмечается)

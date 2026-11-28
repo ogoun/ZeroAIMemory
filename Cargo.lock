@@ -6967,6 +6967,7 @@ dependencies = [
  "zam-code",
  "zam-core",
  "zam-markdown",
+ "zam-search",
  "zam-secrets",
  "zam-server",
  "zam-store",
@@ -7109,6 +7110,7 @@ name = "zam-search"
 version = "0.0.17-m7.4"
 dependencies = [
  "blake3",
+ "globset",
  "jiff",
  "regex",
  "serde",

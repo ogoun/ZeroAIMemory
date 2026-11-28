@@ -781,3 +781,90 @@ fn read_focus_cli() {
     ]);
     assert_eq!(o.status.code(), Some(6), "{}", err(&o));
 }
+
+/// «Ключ» собирается из частей: в исходниках нет строки, похожей на настоящий.
+fn fake_secret() -> String {
+    format!("gh{}_{}", "p", "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1eF3hJ5")
+}
+
+/// M7.5 §8.9 п. 5: `zam write --reject-secrets` — текст с секретом не пишется (код 6, «вид
+/// (строка N)» из ответа сервера, значения нет), чистый — пишется; повтор без флага — как прежде
+/// (записано, находки в ответе).
+#[test]
+fn write_reject_secrets_rejects_and_writes_clean() {
+    let e = Env::new("reject-secrets");
+    let leak = format!("# K\n\nстрока\ntoken: {}\n", fake_secret());
+    let o = e.run_stdin(
+        &["write", "knowledge:ops/k", "--reject-secrets"],
+        leak.as_bytes(),
+    );
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
+    assert!(err(&o).contains("known_prefix (строка 4)"), "{}", err(&o));
+    assert!(!err(&o).contains(&fake_secret()) && !out(&o).contains(&fake_secret()));
+    let o = e.run(&["read", "knowledge:ops/k"]);
+    assert_eq!(o.status.code(), Some(5), "ничего не записано: {}", out(&o));
+    let o = e.run_stdin(
+        &["write", "knowledge:ops/k", "--reject-secrets"],
+        "# K\n\nчисто\n".as_bytes(),
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    // замена: новый секрет — отказ, ревизия прежняя
+    let o = e.run_stdin(
+        &["write", "knowledge:ops/k", "--reject-secrets"],
+        leak.as_bytes(),
+    );
+    assert_eq!(o.status.code(), Some(6), "{}", err(&o));
+    let o = e.run(&["read", "knowledge:ops/k"]);
+    assert!(out(&o).contains("чисто"), "{}", out(&o));
+    // без флага — как 0.0.17
+    let o = e.run_stdin(&["write", "knowledge:ops/k"], leak.as_bytes());
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+}
+
+/// M7.5 §8.9 п. 5: сервер без признака `reject_secrets` (0.0.17 молча пропустил бы поле и записал
+/// секрет) — `zam write --reject-secrets` и `zam import --reject-secrets`: код 1 с подсказкой
+/// обновить сервер, без запросов записи.
+#[test]
+fn write_reject_secrets_old_server_code_1() {
+    let e = Env::new("reject-secrets-old");
+    let (url, seen) = common::stub(
+        200,
+        r#"{"status":"ok","features":["m6","search_m75"]}"#,
+        std::time::Duration::ZERO,
+    );
+    let dir = e.cwd.join("md");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.md"), "# A\n").unwrap();
+    let leak = format!("# K\n\ntoken: {}\n", fake_secret());
+    for args in [
+        vec!["write", "knowledge:ops/k", "--reject-secrets"],
+        vec![
+            "import",
+            dir.to_str().unwrap(),
+            "--space",
+            "knowledge",
+            "--reject-secrets",
+        ],
+    ] {
+        let o = e
+            .zam()
+            .env("ZAM_URL", &url)
+            .args(&args)
+            .write_stdin(leak.as_bytes().to_vec())
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {}", err(&o));
+        assert!(err(&o).contains("0.0.18-m7.5"), "{}", err(&o));
+    }
+    let reqs: Vec<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(m, p, _)| format!("{m} {p}"))
+        .collect();
+    assert!(
+        reqs.iter().all(|r| r.starts_with("GET ")),
+        "только чтение: {reqs:?}"
+    );
+    assert!(reqs.iter().any(|r| r == "GET /api/v1/health"), "{reqs:?}");
+}

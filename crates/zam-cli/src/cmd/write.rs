@@ -14,6 +14,12 @@
 //! содержимому; ревью задачи 6 M5.6, I3: без символов подтверждение файла не должно снимать
 //! ориентир ссылок на его символы). Коммит у заметки не хранится (полей нет). Сбой
 //! подтверждения — предупреждение в stderr, заметка уже записана.
+//!
+//! `--reject-secrets` (M7.5 §8.9 п. 5): поле `reject_secrets: true` — сервер не пишет текст с
+//! новыми значениями, похожими на секреты (422 `/problems/secrets-detected` → код 6 со списком
+//! «вид (строка N)» из ответа). Сначала — признак `reject_secrets` в `GET /health`: у сервера без
+//! него (0.0.17 и раньше поле молча пропустил бы и записал секрет) — код 1 с подсказкой, без
+//! записи.
 use std::io::Read;
 use std::path::Path;
 
@@ -29,6 +35,27 @@ pub struct Opts<'a> {
     pub base_rev: Option<i64>,
     pub l0: Option<&'a str>,
     pub refs: &'a [String],
+    /// Отказ при секрете (`--reject-secrets`).
+    pub reject_secrets: bool,
+}
+
+/// Признак отказа при секрете в `GET /health` `features` (`docs/api-compat.md`).
+pub const FEATURE_REJECT_SECRETS: &str = "reject_secrets";
+
+/// Сообщение для сервера без признака [`FEATURE_REJECT_SECRETS`].
+pub const OLD_SERVER_REJECT: &str = "сервер не поддерживает --reject-secrets (отказ при секрете): \
+     нужен zam-server 0.0.18-m7.5 или новее; ничего не записано — уберите секреты из текста сами \
+     или запишите без флага";
+
+/// `--reject-secrets` у сервера без признака — код 1 до записи: старый сервер поле пропустил бы
+/// и записал текст с секретом.
+pub fn ensure_reject_secrets(ctx: &Ctx) -> Result<(), CliError> {
+    let h = read_json(ctx.client.get("/health", &[])?)?;
+    if super::has_feature(&h, FEATURE_REJECT_SECRETS) {
+        Ok(())
+    } else {
+        Err(CliError::config(OLD_SERVER_REJECT))
+    }
 }
 
 /// Текст заметки из файла или stdin; не UTF-8 → код 6.
@@ -72,6 +99,9 @@ pub fn run(ctx: &Ctx, raw: &str, o: &Opts) -> Result<(), CliError> {
         local
     };
     ctx.ensure_solution(&loc)?;
+    if o.reject_secrets {
+        ensure_reject_secrets(ctx)?;
+    }
 
     // существующий узел?
     let existing = match ctx.node_json(&loc) {
@@ -85,6 +115,9 @@ pub fn run(ctx: &Ctx, raw: &str, o: &Opts) -> Result<(), CliError> {
     }
     if let Some(l0) = o.l0 {
         body["l0"] = json!(l0);
+    }
+    if o.reject_secrets {
+        body["reject_secrets"] = json!(true);
     }
 
     let Some(cur) = existing else {

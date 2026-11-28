@@ -874,3 +874,277 @@ async fn brief_code_section_budget_150() {
     );
     assert!(j["tokens"].as_u64().unwrap() <= 800, "{j}");
 }
+
+// ---- M7.5 §8.9 п. 2: ловушки по триггерам в пакете под задачу ----
+
+/// Строки раздела `### Ловушки` (до пустой строки).
+fn traps(t: &str) -> Vec<String> {
+    let Some(rest) = t.split("### Ловушки\n").nth(1) else {
+        return Vec::new();
+    };
+    rest.split("\n\n")
+        .next()
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Ловушка `kind` в пространстве `space_uri` с триггерами `[(вид, шаблон)]`; id.
+async fn trap(
+    a: &Api,
+    space_uri: &str,
+    title: &str,
+    kind: &str,
+    triggers: &[(&str, &str)],
+) -> String {
+    let tok = a.token.clone();
+    let triggers: Vec<Value> = triggers
+        .iter()
+        .map(|(t, p)| json!({"type": t, "pattern": p}))
+        .collect();
+    entry(
+        a,
+        &tok,
+        space_uri,
+        json!({"kind": "insight", "title": title, "body": "ровно один раз",
+               "data": {"kind": kind}, "triggers": triggers, "force": true}),
+    )
+    .await
+}
+
+fn knowledge() -> String {
+    "/api/v1/spaces/knowledge/entries".to_string()
+}
+
+/// M7.5 §8.9 п. 2: `file_glob` ловушки — с путём из текста задания (слово с `/` или `\` и
+/// расширением; регистр не учитывается) и с путём раздела «Код» (задание без пути, имя символа
+/// карты); чужая маска — нет. Слов ловушки в задании нет: её нашёл не поиск.
+#[tokio::test]
+async fn brief_task_matches_file_glob_from_text() {
+    let a = api("brief-trig-glob", roomy).await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let runner = trap(
+        &a,
+        &sol(),
+        "Повтор вызова недопустим",
+        "gotcha",
+        &[("file_glob", "services/strategyrunner/**")],
+    )
+    .await;
+    let py = trap(
+        &a,
+        &sol(),
+        "Кодировка вывода",
+        "gotcha",
+        &[("file_glob", "**/*.py")],
+    )
+    .await;
+    let code = trap(
+        &a,
+        &sol(),
+        "Порядок блокировок",
+        "failure",
+        &[("file_glob", "src/engine/**")],
+    )
+    .await;
+    load_map(
+        &a,
+        &[(
+            "src/engine/core.rs",
+            vec![fsym("DemoStrategy", 7, "pub struct DemoStrategy")],
+        )],
+    )
+    .await;
+    let j = brief(
+        &a,
+        &a.token,
+        "tg1:ag",
+        json!({"event": "brief", "solution": G,
+        "task": r"Доработай Services\StrategyRunner\Strategy\DemoStrategy.cs: итоги дня"}),
+    )
+    .await;
+    let t = text(&j);
+    let tr = traps(t);
+    assert!(
+        tr.iter().any(|l| l.ends_with(&format!("i:{runner}"))),
+        "{t}"
+    );
+    assert!(!t.contains(&format!("i:{py}")), "{t}");
+    let item = j["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == format!("i:{runner}"))
+        .unwrap_or_else(|| panic!("{j}"));
+    assert_eq!(item["reason"], "gotcha", "{j}");
+    // путь из раздела «Код»: в задании только имя символа
+    let j = brief(
+        &a,
+        &a.token,
+        "tg2:ag",
+        json!({"event": "brief", "solution": G,
+        "task": "Перепиши DemoStrategy под новый формат"}),
+    )
+    .await;
+    let t = text(&j);
+    assert!(
+        code_section(t).is_some_and(|s| s.contains("src/engine/core.rs:7")),
+        "{t}"
+    );
+    assert!(
+        traps(t).iter().any(|l| l.ends_with(&format!("i:{code}"))),
+        "{t}"
+    );
+    assert!(!t.contains(&format!("i:{runner}")), "{t}");
+    // без карты (`code_map: false` хука) — путь кода не вход триггеров
+    let j = brief(
+        &a,
+        &a.token,
+        "tg3:ag",
+        json!({"event": "brief", "solution": G,
+        "task": "Перепиши DemoStrategy под новый формат", "code_map": false}),
+    )
+    .await;
+    assert!(!text(&j).contains(&format!("i:{code}")), "{j}");
+}
+
+/// M7.5 §8.9 п. 2: `keyword` — с текстом задания без учёта регистра, целым словом или фразой
+/// (пробелы фразы — любые); часть слова не совпадает.
+#[tokio::test]
+async fn brief_task_matches_keyword() {
+    let a = api("brief-trig-kw", roomy).await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let fee = trap(
+        &a,
+        &knowledge(),
+        "Ставка 4.5 вместо 10",
+        "gotcha",
+        &[("keyword", "комиссия")],
+    )
+    .await;
+    let lots = trap(
+        &a,
+        &sol(),
+        "Округление объёма",
+        "failure",
+        &[("keyword", "дробные лоты")],
+    )
+    .await;
+    let ask = |s: &'static str, task: &'static str| {
+        let a = &a;
+        async move {
+            let j = brief(
+                a,
+                &a.token,
+                s,
+                json!({"event": "brief", "solution": G, "task": task}),
+            )
+            .await;
+            text(&j).to_string()
+        }
+    };
+    let t = ask("kw1:ag", "Проверь КОМИССИЯ ES и ДРОБНЫЕ   лоты в бэктесте").await;
+    let tr = traps(&t);
+    assert!(tr.iter().any(|l| l.ends_with(&format!("i:{fee}"))), "{t}");
+    assert!(tr.iter().any(|l| l.ends_with(&format!("i:{lots}"))), "{t}");
+    let t = ask("kw2:ag", "Проверь комиссионные и дробные лотки").await;
+    assert!(
+        !t.contains(&format!("i:{fee}")) && !t.contains(&format!("i:{lots}")),
+        "{t}"
+    );
+}
+
+/// M7.5 §8.9 п. 2: в «Ловушках» сначала ловушки решения по триггерам, затем Knowledge по
+/// триггерам (даже более новые), затем найденные поиском; повторов нет.
+#[tokio::test]
+async fn brief_solution_traps_before_knowledge() {
+    let a = api("brief-trig-order", roomy).await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let own = trap(
+        &a,
+        &sol(),
+        "Сначала копия базы",
+        "gotcha",
+        &[("keyword", "миграции")],
+    )
+    .await;
+    let kn = trap(
+        &a,
+        &knowledge(),
+        "Остановить воркеры",
+        "gotcha",
+        &[("keyword", "миграции")],
+    )
+    .await;
+    let found = trap(&a, &sol(), "Перед миграции проверь место", "failure", &[]).await;
+    let j = brief(
+        &a,
+        &a.token,
+        "ord:ag",
+        json!({"event": "brief", "solution": G,
+        "task": "Проведи миграции базы"}),
+    )
+    .await;
+    let t = text(&j);
+    let tr = traps(t);
+    let at = |id: &str| {
+        tr.iter()
+            .position(|l| l.ends_with(&format!("i:{id}")))
+            .unwrap_or_else(|| panic!("нет i:{id}: {t}"))
+    };
+    assert!(at(&own) < at(&kn) && at(&kn) < at(&found), "{t}");
+    assert_eq!(tr.len(), 3, "{t}");
+}
+
+/// M7.5 §8.9 п. 2: предел раздела прежний (`BRIEF_ENTRIES_MAX`): совпавших по триггерам больше —
+/// новые первыми, найденная поиском не вошла; ловушка, которую нашли и триггер, и поиск, —
+/// одной строкой.
+#[tokio::test]
+async fn brief_trigger_traps_respect_limit() {
+    let a = api("brief-trig-limit", roomy).await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let max = zam_server::api::recall::BRIEF_ENTRIES_MAX;
+    let mut ids = Vec::new();
+    for i in 0..max + 2 {
+        ids.push(
+            trap(
+                &a,
+                &sol(),
+                &format!("Шаг выпуска {i}"),
+                "gotcha",
+                &[("keyword", "релиз")],
+            )
+            .await,
+        );
+    }
+    // и триггер, и поиск («релиз» в заголовке) — самая новая
+    let both = trap(
+        &a,
+        &sol(),
+        "Релиз только с тегом",
+        "gotcha",
+        &[("keyword", "релиз")],
+    )
+    .await;
+    let search_only = trap(&a, &sol(), "Релиз без записи changelog", "failure", &[]).await;
+    let j = brief(
+        &a,
+        &a.token,
+        "lim:ag",
+        json!({"event": "brief", "solution": G,
+        "task": "Готовим релиз 0.0.18"}),
+    )
+    .await;
+    let t = text(&j);
+    let tr = traps(t);
+    assert_eq!(tr.len(), max, "{t}");
+    assert!(tr[0].ends_with(&format!("i:{both}")), "{t}");
+    assert_eq!(t.matches(&format!("i:{both}")).count(), 1, "{t}");
+    assert!(
+        tr[1].ends_with(&format!("i:{}", ids[max + 1])),
+        "новые первыми: {t}"
+    );
+    assert!(!t.contains(&format!("i:{search_only}")), "{t}");
+    assert!(!t.contains(&format!("i:{}", ids[0])), "{t}");
+}

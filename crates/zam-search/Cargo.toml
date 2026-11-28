@@ -19,3 +19,6 @@ serde_json.workspace = true
 # разбиения наборов `eval` (M7.3 §6.4 п. 2): `probe_split` и `split_by_rank` — blake3(соль ‖ id);
 # крейт уже в workspace (zam-store, xtask; CC0-1.0 OR Apache-2.0)
 blake3.workspace = true
+# `file_glob` триггеров (`triggers`, M7.5 §8.9 п. 2): одно сопоставление для `brief` сервера и хука
+# `pre-tool` клиента; крейт уже в workspace (zam-store, zam-cli; Unlicense OR MIT, берём MIT)
+globset.workspace = true
