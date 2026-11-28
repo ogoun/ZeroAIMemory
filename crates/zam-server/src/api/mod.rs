@@ -242,7 +242,12 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
         .route("/api/v1/check/runs/{id}", get(check::run))
         .route("/api/v1/check/run", post(check::start))
         .route("/api/v1/check/accept", post(check::accept))
-        .route("/api/v1/check/probes", get(check::probes))
+        // ручные пробы и снятие (M7.4 §7.6 п. 3): набор проверки, не запись памяти
+        .route(
+            "/api/v1/check/probes",
+            get(check::probes).post(check::create_probe),
+        )
+        .route("/api/v1/check/probes/{id}", delete(check::retire_probe))
         .route("/api/v1/health", get(health::health))
         .route("/api/v1/ready", get(health::ready))
         .route("/api/v1/auth/login", post(login::login))
@@ -421,6 +426,8 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
         )
         .route("/api/v1/admin/tokens/{id}", delete(admin::revoke_token))
         .route("/api/v1/admin/audit", get(admin::list_audit))
+        // сводка внутренних работ по всем пользователям (M7.4 §7.6 п. 2)
+        .route("/api/v1/admin/works", get(works::admin_summary))
         // копии из WebUI (M7 §5.6): копия в процессе сервера, список, удаление готовой копии
         .route(
             "/api/v1/admin/backups",

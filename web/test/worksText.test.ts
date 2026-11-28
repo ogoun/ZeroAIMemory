@@ -7,9 +7,11 @@ import { test } from 'node:test';
 import {
   CALL_NO_MS_HINT,
   addressView,
+  adminCheckText,
   callDurationText,
   callMsText,
   checkOffText,
+  modesSummary,
   num,
   pinnedHost,
   pinnedUrl,
@@ -18,6 +20,7 @@ import {
   outcomeText,
   parseBodyExtra,
   proposalAuthorText,
+  queueText,
   reachOfHost,
   rulesTokensText,
   tzOffsetMin,
@@ -167,4 +170,15 @@ test('works_proposal_texts', () => {
   assert.equal(rulesTokensText({ now: 0, after: 43 }), 'Rules в каждой сессии: 0 → 43 токена (+43)');
   assert.equal(rulesTokensText({ now: 20, after: 21 }), 'Rules в каждой сессии: 20 → 21 токен (+1)');
   assert.equal(rulesTokensText(null), '');
+});
+
+test('works_admin_summary_texts', () => {
+  // сводка администратора (M7.4 §7.7 п. 2): режимы видов, очередь, последний прогон проверки
+  assert.equal(modesSummary({ probes: { mode: 'agent' }, rules: { mode: 'off' } }), 'пробы: агент · кандидаты в Rules: выкл');
+  assert.equal(modesSummary(undefined), 'пробы: выкл · кандидаты в Rules: выкл');
+  assert.equal(queueText(2, 1), '2 в очереди · 1 идёт');
+  assert.equal(queueText(0, 0), 'пусто');
+  assert.equal(adminCheckText({ status: 'done', verdict: 'regression' }), 'ухудшение');
+  assert.equal(adminCheckText({ status: 'skipped', verdict: null }), 'пропущен');
+  assert.equal(adminCheckText({ status: null, verdict: null }), 'не было');
 });

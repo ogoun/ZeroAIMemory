@@ -198,7 +198,8 @@ test('admin_backups_run_list_delete', async ({ page }) => {
 test('admin_audit_feed', async ({ page }) => {
   // лента по 100 (§5.6 п. 4): выпуск токена — за первой сотней событий, виден после «Показать
   // ещё»; вход администратора (global-setup и прежние спеки) — на одной из следующих страниц;
-  // фильтры по действию и пользователю — по загруженному. Своего входа нет: лимит входа общий
+  // фильтры по действию и пользователю — с M7.4 запросом к серверу (раньше — по загруженному,
+  // решение 25 снято). Своего входа нет: лимит входа общий
   test.setTimeout(120_000);
   const problems = watch(page);
   const call = await adminApi(page.request);
@@ -218,16 +219,17 @@ test('admin_audit_feed', async ({ page }) => {
   await open(page, '#/admin/audit');
   await expect(page.getByRole('heading', { name: 'Аудит', exact: true })).toBeVisible();
   const rows = page.locator('tr[data-audit]');
-  const shown = page.getByRole('status').filter({ hasText: 'загруженных' });
+  // M7.4 (§7.7 п. 3): строка числа — «Загружено: N» (фильтры — на сервере, «из загруженных» нет)
+  const shown = page.getByTestId('audit-count');
   await expect(rows).toHaveCount(100);
-  await expect(shown).toHaveText('показано 100 из 100 загруженных');
+  await expect(shown).toHaveText('Загружено: 100 — есть ещё');
   await expect(page.locator('tr[data-audit="token_issue"]').filter({ hasText: name })).toHaveCount(0);
   await page.getByRole('button', { name: 'Показать ещё' }).click();
   // вторая страница — до 100 событий (сколько их было до сценария, зависит от прогона)
   await expect.poll(() => rows.count()).toBeGreaterThan(100);
   const total = await rows.count();
   expect(total).toBeLessThanOrEqual(200);
-  await expect(shown).toHaveText(`показано ${total} из ${total} загруженных`);
+  await expect(shown).toHaveText(new RegExp(`^Загружено: ${total}( — есть ещё)?$`));
   await expect(page.locator('tr[data-audit="token_issue"]').filter({ hasText: name })).toHaveCount(2);
   const token = page.locator('tr[data-audit="token_issue"]').filter({ hasText: issued.info.id });
   await expect(token).toHaveCount(1);
@@ -249,22 +251,29 @@ test('admin_audit_feed', async ({ page }) => {
   await details.locator('summary').click();
   await expect(details.locator('pre')).toContainText('"token"');
 
-  // фильтр по действию: только выпуски токенов, затем все
-  const actionSel = page.getByRole('combobox', { name: /^Действие/ });
+  expect(loaded).toBeGreaterThan(100);
+
+  // фильтр по действию — запросом к серверу (M7.4 §7.7 п. 3, решение 25 снято): только выпуски
+  // токенов, лента — с первой страницы
+  const action = page.getByLabel('Действие');
   const userSel = page.getByRole('combobox', { name: /^Пользователь/ });
-  await actionSel.selectOption('token_issue');
-  await expect(rows.first()).toBeVisible();
+  await action.fill('token_issue');
+  await action.press('Enter');
+  await expect(shown).toHaveText(/^По фильтрам: \d+/);
+  await expect(page.locator('tr[data-audit]:not([data-audit="token_issue"])')).toHaveCount(0);
   const issues = await rows.count();
   expect(issues).toBeGreaterThanOrEqual(2);
-  await expect(page.locator('tr[data-audit]:not([data-audit="token_issue"])')).toHaveCount(0);
-  await expect(shown).toHaveText(`показано ${issues} из ${loaded} загруженных`);
   // и по пользователю: выпуски токенов нового пользователя — при создании и явный
   await userSel.selectOption({ label: name });
   await expect(rows).toHaveCount(2);
-  await actionSel.selectOption('');
-  // все события пользователя: создание, выпуски токенов и правки имени
+  await action.fill('');
+  await action.press('Enter');
+  // все события пользователя: создание, выпуски токенов и правки имени — с первой страницы (100)
+  await expect(rows).toHaveCount(100);
   await expect(page.locator('tr[data-audit]:not([data-audit="user_update"]):not([data-audit="token_issue"]):not([data-audit="user_create"])')).toHaveCount(0);
+  // без фильтров — снова первая страница всех событий
   await userSel.selectOption('');
-  await expect(rows).toHaveCount(loaded);
+  await expect(rows).toHaveCount(100);
+  await expect(shown).toHaveText('Загружено: 100 — есть ещё');
   expect(problems, problems.join('\n')).toEqual([]);
 });

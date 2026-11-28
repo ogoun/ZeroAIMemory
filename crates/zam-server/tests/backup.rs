@@ -839,6 +839,62 @@ async fn backup_missing_blob_fails_listed() {
     stop(a).await;
 }
 
+/// Копия и её опись берут только блобы со ссылками (M7.4 §7.4 п. 5): откреплённый блоб
+/// (`refcount = 0`) в копию не идёт, а его пропавший файл копию не роняет.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_lists_only_referenced_blobs() {
+    let _g = CHUNKER.read().await;
+    let (a, shas) = seeded("bk-referenced").await;
+    let cfg = cfg_of(&a);
+    let user = uid(&a);
+    let node = a.note("knowledge", "docs/c", "# В\n").await;
+    let node = node["id"].as_str().unwrap();
+    let data: Vec<u8> = (0..1700usize).map(|i| (i * 13 % 241) as u8).collect();
+    let j = common::attach::upload(&a, &a.token, node, "c.bin", &data).await;
+    let gone = j["sha256"].as_str().unwrap().to_string();
+    let r = a
+        .t(
+            Method::DELETE,
+            &format!("/api/v1/nodes/{node}/attachments/{gone}/c.bin"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    // файл мусора пропал (сборщик или руками) — копия всё равно снимается
+    std::fs::remove_file(
+        cfg.data_dir
+            .join("blobs")
+            .join(user.to_string())
+            .join(&gone[..2])
+            .join(&gone),
+    )
+    .unwrap();
+    let rep = run_backup(&cfg, BackupOpts::default()).await.unwrap();
+    let m = read_manifest(&rep.path);
+    let blobs: Vec<String> = m
+        .files
+        .iter()
+        .filter(|f| f.path.starts_with("blobs/"))
+        .map(|f| f.sha256.clone())
+        .collect();
+    let mut want = shas.clone();
+    want.sort();
+    let mut got = blobs.clone();
+    got.sort();
+    assert_eq!(got, want, "только блобы со ссылками");
+    assert!(m.missing_blobs.is_empty(), "{:?}", m.missing_blobs);
+    // строка мусора в копии базы осталась (её уберёт сборщик после восстановления)
+    let copy_db = rep.path.join("users").join(format!("{user}.db"));
+    assert_eq!(
+        count(
+            &copy_db,
+            &format!("SELECT count(*) FROM blobs WHERE sha256 = '{gone}' AND refcount = 0")
+        ),
+        1
+    );
+    stop(a).await;
+}
+
 // ---------------------------------------------------------------- отказы restore
 
 /// Готовая копия остановленного сервера и её конфигурация.
@@ -1200,6 +1256,199 @@ async fn restore_without_key_vault_unavailable() {
     };
     let r = restore(&dst, &copy, &opts).await.unwrap();
     assert!(r.vault_ok);
+}
+
+// ---------------------------------------------------------------- M7.4 §7.3: restore и долги
+
+/// Ключ Vault — три состояния (M7.4 §7.3 п. 1): ключа нет — `Missing` со строкой «мастер-ключа
+/// нет (ни ZAM_MASTER_KEY, ни <путь>)», чужой ключ — `Mismatch` с прежним `VAULT_WARNING`,
+/// прежний — `Fits` без строки; базы без ключей Vault — `NoKeys`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_vault_key_missing_vs_mismatch() {
+    use base64::Engine as _;
+    use zam_server::vault::keys::{VaultKeyState, key_state};
+    let _g = CHUNKER.read().await;
+    let (copy, src_cfg, _, _) = copy_of("rs-vault3").await;
+    let dst = dst_cfg("rs-vault3-dst");
+    let key_path = dst.data_dir.join("master.key");
+    let r = restore(&dst, &copy, &RestoreOpts::default()).await.unwrap();
+    assert_eq!(r.vault, VaultKeyState::Missing);
+    let w = r.vault_warning.clone().expect("строка о ключе");
+    assert!(w.contains("мастер-ключа нет"), "{w}");
+    assert!(w.contains("ZAM_MASTER_KEY"), "{w}");
+    assert!(w.contains(&key_path.display().to_string()), "{w}");
+
+    // чужой ключ того же формата: первый байт прежнего ключа изменён
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let own = std::fs::read_to_string(src_cfg.data_dir.join("master.key")).unwrap();
+    let mut raw = b64.decode(own.trim()).unwrap();
+    raw[0] ^= 0x5a;
+    std::fs::write(&key_path, b64.encode(&raw)).unwrap();
+    let opts = RestoreOpts {
+        replace: true,
+        ..RestoreOpts::default()
+    };
+    let r = restore(&dst, &copy, &opts).await.unwrap();
+    assert_eq!(r.vault, VaultKeyState::Mismatch);
+    assert_eq!(
+        r.vault_warning.as_deref(),
+        Some(zam_server::backup::restore::VAULT_WARNING)
+    );
+    assert!(!r.vault_ok);
+
+    std::fs::write(&key_path, own).unwrap();
+    let r = restore(&dst, &copy, &opts).await.unwrap();
+    assert_eq!(
+        (r.vault, r.vault_warning.as_deref()),
+        (VaultKeyState::Fits, None)
+    );
+    assert!(r.vault_ok);
+
+    // ключей Vault нет — раскрывать нечего
+    let empty = common::cfg_in(common::tmp("rs-vault3-empty").join("d"));
+    let dd = DataDir::open(&empty.data_dir).unwrap();
+    let sys = SystemStore::open(&dd).unwrap();
+    assert_eq!(
+        key_state(&empty, &sys, None).await.unwrap(),
+        VaultKeyState::NoKeys
+    );
+}
+
+/// `--replace` переносит `first-admin-token.txt` прежних данных в `backups/pre-restore-…`
+/// вместе с базами (M7.4 §7.3 п. 2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_replace_moves_first_admin_token() {
+    let _g = CHUNKER.read().await;
+    let (copy, _, _, _) = copy_of("rs-token").await;
+    let dst = dst_cfg("rs-token-dst");
+    let old = api_with(dst.clone()).await;
+    stop(old).await;
+    let token = dst.data_dir.join(zam_server::INITIAL_TOKEN_FILE);
+    std::fs::write(&token, "прежний первый токен").unwrap();
+    let opts = RestoreOpts {
+        replace: true,
+        ..RestoreOpts::default()
+    };
+    let rep = restore(&dst, &copy, &opts).await.unwrap();
+    let moved = rep.moved_to.expect("перенос прежних данных");
+    assert!(!token.exists(), "прежний токен остался в каталоге данных");
+    assert_eq!(
+        std::fs::read_to_string(moved.join(zam_server::INITIAL_TOKEN_FILE)).unwrap(),
+        "прежний первый токен"
+    );
+}
+
+/// Управляемый Qdrant, `--replace --no-reindex` — строка итога о прежнем хранилище; с
+/// пересборкой (хранилище стирается при старте) и в пустой каталог — без неё.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_replace_no_reindex_qdrant_note() {
+    const NOTE: &str = "хранилище Qdrant прежних данных остаётся: zam-server qdrant reset --yes \
+                        или reindex";
+    let _g = CHUNKER.read().await;
+    let (copy, _, _, _) = copy_of("rs-qnote").await;
+    let dst = dst_cfg("rs-qnote-dst");
+    assert_eq!(dst.qdrant.mode, zam_server::config::QdrantMode::Managed);
+    let no_reindex = RestoreOpts {
+        reindex: false,
+        ..RestoreOpts::default()
+    };
+    let r = restore(&dst, &copy, &no_reindex).await.unwrap();
+    assert!(!r.notes.iter().any(|n| n == NOTE), "{:?}", r.notes);
+    let replace = RestoreOpts {
+        replace: true,
+        reindex: false,
+        ..RestoreOpts::default()
+    };
+    let r = restore(&dst, &copy, &replace).await.unwrap();
+    assert!(r.notes.iter().any(|n| n == NOTE), "{:?}", r.notes);
+    assert!(r.text().contains(NOTE));
+    let reindex = RestoreOpts {
+        replace: true,
+        ..RestoreOpts::default()
+    };
+    let r = restore(&dst, &copy, &reindex).await.unwrap();
+    assert!(!r.notes.iter().any(|n| n == NOTE), "{:?}", r.notes);
+}
+
+/// Срок признака копии — одна функция `BackupSection::flag_max_age()` (M7.4 §7.3 п. 3): её берут
+/// `serve`, `backup` и `restore`, своей арифметики часов у них нет.
+#[test]
+fn flag_max_age_single_source() {
+    let b = BackupSection {
+        flag_max_hours: 3,
+        ..BackupSection::default()
+    };
+    assert_eq!(b.flag_max_age(), Duration::from_secs(3 * 3600));
+    assert_eq!(
+        BackupSection::default().flag_max_age(),
+        Duration::from_secs(6 * 3600)
+    );
+    for (name, src) in [
+        ("app.rs", include_str!("../src/app.rs")),
+        ("backup/mod.rs", include_str!("../src/backup/mod.rs")),
+        (
+            "backup/restore.rs",
+            include_str!("../src/backup/restore.rs"),
+        ),
+    ] {
+        assert!(src.contains("backup.flag_max_age()"), "{name}");
+        assert!(
+            !src.contains("flag_max_hours) * 3600"),
+            "{name}: свой расчёт срока признака"
+        );
+    }
+}
+
+/// Размер из описи — параметр `with_reader` (M7.4 §7.3 п. 4): источник длиннее заявленного —
+/// `Oversize` до чтения потока (замыкание не вызывается) — и у каталога, и у архива; поток
+/// заявленного размера читается целиком.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restore_oversize_stream_early() {
+    use zam_server::backup::restore::Source;
+    let _g = CHUNKER.read().await;
+    let (a, _) = seeded("rs-early").await;
+    let cfg = cfg_of(&a);
+    let zip = common::tmp("rs-early-zip").join("copy.zip");
+    let zrep = run_backup(
+        &cfg,
+        BackupOpts {
+            zip: Some(zip.clone()),
+            ..BackupOpts::default()
+        },
+    )
+    .await
+    .unwrap();
+    let drep = run_backup(&cfg, BackupOpts::default()).await.unwrap();
+    stop(a).await;
+    let m = read_manifest(&drep.path);
+    let f = m.files.iter().find(|f| f.path == "system.db").unwrap();
+    for src in [drep.path.clone(), zrep.path.clone()] {
+        let mut s = Source::open(&src).unwrap();
+        let mut called = false;
+        let r = s.with_reader(&f.path, f.size - 1, |_r| {
+            called = true;
+            Ok(())
+        });
+        match r {
+            Err(BackupError::Oversize { path, max }) => {
+                assert_eq!((path.as_str(), max), ("system.db", f.size - 1));
+            }
+            other => panic!("ожидался Oversize: {other:?}"),
+        }
+        assert!(
+            !called,
+            "{}: поток читался до проверки размера",
+            src.display()
+        );
+        let n = s
+            .with_reader(&f.path, f.size, |r| {
+                let mut buf = Vec::new();
+                r.read_to_end(&mut buf)?;
+                Ok(buf.len() as u64)
+            })
+            .unwrap();
+        assert_eq!(n, f.size, "{}", src.display());
+    }
 }
 
 /// Прогноз векторов: другой `model_id` — пересчёт по модели, другой `meta.chunker` —

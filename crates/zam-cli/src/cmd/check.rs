@@ -3,6 +3,12 @@
 //! советами), `run [--no-wait]` (ручной прогон `POST /check/run`, ожидание конца). Время — UTC.
 //! Сервер без признака `memory_check` (`/health.features`) — код 1 с подсказкой обновить
 //! `zam-server`.
+//!
+//! Набор проб (M7.4 §7.6 п. 3): `probes list [--kind] [--status]` (`GET /check/probes`), `probes add
+//! "<вопрос>" --target <ссылка>… [--space]` (`POST /check/probes`, печатает `x:<id>`), `probes
+//! retire x:<id> --reason "…"` (`DELETE /check/probes/{id}`; снимает только человек — агентскому
+//! токену 403 с подсказкой [`RETIRE_HUMAN`]). `add` и `retire` у сервера без признака
+//! `check_probes_manage` (0.0.16-m7.3: 405 и 404) — код 1 с подсказкой обновить `zam-server`.
 
 use std::time::{Duration, Instant};
 
@@ -15,6 +21,14 @@ use crate::client::{CliError, read_json};
 pub const FEATURE: &str = "memory_check";
 /// Текст для старого сервера.
 pub const OLD_SERVER: &str = "сервер не поддерживает проверку памяти (/check): обновите zam-server";
+/// Признак ручных проб и снятия (`POST`, `DELETE /check/probes`; M7.4).
+pub const FEATURE_PROBES: &str = "check_probes_manage";
+/// Текст для сервера без ручных проб.
+pub const OLD_SERVER_PROBES: &str = "сервер не поддерживает ручные пробы (POST и DELETE \
+     /check/probes): обновите zam-server до 0.0.17-m7.4 или новее";
+/// Отказ снятия пробы агентским токеном (403): агент не прячет регрессию (решение 109).
+pub const RETIRE_HUMAN: &str = "снимает человек: WebUI «Проверка памяти» — агентский токен пробу \
+     не снимает; ошибочную пробу опишите человеку";
 /// Ожидание конца ручного прогона (предел `check_max_min` — до 240 мин).
 const RUN_WAIT: Duration = Duration::from_secs(4 * 60 * 60 + 60);
 /// Опрос прогона.
@@ -229,6 +243,95 @@ pub fn report(ctx: &Ctx) -> Result<(), CliError> {
         }
     }
     emit(s.as_bytes())
+}
+
+/// Строка пробы: `x:<id> вид/часть статус «вопрос» → цели` (снятая — с причиной).
+fn probe_line(p: &Value) -> String {
+    let targets: Vec<&str> = p["targets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t["ref"].as_str())
+        .collect();
+    let mut s = format!(
+        "{} {}/{} {} «{}»",
+        p["id"].as_str().unwrap_or("?"),
+        p["kind"].as_str().unwrap_or("?"),
+        p["split"].as_str().unwrap_or("?"),
+        p["status"].as_str().unwrap_or("?"),
+        p["question"].as_str().unwrap_or(""),
+    );
+    if !targets.is_empty() {
+        s.push_str(&format!(" → {}", targets.join(", ")));
+    }
+    if let Some(r) = p["retired_reason"].as_str() {
+        s.push_str(&format!(" (снята: {r})"));
+    }
+    s.push('\n');
+    s
+}
+
+/// `zam check probes list [--kind] [--status]`.
+pub fn probes_list(ctx: &Ctx, kind: Option<&str>, status: Option<&str>) -> Result<(), CliError> {
+    let mut q: Vec<(&str, &str)> = Vec::new();
+    q.extend(kind.map(|k| ("kind", k)));
+    q.extend(status.map(|s| ("status", s)));
+    let v = ctx
+        .client
+        .get("/check/probes", &q)
+        .and_then(read_json)
+        .map_err(|e| old_server(ctx, e, &[404], FEATURE, OLD_SERVER))?;
+    if ctx.json {
+        return emit_json(&v);
+    }
+    let items = v["items"].as_array().cloned().unwrap_or_default();
+    if items.is_empty() {
+        return emit("проб нет\n".as_bytes());
+    }
+    let s: String = items.iter().map(probe_line).collect();
+    emit(s.as_bytes())
+}
+
+/// `zam check probes add "<вопрос>" --target <ссылка>… [--space]`: печатает `x:<id>`.
+pub fn probes_add(
+    ctx: &Ctx,
+    question: &str,
+    targets: &[String],
+    space: Option<&str>,
+) -> Result<(), CliError> {
+    let mut body = json!({"question": question, "targets": targets});
+    if let Some(s) = space {
+        body["space"] = json!(s);
+    }
+    let v = ctx
+        .client
+        .post_json("/check/probes", &body)
+        .and_then(read_json)
+        .map_err(|e| old_server(ctx, e, &[404, 405], FEATURE_PROBES, OLD_SERVER_PROBES))?;
+    if ctx.json {
+        return emit_json(&v);
+    }
+    emit(format!("{}\n", v["id"].as_str().unwrap_or("?")).as_bytes())
+}
+
+/// `zam check probes retire x:<id> --reason "…"`: снимает только человек — агентскому токену
+/// сервер отвечает 403 ([`RETIRE_HUMAN`]).
+pub fn probes_retire(ctx: &Ctx, id: &str, reason: &str) -> Result<(), CliError> {
+    let id = id.trim();
+    ctx.client
+        .delete_json(&format!("/check/probes/{id}"), &json!({"reason": reason}))
+        .map_err(|e| {
+            let e = old_server(ctx, e, &[404, 405], FEATURE_PROBES, OLD_SERVER_PROBES);
+            if e.http_status() == Some(403) {
+                CliError::with_problem(e.code, format!("{RETIRE_HUMAN} (HTTP 403)"), e.problem)
+            } else {
+                e
+            }
+        })?;
+    if ctx.json {
+        return emit_json(&json!({"id": id, "status": "retired"}));
+    }
+    emit(format!("проба {id} снята\n").as_bytes())
 }
 
 /// `zam check run [--no-wait]`: ручной прогон; без `--no-wait` — ждёт его конца.

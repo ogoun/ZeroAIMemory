@@ -17,6 +17,15 @@
 //! копии сверх `keep` удаляются, начиная с самых старых. С M7.2 (§5.6) шаг идёт под замком
 //! [`crate::backup::runner::BackupRunner`], общим со страницей «Копии» WebUI: замок занят —
 //! шаг пропускается целиком до следующей минуты (ни копии, ни удаления, ни отметки попытки).
+//!
+//! Сборщик мусора блобов (M7.4 §7.4): раз в [`PERIOD`], первый проход — через
+//! [`BLOB_GC_FIRST_RUN`] после старта, при `limits.blob_gc_days > 0` — [`gc_blobs`] по всем
+//! пользователям ([`zam_store::blob_gc::sweep`]). Проход пропускается целиком, пока активен
+//! признак копии или занят замок копий [`BackupRunner`]; пользователь, чьи блобы сейчас пишутся
+//! (замок блобов занят), — до следующего прохода. Итог — строка INFO `blob gc: user=… rows=…
+//! files=… bytes=…` на пользователя и аудит `blobs.gc {users, rows, files, bytes}` при ненулевом
+//! итоге.
+//!
 //! Задача держит только `system.db` и кэш баз пользователей (открытые соединения SQLite);
 //! останавливается [`Maintenance::stop`] (с ожиданием: после него соединений **этой** задачи
 //! нет) или с последней копией состояния приложения. Другие держатели `Db` при остановке —
@@ -53,6 +62,9 @@ pub const FIRST_RUN: Duration = Duration::from_secs(10 * 60);
 /// Период проверки расписания автокопий.
 pub const BACKUP_TICK: Duration = Duration::from_secs(60);
 
+/// Задержка первого прохода сборщика мусора блобов после старта (M7.4 §7.4 п. 6).
+pub const BLOB_GC_FIRST_RUN: Duration = Duration::from_secs(60 * 60);
+
 /// Фоновая задача обслуживания; снимается при уничтожении.
 #[derive(Debug)]
 pub struct Maintenance {
@@ -71,6 +83,19 @@ impl Maintenance {
     ) -> Maintenance {
         let mut handles = Vec::new();
         let keep_days = cfg.snapshot.keep_days;
+        if cfg.limits.blob_gc_days > 0 {
+            let (system, users, cfg, backups) =
+                (system.clone(), users.clone(), cfg.clone(), backups.clone());
+            handles.push(tokio::spawn(async move {
+                let start = tokio::time::Instant::now() + BLOB_GC_FIRST_RUN;
+                let mut tick = tokio::time::interval_at(start, PERIOD);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    gc_blobs_in(&system, &users, &cfg, &backups, zam_store::time::now()).await;
+                }
+            }));
+        }
         if cfg.backup.schedule != BackupSchedule::Off {
             let system = system.clone();
             handles.push(tokio::spawn(async move {
@@ -345,6 +370,107 @@ async fn gc_cache_in(
         }
     }
     total
+}
+
+/// Итог прохода сборщика мусора блобов по всем пользователям ([`gc_blobs`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct BlobGcPass {
+    /// Проход пропущен целиком: `disabled` (`blob_gc_days = 0`) или `backup` (идёт копия).
+    pub skipped: Option<&'static str>,
+    /// Пользователей с удалениями.
+    pub users: u64,
+    pub rows: u64,
+    pub files: u64,
+    pub bytes: u64,
+    /// Пользователей, пропущенных до следующего прохода: замок блобов занят (идёт запись).
+    pub busy: u64,
+}
+
+/// Идёт ли копия каталога данных: признак копии или замок копий процесса.
+fn backup_running(cfg: &ServerConfig, backups: &BackupRunner) -> bool {
+    backups.state().running.is_some()
+        || zam_store::backup_flag_active(&cfg.data_dir, cfg.backup.flag_max_age())
+}
+
+/// Один проход сборщика мусора блобов (M7.4 §7.4) на момент `now` по всем пользователям.
+pub async fn gc_blobs(st: &AppState, now: Timestamp) -> BlobGcPass {
+    gc_blobs_in(&st.system, &st.users, &st.cfg, &st.backups, now).await
+}
+
+async fn gc_blobs_in(
+    system: &SystemStore,
+    users: &UserDbs,
+    cfg: &ServerConfig,
+    backups: &BackupRunner,
+    now: Timestamp,
+) -> BlobGcPass {
+    let mut pass = BlobGcPass::default();
+    let days = cfg.limits.blob_gc_days;
+    if days == 0 {
+        pass.skipped = Some("disabled");
+        return pass;
+    }
+    if backup_running(cfg, backups) {
+        tracing::info!("blob gc: идёт копия — проход пропущен до следующих суток");
+        pass.skipped = Some("backup");
+        return pass;
+    }
+    let list = match system.list_users().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "обслуживание: список пользователей недоступен");
+            return pass;
+        }
+    };
+    let blobs_dir = cfg.data_dir.join("blobs");
+    for u in list {
+        // копия могла начаться посреди прохода: остаток — следующим проходом
+        if backup_running(cfg, backups) {
+            tracing::info!("blob gc: началась копия — проход прерван до следующих суток");
+            break;
+        }
+        let store = zam_store::BlobStore::new(&blobs_dir, u.id);
+        let r = match users.get(u.id).await {
+            Ok(db) => zam_store::blob_gc::sweep(&db, store.root(), now, days).await,
+            Err(e) => Err(e),
+        };
+        match r {
+            Ok(r) if r.busy => {
+                tracing::debug!(user = %u.id, "blob gc: идёт запись блобов — пользователь пропущен");
+                pass.busy += 1;
+            }
+            Ok(r) if r.is_empty() => {}
+            Ok(r) => {
+                tracing::info!(
+                    "blob gc: user={} rows={} files={} bytes={}",
+                    u.id,
+                    r.rows,
+                    r.files,
+                    r.bytes
+                );
+                pass.users += 1;
+                pass.rows += r.rows;
+                pass.files += r.files;
+                pass.bytes += r.bytes;
+            }
+            Err(e) => tracing::warn!(user = %u.id, error = %e, "blob gc: проход не выполнен"),
+        }
+    }
+    if pass.rows + pass.files > 0 {
+        let details = serde_json::json!({
+            "users": pass.users,
+            "rows": pass.rows,
+            "files": pass.files,
+            "bytes": pass.bytes,
+        });
+        if let Err(e) = system
+            .audit("system", None, "blobs.gc", None, None, details)
+            .await
+        {
+            tracing::warn!(error = %e, "аудит blobs.gc не записан");
+        }
+    }
+    pass
 }
 
 /// Состояние автокопий между шагами: последняя попытка (удачная или нет) и подряд неудач.

@@ -1315,6 +1315,40 @@ async fn big_bodies_busy_503_small_unaffected() {
     assert_ne!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.text());
 }
 
+/// M7.4 §7.6 п. 6: `limits.big_body_permits = 1` (малая машина) — одно разрешение на большие
+/// тела: занято — большой отчёт получает 503 `/problems/busy` с `Retry-After`, малые тела идут;
+/// освобождено — отчёт принят.
+#[tokio::test]
+async fn big_body_permits_one_busy_503() {
+    let w = world_cfg("big-one", None, |c| {
+        c.limits.note_max_bytes = 1000;
+        c.limits.big_body_permits = 1;
+    })
+    .await;
+    assert_eq!(w.a.st.big_bodies.available(), 1);
+    let img = png(2, 80 * 1024);
+    let report = json!({"kind": "report", "title": "Т", "body": "![a](a.png)",
+                        "images": [{"name": "a.png", "data": b64(&img)}]})
+    .to_string();
+    let p = w.a.st.big_bodies.admit().await.unwrap();
+    assert_eq!(w.a.st.big_bodies.available(), 0);
+    let r = post_raw(&w, report.clone()).await;
+    assert_status(
+        &r,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "отчёт при занятом разрешении",
+    );
+    assert_eq!(r.json()["type"], "/problems/busy");
+    assert_eq!(r.header("retry-after"), "2");
+    let r = w
+        .js(&w.a_tok, G, json!({"title": "Малый", "body": "x"}), None)
+        .await;
+    assert_status(&r, StatusCode::CREATED, "малый отчёт");
+    drop(p);
+    let r = post_raw(&w, report).await;
+    assert_status(&r, StatusCode::CREATED, "отчёт после освобождения");
+}
+
 /// Имя части `filename*=UTF-8''…` (RFC 8187) с кириллицей и пробелом: только `filename*` и
 /// вместе с `filename` в UTF-8 (как шлёт `zam report`); неверный `filename*` — 400.
 #[tokio::test]

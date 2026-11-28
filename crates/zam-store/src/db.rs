@@ -420,11 +420,14 @@ impl Db {
             )));
         }
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        let before: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        // суммы миграций (M7.4 §7.1 п. 3) — до досборки 0025 и миграций: база с изменённой
+        // выпущенной миграцией не меняется вовсе
+        migrate::verify(&conn, migrations, before)?;
         // база пользователя версии 25 промежуточной сборки M6 — досборка схемы 0025 до
         // следующих миграций (`schema_repair`, ревью задачи 19 I-1, N-1): версия читается до
         // `apply`, иначе после 0026 досборка уже не сработала бы; у прочих баз — ничего
         if crate::schema_repair::is_user_list(migrations) {
-            let before: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
             let fixed = crate::schema_repair::repair_user_schema(&mut conn, before)?;
             if !fixed.is_empty() {
                 tracing::warn!(

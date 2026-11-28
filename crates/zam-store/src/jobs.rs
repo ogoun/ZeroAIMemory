@@ -762,6 +762,34 @@ pub async fn set_reindex_pending(db: &Db, spec: &serde_json::Value) -> Result<()
     mark_reindex(db, Some(spec.to_string())).await
 }
 
+/// [`set_reindex_pending`] на закрытом файле базы без миграций и досборки (`zam-server
+/// rollback`, M7.4 §7.2 п. 5: откаченная база мигратором этой сборки открываться не должна —
+/// он снова обновил бы её схему). Таблицы `meta` нет (схема до 0004) — `false`, файл не
+/// меняется.
+pub fn set_reindex_pending_closed(
+    path: &std::path::Path,
+    spec: &serde_json::Value,
+) -> Result<bool, StoreError> {
+    let c = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    c.busy_timeout(std::time::Duration::from_secs(5))?;
+    let has_meta: bool = c.query_row(
+        "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'meta'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_meta {
+        return Ok(false);
+    }
+    c.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        params![REINDEX_KEY, spec.to_string()],
+    )?;
+    Ok(true)
+}
+
 /// Незавершённая пересборка индекса базы ([`mark_reindex`]), если есть.
 pub async fn pending_reindex(db: &Db) -> Result<Option<String>, StoreError> {
     db.read(|c| {

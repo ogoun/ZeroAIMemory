@@ -178,6 +178,8 @@ impl ToolName {
                     "budget_tokens": {"type": "integer", "minimum": 1},
                     "expand": {"type": "string", "enum": ["none", "section", "neighbors", "graph"]},
                     "rerank": {"type": "string", "enum": ["off", "on"]},
+                    "include_history": {"type": "boolean", "description":
+                        "true — и замещённые, отозванные, закрытые записи (история); по умолчанию — только действующие"},
                     "skip_seen": {"type": "boolean", "description":
                         "true — выданное в сессии без фрагмента (seen); по умолчанию фрагмент и (выдавалось)"},
                     "session_id": session_id(),
@@ -232,6 +234,8 @@ impl ToolName {
                     }, "required": ["as"]},
                     "scope": {"type": "object", "description": "как у memory_search"},
                     "filters": {"type": "object", "description": "как у memory_search"},
+                    "include_history": {"type": "boolean", "description":
+                        "как у memory_search: выжимка запроса с историей (замещённые, отозванные, закрытые)"},
                     "format": fmt,
                 }),
                 &["query", "summary", "sources"],

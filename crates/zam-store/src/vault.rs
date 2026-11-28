@@ -30,6 +30,41 @@ use crate::{Db, StoreError, SystemStore};
 
 /// Ключ настройки с проверочным шифротекстом мастер-ключа (base64 в JSON-строке).
 pub const KEY_CHECK_SETTING: &str = "vault.key_check";
+
+/// Любой обёрнутый ключ пользователя на соединении `c` с `system.db` (в том числе только для
+/// чтения — `zam-server doctor`): `(user, wrapped)`.
+pub fn any_user_key_in(c: &Connection) -> Result<Option<(Id, Vec<u8>)>, StoreError> {
+    Ok(c.query_row(
+        "SELECT user_id, wrapped FROM user_keys ORDER BY created_at, user_id LIMIT 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()?)
+}
+
+/// Проверочный шифротекст мастер-ключа на соединении `c` с `system.db` (как
+/// [`SystemStore::vault_key_check`]).
+pub fn key_check_in(c: &Connection) -> Result<Option<Vec<u8>>, StoreError> {
+    let raw: Option<String> = c
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            [KEY_CHECK_SETTING],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let b64: String = serde_json::from_str(&raw).map_err(json_err)?;
+    decode_key_check(&b64)
+}
+
+fn decode_key_check(b64: &str) -> Result<Option<Vec<u8>>, StoreError> {
+    STANDARD
+        .decode(b64.as_bytes())
+        .map(Some)
+        .map_err(|_| StoreError::Corrupt(format!("{KEY_CHECK_SETTING}: не base64")))
+}
 /// Открытые поля `data`, что попадают в `vault_fts.open_text` (порядок — как в миграции 0018).
 pub const VAULT_OPEN_FIELDS: [&str; 7] = [
     "description",
@@ -646,16 +681,7 @@ impl SystemStore {
 
     /// Любой обёрнутый ключ (проверка мастер-ключа без `key_check`): `(user, wrapped)`.
     pub async fn vault_any_user_key(&self) -> Result<Option<(Id, Vec<u8>)>, StoreError> {
-        self.db
-            .read(|c| {
-                Ok(c.query_row(
-                    "SELECT user_id, wrapped FROM user_keys ORDER BY created_at, user_id LIMIT 1",
-                    [],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?)
-            })
-            .await
+        self.db.read(any_user_key_in).await
     }
 
     /// Проверочный шифротекст мастер-ключа (`settings['vault.key_check']`).
@@ -663,10 +689,7 @@ impl SystemStore {
         let Some(b64) = self.get_setting::<String>(KEY_CHECK_SETTING).await? else {
             return Ok(None);
         };
-        STANDARD
-            .decode(b64.as_bytes())
-            .map(Some)
-            .map_err(|_| StoreError::Corrupt(format!("{KEY_CHECK_SETTING}: не base64")))
+        decode_key_check(&b64)
     }
 
     /// Записывает проверочный шифротекст, если его ещё нет; возвращает действующий.

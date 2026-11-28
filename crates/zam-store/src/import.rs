@@ -1318,10 +1318,14 @@ fn parse_entry(t: &RawText) -> Result<PlanEntry, ImportError> {
 
 /// Распаковывает файлы вложений плана (`Plan::blobs`) в блобы пользователя (после [`validate_archive`], не при
 /// `dry_run`). Файл — потоком, через `<root>/.incoming/<id>.part`; sha256 сверяется с планом.
+/// `_held` — разделяемый замок блобов пользователя ([`BlobStore::share`]): вызывающий держит его
+/// до конца [`apply_plan`], иначе сборщик мусора мог бы убрать уже бывший файл до записи строки
+/// (M7.4 §7.4 п. 3).
 pub fn extract_blobs<R: Read + Seek>(
     zip: &mut ZipArchive<R>,
     blobs: &BTreeMap<String, (String, u64)>,
     store: &BlobStore,
+    _held: &crate::blob_gc::BlobShare,
 ) -> Result<(), ImportError> {
     for (name, (sha, size)) in blobs {
         let f = zip
@@ -1837,7 +1841,9 @@ fn note_attrib(ctx: &Ctx) -> Attribution {
     }
 }
 
-/// Вложения новой заметки (блобы уже на месте; документы — с id назначения).
+/// Вложения новой заметки (блобы уже на месте; документы — с id назначения). Идёт под замком
+/// блобов пользователя, взятым до [`extract_blobs`]: файл, распакованный или уже бывший, не
+/// убирается сборщиком до этой строки.
 fn put_attachments(
     c: &Connection,
     ctx: &Ctx,
@@ -2497,6 +2503,7 @@ fn apply_entry(
             None => (e.author.clone(), created.clone()),
         };
         put_entry_rev(c, e.id, 1, e.kind, &fields, None, &a, &ts)?;
+        // файлы отчёта — под замком блобов, взятым до `extract_blobs` (как `put_attachments`)
         for f in &e.files {
             let size = i64::try_from(f.size).unwrap_or(i64::MAX);
             let mime = f
@@ -2722,7 +2729,8 @@ const DRY_RUN: &str = "\u{0}dry-run";
 
 /// Записывает план в пространство `space` (см. модуль). `attrib` — атрибуция запроса (автор
 /// ревизий импорта — `system`). `user` — пользователь базы (свой ли архив). План забирается по
-/// значению: элементы уходят пачкам без копий.
+/// значению: элементы уходят пачкам без копий. Строки `blobs` вложений пишутся под замком
+/// блобов, взятым вызывающим до [`extract_blobs`] (M7.4 §7.4 п. 3).
 pub async fn apply_plan(
     db: &Db,
     space: Id,

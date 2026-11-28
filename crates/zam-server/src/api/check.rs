@@ -25,6 +25,24 @@
 //!   эпизода (иначе 409 `/problems/check-accept-not-latest`); аудит `check.accept {run, verdict}`.
 //! - `GET /check/probes?kind=&status=&split=&limit=` (1..=1000, 200) → `{items}` — пробы, новые
 //!   первыми.
+//! - `POST /check/probes {question, targets: ["<буква>:<id>"], space?}` (M7.4 §7.6 п. 3, признак
+//!   `check_probes_manage`; человек или токен `rw`, `ro` — 403) → 201 `{id: "x:<id>"}` — ручная
+//!   проба вида `manual`: автор по принципалу (токен — `agent`, сессия WebUI — `human`), часть —
+//!   общим правилом по первой цели (`zam_search::eval::probe_split`), ревизии целей — текущие.
+//!   Цель — живая заметка `n:` или запись журнала своей буквы
+//!   ([`zam_store::probes::live_target`]); не найдена, не действует или не из пространства
+//!   пробы — 422; пространство — `space` (`knowledge`, `rules`, GUID решения, id) или цели,
+//!   Human — 422 (агент его не видит — проба ничего не меряет). Повтор вопроса — 409
+//!   `/problems/probe-duplicate`, активных проб с целью — `PROBES_MAX` — 409
+//!   `/problems/probes-limit`; ссылка не `<буква>:<id>`, без целей или больше
+//!   [`MANUAL_TARGETS_MAX`], пустой или длиннее [`MANUAL_QUESTION_MAX`] вопрос — 400.
+//! - `DELETE /check/probes/{id} {reason}` — снять пробу: **только человек** (сессия WebUI, как
+//!   `accept`; агентский токен — 403: агент не прячет регрессию, решение 109); `reason` 3..=500
+//!   символов (иначе 422 `/problems/reason-required`) — причина снятия в пробе и аудит
+//!   `check.probe.retire {probe, reason}`; снятая, чужая и несуществующая — 404; посторонний
+//!   вопрос набора сервера — 409 `code: negative_probe` (набор вернул бы его следующим прогоном).
+use std::ops::RangeInclusive;
+
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
@@ -34,8 +52,11 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use zam_core::Id;
+use zam_store::SpaceKind;
 use zam_store::check::{AcceptOutcome, CheckRun, RunStatus, Trigger};
-use zam_store::probes::{Probe, ProbeFilter, ProbeKind, Split};
+use zam_store::probes::{
+    InsertOutcome, NewProbe, PROBES_MAX, Probe, ProbeAuthor, ProbeFilter, ProbeKind, Split,
+};
 
 use super::{json_body, parse_id, query};
 use crate::app::AppState;
@@ -53,6 +74,12 @@ pub const RUNS_LIMIT_MAX: usize = 365;
 /// `GET /check/probes`: по умолчанию и предел.
 pub const PROBES_LIMIT_DEFAULT: usize = 200;
 pub const PROBES_LIMIT_MAX: usize = 1000;
+/// Ручная проба: вопрос, символов (как запрос `memory_search` — до 512).
+pub const MANUAL_QUESTION_MAX: usize = 512;
+/// Ручная проба: целей (как у пробы из кэша, `zam_store::probes::CACHE_PROBE_TARGETS`).
+pub const MANUAL_TARGETS_MAX: usize = zam_store::probes::CACHE_PROBE_TARGETS;
+/// Причина снятия пробы, символов.
+pub const RETIRE_REASON_CHARS: RangeInclusive<usize> = 3..=500;
 
 /// Пользователь запроса (несуществующий — 404).
 async fn user_of(st: &AppState, p: &Principal, h: &HeaderMap) -> Result<Id, ApiError> {
@@ -216,6 +243,24 @@ pub(crate) fn check_json(cfg: &crate::config::WorksSection, works: &UserWorks) -
         "user": if works.check { "on" } else { "off" },
         "reason": reason,
     })
+}
+
+/// Последний законченный прогон пользователя `{status, verdict}` — тот же `last`, что у
+/// `GET /check/status` (прерванные помечены): строка сводки администратора `GET /admin/works`
+/// (M7.4 §7.6 п. 2). Прогонов нет — оба `null`.
+pub(crate) async fn last_brief(
+    st: &AppState,
+    user: Id,
+    db: &zam_store::Db,
+) -> Result<Value, ApiError> {
+    crate::check::ensure_marked(st, user, db).await?;
+    // идущий прогон у пользователя — не больше одного: последний законченный — среди трёх
+    let runs = zam_store::check::runs(db, 3).await?;
+    let last = runs.iter().find(|r| r.status != RunStatus::Running);
+    Ok(json!({
+        "status": last.map(|r| r.status.as_str()),
+        "verdict": last.and_then(CheckRun::verdict_kind),
+    }))
 }
 
 #[derive(Deserialize)]
@@ -457,4 +502,210 @@ pub async fn probes(
     Ok(Json(json!({
         "items": items.iter().map(|pr| probe_json(&p, pr)).collect::<Vec<_>>(),
     })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeReq {
+    question: String,
+    targets: Vec<String>,
+    /// `knowledge`, `rules`, GUID решения или id пространства; без поля — пространство целей.
+    space: Option<String>,
+}
+
+/// Ссылка формы `<буква>:<id>` (буква — латинская строчная, id — разбирается).
+fn ref_form(s: &str) -> bool {
+    s.split_once(':').is_some_and(|(l, id)| {
+        !l.is_empty() && l.bytes().all(|b| b.is_ascii_lowercase()) && id.parse::<Id>().is_ok()
+    })
+}
+
+/// Пространства, которые меряет проба: Knowledge, Rules, решения личной базы (Human агент не
+/// видит — проба ничего бы не мерила).
+const PROBE_SPACES: [SpaceKind; 3] = [SpaceKind::Knowledge, SpaceKind::Rules, SpaceKind::Solution];
+
+/// Пространство пробы по `space` (`knowledge`, `rules`, GUID решения или id) — из пространств
+/// [`PROBE_SPACES`] базы; иначе 400.
+async fn probe_space(db: &zam_store::Db, raw: &str) -> Result<Id, ApiError> {
+    let s = raw.trim();
+    zam_store::list_spaces(db)
+        .await?
+        .iter()
+        .filter(|x| PROBE_SPACES.contains(&x.kind))
+        .find(|x| {
+            x.kind.as_str() == s
+                || x.id.to_string() == s
+                || x.solution_guid
+                    .as_deref()
+                    .is_some_and(|g| g.eq_ignore_ascii_case(s))
+        })
+        .map(|x| x.id)
+        .ok_or_else(|| {
+            ApiError::BadRequest(
+                "space: knowledge, rules, GUID решения или id пространства вашей базы".into(),
+            )
+        })
+}
+
+/// `POST /check/probes {question, targets, space?}` → 201 `{id}` (см. модуль).
+pub async fn create_probe(
+    State(st): State<AppState>,
+    p: Principal,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    crate::api::scope::require_rw(&p)?;
+    let req: ProbeReq = json_body(body)?;
+    let question = req.question.trim();
+    if question.is_empty() || question.chars().count() > MANUAL_QUESTION_MAX {
+        return Err(ApiError::BadRequest(format!(
+            "question: вопрос, от 1 до {MANUAL_QUESTION_MAX} символов"
+        )));
+    }
+    let mut refs: Vec<&str> = Vec::new();
+    for t in req.targets.iter().map(|t| t.trim()) {
+        if !ref_form(t) {
+            return Err(ApiError::BadRequest(format!(
+                "targets: «{t}» — не ссылка <буква>:<id> (n:<id> заметки, i:<id> insight …)"
+            )));
+        }
+        if !refs.contains(&t) {
+            refs.push(t);
+        }
+    }
+    if refs.is_empty() || refs.len() > MANUAL_TARGETS_MAX {
+        return Err(ApiError::BadRequest(format!(
+            "targets: от 1 до {MANUAL_TARGETS_MAX} ссылок на записи, которые должен находить вопрос"
+        )));
+    }
+    let user = user_of(&st, &p, &headers).await?;
+    let db = st.users.get(user).await?;
+    let mut space = match req.space.as_deref() {
+        Some(s) => Some(probe_space(&db, s).await?),
+        None => None,
+    };
+    let mut targets = Vec::with_capacity(refs.len());
+    for r in &refs {
+        let Some((t, of)) = zam_store::probes::live_target(&db, r).await? else {
+            return Err(ApiError::Unprocessable(format!(
+                "цель {r} не найдена или не действует (удалена, замещена, отозвана; буква — \
+                 не того вида)"
+            )));
+        };
+        match space {
+            None => space = Some(of),
+            Some(s) if s != of => {
+                return Err(ApiError::Unprocessable(format!(
+                    "цель {r} — из другого пространства, чем проба: цели пробы — записи одного \
+                     пространства"
+                )));
+            }
+            Some(_) => {}
+        }
+        targets.push(t);
+    }
+    let space = space.ok_or_else(|| ApiError::Internal("проба без пространства".into()))?;
+    let kind = zam_store::list_spaces(&db)
+        .await?
+        .into_iter()
+        .find(|x| x.id == space)
+        .map(|x| x.kind);
+    if !kind.is_some_and(|k| PROBE_SPACES.contains(&k)) {
+        return Err(ApiError::Unprocessable(
+            "цели в Human: агент Human не видит — проба ничего не мерила бы".into(),
+        ));
+    }
+    let probe = NewProbe {
+        space: Some(space),
+        question: question.to_string(),
+        kind: ProbeKind::Manual,
+        split: zam_search::eval::probe_split(&targets[0].target),
+        targets,
+        overlap: None,
+        author_kind: if p.is_human() {
+            ProbeAuthor::Human
+        } else {
+            ProbeAuthor::Agent
+        },
+        author: Some(p.actor()),
+        work_id: None,
+    };
+    match zam_store::probes::insert_probe(&db, probe).await? {
+        InsertOutcome::Inserted(id) => {
+            Ok((StatusCode::CREATED, Json(json!({"id": format!("x:{id}")}))))
+        }
+        InsertOutcome::Duplicate => Err(ApiError::ProbeDuplicate(
+            "такой вопрос уже есть у активной пробы пространства (без учёта регистра и пробелов)"
+                .into(),
+        )),
+        InsertOutcome::Full => Err(ApiError::ProbesLimit(format!(
+            "активных проб с целью — {PROBES_MAX}: новые не принимаются; лишние снимает человек \
+             на странице «Проверка памяти»"
+        ))),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetireReq {
+    reason: Option<String>,
+}
+
+/// `DELETE /check/probes/{id} {reason}` → 204 — только человек (см. модуль).
+pub async fn retire_probe(
+    State(st): State<AppState>,
+    client: Client,
+    p: Principal,
+    headers: HeaderMap,
+    Path(raw): Path<String>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<StatusCode, ApiError> {
+    if !p.is_human() {
+        return Err(ApiError::Denied(
+            "пробу снимает только человек (WebUI «Проверка памяти»): агент не прячет регрессию — \
+             опишите ошибочную пробу человеку"
+                .into(),
+        ));
+    }
+    let raw = raw.trim();
+    let id = parse_id(raw.strip_prefix("x:").unwrap_or(raw))?;
+    let req: RetireReq = json_body(body)?;
+    let reason = req.reason.as_deref().map_or("", str::trim);
+    if !RETIRE_REASON_CHARS.contains(&reason.chars().count()) {
+        return Err(ApiError::ReasonRequired(format!(
+            "reason: причина снятия, от {} до {} символов",
+            RETIRE_REASON_CHARS.start(),
+            RETIRE_REASON_CHARS.end()
+        )));
+    }
+    let user = user_of(&st, &p, &headers).await?;
+    let db = st.users.get(user).await?;
+    let pr = zam_store::probes::probes_by_ids(&db, vec![id])
+        .await?
+        .into_iter()
+        .find(|x| x.active)
+        .ok_or(ApiError::NotFound)?;
+    if pr.kind == ProbeKind::Negative {
+        return Err(ApiError::conflict_code(
+            "negative_probe",
+            "посторонний вопрос — из набора сервера: снять его нельзя (набор вернёт его \
+             следующим прогоном)",
+            &[],
+        ));
+    }
+    if !zam_store::probes::retire_probe(&db, id, reason).await? {
+        return Err(ApiError::NotFound);
+    }
+    let probe = pr.reference();
+    st.system
+        .audit(
+            &p.actor(),
+            Some(user),
+            "check.probe.retire",
+            Some(&probe),
+            Some(&client.ip.to_string()),
+            json!({"probe": probe, "reason": reason}),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }

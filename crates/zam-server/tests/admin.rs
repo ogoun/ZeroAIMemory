@@ -413,6 +413,123 @@ async fn audit_pagination() {
     assert_eq!(s, StatusCode::OK);
 }
 
+/// M7.4 §7.6 п. 1: фильтры аудита запросом к серверу — `action` точно или префиксом `user.*`,
+/// `user` — id пользователя записи, `since`/`until` — RFC 3339 (`until` исключительно); прежние
+/// `limit` и `before` — как были и вместе с фильтрами; неверное значение — 400.
+#[tokio::test]
+async fn audit_filters_action_user_period() {
+    let c = ctx("filters").await;
+    let id = |j: &Value| j["user"]["id"].as_str().unwrap().to_string();
+    let ivan = id(&c.create("ivan").await);
+    let olga = id(&c.create("olga").await);
+    let pw = |uid: &str| format!("/api/v1/admin/users/{uid}/password");
+    let set = |uid: String| {
+        let c = &c;
+        async move {
+            let (s, j) = c
+                .call(
+                    Method::POST,
+                    &pw(&uid),
+                    Some(json!({"password": "filters-pass-1"})),
+                )
+                .await;
+            assert_eq!(s, StatusCode::OK, "{j}");
+        }
+    };
+    set(ivan.clone()).await;
+    // время записей различимо: границы периода — их метки
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let (s, _) = c.call(Method::DELETE, &pw(&ivan), None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    set(olga.clone()).await;
+    let get = |q: String| {
+        let c = &c;
+        async move {
+            let (s, j) = c
+                .call(Method::GET, &format!("/api/v1/admin/audit{q}"), None)
+                .await;
+            assert_eq!(s, StatusCode::OK, "{q}: {j}");
+            j["items"].as_array().cloned().unwrap_or_default()
+        }
+    };
+    let actions = |items: &[Value]| -> Vec<String> {
+        items
+            .iter()
+            .map(|r| r["action"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // точное действие
+    let exact = get("?action=user.password.set".into()).await;
+    assert_eq!(actions(&exact), ["user.password.set", "user.password.set"]);
+    // префикс `user.password.*`: set, clear, set — новые первыми
+    let pre = get("?action=user.password.*".into()).await;
+    assert_eq!(
+        actions(&pre),
+        [
+            "user.password.set",
+            "user.password.clear",
+            "user.password.set"
+        ]
+    );
+    // `_` в действии — не шаблон: `user_*` не находит `user.password.*`
+    let under = get("?action=user_*".into()).await;
+    assert!(
+        !under.is_empty() && under.iter().all(|r| r["action"] == "user_create"),
+        "{under:?}"
+    );
+    // пользователь записи
+    let of_ivan = get(format!("?action=user.password.*&user={ivan}")).await;
+    assert_eq!(
+        actions(&of_ivan),
+        ["user.password.clear", "user.password.set"]
+    );
+    assert!(of_ivan.iter().all(|r| r["user_id"] == ivan.as_str()));
+    // период: since включительно, until исключительно — только «clear»
+    let ts = |r: &Value| r["ts"].as_str().unwrap().to_string();
+    let (clear_ts, last_ts) = (ts(&pre[1]), ts(&pre[0]));
+    let period = get(format!("?since={clear_ts}&until={last_ts}")).await;
+    assert_eq!(actions(&period), ["user.password.clear"], "{period:?}");
+    let since = get(format!("?action=user.password.*&since={clear_ts}")).await;
+    assert_eq!(since.len(), 2);
+    // смещение пояса — то же мгновение (RFC 3339)
+    let t: jiff::Timestamp = clear_ts.parse().unwrap();
+    let local = t
+        .to_zoned(jiff::tz::TimeZone::fixed(jiff::tz::offset(3)))
+        .strftime("%Y-%m-%dT%H:%M:%S%.6f%:z")
+        .to_string()
+        .replace('+', "%2B");
+    let period = get(format!("?since={local}&until={last_ts}")).await;
+    assert_eq!(actions(&period), ["user.password.clear"], "{local}");
+    // с прежними limit и before: курсор продолжает отфильтрованный список
+    let (_, p1) = c
+        .call(
+            Method::GET,
+            "/api/v1/admin/audit?action=user.password.*&limit=2",
+            None,
+        )
+        .await;
+    assert_eq!(p1["items"].as_array().unwrap().len(), 2);
+    let next = p1["next"].as_i64().unwrap();
+    let p2 = get(format!("?action=user.password.*&before={next}")).await;
+    assert_eq!(actions(&p2), ["user.password.set"]);
+    // пустой параметр — без фильтра (форма WebUI со сброшенным полем)
+    let all = get("?action=&user=&since=&until=".into()).await;
+    assert_eq!(all.len(), get(String::new()).await.len());
+    // неверные значения — 400
+    for q in [
+        "?since=%D0%B2%D1%87%D0%B5%D1%80%D0%B0",
+        "?until=2026-13-01T00:00:00Z",
+        "?user=bad-id",
+        "?action=*",
+    ] {
+        let (s, j) = c
+            .call(Method::GET, &format!("/api/v1/admin/audit{q}"), None)
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{q}: {j}");
+    }
+}
+
 #[tokio::test]
 async fn admin_routes_reject_tokens_and_anonymous() {
     let c = ctx("authz").await;

@@ -13,6 +13,10 @@
 //!   суток и месяца UTC по журналу отправок, пределы ([`crate::works::exec::token_limits`] — те
 //!   же, по которым сервер отказывает), ночная проверка сервера и пользователя (как у
 //!   `GET /check/status`).
+//! - `GET /admin/works` (M7.4 §7.6 п. 2, признак `admin_works`; только администратор) →
+//!   `{users: [{user, login, modes, paused?, queued, running, failed_7d, last_night, tokens:
+//!   {day, month}, check: {status, verdict}}]}` — сводка по всем пользователям тем же кодом, что
+//!   `GET /works/usage` и `GET /check/status` ([`admin_summary`]).
 //! - `POST /works/run {kind, space?}` — ручной запуск вида (§6.3 п. 2), **только человек**
 //!   (токену — 403); `[works] enabled = false` — 409 `/problems/works-disabled` (решение 76);
 //!   действующий режим вида `off` — 409 `code: works_off` с причиной; предел ручных запусков
@@ -67,7 +71,7 @@ use super::search::targets::{ScopeReq, resolve_targets};
 use super::sessions::{McpOrigin, RequestSession, explicit_only, request_session};
 use super::{json_body, query};
 use crate::app::AppState;
-use crate::auth::Principal;
+use crate::auth::{AdminOnly, Principal};
 use crate::config::WorksMode;
 use crate::error::ApiError;
 use crate::works::kinds::{Author, ItemCtx};
@@ -167,14 +171,19 @@ fn modes_json(u: &settings::UserWorks, st: &AppState) -> Value {
     Value::Object(m)
 }
 
+/// Пауза исполнителя `{class, since, from, to}` (показ — только человеку).
+fn pause_json(u: &settings::UserWorks) -> Option<Value> {
+    u.pause.as_ref().map(|x| {
+        json!({"class": x.class, "since": zam_store::time::fmt_ts(x.since), "from": x.from, "to": x.to})
+    })
+}
+
 /// Пауза исполнителя для человека (`{class, since}`); агенту — нет.
 fn paused_json(p: &Principal, u: &settings::UserWorks) -> Option<Value> {
     if !p.is_human() {
         return None;
     }
-    u.pause.as_ref().map(|x| {
-        json!({"class": x.class, "since": zam_store::time::fmt_ts(x.since), "from": x.from, "to": x.to})
-    })
+    pause_json(u)
 }
 
 #[derive(Deserialize)]
@@ -257,6 +266,69 @@ pub async fn list(
     Ok(Json(out))
 }
 
+/// Расход токенов модели суток и месяца UTC по журналу отправок — одно определение у
+/// `GET /works/usage` и сводки администратора `GET /admin/works`.
+async fn tokens_used(db: &zam_store::Db) -> Result<(u64, u64), ApiError> {
+    let now = zam_store::time::now();
+    let day = zam_store::work_calls::tokens_since(db, zam_store::time::day_start_utc(now)).await?;
+    let month =
+        zam_store::work_calls::tokens_since(db, zam_store::time::month_start_utc(now)).await?;
+    Ok((day, month))
+}
+
+/// Упавшие работы сводки администратора — за столько суток (`failed_7d`).
+pub const ADMIN_FAILED_DAYS: i64 = 7;
+
+/// Строка сводки администратора одного пользователя (M7.4 §7.6 п. 2): режимы, пауза, очередь,
+/// упавшие за [`ADMIN_FAILED_DAYS`] суток, последняя ночь, токены, последний прогон проверки —
+/// теми же функциями, что `GET /works/usage`, `GET /works` и `GET /check/status`.
+async fn admin_row(st: &AppState, u: &zam_store::User) -> Result<Value, ApiError> {
+    let db = st.users.get(u.id).await?;
+    let now = zam_store::time::now();
+    store::expire(&db, now).await?;
+    let since = now - jiff::SignedDuration::from_hours(24 * ADMIN_FAILED_DAYS);
+    let c = store::state_counts(&db, since).await?;
+    let (day, month) = tokens_used(&db).await?;
+    let w = settings::load(&st.system, u.id).await?;
+    let last = store::last_night(&db).await?;
+    let mut row = json!({
+        "user": u.id,
+        "login": u.name,
+        "modes": modes_json(&w, st),
+        "queued": c.queued,
+        "running": c.running,
+        "failed_7d": c.failed_since,
+        "last_night": last.map(|d| d.to_string()),
+        "tokens": {"day": day, "month": month},
+        "check": super::check::last_brief(st, u.id, &db).await?,
+    });
+    if let Some(pz) = pause_json(&w) {
+        row["paused"] = pz;
+    }
+    Ok(row)
+}
+
+/// `GET /admin/works` → `{users: [...]}` — только администратор (M7.4 §7.6 п. 2, признак
+/// `admin_works`): строка на каждого пользователя ([`admin_row`]); база пользователя не
+/// открылась — строка `{user, login, error}` (WARN в журнал), сводка остальных не теряется.
+/// Подробности — `GET /works?user=`, `GET /works/calls?user=`.
+pub async fn admin_summary(
+    _: AdminOnly,
+    State(st): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let mut users = Vec::new();
+    for u in st.system.list_users().await? {
+        users.push(match admin_row(&st, &u).await {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::warn!(user = %u.id, error = %e, "сводка работ: база пользователя не прочитана");
+                json!({"user": u.id, "login": u.name, "error": e.to_string()})
+            }
+        });
+    }
+    Ok(Json(json!({"users": users})))
+}
+
 /// `GET /works/usage?user=` → `{day, month, ceiling, last_night, night, modes, check, paused?}`.
 pub async fn usage(
     State(st): State<AppState>,
@@ -267,10 +339,7 @@ pub async fn usage(
     let q = query(q)?;
     let user = works_user(&st, &p, &headers, q.user.as_deref()).await?;
     let db = st.users.get(user).await?;
-    let now = zam_store::time::now();
-    let day = zam_store::work_calls::tokens_since(&db, zam_store::time::day_start_utc(now)).await?;
-    let month =
-        zam_store::work_calls::tokens_since(&db, zam_store::time::month_start_utc(now)).await?;
+    let (day, month) = tokens_used(&db).await?;
     let u = settings::load(&st.system, user).await?;
     let cfg = &st.cfg.works;
     // те же пределы, по которым сервер отказывает (финальное ревью M7.3, Minor 6)

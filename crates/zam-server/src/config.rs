@@ -15,8 +15,9 @@ use zam_search::recall::CoverageRule;
 /// сборочные (build.rs, xtask), попадающие в окружение CI. Переменные клиента `zam` —
 /// [`zam_core::CLIENT_ENV_VARS`] (сессия, признак агента, имя машины, сессия `zam mcp`, пределы
 /// ожидания `zam export`/`zam import`): без этого `ZAM_MACHINE` или `ZAM_EXPORT_IDLE_SECS` в
-/// окружении пользователя ломали бы ручной запуск сервера.
-const RESERVED_ENV: [&str; 9] = [
+/// окружении пользователя ломали бы ручной запуск сервера. Открыт для сторожа литералов `ZAM_*`
+/// клиента (`crates/zam-cli/tests/env_literals.rs`, M7.4 §7.6 п. 7).
+pub const RESERVED_ENV: [&str; 9] = [
     "ZAM_ADMIN_PASSWORD",
     "ZAM_URL",
     "ZAM_TOKEN",
@@ -1065,6 +1066,34 @@ pub struct VaultSection {
 pub struct LimitsSection {
     pub note_max_bytes: usize,
     pub blob_max_bytes: usize,
+    /// Разрешений на большие тела запросов (больше `note_max_bytes`: отчёт MCP, тело `/mcp`) в
+    /// обработке одновременно (1..=8, по умолчанию 2; M7.4 §7.6 п. 6, решение 108): каждое тело
+    /// держится в памяти целиком ([`crate::api::big_body`]); на малой машине — 1.
+    pub big_body_permits: usize,
+    /// Возраст мусорного блоба, суток (0..=365, по умолчанию 7; M7.4 §7.4, решение 103): строку
+    /// `blobs` с `refcount = 0` и файл без строки, чей файл не менялся столько суток, удаляет
+    /// сборщик мусора воркера обслуживания (раз в сутки); 0 — сборщик выключен.
+    pub blob_gc_days: u32,
+}
+
+impl LimitsSection {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("limits.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
+        if !(1..=8).contains(&self.big_body_permits) {
+            return Err(bad("big_body_permits", "от 1 до 8"));
+        }
+        if self.blob_gc_days > 365 {
+            return Err(bad(
+                "blob_gc_days",
+                "от 0 до 365 суток (0 — сборщик мусора блобов выключен)",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Секция `[reports]` (M5.5 §5–6): пределы файлов отчёта. Размер одного файла — общий предел
@@ -1337,6 +1366,13 @@ impl BackupSection {
     /// Пояс `at`; проверен [`BackupSection::validate`] (иначе — UTC).
     pub fn time_zone(&self) -> jiff::tz::TimeZone {
         crate::schedule::parse_tz(&self.tz).unwrap_or(jiff::tz::TimeZone::UTC)
+    }
+
+    /// Срок годности признака копии `.zam-backup` и брошенных сборок `*.partial`
+    /// (`flag_max_hours`) — один источник для `serve`, `backup`, `restore`, `rollback` и
+    /// `doctor` (M7.4 §7.3 п. 3).
+    pub fn flag_max_age(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.flag_max_hours) * 3600)
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -1792,6 +1828,8 @@ impl Default for ServerConfig {
             limits: LimitsSection {
                 note_max_bytes: 5_242_880,
                 blob_max_bytes: 209_715_200,
+                big_body_permits: 2,
+                blob_gc_days: 7,
             },
             vault: VaultSection::default(),
             docs: DocsSection::default(),
@@ -1976,6 +2014,7 @@ pub fn load(
     cfg.recall.validate()?;
     cfg.docs.validate()?;
     cfg.reports.validate()?;
+    cfg.limits.validate()?;
     cfg.code.validate()?;
     cfg.ideas.validate()?;
     cfg.backup.validate()?;
@@ -2236,6 +2275,42 @@ note_max_bytes = 1000
             .unwrap_err()
             .to_string();
         assert!(e.contains("limits.note_max_bytes"), "{e}");
+    }
+
+    /// M7.4 §7.6 п. 6: `limits.big_body_permits` — 2 по умолчанию, 1..=8; вне диапазона — ошибка
+    /// с ключом.
+    #[test]
+    fn big_body_permits_range() {
+        let d = load(None, &[], &Default::default()).unwrap();
+        assert_eq!(d.limits.big_body_permits, 2);
+        for ok in ["1", "8"] {
+            let e = vec![env("ZAM_LIMITS__BIG_BODY_PERMITS", ok)];
+            let c = load(None, &e, &Default::default()).unwrap();
+            assert_eq!(c.limits.big_body_permits.to_string(), ok);
+        }
+        for bad in ["0", "9", "-1"] {
+            let e = vec![env("ZAM_LIMITS__BIG_BODY_PERMITS", bad)];
+            let err = load(None, &e, &Default::default()).unwrap_err().to_string();
+            assert!(err.contains("limits.big_body_permits"), "{bad}: {err}");
+        }
+    }
+
+    /// M7.4 §7.4: `limits.blob_gc_days` — 7 по умолчанию, 0..=365 (0 — сборщик выключен); вне
+    /// диапазона — ошибка с ключом.
+    #[test]
+    fn blob_gc_days_range() {
+        let d = load(None, &[], &Default::default()).unwrap();
+        assert_eq!(d.limits.blob_gc_days, 7);
+        for ok in ["0", "1", "365"] {
+            let e = vec![env("ZAM_LIMITS__BLOB_GC_DAYS", ok)];
+            let c = load(None, &e, &Default::default()).unwrap();
+            assert_eq!(c.limits.blob_gc_days.to_string(), ok);
+        }
+        for bad in ["366", "-1"] {
+            let e = vec![env("ZAM_LIMITS__BLOB_GC_DAYS", bad)];
+            let err = load(None, &e, &Default::default()).unwrap_err().to_string();
+            assert!(err.contains("limits.blob_gc_days"), "{bad}: {err}");
+        }
     }
 
     #[test]

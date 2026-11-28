@@ -163,6 +163,25 @@ pub struct AuditRow {
     pub details: serde_json::Value,
 }
 
+/// Действие в фильтре аудита (M7.4 §7.6 п. 1): точное или префикс (`user.*` — `user.`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditAction {
+    Exact(String),
+    Prefix(String),
+}
+
+/// Фильтр [`SystemStore::list_audit_filtered`]: `before` — курсор (id строго меньше), `user` —
+/// пользователь записи, `since`/`until` — период по времени записи (`until` исключительно).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AuditFilter {
+    pub limit: u32,
+    pub before: Option<i64>,
+    pub action: Option<AuditAction>,
+    pub user: Option<Id>,
+    pub since: Option<Timestamp>,
+    pub until: Option<Timestamp>,
+}
+
 /// Хранилище `system.db`; дёшево клонируется.
 #[derive(Clone, Debug)]
 pub struct SystemStore {
@@ -245,6 +264,23 @@ pub(crate) fn audit_tx(
         ],
     )?;
     Ok(())
+}
+
+/// Запись аудита в закрытый файл `system.db` без миграций (`zam-server rollback`, M7.4 §7.2
+/// п. 5: база может быть откачена к старой схеме, мигратор этой сборки её снова обновил бы;
+/// таблица `audit` — с 0001).
+pub fn audit_closed(
+    path: &std::path::Path,
+    actor: &str,
+    action: &str,
+    details: &serde_json::Value,
+) -> Result<(), StoreError> {
+    let c = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    c.busy_timeout(std::time::Duration::from_secs(5))?;
+    audit_tx(&c, actor, None, action, None, None, details)
 }
 
 impl SystemStore {
@@ -762,13 +798,40 @@ impl SystemStore {
         limit: u32,
         before_id: Option<i64>,
     ) -> Result<Vec<AuditRow>, StoreError> {
+        self.list_audit_filtered(AuditFilter {
+            limit,
+            before: before_id,
+            ..AuditFilter::default()
+        })
+        .await
+    }
+
+    /// Записи аудита по фильтру ([`AuditFilter`]), новые первыми (M7.4 §7.6 п. 1). Префикс
+    /// действия сравнивается `substr`, а не `LIKE`: `_` в именах действий (`user_create`) — не
+    /// шаблон. Время — строки фиксированной ширины ([`fmt_ts`]): порядок строк равен порядку
+    /// времени, индекс `idx_audit_ts` работает.
+    pub async fn list_audit_filtered(&self, f: AuditFilter) -> Result<Vec<AuditRow>, StoreError> {
+        let (exact, prefix) = match f.action {
+            Some(AuditAction::Exact(a)) => (Some(a), None),
+            Some(AuditAction::Prefix(p)) => (None, Some(p)),
+            None => (None, None),
+        };
+        let user = f.user.map(|u| u.to_string());
+        let (since, until) = (f.since.map(fmt_ts), f.until.map(fmt_ts));
         self.db
             .read(move |c| {
                 let mut st = c.prepare(
                     "SELECT id, ts, actor, user_id, action, target, ip, details FROM audit
-                     WHERE (?1 IS NULL OR id < ?1) ORDER BY id DESC LIMIT ?2",
+                     WHERE (?1 IS NULL OR id < ?1)
+                       AND (?3 IS NULL OR action = ?3)
+                       AND (?4 IS NULL OR substr(action, 1, length(?4)) = ?4)
+                       AND (?5 IS NULL OR user_id = ?5)
+                       AND (?6 IS NULL OR ts >= ?6)
+                       AND (?7 IS NULL OR ts < ?7)
+                     ORDER BY id DESC LIMIT ?2",
                 )?;
-                let rows = st.query_map(params![before_id, limit], |r| {
+                let args = params![f.before, f.limit, exact, prefix, user, since, until];
+                let rows = st.query_map(args, |r| {
                     let details: String = r.get(7)?;
                     Ok(AuditRow {
                         id: r.get(0)?,

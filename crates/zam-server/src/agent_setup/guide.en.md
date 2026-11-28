@@ -214,6 +214,7 @@ If a session broke off (a limit, a closed window) and the task's `next_step` was
 - **Fix it when the human asks**: the asker's words are missing — extend the record or add a term (`term`); a neighbouring record ranks above the target — `supersede` or merge; the index — `GET /index/status`, `zam-server reindex` (done by the administrator); worse after a server update — report it to the developer.
 - **Only the human accepts a new norm** (WebUI “Проверка памяти” → “Принять как норму”); with a token — 403: do not hide a regression.
 - A manual run — `zam check run` (runs outside the night window too), the latest verdict — `zam check status`. Probe references `x:` are not for `memory_read`.
+- **Do not retire a wrong probe — describe it to the human** (the human retires it in the WebUI; with a token — 403); a new one — `zam check probes add "<question>" --target <reference>` (a question memory must answer; the target is a live record of the same space), the set — `zam check probes list`.
 
 ## Rules candidates
 

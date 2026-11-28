@@ -123,7 +123,10 @@ async function seedForms(): Promise<void> {
   const cacheQuery = `Выжимка форм E2E ${run}`;
   const src = await api<{ id: string }>('POST', 'nodes', { space: 'knowledge', path: `E2E/Формы/Источник ${run}`, kind: 'note', content: '# Источник\n\nТекст.\n' });
   await api('POST', 'cache', { query: cacheQuery, summary: 'Выжимка для окон формы.', sources: [{ id: src.id }] });
+  // ручная проба агента (M7.4 §7.6 п. 3) — окно «Снять» набора проб (снимает человек, отправки нет)
+  const probe = await api<{ id: string }>('POST', 'check/probes', { question: `Проба форм E2E: окно снятия ${run}`, targets: [`k:${open.id}`] });
   Object.assign(process.env, {
+    E2E_FORMS_PROBE: probe.id,
     E2E_FORMS_SOLUTION: guid,
     E2E_FORMS_TASK_OPEN: open.id,
     E2E_FORMS_TASK_DONE: done.id,

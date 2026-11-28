@@ -5,12 +5,19 @@
 //! Запись атомарна: поток пишется во временный `<root>/.incoming/<id>.part` с
 //! подсчётом sha256 и проверкой лимита на лету, затем `fsync` и `rename` на место.
 //! Если файл с таким хэшем уже есть, временный просто удаляется. При любой ошибке
-//! (лимит, ввод-вывод, обрыв потока) временный файл удаляется.
+//! (лимит, ввод-вывод, обрыв потока) временный файл удаляется. Файл на месте (новый или уже
+//! бывший) получает `mtime` «сейчас» часов хранилища: по нему считает возраст сборщик мусора
+//! ([`crate::blob_gc`], M7.4 §7.4 п. 2).
+//!
+//! **Замок.** От записи файла до фиксации строки (`attach`, `create_report`, импорт) вызывающий
+//! держит разделяемый замок блобов пользователя ([`BlobStore::share`]): иначе сборщик мог бы
+//! убрать уже бывший файл между `put` и привязкой.
 //!
 //! **Таблицы.** `attachments` — пара (узел, sha256, имя файла) с MIME и размером;
 //! `blobs.refcount` — число таких различных пар (повторная привязка той же пары
-//! счётчик не меняет). Сборщик мусора (`refcount = 0`) — не в M1. Документ вложения для
-//! индексации — `attachment_docs` ([`crate::attachments`], M5).
+//! счётчик не меняет). Строки с `refcount = 0` и файлы без строк убирает сборщик мусора
+//! ([`crate::blob_gc`], M7.4). Документ вложения для индексации — `attachment_docs`
+//! ([`crate::attachments`], M5).
 //!
 //! **Ссылка** в Markdown: `_attachments/<sha256[0..16]>/<имя>`; в имени
 //! percent-кодируются только символы, ломающие синтаксис ссылки Markdown
@@ -34,7 +41,7 @@ use crate::time::fmt_ts;
 use crate::{Db, StoreError};
 
 /// Каталог временных файлов загрузки внутри корня пользователя.
-const INCOMING: &str = ".incoming";
+pub(crate) const INCOMING: &str = ".incoming";
 /// Размер буфера чтения потока, байт.
 const BUF: usize = 64 * 1024;
 /// Длина префикса хэша в ссылке.
@@ -62,6 +69,17 @@ impl BlobStore {
     pub fn path_of(&self, sha256: &str) -> PathBuf {
         let aa = sha256.get(..2).unwrap_or("00");
         self.root.join(aa).join(sha256)
+    }
+
+    /// Замок блобов пользователя ([`crate::blob_gc::BlobGate`]).
+    pub fn gate(&self) -> crate::blob_gc::BlobGate {
+        crate::blob_gc::BlobGate::of(&self.root)
+    }
+
+    /// Разделяемый замок записи блобов (см. модуль): держать от [`BlobStore::put`] до фиксации
+    /// строки.
+    pub async fn share(&self) -> crate::blob_gc::BlobShare {
+        self.gate().share().await
     }
 
     /// Поток → временный файл → sha256 → файл на месте. Больше `limit` байт →
@@ -127,16 +145,16 @@ impl BlobStore {
             }
             if target.exists() {
                 std::fs::remove_file(&part)?;
+                touch_logged(&target);
                 return Ok((sha, size));
             }
             match std::fs::rename(&part, &target) {
-                Ok(()) => Ok((sha, size)),
-                Err(_) if target.exists() => {
-                    std::fs::remove_file(&part)?;
-                    Ok((sha, size))
-                }
-                Err(e) => Err(e.into()),
+                Ok(()) => {}
+                Err(_) if target.exists() => std::fs::remove_file(&part)?,
+                Err(e) => return Err(e.into()),
             }
+            touch_logged(&target);
+            Ok((sha, size))
         })();
         if res.is_err() {
             let _ = std::fs::remove_file(&part);
@@ -172,7 +190,8 @@ impl BlobStore {
         Ok((hex(&hasher.finalize()), size))
     }
 
-    /// Временный файл → `<root>/<aa>/<sha256>`; уже есть — временный удаляется.
+    /// Временный файл → `<root>/<aa>/<sha256>`; уже есть — временный удаляется. Файл на месте
+    /// получает `mtime` «сейчас» ([`touch`]).
     async fn commit(&self, part: &Path, sha: &str) -> Result<(), StoreError> {
         let target = self.path_of(sha);
         if let Some(dir) = target.parent() {
@@ -180,18 +199,46 @@ impl BlobStore {
         }
         if tokio::fs::try_exists(&target).await? {
             tokio::fs::remove_file(part).await?;
-            return Ok(());
-        }
-        match tokio::fs::rename(part, &target).await {
-            Ok(()) => Ok(()),
-            // параллельная загрузка того же содержимого успела раньше (Windows не
-            // перезаписывает существующий файл при rename)
-            Err(_) if tokio::fs::try_exists(&target).await.unwrap_or(false) => {
-                tokio::fs::remove_file(part).await?;
-                Ok(())
+        } else {
+            match tokio::fs::rename(part, &target).await {
+                Ok(()) => {}
+                // параллельная загрузка того же содержимого успела раньше (Windows не
+                // перезаписывает существующий файл при rename)
+                Err(_) if tokio::fs::try_exists(&target).await.unwrap_or(false) => {
+                    tokio::fs::remove_file(part).await?;
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => Err(e.into()),
         }
+        touch_logged(&target);
+        Ok(())
+    }
+}
+
+/// `mtime` файла — «сейчас» часов хранилища (`time::now()`): возраст блоба для сборщика мусора
+/// (M7.4 §7.4 п. 2). Атрибуты меняются без записи содержимого: Windows — доступ
+/// `FILE_WRITE_ATTRIBUTES`, unix — дескриптор только для чтения (`futimens` владельца файла).
+pub(crate) fn touch(path: &Path) -> std::io::Result<()> {
+    let t = std::time::SystemTime::from(crate::time::now());
+    #[cfg(windows)]
+    let f = {
+        use std::os::windows::fs::OpenOptionsExt;
+        /// `FILE_WRITE_ATTRIBUTES` (winnt.h).
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .open(path)?
+    };
+    #[cfg(not(windows))]
+    let f = std::fs::File::open(path)?;
+    f.set_modified(t)
+}
+
+/// [`touch`] с WARN вместо ошибки: запись блоба от неё не зависит (её защищает замок блобов), а
+/// не обновлённое время лишь раньше отдаёт непривязанный файл сборщику.
+pub(crate) fn touch_logged(path: &Path) {
+    if let Err(e) = touch(path) {
+        tracing::warn!(path = %path.display(), error = %e, "mtime блоба не обновлён");
     }
 }
 
@@ -239,6 +286,7 @@ pub fn attachment_link(sha256: &str, filename: &str) -> String {
 /// Пара получает документ `attachment_docs` (M5) в состоянии по `intake` ([`DocIntake`]):
 /// поддерживаемый вид — `pending` с заданием индексации `Attachment`, больше `docs.max_bytes` —
 /// `failed` (`too_large`), неподдерживаемый — `unsupported`; два последних — без задания.
+/// Вызывающий держит [`BlobStore::share`] с записи файла ([`BlobStore::put`]) до возврата.
 #[allow(clippy::too_many_arguments)]
 pub async fn attach(
     db: &Db,

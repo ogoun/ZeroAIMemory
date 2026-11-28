@@ -125,7 +125,7 @@ pub fn hold_backup_flag(data_dir: &Path) -> std::io::Result<BackupFlagHold> {
 
 /// Состояние признака копии.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum FlagState {
+pub enum FlagState {
     Absent,
     Active,
     /// Брошенный признак: причина для WARN.
@@ -177,6 +177,12 @@ pub(crate) fn warn_stale(flag: &Path, why: &str) {
     }
 }
 
+/// Состояние признака копии каталога данных `data_dir` без записи в журнал (`zam-server
+/// doctor`, M7.4 §7.5).
+pub fn backup_flag_state(data_dir: &Path, max_age: Duration) -> FlagState {
+    flag_state(&backup_flag_path(data_dir), max_age)
+}
+
 /// Идёт ли копия каталога данных: признак есть, его лок держит процесс копии и признак не
 /// старше `max_age`. Брошенный признак — `false` и WARN «брошенный признак копии».
 pub fn backup_flag_active(data_dir: &Path, max_age: Duration) -> bool {
@@ -222,7 +228,7 @@ fn open_source(src: &Path, mode: OpenMode) -> Result<Connection, StoreError> {
 }
 
 /// `file:<путь>?immutable=1` с процент-кодированием (`%`, `?`, `#`, пробелы, не-ASCII).
-fn immutable_uri(p: &Path) -> String {
+pub(crate) fn immutable_uri(p: &Path) -> String {
     let s = p.to_string_lossy().replace('\\', "/");
     let mut out = String::from("file:");
     // абсолютный путь Windows `C:/…` — как `file:/C:/…`
@@ -310,7 +316,9 @@ pub fn query_strings(path: &Path, table: &str, sql: &str) -> Result<Vec<String>,
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-/// Блобы копии базы пользователя: `(sha256, size)`.
+/// Блобы копии базы пользователя, на которые есть ссылки (`refcount > 0`): `(sha256, size)`.
+/// Мусор (`refcount = 0`) в копию и её опись не идёт (M7.4 §7.4 п. 5, решение 106): его файл
+/// может удалить сборщик; в восстановленной базе такие строки без файлов убирает он же.
 pub fn blob_list(path: &Path) -> Result<Vec<(String, u64)>, StoreError> {
     let c = open_closed(path)?;
     let has: bool = c.query_row(
@@ -321,7 +329,7 @@ pub fn blob_list(path: &Path) -> Result<Vec<(String, u64)>, StoreError> {
     if !has {
         return Ok(Vec::new());
     }
-    let mut st = c.prepare("SELECT sha256, size FROM blobs ORDER BY sha256")?;
+    let mut st = c.prepare("SELECT sha256, size FROM blobs WHERE refcount > 0 ORDER BY sha256")?;
     let rows = st.query_map([], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64))
     })?;

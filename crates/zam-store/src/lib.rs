@@ -11,12 +11,15 @@
 //! снимки сессий (`session_snapshots`; M6), виды внутренних работ и открытия подсказок
 //! (`works`, `usage_opened`; M7.3), журнал отправок подключённой модели (`work_calls`; M7.3), пробы
 //! ночной проверки памяти, её прогоны и результаты (`probes`, `check_runs`, `check_results`; M7.3),
-//! предложения человеку — кандидаты в Rules (`proposals`; M7.3).
+//! предложения человеку — кандидаты в Rules (`proposals`; M7.3), контрольные суммы миграций
+//! (`zam_migrations`), открытие без изменений и сверка схемы с эталоном ([`inspect`]; M7.4),
+//! сборщик мусора блобов и замок блобов пользователя ([`blob_gc`]; M7.4).
 
 pub mod access;
 pub mod archive;
 pub mod attachments;
 pub mod backup;
+pub mod blob_gc;
 pub mod blobs;
 pub mod cache;
 pub mod certainty;
@@ -33,6 +36,7 @@ pub mod glossary;
 pub mod graph;
 pub mod ideas;
 pub mod import;
+pub mod inspect;
 pub mod jobs;
 pub mod links;
 pub mod migrate;
@@ -76,6 +80,7 @@ pub use backup::{
     backup_flag_path, hold_backup_flag, integrity_ok, meta_value, set_backup_flag_max_age,
     vacuum_into,
 };
+pub use blob_gc::{BlobGate, BlobShare, GcPlan, GcReport};
 pub use blobs::{
     AttachScope, BlobStore, attach, attachment_link, blob_meta, blob_meta_by_sha,
     blob_meta_by_sha_in_space, blob_meta_in_space, resolve_attachment,
@@ -94,7 +99,8 @@ pub use certainty::{
 pub use counts::{SpaceCounts, space_counts};
 pub use datadir::{
     DataDir, DirLock, LockMark, MAX_DATA_DIR_CHARS_WINDOWS, RESTORE_INCOMPLETE_FILE,
-    RESTORE_MARK_FILE, check_data_dir_len, lock_mark, restore_incomplete, try_lock_dir,
+    RESTORE_MARK_FILE, check_data_dir_len, lock_mark, restore_incomplete, rollback_incomplete,
+    try_lock_dir,
 };
 pub use db::{Db, DbOptions, LongReader};
 pub use embeddings::{
@@ -286,6 +292,32 @@ pub enum StoreError {
     InvalidMigrations(String),
     #[error("база закрыта или операция аварийно прервана")]
     Closed,
+    /// Сумма выпущенной миграции, записанная в базе (`zam_migrations`), не совпала с суммой
+    /// миграции программы (M7.4 §7.1 п. 3): база не открывается.
+    #[error(
+        "миграция {version} изменилась после применения к этой базе (сумма в базе {}…, в \
+         программе {}…): верните выпуск, которым база обновлялась, или восстановите копию; \
+         подробности — zam-server doctor",
+        short_sum(.recorded),
+        short_sum(.compiled)
+    )]
+    MigrationChanged {
+        version: u32,
+        recorded: String,
+        compiled: String,
+    },
+    /// В каталоге данных прерван `zam-server rollback` (M7.4 §7.2 п. 5): базы неполны.
+    #[error(
+        "откат каталога данных {} не завершён: повторите ту же команду zam-server rollback \
+         (прежние базы — в backups/pre-rollback-…)",
+        .0.display()
+    )]
+    RollbackIncomplete(std::path::PathBuf),
+}
+
+/// Начало суммы для текста ошибки (12 знаков hex).
+fn short_sum(s: &str) -> &str {
+    s.get(..12).unwrap_or(s)
 }
 
 impl StoreError {
@@ -296,6 +328,7 @@ impl StoreError {
         match self {
             StoreError::Corrupt(_)
             | StoreError::SchemaTooNew { .. }
+            | StoreError::MigrationChanged { .. }
             | StoreError::InvalidMigrations(_) => true,
             StoreError::Sqlite(rusqlite::Error::SqliteFailure(f, _)) => matches!(
                 f.code,

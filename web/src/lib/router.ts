@@ -11,7 +11,8 @@
 // - `#/sessions[/<id сессии>]` — «Сессии»: сессии агентов и выданное им по событию (M6 §8),
 //   необязательно — открытая сессия (M7.2: на узкой области карточка вместо списка);
 // - `#/works` — «Внутренние работы», `#/check` — «Проверка памяти», `#/proposals[/<o:id>]` —
-//   «Кандидаты в Rules», необязательно — открытый кандидат (M7.3 §6.9);
+//   «Кандидаты в Rules», необязательно — открытый кандидат (M7.3 §6.9); `#/works?user=<id>` —
+//   «Внутренние работы» пользователя глазами администратора (M7.4 §7.7 п. 2);
 // - `#/u/<user_id>` — пространства пользователя;
 // - `#/u/<user_id>/s/<space_ref>/n/<node_id>[#<якорь>]` — документ, якорь — `id`
 //   элемента в percent-encoding (как в href вики-ссылок сервера: `#/n/<id>#h-<slug>`);
@@ -64,7 +65,7 @@ export type Route =
   | { name: 'agentsetup' }
   | { name: 'cache' }
   | { name: 'sessions'; session?: string | null }
-  | { name: 'works' }
+  | { name: 'works'; user?: string | null }
   | { name: 'check' }
   | { name: 'proposals'; proposal: string | null }
   | { name: 'journal'; user: string; space: string; journal: Journal; entry: string | null }
@@ -99,6 +100,14 @@ export function parse(hash: string): Route {
     anchor = h.slice(cut + 1) || null;
     h = h.slice(0, cut);
   }
+  // параметры адреса (`?user=` у «Внутренних работ»); прочие маршруты их не читают — `?` в
+  // сегментах кодируется (`enc`)
+  let query: URLSearchParams | null = null;
+  const qi = h.indexOf('?');
+  if (qi >= 0) {
+    query = new URLSearchParams(h.slice(qi + 1));
+    h = h.slice(0, qi);
+  }
   const parts = h.split('/').filter((p) => p !== '');
   if (parts.length === 1 && parts[0] === 'admin') return { name: 'admin' };
   if (parts.length === 1 && parts[0] === 'account') return { name: 'account' };
@@ -107,7 +116,7 @@ export function parse(hash: string): Route {
   if ((parts.length === 1 || parts.length === 2) && parts[0] === 'sessions') {
     return { name: 'sessions', session: parts[1] ? dec(parts[1]) : null };
   }
-  if (parts.length === 1 && parts[0] === 'works') return { name: 'works' };
+  if (parts.length === 1 && parts[0] === 'works') return { name: 'works', user: query?.get('user') || null };
   if (parts.length === 1 && parts[0] === 'check') return { name: 'check' };
   if ((parts.length === 1 || parts.length === 2) && parts[0] === 'proposals') {
     return { name: 'proposals', proposal: parts[1] ? dec(parts[1]) : null };
@@ -178,7 +187,7 @@ export function href(r: Route): string {
     case 'sessions':
       return '#/sessions' + (r.session ? `/${enc(r.session)}` : '');
     case 'works':
-      return '#/works';
+      return '#/works' + (r.user ? `?user=${enc(r.user)}` : '');
     case 'check':
       return '#/check';
     case 'proposals':

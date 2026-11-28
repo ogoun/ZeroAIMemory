@@ -453,6 +453,39 @@ export function proposalAuthorText(kind: string, author: string | null | undefin
   return s ? `агент, сессия ${s}` : 'агент';
 }
 
+// ---- сводка администратора `GET /admin/works` (M7.4 §7.6 п. 2, §7.7 п. 2) ----
+
+/** Действующие режимы видов строкой: «пробы: агент · кандидаты в Rules: выкл»; вид без строки —
+ * «выкл». */
+export function modesSummary(modes: Record<string, { mode: WorksMode }> | null | undefined): string {
+  return WORK_KINDS.map((k) => `${KIND_SHORT[k]}: ${MODE_TITLE[modes?.[k]?.mode ?? 'off'] ?? modes?.[k]?.mode}`).join(' · ');
+}
+
+/** Очередь строкой: «2 в очереди · 1 идёт», пусто — «пусто». */
+export function queueText(queued: number | null | undefined, running: number | null | undefined): string {
+  const parts = [...(queued ? [`${num(queued)} в очереди`] : []), ...(running ? [`${num(running)} идёт`] : [])];
+  return parts.length ? parts.join(' · ') : 'пусто';
+}
+
+/** Вердикт прогона коротко (сводка, без чисел флагов — они на странице «Проверка памяти»). */
+const VERDICT_SHORT: Record<string, string> = {
+  ok: 'в норме',
+  regression: 'ухудшение',
+  baseline: 'накопление базы',
+  changed: 'изменилось',
+  degraded: 'поиск без векторов',
+};
+/** Прогон без вердикта коротко. */
+const RUN_SHORT: Record<string, string> = { skipped: 'пропущен', timeout: 'предел времени', failed: 'сбой' };
+
+/** Последний законченный прогон проверки строкой: вердикт, иначе состояние; прогонов нет —
+ * «не было». */
+export function adminCheckText(c: { status: string | null; verdict: string | null } | null | undefined): string {
+  if (!c?.status) return 'не было';
+  if (c.verdict) return VERDICT_SHORT[c.verdict] ?? c.verdict;
+  return RUN_SHORT[c.status] ?? c.status;
+}
+
 /** Сумма Rules в дайджесте и прирост (§6.7 п. 4): «Rules в каждой сессии: 1 840 → 1 990 токенов
  * (+150)», «0 → 43 токена (+43)» — форма по второму числу. */
 export function rulesTokensText(t: { now: number; after: number } | null | undefined): string {

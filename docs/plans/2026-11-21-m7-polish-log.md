@@ -7622,6 +7622,524 @@ LAN»: её адрес, ключ и значения Vault в журнал, от
 `k:01M7GAQQGBERPTY57K706BBTBS`, `k:01M85AS1C0EZVV95FQZ2ZEQCET`, `k:01M86MDJHXEMHTBNDEXFS73NGN`),
 перенесённое (§6.13) — задачами с причиной; ловушки и решения волны — в память.
 
+## Волна M7.4 «Администрирование сервера»
+
+Проект — спецификация этапа §7 (решения координатора 97–113 — §12), план —
+`docs/plans/2026-11-28-m7.4-admin.md`. Ветка `m7.4-admin` от `main` `c9f462c7`.
+
+### M7.4 · Задача 1 — Миграции: суммы, сверка схемы, `rollback`, `restore`
+
+Спецификация §7.1–§7.3; worktree `.tmp/m74/wt-t1`, ветка `m7.4-t1` от `897a86d1`.
+
+**Суммы (§7.1 пп. 1–4).** `migrate.rs`: таблица `zam_migrations` (DDL `TABLE_DDL`, `CREATE TABLE IF
+NOT EXISTS` в каждой транзакции записи сумм), `checksum` (SHA-256 после `\r\n` → `\n`), строка
+`applied` — в транзакции миграции и в `rebuild_tx`, `adopt_missing` (одна транзакция `IMMEDIATE`,
+`INSERT OR IGNORE`; ничего не нужно — без записи), `verify` → `StoreError::MigrationChanged
+{version, recorded, compiled}` (`is_permanent`). `migrations/SHA256SUMS` — 34 строки (system
+0001–0007, user 0001–0027), файлы — LF без BOM (проверено при генерации). `system.db` при старте —
+`app::open_system`: текст спецификации «миграция N system.db изменилась после применения к этой
+базе: …; подробности — zam-server doctor».
+
+**`inspect` (§7.1 пп. 5–6).** `open_ro` (закрытая база — `immutable=1`; есть `-wal`/`-shm` —
+`READ_ONLY`, видит WAL; `query_only`; файла нет — ошибка без создания), `RoDb::{user_version,
+checksum_status, schema_diff, quick_check, integrity_check, fts_check, path}`, `ChecksumStatus {Ok,
+AdoptedPending, Changed(Vec<u32>)}`, `DIFF_MAX` = 20 (последняя строка — «… и ещё N различий»).
+Эталон — `:memory:` с `migrate::apply` миграций `1..=user_version`.
+
+**`rollback` (§7.2).** `backup/rollback.rs`: `RollbackOpts`, `parse_version` (`v<N>` | `N`),
+`RollbackPlan {items, skipped, resume}`, `PlanItem {db, from, to, copy, copy_time, copy_bytes,
+current_bytes, step: Move | Place | Done}`, `RollbackReport {to, system, dry_run, plan, applied,
+moved_to}` (`text`, `needs_yes`). `Cmd::Rollback {to, system, dry_run, yes, json}` в `main.rs`: без
+`--yes` — план и код 1 («ничего не изменено: проверьте план и повторите команду с --yes»).
+`zam-store`: `LockMark::Rollback`, `DataDir::open_for_rollback`, `rollback_incomplete`,
+`StoreError::RollbackIncomplete`, `jobs::set_reindex_pending_closed`, `system::audit_closed`.
+Общие переносы — `backup/mod.rs`: `side`, `ts_name`, `new_pre_dir`, `move_into`, `mark_incomplete`
+(`kind` — `restore` | `rollback`), `incomplete_moved_to` (по префиксу). Тестовые точки сбоя —
+`rollback_moved` (после переноса всех баз), `rollback_placed` (после первой положенной копии).
+
+**`restore` и долги (§7.3).** `vault::keys::{key_state, VaultKeyState, KEY_MISMATCH_WARNING}`
+(`restored_key_fits` удалён), `VaultKeyState::warning(cfg)`; `RestoreReport` — `vault`,
+`vault_warning` (и прежний `vault_ok`); `move_old` переносит `first-admin-token.txt`;
+`restore::QDRANT_KEPT_NOTE` при `--replace --no-reindex` и управляемом Qdrant;
+`BackupSection::flag_max_age()` — `app.rs`, `backup()`, `restore()`, `rollback()`;
+`restore::Source` (публичный) и `with_reader(rel, size, f)` — `Oversize` до чтения, поток
+ограничен `size + 1`.
+
+- [решение исполнителя, задача 1] **Суммы сверяются до применения, а не после.** Спецификация
+  (§7.1 п. 3) — «при каждом открытии, после применения». Сверка записанных строк идёт первой —
+  в `Db::open_with` до досборки 0025 и в `migrate::apply` до копии `bak-v<N>` и миграций: база с
+  изменённой выпущенной миграцией не меняется вовсе (ни досборки, ни копии, ни 0026–0027; тест
+  `checksum_changed_rejected`). Новые строки пишет сам мигратор — их сверять незачем.
+- [решение исполнителя, задача 1] **Тесты промежуточной 0025** (`migrate_rebuild::
+  reopen_historic_0025_versions_repaired`, `repair_runs_before_next_migration`) открывают базу
+  изменённым списком — теперь с суммами она итоговой сборкой не открылась бы (это и есть повод
+  §7.1, тест `checksum_changed_rejected`, ветка `966cb85`). Настоящие базы промежуточной M6 были
+  без таблицы сумм: тесты снимают её (`as_m6_build`) — ожидания прежние. `table_counts` не
+  считает `zam_migrations` (в ней строка на миграцию, число растёт с миграциями).
+- [решение исполнителя, задача 1] **`checksum_status` и `schema_diff` — `Result<…>`** (в плане —
+  без `Result`): ошибка чтения повреждённой базы не прячется за «Ok» или пустым списком.
+- [решение исполнителя, задача 1] **Сверка схемы:** автоиндексы (`sqlite_autoindex_*`) — под
+  правилом «`sqlite_%` не сравниваются»; у явных индексов, кроме `pragma_index_list` и
+  `pragma_index_xinfo`, сравнивается SQL без пробельных различий (меняется предикат частичного
+  индекса — видно); виртуальные таблицы — ещё и SQL (токенизатор FTS5 в столбцах не виден);
+  порядок общих столбцов — отдельной строкой.
+- [решение исполнителя, задача 1] **`fts_check`** — `PRAGMA integrity_check(<таблица FTS5>)`
+  (`xIntegrity`, SQLite ≥ 3.44, только чтение; команда FTS5 `'integrity-check'` — запись и на
+  `READ_ONLY` не идёт). Тест `fts_check_detects_damage`: удалённые листы `vault_fts_data` видят и
+  `fts_check`, и общий `integrity_check`.
+- [решение исполнителя, задача 1] **`open_ro` на запущенном сервере** читает закрытую (ещё не
+  открытую сервером) базу `immutable=1`: если сервер откроет её посреди чтения, картина может быть
+  несогласованной — для `doctor` (задача 3) это ложная тревога, не порча (запись — только у
+  сервера). Базы, которые сервер уже держит (`-wal`/`-shm`), читаются `READ_ONLY` с WAL.
+- [решение исполнителя, задача 1] **Откаченные базы пишутся без мигратора этой сборки:** отметка
+  пересборки — `jobs::set_reindex_pending_closed` (схема без `meta`, до 0004, — без отметки),
+  аудит — `system::audit_closed` (`audit` — с 0001). `Db::open`/`SystemStore::open` снова обновили бы
+  схему откаченной базы.
+- [решение исполнителя, задача 1] **Отказ `rollback` — все причины сразу** (`RollbackRefused`,
+  строки по базам), плюс проверка места под копии (`with_margin`, +10 %) до признака. Откатывать
+  нечего (все базы на N, не продолжение) — код 0, без признака, переноса и аудита.
+- [решение исполнителя, задача 1] **Продолжение после сбоя — по состоянию файлов** (`Step`):
+  база на месте выше N — `Move`; на месте её нет, а в `pre-rollback-…` есть — `Place`; на месте —
+  N, а в `pre-rollback-…` — прежняя — `Done` (не переносится второй раз: иначе копия легла бы
+  поверх прежней базы в каталоге прежних данных; тест `rollback_resume_after_crash` сверяет
+  `probe = v27` в нём). Остатки `-wal`/`-shm` у `Place` переносятся до копии (чужой WAL испортил
+  бы её); занятое имя — в `rollback-remnants-<время>/`.
+- [решение исполнителя, задача 1] **Признак отката — тот же файл с текстом `rollback …`**, а
+  сервер отвечает новым `StoreError::RollbackIncomplete` («повторите ту же команду zam-server
+  rollback»), а не советом `restore --replace`, который потерял бы смысл отката. Метка лока —
+  тот же дубль `.zam-restore` с текстом `rollback <pid>` (`lock_mark` различает по тексту);
+  `backup` и `restore` во время отката — `RollbackInProgress`.
+- [решение исполнителя, задача 1] **`key_state`:** файл ключа не читается по любой причине —
+  `Missing`; ключ не декодируется, не проходит `vault.key_check` или ключи Vault базы повреждены —
+  `Mismatch` (раньше все три — один `false`).
+- [решение исполнителя, задача 1] **`Source` публичен** (`restore::Source::{open, with_reader}`):
+  тест `restore_oversize_stream_early` проверяет, что замыкание чтения не вызывается, если
+  источник длиннее описи (у каталога и у архива); иначе «раньше чтения» не наблюдаемо.
+- [решение исполнителя, задача 1] **Сверх списка спецификации:** `serve_refuses_changed_system_
+  migration` (текст отказа старта, §7.1 п. 3), `fts_check_detects_damage`, ручной замер
+  `migrate_checksum::dev_db_first_open_measure` (`#[ignore]`, `ZAM_DEV_DB=<копия базы>`).
+
+**Прогоны** (Windows, `CARGO_TARGET_DIR=target/m74-t1`, `-j 2`). RED: `migrate_checksum` — 11 из
+11 падают (нет таблицы, `inspect` — заглушка, нет `SHA256SUMS`); `rollback` — 12 из 12, новые
+restore-тесты `backup` — 5 из 5 (заглушки). GREEN: `zam-store --test migrate_checksum` — 12 passed,
+1 ignored; `migrate_rebuild` 11, `user_db` 11, `system` 17, `db` 24, `--lib` 132 (1 ignored);
+`zam-server --test rollback` 13, `backup` 58, `boot` 15 — все passed. Первая попытка
+`rollback_bad_copy_changes_nothing` не прошла по вине теста: 2 КиБ мусора с 16-го байта страницы 2
+легли в её свободное место, `integrity_check` был `ok`; тест портит страницу 3 целиком. clippy
+`-D warnings` (`zam-store`, `zam-server`, `--all-targets`) и `cargo fmt --all --check` — чисто.
+`Cargo.lock` не менялся.
+
+**Замер на копиях баз разработчика** (`.tmp/` основного каталога → `.tmp/devdb/` worktree; HDD;
+`dev_db_first_open_measure`): база v25 из `.tmp/m56/bench` (9,9 МБ) — первое открытие v25 → v27
+(копия `bak-v25`, 0026–0027, принятие сумм 1–25) — 8,9 с, `schema_diff` — 79 мс, пусто, суммы `Ok`;
+база v14 из `.tmp/m4/task-15/bench` (406 МБ) — v14 → v27 с пересборками — 18,8 с, `schema_diff` —
+61 мс, пусто. Только принятие сумм (`migrate::apply` на v27 без таблицы, одна транзакция) — 357 мс
+(406 МБ) и 148 мс (9,9 МБ); повторное открытие с суммами — 4–9 мс. Рабочей базы сервера памяти в
+`.tmp/` нет — она на сервере в LAN; замер `doctor` при развёртывании — решение 111.
+
+Ветка `m7.4-admin` от `main` `c9f462c7`; спецификация §7, план `docs/plans/2026-11-28-m7.4-admin.md`.
+
+### M7.4 · Задача 2 — API и CLI администратора, мелкие долги
+
+Спецификация §7.6 пп. 1–9, решения 108–110. Worktree `.tmp/m74/wt-t2`, ветка `m7.4-t2` от
+`897a86d1`; параллельно с задачей 1 (общие файлы — своими блоками).
+
+**Сделано.**
+- **Фильтры аудита** (п. 1, `audit_filters`): `zam_store::system::{AuditFilter, AuditAction}`,
+  `SystemStore::list_audit_filtered`; `GET /admin/audit` — `action`, `user`, `since`, `until`
+  вместе с `limit` и `before`.
+- **`GET /admin/works`** (п. 2, `admin_works`): `api::works::admin_summary` — строка на
+  пользователя (`admin_row`): режимы и пауза (`modes_json`, `pause_json`), очередь —
+  `zam_store::works::state_counts`, токены — `tokens_used` (общая с `GET /works/usage`),
+  последняя ночь, последний прогон — `api::check::last_brief` (тот же `last`, что у `GET
+  /check/status`).
+- **Ручные пробы** (п. 3, `check_probes_manage`): `POST /check/probes` (`create_probe`) и
+  `DELETE /check/probes/{id}` (`retire_probe`, только `Principal::is_human`); цель —
+  `zam_store::probes::live_target`; запись — прежняя `insert_probe` (повтор, предел); ошибки
+  `ApiError::ProbeDuplicate`, `ProbesLimit`. CLI — `zam check probes list|add|retire`
+  (`cmd::check::probes_*`, `Client::delete_json`); протокол `guide.{ru,en}.md`, «Проверка
+  памяти» — строка п. 3.
+- **`/health.components`** (п. 4, `health_components`): `api::health::Components`,
+  `probe_external_qdrant` (фоном при старте), `zam_ml::ort_version`,
+  `zam_index::QdrantIndex::server_version`, `crate::qdrant::external_version`.
+- **MCP `include_history`** (п. 5) — в схемах `memory_search` и `memory_cache_put`.
+- **`limits.big_body_permits`** (п. 6): `LimitsSection::big_body_permits` (2, 1..=8,
+  `validate`), `BigBodies::new(cfg.limits.big_body_permits, …)`; константа
+  `BIG_BODY_PERMITS` снята.
+- **Сторож `ZAM_`** (п. 7): `crates/zam-cli/tests/env_literals.rs`; `RESERVED_ENV` сервера —
+  `pub`.
+- **Лицензии по цели** (п. 8): `package::license_targets`, `cargo_about_cmd` (`--target` на
+  каждую цель), `generate_licenses(root, work, platform)`.
+- **Флейк** (п. 9): `deep_blocks_definition_respects_timeout` — предел `DEEP_BLOCKS_LIMIT` = 1 с
+  с комментарием о причине.
+
+**Решения исполнителя.**
+- [решение исполнителя, задача 2] `list_audit(limit, before)` оставлен обёрткой над новым
+  `list_audit_filtered(AuditFilter)`: у прежней сигнатуры полсотни вызовов в тестах.
+- [решение исполнителя, задача 2] Префикс действия — `substr(action, 1, length(?)) = ?`, а не
+  `LIKE`: `_` в именах действий (`user_create`) — не шаблон. Пустой параметр — без фильтра (форма
+  WebUI со сброшенным полем), один `*` — 400.
+- [решение исполнителя, задача 2] `GET /admin/works`: база пользователя не открылась — строка
+  `{user, login, error}` и WARN, а не 500 всей сводки; `check` — последний **законченный**
+  прогон (`status`, вид `verdict`), идущий прогон в сводку не входит.
+- [решение исполнителя, задача 2] Ручная проба: цели — живые записи **одного** пространства
+  (явное `space` или пространство первой цели), Human — 422 (агент его не видит); целей до 5 (как
+  у пробы из кэша), вопрос до 512 символов (как запрос поиска); `overlap` — `null` (метрика
+  `hard` её не считает); автор — `Principal::actor()` (id токена, `admin`, `user`).
+- [решение исполнителя, задача 2] Снятие: `id` — `x:<id>` или id; причина — в `retired_reason`
+  пробы и в аудите; посторонний вопрос набора сервера — 409 `code: negative_probe` (набор вернул
+  бы его следующим прогоном).
+- [решение исполнителя, задача 2] Подсказка CLI на 403 снятия — «снимает человек: WebUI
+  «Проверка памяти» …» без «или человеческий токен» спецификации: токен всегда агентский
+  (`Principal::is_human` — только сессии WebUI).
+- [решение исполнителя, задача 2] Версия внешнего Qdrant — gRPC `HealthCheck` (`title`,
+  `version` — то же, что `GET /` REST): у внешнего настроен только gRPC-адрес `qdrant.url`;
+  спрашивается фоном после сборки состояния, ждёт не дольше 5 с, ответ `/health` его не ждёт.
+- [решение исполнителя, задача 2] Сводка лицензий комплекта сервера — по целям всего Rust в нём:
+  `zam-server`, свой `zam` (Linux — musl) и раздаваемый `zam` другой платформы; архив клиента —
+  только цель его `zam`.
+
+**Лицензии по цели** (`cargo about generate --format json --target …`, dev, 2026-11-28; число
+крейтов в сводке):
+
+| Сводка | До (все цели `about.toml`) | Windows | Linux |
+|---|---|---|---|
+| Комплект сервера | 426 | 426 (msvc + musl) | 426 (gnu + musl + msvc) |
+| — без раздаваемого `zam` другой платформы | — | 419 (msvc) | 407 (gnu + musl) |
+| Архив клиента `zam` | 119 | 118 (msvc) | 104 (musl) |
+
+Разница архивов клиента: только у Windows — 15 крейтов (`windows*`, `anstyle-wincon`,
+`once_cell_polyfill`, `syn` — proc-macro `windows-implement`), только у Linux — `libc`.
+
+**RED → GREEN.** RED (до кода сервера): `audit_filters_action_user_period` — фильтр не действует
+(9 записей вместо 2); `health_features_documented` — нет `audit_filters`;
+`health_components_present` — `components` нет; пять `check_probes_*` — 405 у `POST`;
+`mcp_schema_include_history` — поля нет; `admin_works_*` — 404; `big_body_permits_one_busy_503`
+и `big_body_permits_range` — нет поля `limits.big_body_permits`; `cli_env_literals_registered` —
+`RESERVED_ENV` закрыт; `check_probes_cli` — сервер без признака, код 1. Код CLI и xtask написан
+раньше прогона RED их тестов: `check_probes_old_server_code_1` зелёный с первого прогона,
+`cargo_about_uses_package_target` не запускался до кода.
+
+**Прогоны** (Windows, dev, `CARGO_TARGET_DIR=target\m74-t2`, `-j 2`). `cargo test -p zam-server
+--test admin --test works --test check_probes --test boot --test mcp --test reports` — 11 + 36 +
+12 + 16 + 85 + 27 = **187/187** за 5 мин 51 с; `--lib config::` — 50/50
+(`big_body_permits_range`, `example_config_parses_to_defaults`); `boot` повторно после
+расширения `health_components_present` настоящим внешним Qdrant (`target/deps`, копия из
+основного каталога) — 16/16; `cargo test -p zam-cli --test check --test env_literals` — 4 + 1;
+`cargo test -p xtask` — 245 + 6 + 5; `cargo test -p zam-code --features parse --test extract` —
+31/31 (без фичи файл пуст — 0 тестов); `cargo test -p zam-store --lib` — 132/132 (1 ignored).
+Первый прогон `check_probes_cli` упал на моём ожидании кода 2 у ошибки разбора аргументов: `zam`
+отвечает на неё кодом ввода 6 (как прочие команды) — ожидание исправлено. Clippy `-D warnings`
+(`zam-store`, `zam-ml`, `zam-index`, `zam-server`, `zam-cli`, `xtask`, `zam-code --features
+parse`, `--all-targets`) и `cargo fmt --all --check` — чисто. `cargo xtask package` не
+запускался (нужны release-сборки, `web/dist` и `license-checker`): числа сводок — прямым `cargo
+about generate --target` для обеих платформ (таблица выше). `git diff main -- Cargo.lock` — без
+изменений (новых крейтов нет).
+
+### M7.4 · Задача 3 — Сборщик мусора блобов и `zam-server doctor`
+
+Спецификация §7.4, §7.5, решения 103–107. Worktree `.tmp/m74/wt-t3`, ветка `m7.4-t3` от
+`2a8d27a8` (слиты задачи 1 и 2); параллельно с задачей 4 (общие файлы — своими блоками).
+
+**Сделано.**
+- **`zam_store::blob_gc`**: `BlobGate` (замок блобов пользователя: `share` — разделяемый,
+  `try_exclusive` — исключительный без ожидания), `BlobShare`, `plan(conn, root, now, days) ->
+  GcPlan` (`rows`, `orphans`, `dangling`, `parts`, `missing`, `leftovers`, `incoming_*`; только
+  чтение — тот же отбор считает `doctor`), `sweep(db, root, now, days) -> GcReport` (`rows`,
+  `files`, `bytes`, `parts`, `restored`, `kept`, `errors`, `busy`), `recover` (разбор `.gc/`),
+  `remove_stale_parts`; константы `GC_DIR` = `.gc`, `PART_MAX_AGE` = 24 ч. Тестовые точки
+  (`test_hooks`): `set_gc_fail(root, "after_rename" | "after_commit")`, `pause_gc_after_plan`.
+- **`mtime`** (§7.4 п. 2): `BlobStore::put`/`put_blocking` ставят файлу на месте (новому и уже
+  бывшему) «сейчас» часов хранилища (`blobs::touch`: Windows — `FILE_WRITE_ATTRIBUTES`, unix —
+  дескриптор для чтения); `attachments::detach(db, store, …)` — при `refcount → 0` в той же
+  транзакции (`UPDATE … RETURNING refcount`).
+- **Замок** (§7.4 п. 3): `BlobStore::{gate, share}`; держат `api::blobs::upload` (от `put` до
+  `attach`), `api::reports::create` (от первого файла до `create_report`), импорт
+  (`api::transfer::import`: от `extract_blobs` до конца `apply_plan`; `extract_blobs(…,
+  &BlobShare)`).
+- **Копия** (§7.4 п. 5): `zam_store::backup::blob_list` — `WHERE refcount > 0`.
+- **Воркер** (§7.4 п. 6): `maintenance::{gc_blobs, BlobGcPass, BLOB_GC_FIRST_RUN}` — отдельная
+  задача при `blob_gc_days > 0`: первый проход через час, затем раз в сутки; пропуск при
+  признаке копии (`backup_flag_active`) или занятом `BackupRunner` (до прохода и перед каждым
+  пользователем); INFO `blob gc: user=… rows=… files=… bytes=…`, аудит `blobs.gc`.
+- **Конфигурация**: `LimitsSection::blob_gc_days` (7, 0..=365, `validate`, тест
+  `config::tests::blob_gc_days_range`), `deploy/config.example.toml` — с пояснением.
+- **`zam-server doctor`** (§7.5): `crates/zam-server/src/doctor.rs` — `run(cfg, DoctorOpts {full,
+  fix}, env_key) -> Report {checks, errors, warnings}` (`text`, `exit_code`), `DoctorError::Busy`;
+  `main.rs` — `Cmd::Doctor {full, fix, json}` (конфигурация не прочитана — код 2). Под него в
+  `zam-store`: `RoDb::{conn, immutable, opened_meanwhile}`, `backup::{FlagState (pub),
+  backup_flag_state}`, `vault::{any_user_key_in, key_check_in}`, `check::nightly_done_in` (pub);
+  в сервере: `vault::keys::key_state_in` (общий разбор `state_of` с `key_state`),
+  `backup::restore::STAGING` (pub).
+
+**Решения исполнителя.**
+- [решение исполнителя, задача 3] Замок блобов — реестр процесса по абсолютному пути корня
+  `blobs/<user>` (слабые ссылки: замок без держателей создаётся заново), а не поле `AppState`:
+  один корень — один замок, как бы ни был получен `BlobStore` (обработчики сервера, импорт в
+  `zam-store`, тесты).
+- [решение исполнителя, задача 3] Новый тип в сигнатуре — только у `extract_blobs` (замок едет в
+  блокирующий поток распаковки); `attach`, `create_report`, `apply_plan` сигнатур не меняют — у
+  них десятки вызовов в тестах `zam-store`, контракт «вызывающий держит `BlobShare`» — в
+  документации; держат его все обработчики записи блобов сервера.
+- [решение исполнителя, задача 3] `detach` ставит `mtime` без замка — внутри своей транзакции до
+  `COMMIT`: писатель базы один, повторная проверка сборщика идёт своей транзакцией после неё.
+  Ошибка `touch` — WARN, не отказ записи (запись защищает замок, время лишь откладывает удаление).
+- [решение исполнителя, задача 3] Вместе со строкой блоба удаляются документы `attachment_docs`
+  откреплённых пар без чанков: внешний ключ `attachment_docs.blob_sha256 → blobs` иначе не дал бы
+  удалить строку. Блоб, на который ссылаются `attachments`, `entry_attachments` или живой (или с
+  чанками) документ, не удаляется даже при `refcount = 0`.
+- [решение исполнителя, задача 3] Отбор — без замка (только чтение), удаление — под
+  исключительным с повторной проверкой в транзакции; точка теста между ними не держит замок, и
+  параллельная привязка того же sha проходит. Проход начинает и заканчивает разбором `.gc/`:
+  транзакция, откаченная после переименования (ошибка, а не смерть процесса), возвращает файл
+  сразу, а не через сутки. «Смерть процесса» в тестах — точки, обрывающие проход без итогового
+  разбора. Ошибка одного блоба — WARN и `errors`, проход продолжается.
+- [решение исполнителя, задача 3] `doctor --fix` сначала исправляет, потом проверяет (строки
+  `fix:…` — в конце). Проход сборщика в `--fix` — через `Db::open` и `blob_gc::sweep`, только у баз,
+  проверенных начисто (версия = программе, суммы `ok`/`adopted_pending`, схема без различий,
+  `quick_check`): мигратор там схему не меняет (у базы до 0.0.17 он примет суммы — то же сделал бы
+  старт сервера). FTS5 `rebuild` — соединением без мигратора. Аудит — `audit_closed` с `by:
+  "doctor"`.
+- [решение исполнителя, задача 3] Ложная тревога из-за `immutable` (замечание по задаче 1): база,
+  открытая `immutable=1`, с ошибкой проверяется второй раз, если рядом появились `-wal`/`-shm`
+  (сервер открыл её посреди чтения). Признак незавершённости с текстом `rollback …` — строка
+  `StoreError::RollbackIncomplete` («повторите ту же команду zam-server rollback»), иначе —
+  `RestoreIncomplete` (замечание по задаче 1: сервер 0.0.16 советовал бы `restore`).
+- [решение исполнителя, задача 3] `check:<user>` «двое суток без прогона» — только при активных
+  пробах (без проб проверять нечего); `links:<user>` — живые источники и цели этой базы
+  (`dst_space_id` пуст или пространство базы: рёбра к общему решению в чужой базе не сверяются).
+- [решение исполнителя, задача 3] `qdrant` управляемого режима — `zam_index::supervisor::inspect`
+  (как `qdrant status`, с пробой своего HTTP-порта); тесты `doctor` идут с `qdrant.mode = "edge"`
+  — без процесса и без обращений к порту 6333 на машине разработки.
+- [решение исполнителя, задача 3] Порча FTS в тесте — правка теневой таблицы `vault_fts_content`
+  (таблица с хранимым содержимым); у `chunks_fts` (внешнее содержимое `chunks`) сверку индекса с
+  таблицей содержимого `PRAGMA integrity_check(<таблица>)` не гарантирует, поэтому тест на ней не
+  строится.
+- Попутно: `zam-store/tests/reports.rs::migration_0022_keeps_entries_and_indexes` падал после
+  задачи 1 (число строк `zam_migrations` растёт с миграциями) — таблица исключена из сравнения,
+  как `meta`.
+
+**RED → GREEN.** Тесты писались вместе с кодом, поэтому RED подтверждён мутациями (исходники
+сохранены в `target/mut`, затем возвращены): без `touch` в `detach` —
+`gc_keeps_recently_detached` падает; замок, который всегда свободен, —
+`gc_skips_user_while_writer_holds_gate`; `delete_row` без повторной проверки —
+`gc_attach_race_keeps_file` (файл потерян); `blob_list` без `refcount > 0` —
+`backup_lists_only_referenced_blobs` (`MissingBlob`). Первый прогон `doctor` —
+`doctor_read_only_with_server_running` упал: `mtime` `system.db` сменил checkpoint сервера
+(интервал 1 с), а окно «сервер затих» было 0,7 с; теперь — два снимка подряд через 1,5 с.
+Ловушка прогона: исходники после мутаций вернул `Copy-Item`, а он сохраняет прежний `mtime` —
+cargo счёл сборку с мутацией свежей, и первый покрывающий прогон шёл на ней (упал
+`backup_lists_only_referenced_blobs`); после `touch` файлов — пересборка и зелёный прогон.
+
+**Прогоны** (Windows, dev, `CARGO_TARGET_DIR=target\m74-t3`, `-j 2`). `cargo test -p zam-store
+--lib --test attachments --test blobs --test reports` — 132 (1 ignored) + 18 + 5 + 21; `cargo
+test -p zam-server --features test-hooks --test blob_gc --test doctor --test backup --test
+transfer_import --test transfer_export --test reports --test blobs --test attachments_index` — 12
++ 14 + 59 + 49 + 17 + 27 + 11 + 17 = **206/206**; `--lib config::` — 51/51 (`blob_gc_days_range`,
+`example_config_parses_to_defaults`); весь прогон — 11 мин 21 с. После правки `--fix` (строка
+«пропущены» — только когда сборщику есть дело) — `doctor` 14/14 и `blob_gc` 12/12 повторно.
+Clippy `-D warnings`: `zam-store --all-targets` (с `test-hooks` и без), `zam-server
+--all-targets` — чисто; `cargo fmt -p zam-store -p zam-server --check` — чисто. `git diff
+2a8d27a8 -- Cargo.lock` и манифесты — без изменений.
+
+**`doctor` на каталоге данных e2e** (копия `.tmp/e2e/data` в `target/e2e-copy`, 108 файлов,
+96 МиБ: `system.db` с `-wal` и 16 баз пользователей v26; сборка dev; управляемый Qdrant на
+свободном порту): без флагов — код 0, 94 строки, ошибок 0, предупреждений 3 (бинарника Qdrant и
+модели в копии нет, копий нет), **1,9 с**; `--full` — то же, 1,7 с; `--fix` — код 0, исправлять
+нечего (базы v26 сборщик не трогает, дела ему нет — строк `fix:` нет), 1,8 с; `--json` — код 0.
+По базам: `info` «схема v26, программа v27: обновится при запуске» и «суммы миграций примет
+первое открытие сервером», `ok` сверки схемы, `blobs:` — у трёх пользователей 27, 1 и 1 блоб на
+месте, `links:` — одна неразрешённая wikilink.
+
+### M7.4 · Задача 4 — WebUI администрирования
+
+Спецификация §7.7 пп. 1–5; worktree `.tmp/m74/wt-t4`, ветка `m7.4-t4` от `2a8d27a8` (задачи 1 и
+2 слиты); параллельно с задачей 3 (общие файлы — CHANGELOG, журнал этапа, ТЗ — своими блоками;
+сервер не тронут).
+
+**Сделано.**
+- **Тренд** (п. 1): `web/src/lib/trend.ts` — `chronological`, `trendValue` (прогон не `done` или
+  значения нет — пропуск), `niceMax` (1/2/5 × 10ᵏ), `xPositions`, `trendChart` (точки, отрезки
+  между пропусками, деления 0 / середина / верх), `segmentPath`, `trendSummary`. «Проверка памяти»
+  — раздел «Тренд» после метрик: два SVG (доли `hit_search`/`hit_prompt` test 0–100 %,
+  подсказки — пунктиром; p95 со своей осью), ширина — `bind:clientWidth` фигуры, рядом на широкой
+  области и друг под другом на узкой; ухудшение (`verdict = regression`) — красный ▼ у всех рядов
+  прогона; даты краёв под осью; `role="img"` с `<title>` и `aria-describedby` на подпись
+  `trendSummary`; скрытая таблица «Тренд по прогонам»; подсказка точки — `<title>`.
+- **Набор проб** (п. 1): `worksApi.ts` — `listProbes` (`kind`, `status`, `split`, `limit=200`),
+  `addProbe`, `retireProbe`; `web/src/lib/probeForm.ts` — `parseProbeTargets` (форма
+  `<буква>:<id>`, повторы — один раз, 1–5), `questionError` (≤ 512), `reasonError` (3–500),
+  `PROBE_AUTHOR_TEXT`. Раздел «Пробы»: фильтры сервера (вид, состояние — по умолчанию активные,
+  часть), «Добавить пробу» (окно `FormDialog`: вопрос, цели; ошибки формы — под полем с
+  `aria-invalid` и фокусом на поле, 409 `probe-duplicate` и 422 — ошибкой окна), список — таблица
+  «Набор проб», на телефоне — карточки (строка `data-probe-set`), «Снять» (окно `danger` с
+  причиной; у посторонних вопросов набора сервера кнопки нет; 404 — список перечитан). Итог —
+  `Notice` над списком, фокус на нём (итог ставится до закрытия окна).
+- **Блок администратора** (п. 2): `web/src/components/WorksAdmin.svelte` (часть чанка `Works`) —
+  сводка `GET /admin/works` (`adminWorks`), тексты — `worksText.ts` (`modesSummary`,
+  `queueText`, `adminCheckText`). Страница пользователя глазами администратора: маршрут
+  `{name: 'works', user}` (`#/works?user=<id>`; `router.ts` разбирает часть `?…` адреса —
+  читает её только этот маршрут), оболочка передаёт `user` и `users` и монтирует страницу заново
+  при смене пользователя (`{#key}`); у функций `worksApi` — `user`: настройки —
+  `/admin/users/{id}/settings`, очередь, токены, журнал, проверка подключения — `?user=`, запуск —
+  `X-Zam-User`, Vault — пользователя; точку паузы шапки ставит только своя страница.
+- **Аудит** (п. 3): `listAudit(filter, before)` (`URLSearchParams`); страница — форма фильтров:
+  действие (поле с `datalist` действий загруженных событий и их префиксов `x.*`, Enter или
+  «Применить»), пользователь (все пользователи), даты «С»/«По» (сразу; «по» — начало следующего
+  дня местного времени, `until` исключителен; «с» позже «по» — ошибка), «Сбросить»; «Показать
+  ещё» — с применёнными фильтрами; строка «По фильтрам: N».
+- **Ленты** (п. 4): `ChangelogView` — сброс фильтров, корзины, формы и итога и перечитывание ленты
+  только при смене `user|space` (`scopeOf`, неудача первой страницы — `scopeOf = ''`); переход к
+  записи при открытой корзине — лента перечитывается с теми же фильтрами. `ReleasesView` — список
+  перечитывается при смене пространства, если релиза из адреса в нём нет или переход выключил
+  корзину. `QuestionsView` — то же; вопрос из загруженной ленты показывается и получает фокус без
+  запроса (`tick` → `reveal`), идущая загрузка покажет его сама.
+- **Обход узких экранов** (п. 5): `mobile-pages.ts` — `insights-корзина`, `insights-карточка`
+  (окно «Заменить»), `задачи-корзина`, `задачи-карточка` («Изменить»), `changelog-корзина`,
+  `changelog-запись` (окно правки), `внутренние-работы-пользователя`, у `проверка-памяти` — окно
+  «Добавить пробу». Запись changelog из адреса — `E2E_CHANGELOG_DOCS` (`seedJournals`).
+  `form-cases.ts` — строки `probe-add`, `probe-retire` (проба строки — `E2E_FORMS_PROBE`,
+  `seedForms`).
+
+**Решения исполнителя.**
+- [решение исполнителя, задача 4] REST набора проб и сводки — в `worksApi.ts` (модуль раздела,
+  ленивые страницы), а не в `api.ts` плана: `api` грузится при старте, а так эти функции туда не
+  попадают; в `api.ts` — только параметры `listAudit`.
+- [решение исполнителя, задача 4] Проверки полей окон проб — отдельный `probeForm.ts`, а не
+  `checkVerdict.ts`: правила страницы держит модуль её чанка; свой модульный тест
+  `web/test/probeForm.test.ts` (`probe_targets_ref_form`, `probe_question_and_reason_limits`) —
+  в `test:build`.
+- [решение исполнителя, задача 4] Тренд — два графика со своими осями (доли и миллисекунды), а не
+  одна ось на три ряда: у долей и p95 нет общей шкалы, вторая ось Y на одном графике читается хуже
+  (правило малых кратных). Ухудшение отмечено у всех рядов прогона: в `trend` нет флагов по
+  метрикам, только вердикт прогона.
+- [решение исполнителя, задача 4] Прогон не `done` (пропущен, сбой, предел времени, идёт) — пропуск
+  и при числах: метрики неполны, точка соврала бы.
+- [решение исполнителя, задача 4] «Внутренние работы» пользователя (`?user=`) — та же страница по
+  его данным, правки разрешены (сервер принимает их от администратора с аудитом), а не только
+  просмотр; блок «Все пользователи» — и на ней (переход между пользователями).
+- [решение исполнителя, задача 4] Фильтра «без пользователя» в «Аудите» больше нет: сервер
+  фильтрует по id пользователя события (§7.6 п. 1), смешивать фильтр сервера с фильтром по
+  загруженному — та же неполнота, ради которой фильтры ушли на сервер.
+- [решение исполнителя, задача 4] У «Вопросов» фильтров нет: `questions_keeps_filters_on_nav`
+  проверяет ленту — переход к вопросу её не запрашивает, фокус на заголовке; вопрос не из
+  загруженной ленты и выход из корзины переходом — перечитывают её (без этого вопрос, заданный
+  после загрузки, по адресу не показался бы, а восстановленный в корзине — пропал бы из ленты).
+- [решение исполнителя, задача 4] Строки набора проб — атрибут `data-probe-set`, а не
+  `data-probe`: тот же id бывает и у строки «Проваленных проб».
+- [решение исполнителя, задача 4] Ошибка формы целей — при отправке, а не при уходе с поля:
+  проверка на `blur` вставляла строку ошибки между полем и кнопками до отпускания мыши, кнопка
+  уезжала из-под указателя и «Добавить» не срабатывала (найдено плавающим
+  `check_probe_add_retire`).
+
+**Пределы чанков** (`npx size-limit`, gzip; до — сборка `2a8d27a8`, после — итог задачи):
+
+| Чанк | До | После | Предел до → после |
+|---|---|---|---|
+| `entry` | 69,83 КБ | 69,86 КБ | 103 КБ |
+| `start` | 96,21 КБ | 96,30 КБ | 103 КБ |
+| `api` | 27,11 КБ | 27,16 КБ | 29,7 КБ |
+| `start+api` | 123,32 КБ | 123,47 КБ | 129,5 КБ |
+| `Check` | 6,57 КБ | 12,63 КБ | 7 → 13,9 КБ (тренд, набор проб, два окна) |
+| `Works` | 11,09 КБ | 12,78 КБ | 11,3 → 14,1 КБ (блок администратора, страница пользователя) |
+| `Audit` | 2,54 КБ | 3,37 КБ | 2,9 → 3,7 КБ (форма фильтров сервера) |
+| `worksText` | 5,09 КБ | 5,34 КБ | 5,25 → 5,9 КБ (тексты сводки) |
+| `ChangelogView` | 3,38 КБ | 3,39 КБ | 3,7 КБ |
+| `ReleasesView` | 3,68 КБ | 3,71 КБ | 4,05 КБ |
+| `QuestionsView` | 5,17 КБ | 5,21 КБ | 5,3 КБ |
+
+Рост `start` (+0,09 КБ) — разбор `?user=` в `router.ts`; сверка `build/start-budget.ts` — без
+новых чанков старта.
+
+**RED → GREEN.** RED — новые e2e на release-сервере с WebUI сборки `2a8d27a8` (те же исходники
+сервера, `web/dist` из `git archive HEAD web`): все семь падают по ожидаемой причине —
+`check_trend_svg` (раздела «Тренд» нет), `check_probe_add_retire` (кнопки «Добавить пробу» нет),
+`works_admin_block` (блока «Все пользователи» нет), `audit_server_filters` (таблица без фильтров
+сервера), `changelog_keeps_filters_on_nav` (после перехода к записи «Вид записи» — `''` вместо
+`fix`), `releases_keeps_feed_on_nav` (4 запроса списка вместо 1), `questions_keeps_filters_on_nav`
+(3 запроса ленты вместо 1). Модульные `trend_points_scale`, `trend_gap_for_skipped` и тесты
+`probeForm`, `works_admin_summary_texts` написаны вместе с модулями (RED отдельно не снимался).
+Первый GREEN-прогон нашёл три ошибки самих тестов (проверка ширины страницы по `innerWidth` с
+полосой прокрутки; второе пространство создавалось после загрузки списка пространств оболочки;
+запросы корзины `deleted=only` считались лентой) и одну страницы (проверка целей на `blur`, см.
+решения) — исправлены. Первый полный прогон остановлен на `forms.spec.ts`: на телефоне окна
+«Принять как норму» и «Добавить пробу» зависали до таймаута 60 с, когда у пользователя уже есть
+прогоны (тренд на странице). Причина — скрытая таблица тренда: таблица не бывает уже своего
+содержимого, и `.sr-only` на самой таблице раздвигал страницу (на компьютере — 1713 px при окне
+1280), на телефоне раскладка менялась по кругу. Исправлено — скрывает обёртка `div.sr-only`;
+`check_trend_svg` проверяет ширину страницы и на 390 px, а помощник `wideOf` сообщает ширину
+страницы, даже если раздвигающий элемент сам себя обрезает (на прежней сборке — «страница 1713 >
+1280»; до этого проверка по элементам его не видела). Строки форм `probe-*` — цель `k:` (ссылка
+задачи), а не `t:` (термин): подсказка окна и текст ошибки исправлены так же.
+
+**Прогоны** (Windows, `npm ci` в `web`; release `zam-server` и `zam` worktree —
+`CARGO_TARGET_DIR=target\m74-t4`, `-j 2`, `pdfium.dll` рядом и в `target\deps`; Edge). `npm run
+check` — 0 ошибок и предупреждений; `npm run test:build` — 130/130; `npm run build` — сверка
+стартовой загрузки без новых чанков; `npx size-limit` — все строки в пределах (таблица выше).
+e2e файлов задачи (`check`, `works`, `admin`, `journals`, `backups`) — 36/36; строки форм
+`probe-add`, `probe-retire` (три ширины и `tabletLand`) и расширенный
+`all_pages_no_horizontal_scroll` — 31/31; после исправления скрытой таблицы — `check.spec.ts` и
+строки форм `check-accept`, `probe-add` на телефоне — 13/13; полный набор e2e — **1110/1110** за
+12,9 мин (у итога M7.3 — 1069; задача добавила 7 сценариев и 30 тестов строк `probe-*` матрицы
+форм). Снимки «после» (`E2E_FORMS_SNAP=after`) — `page-check`,
+`page-works`, `page-works-user`, `page-audit` в трёх ширинах (`.tmp/e2e/screens/forms/after/`,
+вне git); телефонные просмотрены: тренд — графики друг под другом во всю ширину, окно «Добавить
+пробу» — во весь экран, сводка — карточками. Сервер не менялся — `cargo` только для сборки.
+
+**Правки прежних e2e** (форма переехала): `backups.spec.ts` `admin_audit_feed` — фильтры аудита
+полем действия и запросом к серверу вместо выбора по загруженному; строка числа — «Загружено: N —
+есть ещё» / «По фильтрам: N» вместо «показано N из M загруженных»; после снятия фильтров — первая
+страница (100), а не всё загруженное.
+
+### M7.4 · Итог
+
+Волна реализована, выпуск `0.0.17-m7.4` (2026-11-28; ТЗ v1.30, CHANGELOG `[0.0.17-m7.4]`). Ветка
+`m7.4-admin` от `main` `c9f462c7` (выпуск `v0.0.16-m7.3`); рабочие задачи 1–4 — ветки `m7.4-t<N>`
+в своих worktree, по две параллельно (круги 1 ‖ 2 → 3 ‖ 4), слиты координатором (последнее
+слияние до итога — `8a1e61dc`); задача 5 — ветка `m7.4-t5` (версия и документы). Экономный режим
+по указанию владельца 2026-11-28 (решение 97): без отдельных ревью проекта, плана и задач; гейт —
+CI и прогоны исполнителей, аудит — агент владельца. Номерных миграций нет (решение 98); блок v8 и
+11 инструментов MCP прежние; новых крейтов и зависимостей npm нет (`git diff c9f462c7 --
+Cargo.lock` — только версии пакетов workspace). Линия отсечения (решение 112) не понадобилась.
+
+Что сделано по задачам (подробности, решения исполнителей, RED и прогоны — разделы задач выше):
+1. **Миграции, `rollback`, `restore`** (§7.1–§7.3): `zam_migrations` и суммы SHA-256 (`applied`,
+   `adopted`), сторож `SHA256SUMS`, отказ открытия при расхождении, `zam_store::inspect`,
+   `zam-server rollback --to v<N> [--system v<M>]`, `restore` — `key_state`, уборка `--replace`,
+   `flag_max_age()`, размер из описи.
+2. **API и CLI администратора, мелкие долги** (§7.6): фильтры аудита, `GET /admin/works`, ручные
+   пробы и снятие человеком, `components` у `/health`, `include_history`, `big_body_permits`,
+   сводки лицензий по цели, сторож `cli_env_literals_registered`, предел флейка 1 с.
+3. **Сборщик мусора блобов и `doctor`** (§7.4, §7.5): воркер раз в сутки, замок блобов, удаление
+   через `.gc/`, копия без откреплённых блобов; `zam-server doctor [--full] [--fix] [--json]`.
+4. **WebUI администрирования** (§7.7): тренд и набор проб, блок «Все пользователи», фильтры
+   «Аудита» на сервере, ленты журналов без перечитывания, обход узких экранов; e2e — 1110/1110.
+5. **Итог волны** (этот раздел; отчёт исполнителя — в `.superpowers/`, вне git): версия
+   `0.0.17-m7.4` (`Cargo.toml`, `Cargo.lock`, `Cargo.lock` фаззинга `zam-code`, `web/package.json`,
+   `web/package-lock.json`, `config.example.toml`), CHANGELOG (вводная, совместимость, «Изменения
+   ответа», Added, Changed, «Known limitations», «Для разработчиков»), README, `docs/journal.md`,
+   руководство («С 0.0.16-m7.3 на 0.0.17-m7.4», «Известные ограничения (0.0.17-m7.4)»), ТЗ v1.30
+   (§12 «целевой API», §15.4 — строка о `doctor`, §19, §21 п. 24, история; подпункты §6.3, §6.5,
+   §12, §13.1–§13.3, §16.2–§16.4, §18.3 дописаны задачами 1–4), статус спецификации.
+   `docs/api-compat.md` сверен с `FEATURES`: четыре строки M7.4 в конце, в порядке кода.
+
+**Решения координатора** — спецификация §12, пп. 97–113 (краткий смысл — ТЗ §21 п. 24). По ходу
+задач (`Ruling` в `progress.md` SDD): ручные пробы по токену `rw` оставлены — вердикт сравнивает
+общие пробы, разбавление ограничено; цена — агент может влиять на набор проб (в аудит владельца);
+`blob_gc_days` — в `LimitsSection::validate`; строка ТЗ §15.4 «`doctor` нет — M7» — поправлена
+итогом.
+
+**Перенесено** — спецификация §7.10 (потоковый импорт, остальное по `/mcp`, `area.toml`,
+окончательное удаление из корзины, формы Vault, граф «По размеру», сироты кэшей, пересборка Qdrant
+после `restore` на Windows с HDD) — задачами памяти с причиной при развёртывании.
+
+**Приёмка: числа.** CI Windows/Linux, Edge, CUDA, `package-smoke`; e2e у исполнителей — 1110
+passed; полный локальный прогон и тихое окно не запускались — экономный режим по решению владельца
+2026-11-28. У задачи 5: `cargo build -p zam-server -p zam-cli` (версия в `Cargo.lock`), `cargo
+test -p zam-server --test boot`, `cargo fmt --all --check`. Живой приёмки нет (решение 111):
+вывод `zam-server doctor` до и после обновления на обоих серверах, число и объём кандидатов
+сборщика до первого прохода — координатор при развёртывании.
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

@@ -1,5 +1,7 @@
 // Сквозной сценарий администратора в WebUI по HTTP через LAN-IP (без secure context).
 import { expect, test } from '@playwright/test';
+import { pageSnapshots } from './page-snaps';
+import { ADMIN_STATE } from './session';
 
 const base = () => {
   const b = process.env.E2E_BASE_URL;
@@ -113,4 +115,90 @@ test('администратор: вход, пользователь, токен
   await expect(page.getByRole('button', { name: 'Войти' })).toBeVisible();
 
   expect(problems, problems.join('\n')).toEqual([]);
+});
+
+// M7.4 (спецификация §7.7 п. 3, §7.6 п. 1; решение 25 снято): фильтры «Аудита» — запросом к серверу,
+// а не по загруженному: действие точно и префиксом, пользователь, период; «Сбросить».
+test.describe('аудит', () => {
+  test.use({ storageState: ADMIN_STATE });
+
+  // снимки «до/после» (`E2E_FORMS_SNAP`): «Аудит» с полями фильтров сервера
+  pageSnapshots('audit', () => '#/admin/audit');
+
+  test('audit_server_filters', async ({ page }) => {
+    const problems: string[] = [];
+    page.on('pageerror', (e) => problems.push(e.message));
+    page.on('response', (r) => {
+      if (r.status() >= 400 && new URL(r.url()).pathname.includes('/api/v1/')) problems.push(`HTTP ${r.status()} ${r.url()}`);
+    });
+    // события своего пользователя: создание, пароль, настройки (сессией администратора)
+    const me = (await (await page.request.get(`${base()}api/v1/auth/me`)).json()) as { csrf: string };
+    const admin = async <T>(method: string, path: string, data?: unknown): Promise<T> => {
+      const r = await page.request.fetch(`${base()}api/v1/${path}`, { method, headers: { 'X-CSRF-Token': me.csrf }, data });
+      expect(r.ok(), `${method} ${path}: HTTP ${r.status()}`).toBe(true);
+      return (r.status() === 204 ? undefined : await r.json()) as T;
+    };
+    const name = `e2e-audit-${Date.now().toString(36)}`;
+    const u = await admin<{ user: { id: string } }>('POST', 'admin/users', { name });
+    await admin('POST', `admin/users/${u.user.id}/password`, { password: ['audit', 'e2e', 'pass', '1'].join('-') });
+    await admin('PATCH', `admin/users/${u.user.id}/settings`, { hooks: { prompt: false } });
+    // ожидание — ответ сервера с тем же фильтром (страница его только показывает)
+    const serverActions = async (q: string) =>
+      ((await admin<{ items: { action: string }[] }>('GET', `admin/audit?limit=100&${q}`)).items).map((x) => x.action);
+    const shown = () => page.locator('table[aria-label="События аудита"] tbody tr').evaluateAll((rows) => rows.map((r) => r.getAttribute('data-audit')));
+    const sent = (part: string) => page.waitForRequest((r) => r.url().includes('/api/v1/admin/audit?') && r.url().includes(part));
+
+    await page.goto(`${base()}#/admin/audit`);
+    await expect(page.getByRole('heading', { name: 'Аудит', exact: true })).toBeVisible();
+    await expect(page.locator('table[aria-label="События аудита"] tbody tr').first()).toBeVisible();
+
+    // пользователь — фильтр сервера `user=<id>`: только его события
+    let req = sent(`user=${u.user.id}`);
+    await page.getByLabel('Пользователь').selectOption({ label: name });
+    await req;
+    const forUser = await serverActions(`user=${u.user.id}`);
+    expect(forUser).toEqual(expect.arrayContaining(['user.password.set', 'user.settings.update']));
+    await expect.poll(shown).toEqual(forUser);
+    await expect(page.getByTestId('audit-count')).toHaveText(`По фильтрам: ${forUser.length}`);
+
+    // действие префиксом (`user.*`): `user.password.set`, `user.settings.update`, но не `user_create`
+    req = sent('action=user.*');
+    await page.getByLabel('Действие').fill('user.*');
+    await page.getByLabel('Действие').press('Enter');
+    await req;
+    const prefixed = await serverActions(`user=${u.user.id}&action=user.*`);
+    expect(prefixed.length).toBeGreaterThanOrEqual(2);
+    expect(prefixed.every((a) => a.startsWith('user.'))).toBe(true);
+    await expect.poll(shown).toEqual(prefixed);
+    // точно — одно действие
+    req = sent('action=user.password.set');
+    await page.getByLabel('Действие').fill('user.password.set');
+    await page.getByRole('button', { name: 'Применить', exact: true }).click();
+    await req;
+    await expect.poll(shown).toEqual(['user.password.set']);
+
+    // период: «по» — вчера — событий нет; «с» и «по» — сегодня — снова есть
+    const day = (d: number) => {
+      const x = new Date(Date.now() + d * 86_400_000);
+      return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`;
+    };
+    req = sent('until=');
+    await page.getByLabel('По', { exact: true }).fill(day(-1));
+    await req;
+    await expect(page.getByText('Событий по этим фильтрам нет.')).toBeVisible();
+    req = sent('since=');
+    await page.getByLabel('По', { exact: true }).fill(day(0));
+    await page.getByLabel('С', { exact: true }).fill(day(0));
+    await req;
+    await expect.poll(shown).toEqual(['user.password.set']);
+
+    // «Сбросить» — все события, поля пусты
+    req = page.waitForRequest((r) => /\/api\/v1\/admin\/audit\?limit=100$/.test(r.url()));
+    await page.getByRole('button', { name: 'Сбросить', exact: true }).click();
+    await req;
+    await expect(page.getByLabel('Действие')).toHaveValue('');
+    await expect(page.getByLabel('Пользователь')).toHaveValue('');
+    await expect(page.getByTestId('audit-count')).toContainText('Загружено:');
+    expect(problems, problems.join('\n')).toEqual([]);
+  });
 });
