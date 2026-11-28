@@ -7504,23 +7504,23 @@ llama.cpp и vLLM; живую проверку дают `POST /works/model/test`
 
 #### Приёмка: числа
 
-Итоговая приёмка на голове ветки `…` (… (числа впишет координатор); Windows 11, HDD).
+Голова ветки `4a0b56af`; полный локальный прогон и тихое окно не запускались — экономный режим по решению владельца 2026-11-28 (тестирование и аудит — отдельным агентом владельца).
 
 | Проверка | Итог |
 |---|---|
-| Полный прогон workspace `ZAM_REQUIRE_ML=1` (Windows 11, HDD) | … (числа впишет координатор) |
-| `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` | … |
-| CI `ci.yml` — Windows и Linux; Edge; CUDA | … |
-| `package.yml` / `package-smoke` | … |
-| WebUI: `npm run check`, `npm run test:build`, `npm run build` | … |
-| e2e WebUI (release-сборка) | … passed (у 0.0.15-m7.2 — 201; полный набор задачи 8 после слияния с 10b — 1065/1065: матрица форм в трёх ширинах и `tabletLand`) |
-| `npx size-limit` — чанки до (`v0.0.15-m7.2`) и после | … (таблица — координатор; строки `start`, `api`, `start+api` и новые чанки — CHANGELOG, «Для разработчиков») |
-| Тихое окно `m4` (`hook_budgets`) | … |
-| Тихое окно `m57` (`acceptance_recall_p95_with_50_ideas`) | … |
-| Тихое окно `m6` (`acceptance_hook_budgets`, медиана отношения p95 `/recall(prompt)` к v0.0.15-m7.2 ≤ 1,10) | … |
-| Блок v8 ru/en (500/497), MCP — 11 инструментов, описания ≤ 300 | … |
-| Финальное ревью ветки и волна правок | … |
-| Тег `v0.0.16-m7.3`, Release, развёртывание на рабочий сервер памяти (с копией данных) и тестовый стенд, клиент владельца | … |
+| Полный прогон workspace `ZAM_REQUIRE_ML=1` (Windows 11, HDD) | не запускался — экономный режим (решение владельца 2026-11-28); наборы задач — у исполнителей (отчёты задач), workspace — CI |
+| `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` | в CI `4a0b56af` — success |
+| CI `ci.yml` — Windows и Linux; Edge; CUDA | `4a0b56af`: CI 46083904836, Edge 46083904744, CUDA 46083904774 — success; на `main` `0583a99b`: Edge 46087183343, CUDA 46087183331 — success |
+| `package.yml` / `package-smoke` | success в составе CI `4a0b56af` |
+| WebUI: `npm run check`, `npm run test:build`, `npm run build` | у исполнителей на слитых деревьях — чисто (test:build до 123), сборка со сверкой старта |
+| e2e WebUI (release-сборка) | у исполнителей: задача 8 после слияния с 10b — 1065/1065, волна правок — 1069 passed, 10c на слитом дереве — 1069/1069 (один плавающий `code_overview_rereads_status_new_snapshot`, отдельно 8/8); у 0.0.15-m7.2 — 201 |
+| `npx size-limit` — чанки до (`v0.0.15-m7.2`) и после | в пределах: старт без api — до 96,21 КБ из 103, start+api — 123,32 из 129,5 (10c на слитом дереве) |
+| Тихое окно `m4` (`hook_budgets`) | не запускалось — экономный режим |
+| Тихое окно `m57` (`acceptance_recall_p95_with_50_ideas`) | не запускалось — экономный режим |
+| Тихое окно `m6` (`acceptance_hook_budgets`, медиана отношения p95 `/recall(prompt)` к v0.0.15-m7.2 ≤ 1,10) | не запускалось — экономный режим |
+| Блок v8 ru/en (500/497), MCP — 11 инструментов, описания ≤ 300 | зелёные в CI (`agent_setup_block_v8_under_500_tokens_ru_en`, `mcp_tools_still_eleven`, `all_schema_descriptions_under_300`) |
+| Финальное ревью ветки и волна правок | `7e15b5a5..3dc60d0e`: With fixes — Critical 0, Important 0, Minor 12; волна правок f1acd145, cf3e0207, 445e0256, 8156715d — все 12; повторное ревью волны не запускалось — экономный режим |
+| Тег `v0.0.16-m7.3`, Release, развёртывание на рабочий сервер памяти (с копией данных) и тестовый стенд, клиент владельца | merge `0583a99b`, тег `v0.0.16-m7.3`; Release 46087201086 — success, черновик (публикует владелец). Развёртывание 2026-11-28 ≈ 00:58 UTC скриптом обновления на месте (секция `[works]` at = 04:30, tz = Europe/Moscow добавлена в config.toml): тестовый стенд — данные 456 МБ, копия `.bak-0.0.15`, старт 11 с; рабочий сервер памяти — 783 МБ, копия `.bak-0.0.15`, старт 10 с; миграция 0027 — `bak-v26` каждой базы; `/health` — `0.0.16-m7.3`, `ok`, признаки `works`, `memory_check`, `proposals`, `usage_opened`, `space_counts_steps`; ошибок в журнале службы нет; модели — те же (SHA256 `bge-m3-int8` совпадает с 0.0.15-m7.2). Клиент `zam` владельца — 0.0.16-m7.3; `zam check status` — ночная проверка nightly, прогонов ещё нет |
 | Миграция 0027 на рабочем сервере памяти и тестовом стенде (размер баз, время, `bak-v26`) | … (замер задачи 1 на копии локальной базы 406 МБ — 5,09 с, SQL — 41 мс) |
 | День выпуска: `POST /works/model/test` (класс, мс, `thinking`) | … |
 | День выпуска: ручной `POST /works/run {kind: "probes"}` — токены вход/выход, мс пакета (≤ `call_timeout_s`), исход | … |
