@@ -1448,6 +1448,7 @@ async fn released_prompt_ideas(
             continue;
         }
         let q = FtsQuery {
+            drop_stop_words: false,
             alias_groups: Vec::new(),
             text: query.to_string(),
             space_ids: spaces,

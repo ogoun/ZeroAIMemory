@@ -233,6 +233,7 @@ async fn alias_expansion_large_glossary_latency() {
         .map(|k| format!("настройка кэша al{}x очередей", (k * 37) % 2000))
         .collect();
     let query = |text: &str, groups: Vec<zam_store::AliasGroup>| zam_store::FtsQuery {
+        drop_stop_words: false,
         text: text.to_string(),
         space_ids: spaces.clone(),
         path_prefix: None,

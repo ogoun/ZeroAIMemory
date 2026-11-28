@@ -246,16 +246,21 @@ async fn snapshot_kind_boost_fixture() {
     std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap() + "\n").unwrap();
 }
 
-/// `kind_boost_mode = always` (умолчание v0.0.9) — выдача побайтово как эталон до задачи 10.
+/// `kind_boost_mode = always` (умолчание v0.0.9) — выдача побайтово как эталон до задачи 10,
+/// кроме балла сдвинутой по `contradicts` теоремы: с M7.5 (§8.2 п. 1) он на шаг округления выше
+/// балла следующей гипотезы, а не равен ему.
 #[tokio::test]
 async fn always_byte_equal_m57() {
-    let want: Value = serde_json::from_str(
+    let mut want: Value = serde_json::from_str(
         &std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(KIND_BOOST_FIXTURE),
         )
         .unwrap(),
     )
     .unwrap();
+    let moved = &mut want["rerank=on,top_k=10"][0];
+    assert_eq!((&moved[0], &moved[1]), (&json!("thm"), &json!(0.84)));
+    moved[1] = json!(0.8401);
     let (a, ids) = kind_world("kb-always", |c| {
         c.search.kind_boost_mode = KindBoostMode::Always;
     })
@@ -443,4 +448,134 @@ async fn unless_contradicted_warns_on_truncated_graph() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     let j = r.json();
     assert_eq!(count(&j), 1, "порядок по contradicts: {j}");
+}
+
+// ---- ничьи `reliable_first`: балл сдвинутой записи (M7.5 §8.2 п. 1) ----
+
+/// Мир порядка по `contradicts`: записи `(имя, certainty, метка, балл реранкера)` вида
+/// `discovery` (без буста вида) и связь `hyp → thm`. Возвращает сервер и пары (id, имя).
+async fn contra_world(
+    name: &str,
+    world: &[(&'static str, &str, &'static str, f32)],
+) -> (Api, Vec<(String, &'static str)>) {
+    let a = api(name, |c| c.search.brief_min_rel = 0.0).await;
+    let marks = world.iter().map(|w| (w.2, w.3)).collect();
+    a.st.rerank.install(Arc::new(Stub(marks))).await;
+    let mut ids = Vec::new();
+    for &(key, certainty, mark, _) in world {
+        let mut data = json!({"kind": "discovery"});
+        if certainty == "theorem" {
+            data["evidence"] = json!({"checked": "сборка на CI", "method": "прогон 3 раза",
+                                      "result": "воспроизводится"});
+        }
+        let body = json!({"kind": "insight", "title": format!("Сборка кэша: {key}"),
+                          "body": format!("Сборка кэша ускоряется прогревом, {mark}."),
+                          "data": data, "certainty": certainty, "force": true});
+        let r = a
+            .t(Method::POST, "/api/v1/spaces/knowledge/entries", Some(body))
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        ids.push((r.json()["id"].as_str().unwrap().to_string(), key));
+    }
+    let id = |k: &str| ids.iter().find(|(_, n)| *n == k).unwrap().0.clone();
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/edges",
+            Some(
+                json!({"src": format!("e:{}", id("hyp")), "type": "contradicts",
+                        "dst": format!("e:{}", id("thm"))}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    (a, ids)
+}
+
+/// Теорема, которой противоречит гипотеза выше неё, встаёт сразу перед гипотезой с баллом
+/// `min(предыдущий, следующий + 0,0001)`: предыдущего нет — строго выше следующего на шаг
+/// округления ответа (до M7.5 — равный ему, и xtask ставил гипотезу первой по пути).
+#[tokio::test]
+async fn order_by_contradicts_moved_strictly_above_next() {
+    let (a, ids) = contra_world(
+        "rr-contra-next",
+        &[
+            ("hyp", "hypothesis", "маркергипотезы", 0.80),
+            ("thm", "theorem", "маркертеоремы", 0.50),
+        ],
+    )
+    .await;
+    let j = search(&a, json!({"query": "сборка кэша", "rerank": "on"})).await;
+    assert_eq!(j["warnings"], json!([]), "{j}");
+    let v = named(&j, &ids);
+    let order: Vec<&str> = v.iter().map(|x| x.0.as_str()).collect();
+    assert_eq!(order, ["thm", "hyp"], "{j}");
+    // гипотеза 0,80 × 1,00; теорема 0,50 × 1,10 = 0,55 → 0,80 + 0,0001
+    assert_eq!(score_of(&v, "hyp"), 0.8, "{j}");
+    assert_eq!(score_of(&v, "thm"), 0.8001, "{j}");
+    // третья запись ниже пары не мешает: «строго выше» — при любом top_k > 1
+    let (b, ids) = contra_world(
+        "rr-contra-next-none",
+        &[
+            ("hyp", "hypothesis", "маркергипотезы", 0.80),
+            ("thm", "theorem", "маркертеоремы", 0.50),
+            ("x", "hypothesis", "маркерикс", 0.10),
+        ],
+    )
+    .await;
+    for top_k in [2, 3, 10] {
+        let j = search(
+            &b,
+            json!({"query": "сборка кэша", "rerank": "on", "top_k": top_k}),
+        )
+        .await;
+        let v = named(&j, &ids);
+        assert_eq!((v[0].0.as_str(), v[1].0.as_str()), ("thm", "hyp"), "{j}");
+        assert!(v[0].1 > v[1].1, "{j}");
+    }
+}
+
+/// Предыдущий элемент ближе шага округления: балл сдвинутой записи — балл предыдущего (ничья с
+/// ним допустима, порядок задаёт массив ответа); порядок «предыдущий, сдвинутая, источник».
+#[tokio::test]
+async fn order_by_contradicts_tie_with_prev() {
+    let (a, ids) = contra_world(
+        "rr-contra-prev",
+        &[
+            ("hyp", "hypothesis", "маркергипотезы", 0.80),
+            ("thm", "theorem", "маркертеоремы", 0.50),
+            ("top", "hypothesis", "маркерикс", 0.80003),
+        ],
+    )
+    .await;
+    let j = search(&a, json!({"query": "сборка кэша", "rerank": "on"})).await;
+    let v = named(&j, &ids);
+    let order: Vec<&str> = v.iter().map(|x| x.0.as_str()).collect();
+    assert_eq!(order, ["top", "thm", "hyp"], "{j}");
+    // min(0,80003, 0,80 + 0,0001) = 0,80003 → 0,8 в ответе: ничья с предыдущим и со следующим
+    assert_eq!(score_of(&v, "thm"), score_of(&v, "top"), "{j}");
+    assert!(score_of(&v, "thm") >= score_of(&v, "hyp"), "{j}");
+    // предыдущий выше шага: строго между предыдущим и следующим
+    let (b, ids) = contra_world(
+        "rr-contra-prev-far",
+        &[
+            ("hyp", "hypothesis", "маркергипотезы", 0.80),
+            ("thm", "theorem", "маркертеоремы", 0.50),
+            ("top", "hypothesis", "маркерикс", 0.90),
+        ],
+    )
+    .await;
+    let j = search(&b, json!({"query": "сборка кэша", "rerank": "on"})).await;
+    let v = named(&j, &ids);
+    let order: Vec<&str> = v.iter().map(|x| x.0.as_str()).collect();
+    assert_eq!(order, ["top", "thm", "hyp"], "{j}");
+    assert_eq!(
+        (
+            score_of(&v, "top"),
+            score_of(&v, "thm"),
+            score_of(&v, "hyp")
+        ),
+        (0.9, 0.8001, 0.8),
+        "{j}"
+    );
 }

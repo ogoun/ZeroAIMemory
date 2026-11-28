@@ -203,6 +203,7 @@ async fn drop_jobs(db: &Db) {
 
 fn fts(text: &str, spaces: &[Id]) -> FtsQuery {
     FtsQuery {
+        drop_stop_words: false,
         alias_groups: Vec::new(),
         text: text.into(),
         space_ids: spaces.to_vec(),
@@ -1144,6 +1145,7 @@ async fn search_channels_hide_hidden_attachment_docs() {
         id: d.id,
     };
     let q = |text: &str, targets: TargetFilter, groups: Vec<AliasGroup>| FtsQuery {
+        drop_stop_words: false,
         alias_groups: groups,
         targets,
         ..fts(text, &[env.k])
@@ -1335,6 +1337,7 @@ async fn attachment_index_state_and_pending_count() {
         .unwrap();
     let state = || async {
         let q = FtsQuery {
+            drop_stop_words: false,
             targets: TargetFilter::default(),
             ..fts("иттербий", &[env.k])
         };

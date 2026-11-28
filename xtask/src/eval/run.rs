@@ -218,19 +218,39 @@ pub fn build_server(repo: &Path, server_bin: Option<&Path>) -> Result<PathBuf> {
     Ok(exe.parent().context("каталог zam-server")?.to_path_buf())
 }
 
-/// Соседние попадания с **равным** баллом — по пути (M6, задача 1a2, ревью I-1): порядок равных
-/// сервер берёт по случайному id записи, у каждой загрузки свой, и метрики двух прогонов одного
-/// поведения различались бы. Порядок разных баллов не меняется.
-pub fn order_ties(hits: &mut [Hit]) {
-    let mut i = 0;
-    while i < hits.len() {
-        let mut j = i + 1;
-        while j < hits.len() && hits[j].score == hits[i].score {
-            j += 1;
-        }
-        hits[i..j].sort_by(|a, b| a.path.cmp(&b.path));
-        i = j;
-    }
+/// Попадания ответа поиска в порядке сервера: путь заметки или `insight:<key>` записи набора
+/// (`entry_keys`: id записи → ключ; чужая запись — `entry:<id>`). Ничьи баллов порядка не
+/// меняют (M7.5 §8.2 п. 2): порядок равных задаёт массив ответа — сервер ставит сдвинутую по
+/// `contradicts` запись перед источником и при равном балле. До M7.5 `order_ties` упорядочивал
+/// равные по пути (M6, задача 1a2: у равных порядок по случайному id записи), и гипотеза `r-08`
+/// обгоняла теорему.
+pub fn hits_of(v: &Value, entry_keys: &BTreeMap<String, String>) -> Vec<Hit> {
+    v["items"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|i| Hit {
+                    path: match i["entry_id"].as_str() {
+                        Some(id) => match entry_keys.get(id) {
+                            Some(k) => format!("{INSIGHT_REF}{k}"),
+                            None => format!("entry:{id}"),
+                        },
+                        None => i["path"].as_str().unwrap_or_default().to_string(),
+                    },
+                    score: i["score"].as_f64().unwrap_or(0.0),
+                    sources: i["sources"]
+                        .as_array()
+                        .map(|s| {
+                            s.iter()
+                                .filter_map(|x| x.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    reranked: !i["rerank_score"].is_null(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Запущенный сервер прогона.
@@ -765,42 +785,9 @@ impl Session {
         Ok((v, ms))
     }
 
-    /// Элементы выдачи: путь заметки или `insight:<key>` записи набора (чужая запись —
-    /// `entry:<id>`).
+    /// Элементы выдачи в порядке сервера ([`hits_of`]).
     fn hits(&self, v: &Value) -> Vec<Hit> {
-        let mut hits = self.raw_hits(v);
-        order_ties(&mut hits);
-        hits
-    }
-
-    /// Попадания ответа поиска в порядке сервера.
-    fn raw_hits(&self, v: &Value) -> Vec<Hit> {
-        v["items"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .map(|i| Hit {
-                        path: match i["entry_id"].as_str() {
-                            Some(id) => match self.entry_keys.get(id) {
-                                Some(k) => format!("{INSIGHT_REF}{k}"),
-                                None => format!("entry:{id}"),
-                            },
-                            None => i["path"].as_str().unwrap_or_default().to_string(),
-                        },
-                        score: i["score"].as_f64().unwrap_or(0.0),
-                        sources: i["sources"]
-                            .as_array()
-                            .map(|s| {
-                                s.iter()
-                                    .filter_map(|x| x.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        reranked: !i["rerank_score"].is_null(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        hits_of(v, &self.entry_keys)
     }
 
     /// Выполняет запросы в режиме `mode`: основной поиск `mode = notes` и, по виду запроса,
@@ -1562,26 +1549,39 @@ mod tests {
     use super::*;
 
     /// Равные баллы — по пути, разные — в порядке сервера (в том числе не по убыванию: реранк).
+    /// M7.5 §8.2 п. 2: ничьи баллов — в порядке сервера (до M7.5 `order_ties` ставил равные по
+    /// пути, и гипотеза `insight:p08-h` обгоняла сдвинутую перед ней `insight:p08-t`).
     #[test]
-    fn ties_ordered_by_path() {
-        let h = |path: &str, score: f64| Hit {
-            path: path.into(),
-            score,
-            sources: Vec::new(),
-            reranked: false,
-        };
-        let mut hits = vec![
-            h("z", 0.9),
-            h("c", 0.7625),
-            h("a", 0.7625),
-            h("b", 0.7625),
-            h("y", 0.5),
-            h("x", 0.6),
-            h("w", 0.6),
-        ];
-        order_ties(&mut hits);
+    fn eval_keeps_server_order_on_ties() {
+        let v = serde_json::json!({"items": [
+            {"path": "z", "score": 0.9},
+            {"entry_id": "e2", "score": 0.7625},
+            {"entry_id": "e1", "score": 0.7625},
+            {"path": "b", "score": 0.7625, "sources": ["fts"]},
+            {"path": "y", "score": 0.5},
+            {"path": "x", "score": 0.6},
+            {"entry_id": "e3", "score": 0.6, "rerank_score": 0.4},
+        ]});
+        let keys: BTreeMap<String, String> = [("e1", "p08-h"), ("e2", "p08-t")]
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+        let hits = hits_of(&v, &keys);
         let got: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
-        assert_eq!(got, ["z", "a", "b", "c", "y", "w", "x"]);
+        assert_eq!(
+            got,
+            [
+                "z",
+                "insight:p08-t",
+                "insight:p08-h",
+                "b",
+                "y",
+                "x",
+                "entry:e3"
+            ]
+        );
+        assert_eq!(hits[3].sources, ["fts"]);
+        assert!(hits[6].reranked && !hits[0].reranked);
     }
 
     #[test]

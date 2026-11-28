@@ -618,6 +618,7 @@ async fn report_index_state_excluded_fts_only() {
             search_fts(
                 &db,
                 FtsQuery {
+                    drop_stop_words: false,
                     alias_groups: Vec::new(),
                     text: "трансформерлинейный".into(),
                     space_ids: vec![space],
