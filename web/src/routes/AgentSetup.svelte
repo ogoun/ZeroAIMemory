@@ -10,7 +10,12 @@
   // (`ideas.mode`, M6.5 §7: «Идеи: разбирать сам / предлагать мне»). Галочка «Подключить с
   // переносом данных» (M7.6 §9.1) — задание агенту на перенос проекта от сервера
   // (`migration_prompt`); сервер без признака `agent_setup_migrate` — галочка выключена с пояснением.
+  // Выпуск токена (решения координатора 141–142): «Название токена» заполнено «<агент> · <решение> ·
+  // <дата>», пока его не правили; выпущенный здесь токен можно тут же отозвать — команды
+  // возвращаются к заглушке.
   import { onMount } from 'svelte';
+  import Prompt, { type Ask } from '../components/Prompt.svelte';
+  import TokenNameField from '../components/TokenNameField.svelte';
   import TokenShown from '../components/TokenShown.svelte';
   import {
     AGENT_KINDS,
@@ -23,6 +28,8 @@
     issueOwnToken,
     issueToken,
     listSolutions,
+    revokeOwnToken,
+    revokeToken,
     serverFeatures,
     setUserHooks,
     setUserIdeas,
@@ -41,6 +48,8 @@
   } from '../lib/api';
   import { takeIssued } from '../lib/agentSetup';
   import { copyText } from '../lib/clipboard';
+  import { href } from '../lib/router';
+  import { defaultTokenName } from '../lib/tokenName';
 
   let { me, users, onexpired }: { me: Me; users: User[]; onexpired: () => void } = $props();
 
@@ -52,6 +61,8 @@
     agents: 'AGENTS.md (Codex, Cursor и др.)',
     codex: 'Codex (AGENTS.md и хуки Codex)',
   };
+  /** Агент в названии токена по умолчанию. */
+  const AGENT_SHORT: Record<AgentKind, string> = { claude: 'Claude Code', agents: 'AGENTS.md', codex: 'Codex' };
   const HOOK_TITLE: Record<HookKind, string> = {
     session_start: 'Дайджест при старте сессии (SessionStart)',
     prompt: 'Подсказки к запросу пользователя (UserPromptSubmit)',
@@ -92,8 +103,15 @@
   let error = $state('');
   let solutions = $state<SolutionItem[]>([]);
   let tokenName = $state('');
+  /** Название токена правил человек: значение по умолчанию больше не подставляется. */
+  let nameEdited = $state(false);
+  let nameError = $state('');
+  let nameInput = $state<HTMLInputElement>();
   let tokenAccess = $state<Access>('rw');
   let tokError = $state('');
+  /** Итог отзыва выпущенного здесь токена. */
+  let tokNotice = $state('');
+  let ask = $state<Ask | null>(null);
   let flags = $state<HookFlags | null>(null);
   /** `ideas.proactive` пользователя (`null` — ещё не прочитано). */
   let ideasOn = $state<boolean | null>(null);
@@ -109,6 +127,18 @@
   let userSolutions = $derived(
     admin ? solutions.filter((s) => s.owner.id === userId) : solutions,
   );
+  /** Решение в названии токена по умолчанию. */
+  let solTitle = $derived(
+    name.trim() ||
+      (solMode === 'existing' ? userSolutions.find((s) => s.agent_solution_id === existing)?.name : undefined) ||
+      'новое решение',
+  );
+  let tokenDefault = $derived(defaultTokenName(AGENT_SHORT[agent], solTitle, new Date()));
+
+  // название по умолчанию следует за агентом и решением, пока человек его не правил
+  $effect(() => {
+    if (!nameEdited) tokenName = tokenDefault;
+  });
 
   function fail(e: unknown): string {
     if (e instanceof ApiError && e.status === 401) {
@@ -229,17 +259,53 @@
   async function issue(e: SubmitEvent) {
     e.preventDefault();
     tokError = '';
+    tokNotice = '';
+    if (!tokenName.trim()) {
+      nameError = 'Укажите название токена';
+      nameInput?.focus();
+      return;
+    }
     try {
       const t =
         admin && !self
           ? await issueToken(userId, tokenName, tokenAccess)
           : await issueOwnToken(tokenName, tokenAccess);
-      tokenName = '';
+      nameEdited = false;
+      tokenName = tokenDefault;
       issued = t;
       shown = t;
     } catch (err) {
       tokError = fail(err);
     }
+  }
+
+  /** «Отозвать этот токен» — подтверждение тем же окном, что в «Аккаунте»; ошибка — в окне. После
+   * отзыва в командах снова заглушка `<токен>`. */
+  function revokeIssued() {
+    const t = issued;
+    if (!t) return;
+    tokError = '';
+    tokNotice = '';
+    ask = {
+      title: 'Отозвать токен?',
+      message: `Токен «${t.info.name}» (zam_${t.info.prefix}…) перестанет работать сразу: агенты и CLI с ним потеряют доступ. Вернуть его нельзя — только выпустить новый.`,
+      confirm: 'Отозвать',
+      danger: true,
+      run: async () => {
+        try {
+          if (admin && t.info.user_id !== me.user_id) await revokeToken(t.info.id);
+          else await revokeOwnToken(t.info.id);
+        } catch (err) {
+          if (err instanceof ApiError && err.status === 401) return onexpired();
+          throw new Error(errorText(err));
+        }
+        if (issued?.info.id === t.info.id) issued = null;
+        if (shown?.info.id === t.info.id) shown = null;
+        tokNotice = `Токен «${t.info.name}» отозван: в командах снова заглушка <токен>.`;
+      },
+      // кнопка ушла вместе с отзывом — фокус на итог
+      refocus: () => document.querySelector('[data-testid="setup-token-notice"]'),
+    };
   }
 
   const json = (v: unknown) => `${JSON.stringify(v, null, 2)}\n`;
@@ -385,25 +451,43 @@
     <fieldset>
       <legend>Токен</legend>
       {#if issued}
-        <p class="small">
-          Новый токен <code>zam_{issued.info.prefix}…</code> ({issued.info.access}) подставлен в команды установки и
-          <code>zam init</code>.
-        </p>
+        <div class="row issued">
+          <p class="small">
+            Новый токен <code>zam_{issued.info.prefix}…</code> ({issued.info.access}) подставлен в команды установки и
+            <code>zam init</code>.
+          </p>
+          <button type="button" class="danger" onclick={revokeIssued}>Отозвать этот токен</button>
+        </div>
       {:else}
         <p class="muted small">
           Без нового токена в командах — заглушка <code>&lt;токен&gt;</code>: подставьте свой токен
           {userName}. Выпустить новый:
         </p>
       {/if}
-      <form class="row" onsubmit={issue}>
-        <input placeholder="Имя токена" bind:value={tokenName} required maxlength="64" aria-label="Имя токена" />
-        <select bind:value={tokenAccess} aria-label="Доступ">
-          <option value="rw">rw (чтение и запись)</option>
-          <option value="ro">ro (только чтение)</option>
-        </select>
-        <button class="primary">Выпустить токен</button>
+      <p class="small notice" role="status" tabindex="-1" data-testid="setup-token-notice">{tokNotice}</p>
+      <form class="token-form" onsubmit={issue} novalidate aria-label="Выпуск токена">
+        <TokenNameField
+          bind:value={tokenName}
+          bind:input={nameInput}
+          error={nameError}
+          oninput={() => {
+            nameEdited = true;
+            nameError = '';
+          }}
+        />
+        <div class="row">
+          <select bind:value={tokenAccess} aria-label="Доступ">
+            <option value="rw">rw (чтение и запись)</option>
+            <option value="ro">ro (только чтение)</option>
+          </select>
+          <button class="primary">Выпустить токен</button>
+        </div>
       </form>
       {#if tokError}<p class="error" role="alert">{tokError}</p>{/if}
+      <p class="muted small">
+        Все токены — <a href={href({ name: 'account' })}>«Аккаунт» → «Мои токены»</a>{#if admin}; токены
+          пользователей — <a href={href({ name: 'admin' })}>«Администрирование» → «Пользователи»</a>{/if}.
+      </p>
     </fieldset>
   </div>
 
@@ -526,6 +610,7 @@
 </section>
 
 <TokenShown bind:shown />
+<Prompt bind:ask />
 
 <style>
   .snapshot-keys h3 {
@@ -580,6 +665,19 @@
   .copy {
     margin-left: auto;
     padding: 2px 10px;
+  }
+  .token-form {
+    display: grid;
+    gap: 8px;
+  }
+  .issued {
+    align-items: center;
+  }
+  .issued p {
+    margin: 0;
+  }
+  .notice:empty {
+    margin: 0;
   }
   .migrate-opt {
     display: grid;

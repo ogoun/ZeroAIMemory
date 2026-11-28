@@ -170,7 +170,7 @@ test('пользователь: вход, обязательная смена п
   // «Аккаунт»: свой токен — выпуск и отзыв
   await nav.getByRole('link', { name: 'Аккаунт' }).click();
   await expect(page.getByRole('heading', { name: 'Мои токены' })).toBeVisible();
-  await page.getByLabel('Имя токена').fill('e2e-laptop');
+  await page.getByLabel('Название токена').fill('e2e-laptop');
   await page.getByLabel('Доступ').selectOption('ro');
   await page.getByRole('button', { name: 'Выпустить токен' }).click();
   // новый токен — сразу «Подключение агента» с окном токена (§15.5)

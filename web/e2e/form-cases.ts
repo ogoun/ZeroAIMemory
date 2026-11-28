@@ -1058,6 +1058,33 @@ export const FORM_CASES: FormCase[] = [
     after: 'notice',
     added: true,
   },
+  // M7.6 (решение координатора 142): «Отозвать этот токен» на «Подключении агента» — токен
+  // выпускается тут же (название по умолчанию), повторное открытие берёт уже выпущенный
+  {
+    id: 'setup-revoke',
+    name: 'Отозвать этот токен',
+    dialog: 'Отозвать токен?',
+    page: () => '#/agent-setup',
+    open: async (p) => {
+      const b = p.getByRole('button', { name: 'Отозвать этот токен' });
+      if (!(await b.isVisible())) {
+        await p.getByRole('button', { name: 'Выпустить токен' }).click();
+        await p.getByRole('dialog').getByRole('button', { name: 'Закрыть' }).click();
+      }
+      await b.click();
+    },
+    route: { method: 'DELETE', url: /\/api\/v1\/auth\/tokens\/[^/?]+$/ },
+    after: 'notice',
+    confirm: true,
+    danger: true,
+    added: true,
+    kept: async (p) => {
+      await expect(p.getByRole('button', { name: 'Отозвать этот токен' })).toBeVisible();
+      const tokens = await sessionGet<{ name: string; created_at: string; revoked_at: string | null }[]>(p, 'auth/tokens');
+      const last = tokens.filter((t) => t.name.startsWith('Claude Code · ')).sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+      expect(last?.revoked_at).toBeNull();
+    },
+  },
   {
     id: 'idea-delete',
     name: 'Удалить идею',

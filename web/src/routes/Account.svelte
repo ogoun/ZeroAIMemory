@@ -4,8 +4,12 @@
   // прочие разделы закрыты сервером (403 password-change-required). Новый токен — сразу
   // «Подключение агента» (§15.5) с окном токена. «Отозвать» свой токен необратим (агенты и CLI с
   // ним сразу теряют доступ) — окно-подтверждение `danger`, фокус на «Отмена» (M7.3, §6.14 Д).
+  // M7.6 §9.1 (решения координатора 141, 143): поле «Название токена» с пояснением, пустое — ошибка
+  // под полем и фокус на нём; отозванные токены свёрнуты под «Отозванные (N)».
   import { onMount } from 'svelte';
   import Prompt, { type Ask } from '../components/Prompt.svelte';
+  import TokenNameField from '../components/TokenNameField.svelte';
+  import TokenTable from '../components/TokenTable.svelte';
   import {
     ApiError,
     changePassword,
@@ -41,6 +45,9 @@
   let tokError = $state('');
   let tokenName = $state('');
   let tokenAccess = $state<Access>('rw');
+  /** Ошибка поля «Название токена» (пустое). */
+  let nameError = $state('');
+  let nameInput = $state<HTMLInputElement>();
 
   /** Ошибка до отправки: короткий пароль, повтор не совпал, тот же пароль. */
   let pwProblem = $derived(
@@ -85,6 +92,11 @@
   async function addToken(e: SubmitEvent) {
     e.preventDefault();
     tokError = '';
+    if (!tokenName.trim()) {
+      nameError = 'Укажите название токена';
+      nameInput?.focus();
+      return;
+    }
     try {
       const t = await issueOwnToken(tokenName, tokenAccess);
       tokenName = '';
@@ -185,36 +197,16 @@
     </p>
     {#if tokError}<p class="error" role="alert">{tokError}</p>{/if}
     <p class="muted notice" role="status" tabindex="-1" data-testid="token-notice">{tokNotice}</p>
-    <!-- таблица — в `.table-wrap` (§5.1 п. 6): на телефоне прокручивается внутри -->
-    <div class="table-wrap">
-      <table aria-label="Мои токены">
-        <thead><tr><th>Имя</th><th>Префикс</th><th>Доступ</th><th>Использован</th><th></th></tr></thead>
-        <tbody>
-          {#each tokens as t (t.id)}
-            <tr data-token={t.name}>
-              <td>{t.name}</td>
-              <td><code>zam_{t.prefix}…</code></td>
-              <td>{t.access}</td>
-              <td class="muted">{t.last_used_at ? fmtTime(t.last_used_at) : '—'}{#if t.last_ip} · {t.last_ip}{/if}</td>
-              <td>
-                {#if t.revoked_at}
-                  <span class="muted">отозван</span>
-                {:else}
-                  <button type="button" class="danger" onclick={() => revoke(t)}>Отозвать</button>
-                {/if}
-              </td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    </div>
-    <form class="row" style="margin-top: 8px;" onsubmit={addToken}>
-      <input placeholder="Имя токена" bind:value={tokenName} required maxlength="64" aria-label="Имя токена" />
-      <select bind:value={tokenAccess} aria-label="Доступ">
-        <option value="rw">rw (чтение и запись)</option>
-        <option value="ro">ro (только чтение)</option>
-      </select>
-      <button class="primary">Выпустить токен</button>
+    <TokenTable {tokens} label="Мои токены" time={fmtTime} ip onrevoke={revoke} />
+    <form class="token-form" onsubmit={addToken} novalidate aria-label="Выпуск токена">
+      <TokenNameField bind:value={tokenName} bind:input={nameInput} error={nameError} oninput={() => (nameError = '')} />
+      <div class="row">
+        <select bind:value={tokenAccess} aria-label="Доступ">
+          <option value="rw">rw (чтение и запись)</option>
+          <option value="ro">ro (только чтение)</option>
+        </select>
+        <button class="primary">Выпустить токен</button>
+      </div>
     </form>
   </section>
 {/if}
@@ -236,5 +228,10 @@
   }
   .notice:empty {
     margin: 0;
+  }
+  .token-form {
+    display: grid;
+    gap: 8px;
+    margin-top: 12px;
   }
 </style>

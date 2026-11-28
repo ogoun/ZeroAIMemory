@@ -124,7 +124,7 @@ test('Подключение агента: опции меняют фрагме�
   await page.screenshot({ path: `${screens}agent-setup.png`, fullPage: true });
 
   // токен тут же: окно токена, токен — в командах установки и zam init, не в блоке
-  await page.getByLabel('Имя токена').fill('e2e-setup');
+  await page.getByLabel('Название токена').fill('e2e-setup');
   await page.getByRole('button', { name: 'Выпустить токен' }).click();
   const dialog = page.getByRole('dialog');
   const plain = await dialog.getByLabel('Токен').inputValue();
@@ -243,12 +243,88 @@ test('Сервер без признака agent_setup_migrate — галочк�
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
+// M7.6 (решения координатора 141–143): «Название токена» — подпись и пояснение; пустое на
+// «Аккаунте» — ошибка под полем; на «Подключении агента» — название по умолчанию, «Отозвать этот
+// токен» возвращает заглушку, отозванный — в «Отозванные (N)»
+test('Название токена: пустое на «Аккаунте» — ошибка под полем и фокус', async ({ page }) => {
+  const problems = watch(page);
+  const posts: string[] = [];
+  page.on('request', (r) => {
+    if (r.method() === 'POST' && r.url().includes('/api/v1/auth/tokens')) posts.push(r.url());
+  });
+  await page.goto(`${base()}#/account`);
+  const field = page.getByLabel('Название токена');
+  await expect(field).toHaveAttribute('placeholder', 'например: ноутбук, Claude Code');
+  await expect(page.getByText('Это не сам токен, а подпись для себя — чтобы отличить его в списке.')).toBeVisible();
+  await page.getByRole('button', { name: 'Выпустить токен' }).click();
+  const form = page.getByRole('form', { name: 'Выпуск токена' });
+  await expect(form.getByRole('alert')).toHaveText('Укажите название токена');
+  await expect(field).toBeFocused();
+  await expect(field).toHaveAttribute('aria-invalid', 'true');
+  expect(posts).toEqual([]);
+  await field.fill('e2e-name');
+  await expect(form.getByRole('alert')).toHaveCount(0);
+  await expect(page.getByText('Отозвать — токен перестаёт работать сразу и навсегда; строка остаётся в истории.')).toBeVisible();
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('Выпуск на «Подключении агента»: название по умолчанию, «Отозвать этот токен», список отозванных', async ({ page }) => {
+  const problems = watch(page);
+  const day = new Date();
+  const p2 = (n: number) => String(n).padStart(2, '0');
+  const date = `${day.getFullYear()}-${p2(day.getMonth() + 1)}-${p2(day.getDate())}`;
+  await page.goto(`${base()}#/agent-setup`);
+  const field = page.getByLabel('Название токена');
+  await expect(field).toHaveValue(`Claude Code · новое решение · ${date}`);
+  // следует за агентом и решением, пока не правили
+  await page.getByLabel('Codex (AGENTS.md и хуки Codex)').check();
+  await page.getByLabel('Новое (GUID выдаст сервер)').check();
+  await page.getByLabel('Имя решения').fill('Токен E2E');
+  const name = `Codex · Токен E2E · ${date}`;
+  await expect(field).toHaveValue(name);
+  await expect(page.getByRole('link', { name: '«Аккаунт» → «Мои токены»' })).toHaveAttribute('href', '#/account');
+  await expect(page.getByRole('link', { name: '«Администрирование» → «Пользователи»' })).toHaveAttribute('href', '#/admin');
+
+  await page.getByRole('button', { name: 'Выпустить токен' }).click();
+  const dialog = page.getByRole('dialog');
+  const plain = await dialog.getByLabel('Токен').inputValue();
+  await dialog.getByRole('button', { name: 'Закрыть' }).click();
+  const init = frag(page, /zam init — Linux/);
+  await expect(init).toContainText(`--token '${plain}'`);
+
+  // отзыв: подтверждение, после — заглушка в командах
+  await page.getByRole('button', { name: 'Отозвать этот токен' }).click();
+  const ask = page.getByRole('dialog', { name: 'Отозвать токен?' });
+  await expect(ask).toContainText(name);
+  await ask.getByRole('button', { name: 'Отозвать', exact: true }).click();
+  await expect(ask).toBeHidden();
+  await expect(page.getByTestId('setup-token-notice')).toHaveText(`Токен «${name}» отозван: в командах снова заглушка <токен>.`);
+  await expect(page.getByTestId('setup-token-notice')).toBeFocused();
+  await expect(init).not.toContainText(plain);
+  await expect(page.getByRole('button', { name: 'Отозвать этот токен' })).toHaveCount(0);
+  expect((await fetch(`${base()}api/v1/spaces`, { headers: { Authorization: `Bearer ${plain}` } })).status).toBe(401);
+
+  // «Аккаунт»: токен — в свёрнутом списке отозванных
+  await page.getByRole('link', { name: '«Аккаунт» → «Мои токены»' }).click();
+  await expect(page).toHaveURL(/#\/account$/);
+  const active = page.getByRole('table', { name: 'Мои токены' });
+  await expect(active).toBeVisible();
+  await expect(active.locator(`tr[data-token="${name}"]`)).toHaveCount(0);
+  const summary = page.getByText(/^Отозванные \(\d+\)$/);
+  await expect(page.getByRole('table', { name: 'Отозванные токены' })).toBeHidden();
+  await summary.click();
+  const row = page.getByRole('table', { name: 'Отозванные токены' }).locator(`tr[data-token="${name}"]`);
+  await expect(row).toBeVisible();
+  await expect(row).toContainText('отозван');
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
 test('Выпуск токена в «Пользователях» — сразу «Подключение агента»', async ({ page }) => {
   const problems = watch(page);
   await page.goto(`${base()}#/admin`);
   const row = page.getByRole('row').filter({ hasText: '(админ)' }).first();
   await row.getByRole('button', { name: 'Токены' }).click();
-  await page.getByPlaceholder('Имя токена').fill('e2e-jump');
+  await page.getByLabel('Название токена').fill('e2e-jump');
   await page.getByRole('button', { name: 'Выпустить токен' }).click();
   await expect(page).toHaveURL(/#\/agent-setup$/);
   const dialog = page.getByRole('dialog');
