@@ -13,9 +13,9 @@ use zam_code::{
 use zam_core::Id;
 use zam_core::{TargetKind, TargetRef};
 use zam_store::code::{
-    RankState, UploadMeta, code_clear, code_impact, code_map_rows, code_put_files,
-    code_rank_inputs, code_status, code_store_ranks, code_symbol, code_symbols_named,
-    code_symbols_search, code_sync_manifest,
+    MapFileRow, RankState, UploadMeta, code_clear, code_impact, code_put_files, code_rank_inputs,
+    code_status, code_store_ranks, code_symbol, code_symbols_named, code_symbols_search,
+    code_sync_manifest,
 };
 use zam_store::code::{
     code_central, code_files_page, code_map_files, code_map_symbols, code_snapshot,
@@ -60,7 +60,27 @@ fn meta(machine: &str) -> UploadMeta {
         machine: Some(machine.into()),
         user_id: Id::new(),
         now: Timestamp::now(),
+        max_files: None,
     }
+}
+
+/// Файлы карты с символами (`code_map_files` + `code_map_symbols` всех файлов) — помощник
+/// тестов: в библиотеке его нет (M7.5 §8.6 п. 5), сервер собирает карту в две фазы.
+async fn code_map_rows(
+    db: &Db,
+    solution: &str,
+    area: Option<&str>,
+) -> Result<Vec<MapFileRow>, StoreError> {
+    let mut files = code_map_files(db, solution, area).await?;
+    let ids: Vec<i64> = files.iter().map(|f| f.id).collect();
+    let mut syms: std::collections::HashMap<i64, _> = code_map_symbols(db, solution, &ids)
+        .await?
+        .into_iter()
+        .collect();
+    for f in &mut files {
+        f.symbols = syms.remove(&f.id).unwrap_or_default();
+    }
+    Ok(files)
 }
 
 fn sym(name: &str, qual: &str, body: &str, line: u32) -> Symbol {
@@ -386,6 +406,59 @@ async fn manifest_need_and_removed() {
     assert_eq!(st.snapshot.files, 2);
     assert_eq!(st.snapshot.symbols, 2);
     assert_eq!(st.snapshot.rank_state, RankState::Pending);
+}
+
+/// M7.5 §8.6 п. 5: предел файлов карты (`UploadMeta::max_files`) проверяется в транзакции записи:
+/// новые пути сверх предела — `BadInput` с пределом и `code.max_files`, ничего не записано; путь
+/// карты повторно — не новый; повтор пути в загрузке — один; параллельные загрузки, каждая в
+/// пределе, вместе его не превышают (одна проходит, другая — `BadInput`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn check_map_size_in_tx() {
+    let (db, _) = setup("map-size").await;
+    let limited = UploadMeta {
+        max_files: Some(3),
+        ..meta("m")
+    };
+    let up = |p: &str| upload(p, &h('a'), vec![], vec![]);
+    code_put_files(&db, G, &limited, vec![up("a.rs"), up("b.rs")], &[])
+        .await
+        .unwrap();
+    let dbr = &db;
+    let files = move || async move { code_status(dbr, G).await.unwrap().unwrap().snapshot.files };
+    let e = code_put_files(&db, G, &limited, vec![up("c.rs"), up("d.rs")], &[])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, StoreError::BadInput(m) if m.contains('3') && m.contains("code.max_files")),
+        "{e:?}"
+    );
+    assert_eq!(files().await, 2, "ничего не записано");
+    // старые пути не новые, повтор пути в загрузке — один новый
+    code_put_files(
+        &db,
+        G,
+        &limited,
+        vec![up("a.rs"), up("b.rs"), up("c.rs"), up("c.rs")],
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(files().await, 3);
+    // без предела — как до M7.5 (предел у сервера)
+    code_put_files(&db, G, &meta("m"), vec![up("d.rs")], &[])
+        .await
+        .unwrap();
+    assert_eq!(files().await, 4);
+    // гонка: в пустой карте решения с пределом 3 две загрузки по 2 новых файла
+    let (db2, _) = setup("map-size-race").await;
+    let (a, b) = tokio::join!(
+        code_put_files(&db2, G, &limited, vec![up("x1.rs"), up("x2.rs")], &[]),
+        code_put_files(&db2, G, &limited, vec![up("y1.rs"), up("y2.rs")], &[]),
+    );
+    assert!(a.is_ok() != b.is_ok(), "одна проходит: {a:?} / {b:?}");
+    assert!(matches!(a.err().or(b.err()), Some(StoreError::BadInput(_))));
+    let st = code_status(&db2, G).await.unwrap().unwrap();
+    assert_eq!(st.snapshot.files, 2);
 }
 
 /// Повторная загрузка файла заменяет символы, ссылки и строки FTS, `id` файла сохраняется.

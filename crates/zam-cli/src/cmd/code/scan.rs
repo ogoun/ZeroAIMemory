@@ -20,12 +20,15 @@
 //!   каталог, Review Focus 5); повтор пути (другой регистр в индексе) — один раз. Больше
 //!   `code.max_files` файлов — ошибка конфигурации (обход вне git останавливается на
 //!   `max_files + 1`).
+//! - **Вендорный и созданный код** (M7.5 §8.6 п. 4, [`GitAttrs`]): файлы с атрибутами
+//!   `linguist-vendored` или `linguist-generated` из `.gitattributes` корня и подкаталогов в карту
+//!   не входят (`code.exclude_gitattributes = false` — входят); их число — [`Scan::gitattributes`].
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
 
-use globset::GlobSet;
+use globset::{GlobBuilder, GlobMatcher, GlobSet};
 
 use super::config::CodeConfig;
 use crate::client::CliError;
@@ -53,10 +56,160 @@ const SKIP_DIRS: [&str; 6] = [
     "build",
 ];
 
-/// Отбор по языку и маскам.
+/// Итог отбора файлов кода.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Scan {
+    /// Отпечатки файлов карты, по пути.
+    pub files: Vec<Fingerprint>,
+    /// Файлы кода (язык включён, масок `exclude` нет), исключённые по `.gitattributes`, по пути.
+    pub gitattributes: Vec<String>,
+}
+
+/// Имя файла атрибутов git.
+const GITATTRIBUTES: &str = ".gitattributes";
+/// Предел файла `.gitattributes`, байт: больше — не читается.
+const GITATTRIBUTES_MAX: u64 = 1024 * 1024;
+
+/// Правило `.gitattributes` об атрибутах linguist.
+struct AttrRule {
+    /// Каталог файла правила от корня (`""` или `a/b/`), на Windows — в нижнем регистре.
+    dir: String,
+    glob: GlobMatcher,
+    /// `Some(true)` — установлен, `Some(false)` — снят (`-attr`, `!attr`, `attr=false`), `None`
+    /// — не упомянут.
+    vendored: Option<bool>,
+    generated: Option<bool>,
+}
+
+/// Атрибуты `linguist-vendored` и `linguist-generated` из `.gitattributes` (M7.5 §8.6 п. 4) —
+/// по правилам git: маска без `/` — по имени где угодно ниже каталога файла, с `/` — от его
+/// каталога (`/` в начале — тоже), маска каталога (`/` в конце) файлов не задевает; позднее
+/// правило сильнее раннего, файл глубже — сильнее файла выше. Файл исключается, если в итоге хотя
+/// бы один из двух атрибутов установлен (`attr`, `attr=…` кроме `=false`). Макросы (`[attr]`) не
+/// раскрываются; на Windows — без учёта регистра, как маски `exclude`.
+#[derive(Default)]
+pub(super) struct GitAttrs {
+    /// Правила по старшинству: каталоги от корня вглубь, строки файла по порядку.
+    rules: Vec<AttrRule>,
+}
+
+/// Путь для сравнения с каталогом правила: на Windows — в нижнем регистре.
+fn path_key(p: &str) -> String {
+    if cfg!(windows) {
+        p.to_lowercase()
+    } else {
+        p.to_string()
+    }
+}
+
+/// `attr`, `-attr`, `!attr`, `attr=value` → (имя, установлен): `-`, `!` и `=false` — снят.
+fn parse_attr(a: &str) -> (&str, bool) {
+    if let Some(n) = a.strip_prefix('-').or_else(|| a.strip_prefix('!')) {
+        return (n, false);
+    }
+    match a.split_once('=') {
+        Some((n, v)) => (n, v != "false"),
+        None => (a, true),
+    }
+}
+
+/// Маска правила файла каталога `dir` как glob от корня; маска каталога — `None`.
+fn attr_glob(dir: &str, pat: &str) -> Option<GlobMatcher> {
+    let pat = pat
+        .strip_prefix('"')
+        .and_then(|p| p.strip_suffix('"'))
+        .unwrap_or(pat);
+    if pat.is_empty() || pat.ends_with('/') {
+        return None;
+    }
+    let base = globset::escape(dir);
+    let full = match pat.strip_prefix('/') {
+        Some(p) => format!("{base}{p}"),
+        None if pat.contains('/') => format!("{base}{pat}"),
+        None => format!("{base}**/{pat}"),
+    };
+    GlobBuilder::new(&full)
+        .literal_separator(true)
+        .case_insensitive(cfg!(windows))
+        .build()
+        .ok()
+        .map(|g| g.compile_matcher())
+}
+
+impl GitAttrs {
+    /// Правила текста `.gitattributes` каталога `dir` (`""` или `a/b/`): только строки с
+    /// атрибутами linguist; комментарии, макросы и неразборные маски пропускаются.
+    pub(super) fn add_file(&mut self, dir: &str, text: &str) {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with("[attr]") {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let Some(pat) = parts.next() else {
+                continue;
+            };
+            let (mut vendored, mut generated) = (None, None);
+            for a in parts {
+                match parse_attr(a) {
+                    ("linguist-vendored", set) => vendored = Some(set),
+                    ("linguist-generated", set) => generated = Some(set),
+                    _ => {}
+                }
+            }
+            if vendored.is_none() && generated.is_none() {
+                continue;
+            }
+            if let Some(glob) = attr_glob(dir, pat) {
+                self.rules.push(AttrRule {
+                    dir: path_key(dir),
+                    glob,
+                    vendored,
+                    generated,
+                });
+            }
+        }
+    }
+
+    /// Файл `.gitattributes` каталога `dir` под `root`, если он есть.
+    fn add_dir(&mut self, root: &Path, dir: &str) {
+        let path = root.join(dir).join(GITATTRIBUTES);
+        let Ok(m) = std::fs::metadata(&path) else {
+            return;
+        };
+        if !m.is_file() || m.len() > GITATTRIBUTES_MAX {
+            return;
+        }
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            self.add_file(dir, &text);
+        }
+    }
+
+    /// Путь `rel` исключён: итог правил его каталогов — `linguist-vendored` или
+    /// `linguist-generated` установлен.
+    pub(super) fn excluded(&self, rel: &str) -> bool {
+        if self.rules.is_empty() {
+            return false;
+        }
+        let key = path_key(rel);
+        let (mut vendored, mut generated) = (false, false);
+        for r in self
+            .rules
+            .iter()
+            .filter(|r| key.starts_with(&r.dir) && r.glob.is_match(rel))
+        {
+            vendored = r.vendored.unwrap_or(vendored);
+            generated = r.generated.unwrap_or(generated);
+        }
+        vendored || generated
+    }
+}
+
+/// Отбор по языку, маскам и `.gitattributes`.
 struct Filter<'a> {
     cfg: &'a CodeConfig,
     exclude: GlobSet,
+    attrs: GitAttrs,
 }
 
 impl Filter<'_> {
@@ -66,6 +219,11 @@ impl Filter<'_> {
 
     fn excluded(&self, rel: &str) -> bool {
         rel.starts_with(".zeroaimemory/") || self.exclude.is_match(rel)
+    }
+
+    /// Исключён по `.gitattributes` (при `code.exclude_gitattributes`).
+    fn by_attrs(&self, rel: &str) -> bool {
+        self.cfg.exclude_gitattributes && self.attrs.excluded(rel)
     }
 }
 
@@ -82,16 +240,28 @@ fn mt_fp(m: &std::fs::Metadata) -> String {
 
 /// Отпечатки кода под `root`, по пути.
 pub fn fingerprints(root: &Path, cfg: &CodeConfig) -> Result<Vec<Fingerprint>, CliError> {
-    let f = Filter {
+    Ok(scan(root, cfg)?.files)
+}
+
+/// Отбор файлов кода под `root`: отпечатки и исключённые по `.gitattributes`.
+pub fn scan(root: &Path, cfg: &CodeConfig) -> Result<Scan, CliError> {
+    let mut f = Filter {
         cfg,
         exclude: cfg.exclude_set(),
+        attrs: GitAttrs::default(),
     };
-    let (mut out, walked) = match from_git(root, &f)? {
+    let mut by_attrs = Vec::new();
+    let (mut out, walked) = match from_git(root, &mut f, &mut by_attrs)? {
         Some(v) => (v, false),
-        None => (walk(root, &f, cfg.max_files as usize + 1), true),
+        None => (
+            walk(root, &mut f, cfg.max_files as usize + 1, &mut by_attrs),
+            true,
+        ),
     };
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out.dedup_by(|a, b| a.path == b.path);
+    by_attrs.sort();
+    by_attrs.dedup();
     if out.len() > cfg.max_files as usize {
         // обход вне git оборван на `max_files + 1`: точного числа нет (ревью задачи 9A, M3)
         let n = if walked {
@@ -104,7 +274,10 @@ pub fn fingerprints(root: &Path, cfg: &CodeConfig) -> Result<Vec<Fingerprint>, C
             cfg.max_files
         )));
     }
-    Ok(out)
+    Ok(Scan {
+        files: out,
+        gitattributes: by_attrs,
+    })
 }
 
 /// Записи `git ls-files -s -v -z`: `<тег> <mode> <oid> <stage>\t<путь>` → путь → oid (без
@@ -267,10 +440,36 @@ impl<'a> CaseMap<'a> {
     }
 }
 
+/// `.gitattributes` из путей листинга git (отслеживаемые и неотслеживаемые) и корня — от корня
+/// вглубь (старшинство правил).
+fn git_attrs(root: &Path, cands: &[(String, Option<String>)]) -> GitAttrs {
+    let mut dirs: Vec<String> = cands
+        .iter()
+        .filter_map(|(raw, _)| refs::normalize_ref_path(raw).ok())
+        .filter_map(|p| {
+            let dir = p.strip_suffix(GITATTRIBUTES)?;
+            (dir.is_empty() || dir.ends_with('/')).then(|| dir.to_string())
+        })
+        .collect();
+    dirs.push(String::new());
+    dirs.sort_by(|a, b| (a.matches('/').count(), a).cmp(&(b.matches('/').count(), b)));
+    dirs.dedup();
+    let mut attrs = GitAttrs::default();
+    for d in &dirs {
+        attrs.add_dir(root, d);
+    }
+    attrs
+}
+
 /// Отпечатки по git: не репозиторий (или корень в игнорируемой части) — `None`; сбой `git` в
 /// настоящем репозитории (`safe.directory`, битый индекс, нет `git`) — ошибка конфигурации, а
-/// не тихий обход: обход дал бы другой набор файлов, и сервер стёр бы часть карты.
-fn from_git(root: &Path, f: &Filter) -> Result<Option<Vec<Fingerprint>>, CliError> {
+/// не тихий обход: обход дал бы другой набор файлов, и сервер стёр бы часть карты. Файлы,
+/// исключённые по `.gitattributes`, — в `by_attrs`.
+fn from_git(
+    root: &Path,
+    f: &mut Filter,
+    by_attrs: &mut Vec<String>,
+) -> Result<Option<Vec<Fingerprint>>, CliError> {
     match repo_marker(root) {
         None | Some(false) => return Ok(None),
         Some(true) => {}
@@ -312,6 +511,9 @@ fn from_git(root: &Path, f: &Filter) -> Result<Option<Vec<Fingerprint>>, CliErro
         })
         .collect();
     cands.extend(untracked_repo.iter().filter_map(strip).map(|p| (p, None)));
+    if f.cfg.exclude_gitattributes {
+        f.attrs = git_attrs(root, &cands);
+    }
     let mut case = CaseMap::new(root);
     let mut out = Vec::with_capacity(cands.len());
     for (raw, oid) in cands {
@@ -319,6 +521,10 @@ fn from_git(root: &Path, f: &Filter) -> Result<Option<Vec<Fingerprint>>, CliErro
             continue;
         };
         if !f.lang_ok(&rel) || f.excluded(&rel) {
+            continue;
+        }
+        if f.by_attrs(&rel) {
+            by_attrs.push(rel);
             continue;
         }
         let Ok(m) = std::fs::symlink_metadata(root.join(&rel)) else {
@@ -331,6 +537,10 @@ fn from_git(root: &Path, f: &Filter) -> Result<Option<Vec<Fingerprint>>, CliErro
             continue; // через точку соединения или символическую ссылку каталога
         };
         if path != rel && f.excluded(&path) {
+            continue;
+        }
+        if path != rel && f.by_attrs(&path) {
+            by_attrs.push(path);
             continue;
         }
         let (fp, git_oid) = match oid {
@@ -349,8 +559,10 @@ fn from_git(root: &Path, f: &Filter) -> Result<Option<Vec<Fingerprint>>, CliErro
 
 /// Обход вне git (стек каталогов, без символических ссылок и точек соединения) до `limit`
 /// файлов: больше `code.max_files` — всё равно ошибка, полный обход огромного дерева не нужен
-/// (ревью задачи 5, M9).
-fn walk(root: &Path, f: &Filter, limit: usize) -> Vec<Fingerprint> {
+/// (ревью задачи 5, M9). `.gitattributes` каталога читается до его файлов: каталоги-предки
+/// обходятся раньше потомков, так что правила копятся от корня вглубь (старшинство). Файлы,
+/// исключённые по `.gitattributes`, — в `by_attrs`.
+fn walk(root: &Path, f: &mut Filter, limit: usize, by_attrs: &mut Vec<String>) -> Vec<Fingerprint> {
     let mut out = Vec::new();
     let mut stack: Vec<(PathBuf, String)> = vec![(root.to_path_buf(), String::new())];
     while let Some((dir, prefix)) = stack.pop() {
@@ -360,6 +572,9 @@ fn walk(root: &Path, f: &Filter, limit: usize) -> Vec<Fingerprint> {
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
         };
+        if f.cfg.exclude_gitattributes {
+            f.attrs.add_dir(root, &prefix);
+        }
         for e in rd.flatten() {
             let Ok(t) = e.file_type() else {
                 continue;
@@ -381,6 +596,10 @@ fn walk(root: &Path, f: &Filter, limit: usize) -> Vec<Fingerprint> {
                 continue;
             }
             if refs::normalize_ref_path(&rel).as_deref() != Ok(rel.as_str()) {
+                continue;
+            }
+            if f.by_attrs(&rel) {
+                by_attrs.push(rel);
                 continue;
             }
             let Ok(m) = e.metadata() else {
@@ -453,5 +672,163 @@ mod tests {
         d.sort();
         assert_eq!(d, ["conf.rs", "new.rs", "src/a b.rs"]);
         assert_eq!(untracked, ["fresh dir/x.py"]);
+    }
+
+    /// Каталог проекта теста под `target/tmp` (в git-игнорируемой части репозитория — обход).
+    fn proj(name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/tmp/zam-cli-code-scan")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&root);
+        for (rel, body) in files {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+        }
+        root
+    }
+
+    /// Проект `files` с `.gitattributes` — обходом вне git и (если git есть) по git: файлы карты
+    /// и исключённые по `.gitattributes`.
+    fn scan_both(
+        name: &str,
+        files: &[(&str, &str)],
+        cfg: &CodeConfig,
+    ) -> Vec<(Scan, &'static str)> {
+        let mut out = Vec::new();
+        let root = proj(name, files);
+        out.push((scan(&root, cfg).unwrap(), "обход"));
+        let git = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output();
+        if git.is_ok_and(|o| o.status.success()) {
+            out.push((scan(&root, cfg).unwrap(), "git"));
+        }
+        out
+    }
+
+    fn paths(s: &Scan) -> Vec<&str> {
+        s.files.iter().map(|f| f.path.as_str()).collect()
+    }
+
+    /// M7.5 §8.6 п. 4: `linguist-vendored` и `linguist-generated` (в том числе `=true`) из
+    /// `.gitattributes` корня и подкаталогов — не в карте, их число — в итоге; маска без `/` — по
+    /// имени где угодно ниже каталога файла, с `/` — от его каталога, `*` не переходит `/`, маска
+    /// каталога файлов не задевает.
+    #[test]
+    fn gitattributes_vendored_generated_excluded() {
+        let mut a = GitAttrs::default();
+        a.add_file(
+            "",
+            "# комментарий\n*.rs text eol=lf\nvendor/** linguist-vendored\n\
+             *.pb.go linguist-generated=true\n/top.js linguist-vendored\nlibdir/ linguist-vendored\n\
+             [attr]gen linguist-generated\n",
+        );
+        a.add_file("web/", "gen/*.ts linguist-generated\n");
+        for (p, want) in [
+            ("vendor/lib/x.rs", true),
+            ("api/v1/msg.pb.go", true),
+            ("msg.pb.go", true),
+            ("top.js", true),
+            ("src/top.js", false),
+            ("web/gen/a.ts", true),
+            ("gen/a.ts", false),
+            ("web/gen/deep/a.ts", false),
+            ("libdir/a.rs", false),
+            ("src/main.rs", false),
+        ] {
+            assert_eq!(a.excluded(p), want, "{p}");
+        }
+        let files = [
+            (
+                ".gitattributes",
+                "third_party/** linguist-vendored\n*.gen.go linguist-generated\n",
+            ),
+            ("src/main.rs", "fn main() {}\n"),
+            ("src/api.gen.go", "package api\n"),
+            ("third_party/lib/x.py", "def x():\n    pass\n"),
+            ("web/.gitattributes", "*.ts linguist-generated\n"),
+            ("web/client.ts", "export const a = 1;\n"),
+            ("other/client.ts", "export const b = 2;\n"),
+            ("README.md", "# не код\n"),
+        ];
+        let cfg = CodeConfig::default();
+        let runs = scan_both("gitattr-excluded", &files, &cfg);
+        for (s, mode) in &runs {
+            assert_eq!(paths(s), ["other/client.ts", "src/main.rs"], "{mode}");
+            assert_eq!(
+                s.gitattributes,
+                ["src/api.gen.go", "third_party/lib/x.py", "web/client.ts"],
+                "{mode}"
+            );
+        }
+        // `exclude_gitattributes = false` — всё в карте, исключённых нет
+        let off = CodeConfig {
+            exclude_gitattributes: false,
+            ..CodeConfig::default()
+        };
+        for (s, mode) in scan_both("gitattr-off", &files, &off) {
+            assert_eq!(s.files.len(), 5, "{mode}: {:?}", paths(&s));
+            assert!(s.gitattributes.is_empty(), "{mode}");
+        }
+        // маски `exclude` сильнее: исключённый маской в число по `.gitattributes` не входит
+        let masked = CodeConfig {
+            exclude: vec!["third_party/**".into()],
+            ..CodeConfig::default()
+        };
+        for (s, mode) in scan_both("gitattr-masked", &files, &masked) {
+            assert_eq!(
+                s.gitattributes,
+                ["src/api.gen.go", "web/client.ts"],
+                "{mode}"
+            );
+        }
+    }
+
+    /// Снятый атрибут (`-attr`, `attr=false`, `!attr`) файл оставляет; позднее правило сильнее
+    /// раннего, правило файла глубже — сильнее правила корня.
+    #[test]
+    fn gitattributes_unset_keeps_file() {
+        let mut a = GitAttrs::default();
+        a.add_file("", "vendor/** linguist-vendored\n");
+        a.add_file(
+            "vendor/",
+            "keep.rs -linguist-vendored\nown.rs linguist-vendored=false\nreset.rs !linguist-vendored\n",
+        );
+        for (p, want) in [
+            ("vendor/keep.rs", false),
+            ("vendor/own.rs", false),
+            ("vendor/reset.rs", false),
+            ("vendor/other.rs", true),
+        ] {
+            assert_eq!(a.excluded(p), want, "{p}");
+        }
+        let mut b = GitAttrs::default();
+        b.add_file(
+            "",
+            "*.js linguist-generated\nlib.js -linguist-generated\nback.js -linguist-generated\n\
+             back.js linguist-generated\n",
+        );
+        assert!(b.excluded("x.js") && !b.excluded("lib.js") && b.excluded("back.js"));
+        // снят один атрибут — второй всё равно исключает
+        let mut c = GitAttrs::default();
+        c.add_file(
+            "",
+            "*.go linguist-vendored linguist-generated\nmain.go -linguist-vendored\n",
+        );
+        assert!(c.excluded("main.go"));
+        let files = [
+            (".gitattributes", "vendor/** linguist-vendored\n"),
+            ("vendor/.gitattributes", "keep.rs -linguist-vendored\n"),
+            ("vendor/keep.rs", "pub fn keep() {}\n"),
+            ("vendor/drop.rs", "pub fn drop_me() {}\n"),
+        ];
+        for (s, mode) in scan_both("gitattr-unset", &files, &CodeConfig::default()) {
+            assert_eq!(paths(&s), ["vendor/keep.rs"], "{mode}");
+            assert_eq!(s.gitattributes, ["vendor/drop.rs"], "{mode}");
+        }
     }
 }

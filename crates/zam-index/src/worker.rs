@@ -18,6 +18,8 @@
 //!    ставится отметка reindex из кэша, исключение снимается. Для `storage_rebuilt` аудит `index.storage_rebuilt` и
 //!    `ack_storage_rebuilt()` — когда прошли (или исключены) все базы: флаг
 //!    `.zam-reindex` не держит полную перечанковку на каждом рестарте из-за одной базы.
+//!    Коллекция, пересозданная `ensure` на месте частично удалённой (M7.5 §8.5,
+//!    `IndexMeta::healed`), — отметка reindex всей базы из кэша в каждой базе и сразу в очередь.
 //! 3. **Reindex по запросу** ([`WorkerHandle::request_reindex`], `POST /admin/reindex`):
 //!    [`crate::reindex()`] — из кэша без инференса или полный; выполняется здесь же,
 //!    последовательно с заданиями, в том числе при чужой модели коллекции (её он и
@@ -934,7 +936,9 @@ impl Worker {
             s.model_mismatch = None;
             s.last_error = None;
         });
-        if meta.created {
+        if meta.healed {
+            self.heal_rebuild().await;
+        } else if meta.created {
             // коллекция новая: если узлы уже были проиндексированы (коллекцию удалили),
             // их нужно вернуть из `embeddings`
             let mut lost = 0i64;
@@ -953,6 +957,48 @@ impl Worker {
             }
         }
         Ok(true)
+    }
+
+    /// Коллекция создана на месте частично удалённой (M7.5 §8.5, [`crate::IndexMeta::healed`]): в
+    /// каждой базе — отметка reindex всей базы из кэша эмбеддингов (как после `zam-server
+    /// restore`; переживает перезапуск, прерванный повторится), сразу в очередь. База, где
+    /// отметка не записалась, — пересборкой по всем базам (её повторы и исключение, базы с
+    /// отметкой она пропускает).
+    async fn heal_rebuild(&mut self) {
+        let mut marked = 0usize;
+        let mut failed = 0usize;
+        for u in self.users().await {
+            let req = ReindexRequest {
+                user: Some(u),
+                space: None,
+                full: false,
+            };
+            let res = match self.deps.users.get(u).await {
+                Ok(db) => zam_store::mark_reindex(&db, Some(req.spec(None))).await,
+                Err(e) => Err(e),
+            };
+            match res {
+                Ok(()) => {
+                    marked += 1;
+                    // отметку прочитать заново: reindex — в очередь
+                    self.pending_checked.remove(&u);
+                    let _ = self.open_db(u).await;
+                }
+                Err(e) => {
+                    failed += 1;
+                    tracing::warn!(user = %u, error = %e, "отметка reindex после пересоздания коллекции");
+                }
+            }
+        }
+        tracing::info!(
+            users = marked,
+            failed,
+            "коллекция Qdrant пересоздана на месте остатка: пересборка из кэша эмбеддингов"
+        );
+        if failed > 0 && self.pending.is_none() {
+            self.start_rebuild(false);
+            self.rebuild_step().await;
+        }
     }
 
     async fn users(&self) -> Vec<Id> {

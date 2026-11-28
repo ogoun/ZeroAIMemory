@@ -3,8 +3,9 @@
 //! - `cache/code-state.json` — `{server, solution, files: {путь: {fp, size, hash, sent_at}},
 //!   crashed: [[путь, hash]], extractor, recv_count}`: по отпечатку `fp` хэш берётся без чтения файла; `crashed` —
 //!   файлы, на которых оборвался разбор (пропуск `parser_crash`, пока хэш тот же);
-//! - `cache/code-sync.json` — `{server, solution, last_ok_at, head}`: малый файл для хуков
-//!   (задача 6 — «не чаще `auto_interval_min` или при смене `HEAD`»).
+//! - `cache/code-sync.json` — `{server, solution, last_ok_at, head, excluded_gitattributes}`:
+//!   малый файл для хуков (задача 6 — «не чаще `auto_interval_min` или при смене `HEAD`») и
+//!   `zam code status` (число исключённых по `.gitattributes`, M7.5).
 //!
 //! Запись — атомарно, права 0600 ([`cache::write_atomic`], как кэши M4). Битый или чужой
 //! формат — пустое состояние (файлы перечитаются, загрузок от этого не прибавится: решает `need`
@@ -61,6 +62,10 @@ pub struct SyncMark {
     pub last_ok_at: String,
     #[serde(default)]
     pub head: Option<String>,
+    /// Файлов кода, исключённых по `.gitattributes` при этой синхронизации (M7.5 §8.6 п. 4;
+    /// `zam code status`). Нет поля (отметка до 0.0.18) — 0.
+    #[serde(default)]
+    pub excluded_gitattributes: usize,
 }
 
 pub fn cache_dir(root: &Path) -> PathBuf {

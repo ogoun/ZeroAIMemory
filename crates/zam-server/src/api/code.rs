@@ -68,7 +68,7 @@ use zam_store::code::{
 };
 use zam_store::file_refs::PATH_MAX_CHARS;
 use zam_store::{
-    ChangedFile, Db, RefItem, SpaceKind, check_commit, check_hash, count_tokens,
+    ChangedFile, Db, RefItem, SpaceKind, StoreError, check_commit, check_hash, count_tokens,
     normalize_ref_path, path_owners, symbols_uploaded,
 };
 
@@ -501,6 +501,7 @@ fn upload_meta(
         machine: text(machine, "machine")?,
         user_id,
         now: zam_store::time::now(),
+        max_files: None,
     })
 }
 
@@ -1173,40 +1174,9 @@ fn parse_uploads(
     Ok((out, masked))
 }
 
-/// Карта решения после загрузки — не больше `max` файлов (`code.max_files`): текущие файлы и
-/// новые пути загрузки; иначе 422 с пределом. Новые пути считаются, только если быстрая оценка
-/// «файлы + загрузка» предел превышает.
-async fn check_map_size(
-    sc: &MemScope,
-    guid: &str,
-    files: &[FileUpload],
-    max: u32,
-) -> Result<(), ApiError> {
-    let have = store_snapshot(sc, guid).await?.map_or(0, |s| s.files);
-    if have + files.len() as u64 <= u64::from(max) {
-        return Ok(());
-    }
-    let known: HashSet<String> = store_files(sc, guid, None)
-        .await?
-        .into_iter()
-        .map(|f| f.path)
-        .collect();
-    let new: HashSet<&str> = files
-        .iter()
-        .map(|f| f.path.as_str())
-        .filter(|p| !known.contains(*p))
-        .collect();
-    if known.len() + new.len() > max as usize {
-        return Err(unprocessable(format!(
-            "files: в карте решения не больше {max} файлов (code.max_files): сейчас {}, новых {}",
-            known.len(),
-            new.len()
-        )));
-    }
-    Ok(())
-}
-
-/// `PUT /code/files` → `{accepted, stale_refs, warnings}`.
+/// `PUT /code/files` → `{accepted, stale_refs, warnings}`. Карта решения после загрузки — не
+/// больше `code.max_files` файлов: проверка в транзакции записи (`UploadMeta::max_files`, M7.5
+/// §8.6 п. 5), превышение — 422 с пределом.
 pub async fn put_files(
     State(st): State<AppState>,
     p: Principal,
@@ -1217,15 +1187,17 @@ pub async fn put_files(
     let body = code_bytes(request_max(&st), body)?;
     let req: PutReq<'_> = parse_body(&body)?;
     let sc = code_scope(&st, &p, &headers, &req.solution, Mode::Write).await?;
-    let meta = upload_meta(
-        req.commit.as_deref(),
-        req.branch.as_deref(),
-        req.machine.as_deref(),
-        sc.user.id,
-    )?;
+    let meta = UploadMeta {
+        max_files: Some(st.cfg.code.max_files),
+        ..upload_meta(
+            req.commit.as_deref(),
+            req.branch.as_deref(),
+            req.machine.as_deref(),
+            sc.user.id,
+        )?
+    };
     let (files, masked) = parse_uploads(req.files, &st.cfg.code)?;
     let g = guid(&sc);
-    check_map_size(&sc, &g, &files, st.cfg.code.max_files).await?;
     // ссылки на символы в Knowledge участника (другая база) — то же правило карты, что у
     // `code_put_files`: файловые ссылки и хэш файла не трогаются (CRLF-близнец другой машины не
     // мигает ими, ревью задачи 3, I2); неполный или пропущенный разбор — `None` (не судится)
@@ -1249,7 +1221,13 @@ pub async fn put_files(
     let (_, own_spaces) = dbs
         .next()
         .ok_or_else(|| ApiError::Internal("нет базы владельца решения".into()))?;
-    let out = code_put_files(&sc.db, &g, &meta, files, &own_spaces).await?;
+    // предел карты — в транзакции записи: `BadInput` загрузки — 422, как прежде
+    let out = code_put_files(&sc.db, &g, &meta, files, &own_spaces)
+        .await
+        .map_err(|e| match e {
+            StoreError::BadInput(m) => unprocessable(m),
+            e => e.into(),
+        })?;
     let mut stale_refs = out.stale_refs;
     for (db, spaces) in dbs {
         stale_refs += symbols_uploaded(&db, &g, &spaces, &changed, meta.now).await?;
