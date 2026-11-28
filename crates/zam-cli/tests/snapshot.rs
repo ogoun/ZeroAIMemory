@@ -726,6 +726,7 @@ fn secrets_masked_in_prompts_and_flags() {
                     failed: None,
                 },
             ],
+            ..SnapshotData::default()
         },
     };
     let out = snapshot::mask_and_limit(snap, MAX);
@@ -812,6 +813,7 @@ fn flags_do_not_touch_prose_and_uid() {
                     failed: None,
                 },
             ],
+            ..SnapshotData::default()
         },
     };
     let before = snap.data.clone();
@@ -920,6 +922,7 @@ fn limit_order_commands_prompts_summary() {
                     failed: None,
                 })
                 .collect(),
+            ..SnapshotData::default()
         },
     };
     // шаг 1: поля ограничены сами
@@ -1513,5 +1516,117 @@ fn sessions_show_prints_snapshot() {
             .all(|(m, p, _)| m == "GET" && p.ends_with("/snapshot")),
         "{:?}",
         seen_of(&seen)
+    );
+}
+
+// ------------------------------------------------- M7.6 §9.4 п. 5: даты сессии
+
+/// Запись человека Claude со временем `ts` (поле `timestamp` верхнего уровня).
+fn human_at(c: &Case, text: &str, ts: &str) -> String {
+    let mut v: serde_json::Value = serde_json::from_str(&claude_human(c, text)).unwrap();
+    v["timestamp"] = serde_json::json!(ts);
+    v.to_string()
+}
+
+/// Даты сессии — время первой строки журнала со временем (голова: и когда окно хвоста её не
+/// захватило) и последней строки хвоста, RFC 3339 UTC с секундами; строки без времени и
+/// недописанная последняя строка не в счёт; в журнале без времени дат нет.
+#[test]
+fn snapshot_dates_from_journal_head_and_tail() {
+    let c = Case::new("dates");
+    let mut lines = vec![
+        r#"{"type":"summary","summary":"Тема","leafUuid":"x"}"#.to_string(),
+        human_at(&c, "первый", "2026-11-10T11:00:00.250+03:00"),
+    ];
+    for i in 0..300 {
+        let text = format!("запрос {i} {}", "п".repeat(200));
+        lines.push(human_at(&c, &text, "2026-11-10T08:30:00Z"));
+    }
+    lines.push(human_at(&c, "последний", "2026-11-10T09:45:10.9Z"));
+    let p = c.journal(&[], &lines);
+    // агент ещё пишет строку: время в ней есть, но она не дописана
+    let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+    std::io::Write::write_all(&mut f, br#"{"timestamp":"2026-11-10T10:00:00Z","type":"us"#)
+        .unwrap();
+    drop(f);
+    assert!(std::fs::metadata(&p).unwrap().len() > 3 * 64 * 1024);
+    let mut o = c.opts(AgentKind::Claude, SESSION);
+    o.tail_kb = 64;
+    let s = snapshot::take(&p, &o).expect("снимок");
+    assert_eq!(s.data.started_at.as_deref(), Some("2026-11-10T08:00:00Z"));
+    assert_eq!(s.data.ended_at.as_deref(), Some("2026-11-10T09:45:10Z"));
+    assert_eq!(s.data.prompts.last().map(String::as_str), Some("последний"));
+    // журнал целиком в окне — голова из того же чтения
+    let p = c.journal(&[], &lines[..3]);
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!(s.data.started_at.as_deref(), Some("2026-11-10T08:00:00Z"));
+    assert_eq!(s.data.ended_at.as_deref(), Some("2026-11-10T08:30:00Z"));
+    // время не RFC 3339 и строки без времени — дат нет
+    let mut bad: serde_json::Value = serde_json::from_str(&claude_human(&c, "x")).unwrap();
+    bad["timestamp"] = serde_json::json!("вчера");
+    let mut none: serde_json::Value = serde_json::from_str(&claude_human(&c, "y")).unwrap();
+    none.as_object_mut().unwrap().remove("timestamp");
+    let p = c.journal(&[], &[bad.to_string(), none.to_string()]);
+    let s = c.take(AgentKind::Claude, SESSION, &p);
+    assert_eq!((s.data.started_at, s.data.ended_at), (None, None));
+}
+
+/// `zam sessions show` печатает даты сессии «сессия: <начало> — <конец> UTC» (`agent_ts`) и
+/// задачу снимка, если сервер их отдал; без них — как раньше (`sessions_show_prints_snapshot`).
+#[test]
+fn sessions_show_prints_dates() {
+    let c = Case::new("cli-show-dates");
+    let reply = |data: &str| {
+        format!(
+            r#"{{"session_id":"S","taken_at":"2026-11-28T10:00:00Z","trigger":"stop",
+"agent":"claude","status":"complete","skipped":0,"bytes":100,"data":{data}}}"#
+        )
+    };
+    let full = reply(
+        r#"{"prompts":["шаг"],"files":[],"commands":[],"task_id":"01JABCDEFGHJKMNPQRSTVWXYZ0",
+"started_at":"2026-11-28T08:00:00Z","ended_at":"2026-11-28T09:59:30Z"}"#,
+    );
+    let start_only = reply(r#"{"prompts":["шаг"],"started_at":"2026-11-28T08:00:00Z"}"#);
+    let (url, _seen) = common::stub_body(std::sync::Arc::new(
+        move |_: &str, p: &str, _: usize, _: &serde_json::Value| match p {
+            "/api/v1/sessions/S-full/snapshot" => (200, full.clone(), Duration::ZERO),
+            _ => (200, start_only.clone(), Duration::ZERO),
+        },
+    ));
+    let show = |id: &str| {
+        let home = c.dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let o = common::zam_cmd()
+            .env("ZAM_URL", &url)
+            .env("ZAM_TOKEN", "zam_x")
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .current_dir(&c.root)
+            .args(["sessions", "show", id])
+            .output()
+            .unwrap();
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+    let text = show("S-full");
+    assert!(
+        text.starts_with(
+            "снимок сессии S-full · 2026-11-28 10:00:00 UTC · stop · complete · 100 байт\n\
+             сессия: 2026-11-28 08:00:00 — 2026-11-28 09:59:30 UTC\n\
+             задача: k:01JABCDEFGHJKMNPQRSTVWXYZ0\n\
+             запросы (1):"
+        ),
+        "{text}"
+    );
+    // только начало — конец «?»
+    let text = show("S-start");
+    assert!(
+        text.contains(" байт\nсессия: 2026-11-28 08:00:00 — ? UTC\nзапросы (1):"),
+        "{text}"
     );
 }

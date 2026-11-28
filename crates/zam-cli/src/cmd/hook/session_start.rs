@@ -53,7 +53,9 @@
 //! (иначе — только отправка её очереди), на `startup` — догоняющий снимок оборванной сессии
 //! проекта (не уложился — пропуск, старт как обычно). Очереди снимков других сессий уходят
 //! параллельно с `/recall` ([`snapshot_queue::flush_others`]). Сервер недоступен — снимок
-//! остаётся в очереди.
+//! остаётся в очереди. M7.6 §9.4 п. 2: тем же проходом каталога кэша уходят метки отложенного
+//! конца сессий (`endq-*`: `PATCH {ended: true}` у `SessionEnd` не удался) — до трёх за старт в
+//! сроке `SNAPSHOT_PUT_MS`, и при выключенном снимке; своя метка (сессия снова идёт) снимается.
 use std::path::Path;
 use std::time::Duration;
 
@@ -273,11 +275,13 @@ fn digest_net(
             })
         };
         let trig = sc.spawn(|| cache::refresh_triggers(env, &client, false));
-        // очереди снимков других сессий (M6 §8а): параллельно `/recall`
-        let snapq = s.session_snapshot().then(|| {
+        // очереди снимков других сессий (M6 §8а) и метки отложенного конца сессий (M7.6 §9.4
+        // п. 2; они — и при выключенном снимке): параллельно `/recall`
+        let snapq = {
             let except: Vec<&str> = first_ids.iter().map(String::as_str).collect();
-            sc.spawn(move || snapshot_queue::flush_others(env, &except))
-        });
+            let snapshots = s.session_snapshot();
+            sc.spawn(move || snapshot_queue::flush_others(env, &except, snapshots, session))
+        };
         // очередь учёта локального вывода прошлой сессии хуков (M4.5 §9.5)
         let tokens = session
             .filter(|_| cache::tokens_queued(env, session))
@@ -305,9 +309,7 @@ fn digest_net(
         {
             env.log("sessions(new_epoch): паника");
         }
-        if let Some(h) = snapq
-            && h.join().is_err()
-        {
+        if snapq.join().is_err() {
             env.log("snapshot(очереди): паника");
         }
         (reg.map(|h| h.join()), recall.join(), trig.join())

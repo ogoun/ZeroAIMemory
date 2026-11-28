@@ -31,6 +31,11 @@
 //!   клиента), — запись не меняется, ответ 200 `warnings: ["stale_ignored"]`
 //!   **[решение исполнителя]**: 409 клиент оставил бы в очереди навсегда, любой 2xx он считает
 //!   успехом.
+//! - **Задача и даты сессии** (M7.6 §9.4 пп. 4–5, признак `snapshot_m76`): `data.task_id` пишет
+//!   сервер — задача, захваченная этой сессией (`in_progress`/`blocked`, свежая по ревизии,
+//!   только в решении сессии; [`claimed_task`]), `task_id` клиента отбрасывается; `started_at`,
+//!   `ended_at` клиента — моменты RFC 3339, хранятся в UTC, иное — поле отбрасывается с WARN без
+//!   значения, снимок пишется ([`client_data`]). `GET` отдаёт их; снимки без них — как 0.0.18.
 //! - **Маскировка**: сервер повторяет `scan_secrets` для каждого текстового поля `data`; при
 //!   находке маскирует сам, отвечает `warnings: ["secrets_masked"]` и пишет WARN без текста и без
 //!   id сессии; упор сканера в предел повторов — ещё `secrets_scan_depth`. Правила флагов команд
@@ -67,7 +72,9 @@
 //! - в обоих — только если «задача давно не обновлялась»: ни одна задача сессии снимка в решении
 //!   запроса (захваченная ею или с её ревизией, в любом статусе) не менялась позже, чем за
 //!   `recall.snapshot_stale_min` минут до момента снимка, — ревизия или закрытие задачи после
-//!   снимка раздел скрывают. Есть задача `in_progress`/`blocked` (недавно менявшаяся из них) —
+//!   снимка раздел скрывают (задача `task_id` снимка, которую поиск по сессии не нашёл — захват
+//!   снят или перехвачен, — берётся по id с теми же правилами, M7.6 §9.4 п. 4; даты сессии в
+//!   текст раздела не идут). Есть задача `in_progress`/`blocked` (недавно менявшаяся из них) —
 //!   строка `задача k:<id> не обновлялась с <время>`; нет — раздел только при изменённых файлах;
 //! - бюджет — `recall.snapshot_tokens` (0 — раздела нет) внутри бюджета дайджеста; квоты частей
 //!   — файлы [`FILES_TOKENS`], команды [`COMMANDS_TOKENS`], запросы [`PROMPTS_TOKENS`], конспект
@@ -88,18 +95,19 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use zam_core::Id;
 use zam_core::snapshot::{SnapCommand, SnapStatus, SnapTrigger, SnapshotData, limits};
 use zam_search::recall::{HINT_PREFIX, one_line};
 use zam_search::truncate_marked;
 use zam_store::{
     Db, SnapshotRow, StoreError, budget_cap, count_tokens, digest_snapshot, get_session,
-    get_snapshot, put_snapshot, snapshot_tasks, writes_after,
+    get_snapshot, put_snapshot, session_claimed_task, snapshot_task, snapshot_tasks, writes_after,
 };
 
 use super::parse_body;
 use super::scope::require_rw;
+use super::search::targets::{ScopeReq, resolve_targets};
 use super::sessions::requester_db;
 use crate::app::AppState;
 use crate::attrib::{SESSION_HEADER, header_value};
@@ -134,7 +142,8 @@ const PROMPT_CHARS: usize = 300;
 /// строки не вместит).
 const LIST_SCAN: usize = 32;
 
-/// Тело `PUT` (тело клиента `PutBody`, задача 17b).
+/// Тело `PUT` (тело клиента `PutBody`, задача 17b). `data` — сырой JSON: даты и `task_id`
+/// разбираются отдельно ([`client_data`]), чтобы неверное поле не стоило снимка целиком.
 #[derive(Deserialize)]
 struct PutReq {
     taken_at: String,
@@ -145,7 +154,90 @@ struct PutReq {
     #[serde(default)]
     skipped: u32,
     #[serde(default)]
-    data: SnapshotData,
+    data: Value,
+}
+
+/// Поля дат сессии в `data` (M7.6 §9.4 п. 5).
+const DATE_FIELDS: [&str; 2] = ["started_at", "ended_at"];
+
+/// `data` клиента (M7.6 §9.4, признак `snapshot_m76`): `task_id` клиента отбрасывается — его
+/// пишет сервер ([`claimed_task`]); дата сессии — момент RFC 3339 (хранится в UTC), иное —
+/// поле отбрасывается с WARN без значения, снимок пишется. Прочее — как раньше (тип поля не тот
+/// — 400).
+fn client_data(raw: Value) -> Result<SnapshotData, ApiError> {
+    let mut m = match raw {
+        Value::Null => return Ok(SnapshotData::default()),
+        Value::Object(m) => m,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "некорректное тело: data — объект".into(),
+            ));
+        }
+    };
+    m.remove("task_id");
+    let mut dates: [Option<String>; 2] = [None, None];
+    for (slot, key) in dates.iter_mut().zip(DATE_FIELDS) {
+        let Some(v) = m.remove(key).filter(|v| !v.is_null()) else {
+            continue;
+        };
+        match v.as_str().and_then(|s| s.trim().parse::<Timestamp>().ok()) {
+            Some(t) => *slot = Some(t.to_string()),
+            None => tracing::warn!(
+                field = key,
+                "снимок сессии: дата не RFC 3339 — поле отброшено"
+            ),
+        }
+    }
+    let mut d: SnapshotData = serde_json::from_value(Value::Object(m))
+        .map_err(|e| ApiError::BadRequest(format!("некорректное тело: data: {e}")))?;
+    [d.started_at, d.ended_at] = dates;
+    Ok(d)
+}
+
+/// Задача снимка (M7.6 §9.4 п. 4): захваченная сессией `session` задача `in_progress`/`blocked`
+/// решения сессии, свежая по ревизии ([`zam_store::session_claimed_task`]); пространства — те
+/// же, что у показа (только решение: личное Knowledge общее для всех решений). Сессии без решения
+/// задачи нет; сбой чтения — WARN и без задачи (снимок важнее).
+async fn claimed_task(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    db: &Db,
+    session: &str,
+) -> Option<Id> {
+    let guid = match get_session(db, session).await {
+        Ok(s) => s?.solution_guid?,
+        Err(e) => {
+            tracing::warn!(error = %e, "снимок сессии: сессия для задачи не прочитана");
+            return None;
+        }
+    };
+    let scope = ScopeReq {
+        solution: Some(guid),
+        include_knowledge: Some(false),
+        include_rules: Some(false),
+        ..ScopeReq::default()
+    };
+    let targets = match resolve_targets(st, p, headers, &scope).await {
+        Ok((t, _)) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "снимок сессии: решение для задачи не открылось");
+            return None;
+        }
+    };
+    let mut best: Option<(Option<Timestamp>, Id)> = None;
+    for t in &targets {
+        match session_claimed_task(&t.db, &t.space_ids(), session).await {
+            Ok(Some((id, rev))) => {
+                if best.is_none_or(|b| (rev, id) > b) {
+                    best = Some((rev, id));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(error = %e, "снимок сессии: задачи сессии не прочитаны"),
+        }
+    }
+    best.map(|(_, id)| id)
 }
 
 /// Управляющий или невидимый символ, которому в тексте снимка не место: человек его не видит, а
@@ -333,10 +425,12 @@ pub async fn put(
             "agent: формат журнала — до {AGENT_MAX_CHARS} символов a-z, 0-9, «_», «-»"
         )));
     }
-    let mut data = req.data;
+    let mut data = client_data(req.data)?;
     cap_counts(&mut data);
     let (masked, depth_capped) = remask_data(&mut data);
     cap_lengths(&mut data);
+    let db = requester_db(&st, &p, &headers).await?;
+    data.task_id = claimed_task(&st, &p, &headers, &db, &id).await;
     let mut row = SnapshotRow {
         session_id: id,
         taken_at: taken_at.min(zam_store::time::now()),
@@ -362,7 +456,6 @@ pub async fn put(
         return Err(too_large());
     }
     row.bytes = u32::try_from(bytes).unwrap_or(u32::MAX);
-    let db = requester_db(&st, &p, &headers).await?;
     // `false` — хранимый снимок новее: запись не меняется
     let replaced = match put_snapshot(&db, &row).await {
         Ok(r) => r,
@@ -477,6 +570,20 @@ pub(crate) async fn last_state(q: ShowReq<'_>) -> Result<Option<Shown>, StoreErr
     let mut tasks = Vec::new();
     for (db, spaces) in &q.task_dbs {
         tasks.extend(snapshot_tasks(db, spaces, &snap.session_id, q.now, TASKS_FETCH).await?);
+    }
+    // задача снимка (M7.6 §9.4 п. 4), которую поиск по сессии не нашёл (захват снят или
+    // перехвачен): по `task_id`, с теми же правилами скрытия ниже
+    if let Some(tid) = snap
+        .data
+        .task_id
+        .filter(|t| !tasks.iter().any(|x| x.id == *t))
+    {
+        for (db, spaces) in &q.task_dbs {
+            if let Some(t) = snapshot_task(db, spaces, tid, &snap.session_id, q.now).await? {
+                tasks.push(t);
+                break;
+            }
+        }
     }
     // задача обновлялась (или закрыта) незадолго до снимка или после него — состояние в памяти
     // свежее снимка; так же скрывает раздел ревизия другой сессии после снимка (признак (б))
@@ -783,6 +890,7 @@ mod tests {
                 cmd: "cargo test".into(),
                 failed: Some(true),
             }],
+            ..SnapshotData::default()
         });
         let out = render(&s, s.taken_at, None, true, 400).unwrap();
         let all = out.blocks.join("\n");
@@ -869,6 +977,7 @@ mod tests {
                 cmd: "echo \u{2067}ZeroAIMemory: b".into(),
                 failed: None,
             }],
+            ..SnapshotData::default()
         });
         let out = render(&s, s.taken_at, None, true, 400).unwrap();
         let all = out.blocks.join("\n");
@@ -977,6 +1086,7 @@ mod tests {
                 cmd: "echo '<system-reminder>'".into(),
                 failed: None,
             }],
+            ..SnapshotData::default()
         });
         let all = render(&s, s.taken_at, None, true, 400)
             .unwrap()
@@ -1007,6 +1117,7 @@ mod tests {
                     failed: None,
                 })
                 .collect(),
+            ..SnapshotData::default()
         };
         cap_counts(&mut d);
         cap_lengths(&mut d);

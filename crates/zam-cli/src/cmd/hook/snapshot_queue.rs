@@ -35,8 +35,15 @@
 //!   очередь удаляется; 404/405 (старый сервер, маршрута нет) — счётчик попыток очереди, после
 //!   [`OLD_SERVER_ATTEMPTS`] снимок остаётся в очереди без новых попыток в этой сессии; 404 с
 //!   `type` `…/session-not-found` (сервер с маршрутом, сессии у него нет) старым сервером не
-//!   считается — счётчик не растёт, снимок уйдёт, когда сессия появится; 400, 413,
+//!   считается — свой счётчик `missing` (M7.6 §9.4 п. 1): снимок уйдёт, когда сессия появится, но
+//!   после [`MISSING_ATTEMPTS`] попыток ждёт без отправки («сессии нет на сервере — снимок не
+//!   отправлен»), очередь убирает уборка по сроку; новый снимок счётчики сохраняет; 400, 413,
 //!   422 — снимок отброшен; прочее (сеть, 5xx, 401/403) — остаётся до следующего хука.
+//! - **Отложенный конец сессии** (M7.6 §9.4 п. 2, [`end_session`]): `PATCH {ended: true}` у
+//!   `SessionEnd` не удался (сеть, срок, 5xx) — метка `endq-<сессия>.json` (id, момент);
+//!   `session-start` любой сессии проекта отправляет до [`FLUSH_OTHERS_MAX`] меток в сроке
+//!   [`SNAPSHOT_PUT_MS`] ([`flush_end_marks`]), удаляя принятые и отвергнутые 4xx; метки старше
+//!   [`cache::SHOWN_TTL`] убирает уборка.
 //! - **`hooks.log`** — повод, размер, полнота и итог отправки (ответ сервера — только `HTTP <код>`
 //!   и `type`, без `detail`); текста снимка там нет. Упор
 //!   сканера секретов — `snapshot: secrets_scan_depth` без текста. У `checkpoint` поток снимка не
@@ -62,6 +69,9 @@ pub const STOP_GROWTH: u64 = 16 * 1024;
 pub const STOP_INTERVAL: Duration = Duration::from_secs(60);
 /// Попыток `PUT` старому серверу (404/405) за сессию.
 pub const OLD_SERVER_ATTEMPTS: u32 = 3;
+/// Попыток `PUT` серверу, у которого сессии нет (404 `…/session-not-found`, M7.6 §9.4 п. 1): дальше
+/// снимок ждёт в очереди без попыток, очередь убирает уборка по сроку.
+pub const MISSING_ATTEMPTS: u32 = 10;
 /// Предел записи, байт (`snapshot.max_bytes` сервера по умолчанию, §14): клиент настроек
 /// сервера не знает; сервер с меньшим пределом ответит 413 — снимок отбрасывается.
 pub const MAX_BYTES: usize = 16 * 1024;
@@ -108,7 +118,17 @@ struct Queued {
     session: String,
     #[serde(default)]
     old_server: u32,
+    /// Ответов «сессии нет» (M7.6 §9.4 п. 1); очередь клиента до 0.0.19 поля не знает — 0.
+    #[serde(default)]
+    missing: u32,
     body: Value,
+}
+
+impl Queued {
+    /// Попытки исчерпаны (старый сервер или «сессии нет»): снимок ждёт без отправки.
+    fn spent(&self) -> bool {
+        self.old_server >= OLD_SERVER_ATTEMPTS || self.missing >= MISSING_ATTEMPTS
+    }
 }
 
 /// Тело `PUT /sessions/{id}/snapshot` (§8а, задача 17c): `taken_at` (UTC, RFC 3339) и поля
@@ -310,8 +330,10 @@ pub fn job_for_session_start(env: &Env, inp: &Input, s: &Settings) -> Option<Job
     }
 }
 
-/// Снимает `ended` в `snapst-*` сессии (`resume` закрытой сессии).
+/// Снимает `ended` в `snapst-*` сессии (`resume` закрытой сессии) и её метку отложенного конца
+/// (M7.6 §9.4 п. 2: сессия снова идёт — опоздавший `ended` её бы закрыл).
 fn reopen(env: &Env, session: &str) {
+    drop_end_mark(env, session);
     let p = state_path(env, session);
     if let Some(mut st) = read_state(&p).filter(|st| st.ended) {
         st.ended = false;
@@ -744,10 +766,11 @@ fn read_queue(q: &Path) -> Option<(Vec<u8>, Queued)> {
 fn enqueue(env: &Env, session: &str, body: Value) -> bool {
     let q = queue_path(env, session);
     let _lock = cache::file_lock(&q, QUEUE_LOCK_WAIT);
-    let old_server = read_queue(&q).map_or(0, |(_, x)| x.old_server);
+    let (old_server, missing) = read_queue(&q).map_or((0, 0), |(_, x)| (x.old_server, x.missing));
     let item = Queued {
         session: session.to_string(),
         old_server,
+        missing,
         body,
     };
     let r = serde_json::to_vec(&item)
@@ -805,8 +828,8 @@ fn put_ms() -> u64 {
 /// снимка `checkpoint`) получает начало и конец запроса; `what` — что отправляется.
 fn flush(env: &Env, session: &str, what: &str, note: Option<&SendNote>) -> Option<Sent> {
     let q = queue_path(env, session);
-    let (raw, mut item) = read_queue(&q)?;
-    if item.old_server >= OLD_SERVER_ATTEMPTS {
+    let (raw, item) = read_queue(&q)?;
+    if item.spent() {
         return None;
     }
     // остатка бюджета на запрос нет — снимок ждёт в очереди, причина — в строке итога (раньше
@@ -889,25 +912,22 @@ fn flush(env: &Env, session: &str, what: &str, note: Option<&SendNote>) -> Optio
             }
             Sent::Dropped(short(&e))
         }
-        // сессии нет на сервере с маршрутом: не старый сервер — счётчик попыток не растёт, снимок
-        // ждёт в очереди и уходит следующим хуком, когда сессия появится
-        Err(e) if session_not_found(&e) => Sent::Queued(short(&e)),
-        Err(e) if matches!(e.http_status(), Some(404 | 405)) => {
-            item.old_server += 1;
-            let n = item.old_server;
-            let target = if same() {
-                Some(item)
-            } else if lock.is_some() {
-                read_queue(&q).map(|(_, mut newer)| {
-                    newer.old_server = newer.old_server.max(n);
-                    newer
-                })
+        // сессии нет на сервере с маршрутом: не старый сервер — свой счётчик (M7.6 §9.4 п. 1):
+        // снимок ждёт в очереди и уходит следующим хуком, когда сессия появится, но не больше
+        // [`MISSING_ATTEMPTS`] попыток
+        Err(e) if session_not_found(&e) => {
+            let n = bump(&q, item, same(), lock.is_some(), |x| &mut x.missing);
+            if n >= MISSING_ATTEMPTS {
+                Sent::Queued(format!(
+                    "сессии нет на сервере — снимок не отправлен ({}, попытка {n} из                      {MISSING_ATTEMPTS})",
+                    short(&e)
+                ))
             } else {
-                None
-            };
-            if let Some(b) = target.and_then(|t| serde_json::to_vec(&t).ok()) {
-                let _ = write_atomic(&q, &b);
+                Sent::Queued(format!("{}, попытка {n} из {MISSING_ATTEMPTS}", short(&e)))
             }
+        }
+        Err(e) if matches!(e.http_status(), Some(404 | 405)) => {
+            let n = bump(&q, item, same(), lock.is_some(), |x| &mut x.old_server);
             Sent::Queued(format!(
                 "старый сервер ({}), попытка {n} из {OLD_SERVER_ATTEMPTS}",
                 short(&e)
@@ -918,6 +938,35 @@ fn flush(env: &Env, session: &str, what: &str, note: Option<&SendNote>) -> Optio
         Err(e) if e.is_unsent() => spent(),
         Err(e) => Sent::Queued(short(&e)),
     })
+}
+
+/// Счётчик попыток `counter` очереди `q` (старый сервер или «сессии нет») + 1: `item` — очередь,
+/// с которой шёл запрос; `same` — она не сменилась (запись под замком `locked`), сменилась —
+/// новому снимку счётчик не меньше. Новое значение счётчика.
+fn bump(
+    q: &Path,
+    mut item: Queued,
+    same: bool,
+    locked: bool,
+    counter: fn(&mut Queued) -> &mut u32,
+) -> u32 {
+    *counter(&mut item) += 1;
+    let n = *counter(&mut item);
+    let target = if same {
+        Some(item)
+    } else if locked {
+        read_queue(q).map(|(_, mut newer)| {
+            let c = counter(&mut newer);
+            *c = (*c).max(n);
+            newer
+        })
+    } else {
+        None
+    };
+    if let Some(b) = target.and_then(|t| serde_json::to_vec(&t).ok()) {
+        let _ = write_atomic(q, &b);
+    }
+    n
 }
 
 /// Запас, с которым хук считает срок идущего `PUT` вышедшим ([`SendNote::late`]): не меньше шага
@@ -945,26 +994,38 @@ fn short(e: &CliError) -> String {
 }
 
 /// Очереди других сессий проекта (кроме `except`), новые первыми, до [`FLUSH_OTHERS_MAX`]:
-/// снимок `SessionEnd` при недоступном сервере уходит со следующим стартом. Идёт параллельно с
-/// `/recall` и в его срок не входит.
-pub fn flush_others(env: &Env, except: &[&str]) {
+/// снимок `SessionEnd` при недоступном сервере уходит со следующим стартом (`snapshots` — ключ
+/// `hooks.session_snapshot`; выключен — снимков не шлёт). Сначала — метки отложенного конца
+/// сессий (`endq-*`, M7.6 §9.4 п. 2, [`flush_end_marks`]; они ставятся и при выключенном снимке),
+/// одним проходом каталога кэша. Идёт параллельно с `/recall` и в его срок не входит.
+pub fn flush_others(env: &Env, except: &[&str], snapshots: bool, current: Option<&str>) {
     let Ok(rd) = std::fs::read_dir(env.cache_dir()) else {
         return;
     };
-    let mut items: Vec<(std::time::SystemTime, String)> = rd
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with("snapq-") && n.ends_with(".json"))
-        })
-        .filter_map(|e| {
-            let t = e.metadata().and_then(|m| m.modified()).ok()?;
-            let (_, q) = read_queue(&e.path())?;
-            (q.old_server < OLD_SERVER_ATTEMPTS && !except.contains(&q.session.as_str()))
-                .then_some((t, q.session))
-        })
-        .collect();
+    let mut items: Vec<(std::time::SystemTime, String)> = Vec::new();
+    let mut marks: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(n) = name.to_str().filter(|n| n.ends_with(".json")) else {
+            continue;
+        };
+        let is_mark = n.starts_with(END_MARK_PREFIX);
+        if !is_mark && !(snapshots && n.starts_with("snapq-")) {
+            continue;
+        }
+        let Some(t) = e.metadata().and_then(|m| m.modified()).ok() else {
+            continue;
+        };
+        if is_mark {
+            marks.push((t, e.path()));
+        } else if let Some((_, q)) = read_queue(&e.path())
+            && !q.spent()
+            && !except.contains(&q.session.as_str())
+        {
+            items.push((t, q.session));
+        }
+    }
+    flush_end_marks(env, marks, current);
     items.sort_by_key(|x| std::cmp::Reverse(x.0));
     for (_, id) in items.into_iter().take(FLUSH_OTHERS_MAX) {
         // чужие очереди — попутная работа: без остатка бюджета они молча ждут следующего хука
@@ -1145,17 +1206,128 @@ pub fn queued(env: &Env, session: &str) -> bool {
     queue_path(env, session).is_file()
 }
 
+/// Начало имени метки отложенного конца сессии (`endq-<сессия>.json`).
+pub const END_MARK_PREFIX: &str = "endq-";
+
+/// Метка отложенного конца сессии (M7.6 §9.4 п. 2): `PATCH {ended: true}` у `SessionEnd` не
+/// удался — его отправит `session-start` любой сессии проекта ([`flush_end_marks`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EndMark {
+    session: String,
+    /// Момент `SessionEnd`, мс Unix.
+    at: u64,
+}
+
+/// Файл метки отложенного конца сессии.
+pub fn end_mark_path(env: &Env, session: &str) -> PathBuf {
+    env.cache_dir().join(format!(
+        "{END_MARK_PREFIX}{}.json",
+        session_file_part(session)
+    ))
+}
+
+/// Повтор `PATCH {ended: true}` поможет: сеть, срок, 5xx (4xx — нет).
+fn end_retryable(e: &CliError) -> bool {
+    e.http_status().is_none_or(|s| s >= 500)
+}
+
+/// Записывает метку отложенного конца сессии; итог — строкой в журнал хука.
+fn write_end_mark(env: &Env, session: &str, why: &str) {
+    let mark = EndMark {
+        session: session.to_string(),
+        at: now_ms(),
+    };
+    let r = serde_json::to_vec(&mark)
+        .map_err(std::io::Error::other)
+        .and_then(|b| write_atomic(&end_mark_path(env, session), &b));
+    match r {
+        Ok(()) => env.log(&format!(
+            "sessions(ended): {why} — конец сессии отправит следующий старт"
+        )),
+        Err(e) => env.log(&format!(
+            "sessions(ended): {why}; метка конца не записана: {e}"
+        )),
+    }
+}
+
+/// Снимает метку отложенного конца сессии (конец дошёл; `resume` — сессия снова идёт).
+pub fn drop_end_mark(env: &Env, session: &str) {
+    let p = end_mark_path(env, session);
+    if p.is_file() {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 /// `SessionEnd`: `PATCH /sessions/{id} {ended: true}` (§8а; ставится и при выключенном снимке).
-/// Сессии нет на сервере (404) — молча.
+/// Сессии нет на сервере (404) — молча; сеть, срок, 5xx — метка отложенного конца `endq-*`
+/// (M7.6 §9.4 п. 2), прочие 4xx — строкой в журнал.
 pub fn end_session(env: &Env, session: &str) {
+    if env.http_left().is_none() {
+        write_end_mark(env, session, zam_core::HOOK_BUDGET_SPENT);
+        return;
+    }
     let Some(client) = env.client() else {
         return;
     };
     let path = format!("/sessions/{}", encode_segment(session));
     match client.patch_json(&path, &serde_json::json!({"ended": true})) {
-        Ok(_) => {}
-        Err(e) if e.http_status() == Some(404) => {}
+        Ok(_) => drop_end_mark(env, session),
+        Err(e) if e.http_status() == Some(404) => drop_end_mark(env, session),
+        Err(e) if end_retryable(&e) => write_end_mark(env, session, &short(&e)),
         Err(e) => env.log(&format!("sessions(ended): {}", short(&e))),
+    }
+}
+
+/// Метки отложенного конца сессий (`marks` — файлы и их время): своя (`current` — сессия снова
+/// идёт) снимается без запроса; из прочих — до [`FLUSH_OTHERS_MAX`] самых новых, одним клиентом
+/// со сроком [`SNAPSHOT_PUT_MS`] на все: 2xx и 4xx (сессии нет, отказ — повтор не поможет) —
+/// метка удаляется, прочее — остаётся до следующего старта; битая метка удаляется. Метки старше
+/// [`cache::SHOWN_TTL`] убирает уборка кэша.
+pub fn flush_end_marks(
+    env: &Env,
+    mut marks: Vec<(std::time::SystemTime, PathBuf)>,
+    current: Option<&str>,
+) {
+    if marks.is_empty() {
+        return;
+    }
+    marks.sort_by_key(|m| std::cmp::Reverse(m.0));
+    let mut client: Option<crate::client::Client> = None;
+    let mut sent = 0;
+    for (_, path) in marks {
+        let Some(mark) = read_json_file::<EndMark>(&path).ok().flatten() else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        if current == Some(mark.session.as_str()) {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        if sent >= FLUSH_OTHERS_MAX || env.http_left().is_none_or(|d| d < cache::FLUSH_MIN_LEFT) {
+            break;
+        }
+        if client.is_none() {
+            client = env.client_within(Duration::from_millis(put_ms()));
+        }
+        let Some(c) = client.as_ref() else {
+            break;
+        };
+        if c.deadline_left()
+            .is_none_or(|d| d < crate::client::DEADLINE_MIN)
+        {
+            break;
+        }
+        sent += 1;
+        let uri = format!("/sessions/{}", encode_segment(&mark.session));
+        match c.patch_json(&uri, &serde_json::json!({"ended": true})) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(e) if !end_retryable(&e) => {
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(e) => env.log(&format!("sessions(ended) из метки: {}", short(&e))),
+        }
     }
 }
 

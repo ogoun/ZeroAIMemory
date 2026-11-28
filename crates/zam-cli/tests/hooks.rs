@@ -6436,6 +6436,231 @@ fn old_server_three_attempts_then_queue() {
     assert_eq!(log.matches("попытка").count(), 3, "{log}");
 }
 
+// ---- M7.6 §9.4 пп. 1–2: предел «сессии нет», отложенный конец сессии ----
+
+/// M7.6 §9.4 п. 1: сервер с маршрутом, у которого сессии нет (404 `…/session-not-found`), — не
+/// больше 10 попыток `PUT`, затем снимок ждёт в очереди без попыток («сессии нет на сервере —
+/// снимок не отправлен» — один раз); счётчик старого сервера не растёт; исчерпанную очередь
+/// не шлёт и `session-start` другой сессии.
+#[test]
+fn snapshot_missing_session_attempts_limit() {
+    let _g = serial();
+    let (url, seen) = snap_stub(
+        404,
+        r#"{"type":"/problems/session-not-found","status":404,"title":"Not Found"}"#,
+    );
+    let p = Proj::new("snap-missing", &url, "zam_x");
+    let s = "ms-1";
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос 0")]);
+    for i in 0..12 {
+        append_lines(&t, &[cl_user(s, &format!("запрос {}", i + 1))]);
+        let pc = snap_ev(&p, "PreCompact", s, &t, json!({"trigger": "auto"}));
+        empty(&hook_snap(&p, "checkpoint", &pc));
+    }
+    assert_eq!(puts(&seen).len(), 10, "{}", p.log());
+    let q = snap_file(&p, "snapq", s).expect("снимок в очереди");
+    assert_eq!(q["missing"], 10, "{q}");
+    assert_eq!(q["old_server"], 0, "{q}");
+    assert_eq!(prompts_of(&q["body"]).last().unwrap(), "запрос 12", "{q}");
+    let log = p.log();
+    assert_eq!(
+        log.matches("сессии нет на сервере — снимок не отправлен")
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(log.contains("попытка 9 из 10"), "{log}");
+    assert!(!log.contains("старый сервер"), "{log}");
+    let n = puts(&seen).len();
+    let tb = transcript_path(&p, "ms-2");
+    write_lines(&tb, &[]);
+    let ss = snap_ev(
+        &p,
+        "SessionStart",
+        "ms-2",
+        &tb,
+        json!({"source": "startup"}),
+    );
+    context(&hook_snap(&p, "session-start", &ss), "SessionStart");
+    assert_eq!(puts(&seen).len(), n, "{}", p.log());
+}
+
+/// M7.6 §9.4 п. 1: счётчик старого сервера — прежний (3 попытки) и не смешивается со счётчиком
+/// «сессии нет»; очередь клиента до 0.0.19 (без `missing`) читается и отправляется, новый снимок
+/// сохраняет оба счётчика.
+#[test]
+fn snapshot_old_server_counter_kept() {
+    let _g = serial();
+    let (url, seen) = snap_stub(
+        404,
+        r#"{"type":"about:blank","status":404,"title":"Not Found"}"#,
+    );
+    let p = Proj::new("snap-old-kept", &url, "zam_x");
+    let s = "ok-1";
+    let t = transcript_path(&p, s);
+    write_lines(&t, &[cl_user(s, "запрос 0")]);
+    // очередь прежнего клиента: без поля `missing`, две попытки старому серверу
+    let pc = snap_ev(&p, "PreCompact", s, &t, json!({"trigger": "auto"}));
+    empty(&hook_snap(&p, "checkpoint", &pc));
+    let f = p.session_file("snapq", s, ".json").expect("очередь");
+    let mut q: Value = serde_json::from_slice(&std::fs::read(&f).unwrap()).unwrap();
+    q.as_object_mut().unwrap().remove("missing");
+    q["old_server"] = json!(2);
+    std::fs::write(&f, q.to_string()).unwrap();
+    let before = puts(&seen).len();
+    for i in 0..3 {
+        append_lines(&t, &[cl_user(s, &format!("запрос {}", i + 1))]);
+        let pc = snap_ev(&p, "PreCompact", s, &t, json!({"trigger": "auto"}));
+        empty(&hook_snap(&p, "checkpoint", &pc));
+    }
+    assert_eq!(puts(&seen).len(), before + 1, "{}", p.log());
+    let q = snap_file(&p, "snapq", s).expect("очередь");
+    assert_eq!(q["old_server"], 3, "{q}");
+    assert_eq!(q["missing"], 0, "{q}");
+    assert_eq!(prompts_of(&q["body"]).last().unwrap(), "запрос 3", "{q}");
+    assert!(p.log().contains("попытка 3 из 3"), "{}", p.log());
+}
+
+/// Заглушка для меток конца сессии: `PATCH /sessions/{id}` — `patch`; `/recall` — «D»; прочее —
+/// 200 `{}`.
+fn end_stub(patch: u16) -> (String, common::Seen) {
+    common::stub_body(std::sync::Arc::new(
+        move |m: &str, path: &str, _: usize, _: &Value| {
+            if m == "PATCH" && path.starts_with("/api/v1/sessions/") {
+                let body = format!(r#"{{"status":{patch},"title":"x"}}"#);
+                (patch, body, Duration::ZERO)
+            } else if path == "/api/v1/recall" {
+                (200, r#"{"text":"D"}"#.to_string(), Duration::ZERO)
+            } else {
+                (200, "{}".to_string(), Duration::ZERO)
+            }
+        },
+    ))
+}
+
+/// `PATCH /sessions/<id>`, принятые заглушкой: id сессий по порядку.
+fn ended_patches(seen: &common::Seen) -> Vec<String> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|(m, _, b)| m == "PATCH" && b == &json!({"ended": true}))
+        .filter_map(|(_, p, _)| p.strip_prefix("/api/v1/sessions/").map(str::to_string))
+        .collect()
+}
+
+/// Хук `kind` с событием `ev` к серверу `url` (щедрый бюджет, как [`hook_snap`]).
+fn hook_to(p: &Proj, url: &str, kind: &str, ev: &Value) -> Output {
+    p.cmd(url)
+        .env("ZAM_TEST_HOOK_BUDGET_MS", "10000")
+        .env("ZAM_TEST_SNAPSHOT_MS", "5000")
+        .env("ZAM_TEST_SNAPSHOT_PUT_MS", "10000")
+        .args(["hook", kind, "--agent", "claude"])
+        .write_stdin(ev.to_string().into_bytes())
+        .output()
+        .unwrap()
+}
+
+/// M7.6 §9.4 п. 2: `PATCH {ended: true}` у `SessionEnd` не удался (5xx, сеть) — метка
+/// `endq-<сессия>.json` (id и момент) и строка журнала, и при выключенном снимке; удался или
+/// сессии нет (404) — метки нет (прежняя снимается).
+#[test]
+fn session_end_failed_queues_ended_mark() {
+    let _g = serial();
+    let (busy, _) = end_stub(503);
+    let p = Proj::new("end-mark", &busy, "zam_x");
+    project_hooks(&p, "session_snapshot = false");
+    let end_of = |s: &str| {
+        let t = transcript_path(&p, s);
+        write_lines(&t, &[cl_user(s, "запрос")]);
+        snap_ev(&p, "SessionEnd", s, &t, json!({"reason": "exit"}))
+    };
+    empty(&hook_to(&p, &busy, "checkpoint", &end_of("em-5xx")));
+    let m = snap_file(&p, "endq", "em-5xx").unwrap_or_else(|| panic!("нет метки: {}", p.log()));
+    assert_eq!(m["session"], "em-5xx", "{m}");
+    assert!(m["at"].as_u64().unwrap() > 0, "{m}");
+    assert!(
+        p.log()
+            .contains("sessions(ended): HTTP 503 — конец сессии отправит следующий старт"),
+        "{}",
+        p.log()
+    );
+    empty(&hook_to(&p, DEAD, "checkpoint", &end_of("em-net")));
+    assert!(snap_file(&p, "endq", "em-net").is_some(), "{}", p.log());
+    // конец дошёл — прежняя метка снята; 404 — метки нет
+    let (ok, seen) = end_stub(204);
+    empty(&hook_to(&p, &ok, "checkpoint", &end_of("em-5xx")));
+    assert_eq!(ended_patches(&seen), ["em-5xx"]);
+    assert!(snap_file(&p, "endq", "em-5xx").is_none(), "{}", p.log());
+    let (gone, _) = end_stub(404);
+    empty(&hook_to(&p, &gone, "checkpoint", &end_of("em-404")));
+    assert!(snap_file(&p, "endq", "em-404").is_none(), "{}", p.log());
+}
+
+/// Метка отложенного конца сессии `s` с временем файла `secs` секунд назад.
+fn put_end_mark(p: &Proj, s: &str, secs: u64) {
+    let (busy, _) = end_stub(503);
+    let t = transcript_path(p, s);
+    write_lines(&t, &[cl_user(s, "запрос")]);
+    let end = snap_ev(p, "SessionEnd", s, &t, json!({"reason": "exit"}));
+    empty(&hook_to(p, &busy, "checkpoint", &end));
+    let f = p.session_file("endq", s, ".json").expect("метка");
+    age_file(&f, secs);
+}
+
+/// M7.6 §9.4 п. 2: `session-start` любой сессии проекта отправляет до трёх самых новых меток
+/// других сессий (и при выключенном снимке) и удаляет принятые; своя метка (сессия снова идёт)
+/// снимается без запроса; остальные ждут следующего старта.
+#[test]
+fn session_start_flushes_ended_marks() {
+    let _g = serial();
+    let (url, seen) = end_stub(204);
+    let p = Proj::new("end-flush", &url, "zam_x");
+    project_hooks(&p, "session_snapshot = false");
+    for (i, s) in ["m-old", "m-3", "m-2", "m-1", "m-own"].iter().enumerate() {
+        put_end_mark(&p, s, 600 - 100 * i as u64);
+    }
+    let ss = p.ev("SessionStart", "m-own", json!({"source": "resume"}));
+    context(&hook_to(&p, &url, "session-start", &ss), "SessionStart");
+    let mut got = ended_patches(&seen);
+    got.sort();
+    assert_eq!(got, ["m-1", "m-2", "m-3"], "{}", p.log());
+    for s in ["m-1", "m-2", "m-3", "m-own"] {
+        assert!(snap_file(&p, "endq", s).is_none(), "{s}: {}", p.log());
+    }
+    assert!(snap_file(&p, "endq", "m-old").is_some());
+    // следующий старт — оставшаяся
+    let ss = p.ev("SessionStart", "m-next", json!({"source": "startup"}));
+    context(&hook_to(&p, &url, "session-start", &ss), "SessionStart");
+    assert_eq!(ended_patches(&seen).len(), 4, "{}", p.log());
+    assert!(snap_file(&p, "endq", "m-old").is_none());
+}
+
+/// M7.6 §9.4 п. 2: метка, которую сервер отверг 4xx (сессии нет, отказ), удаляется — повтор не
+/// поможет; 5xx — метка остаётся до следующего старта.
+#[test]
+fn ended_mark_dropped_on_4xx() {
+    let _g = serial();
+    let (busy, seen5) = end_stub(503);
+    let p = Proj::new("end-4xx", &busy, "zam_x");
+    put_end_mark(&p, "m-a", 60);
+    let ss = p.ev("SessionStart", "m-b", json!({"source": "startup"}));
+    context(&hook_to(&p, &busy, "session-start", &ss), "SessionStart");
+    assert!(ended_patches(&seen5).contains(&"m-a".to_string()));
+    assert!(snap_file(&p, "endq", "m-a").is_some(), "5xx: {}", p.log());
+    for code in [404u16, 403] {
+        put_end_mark(&p, "m-a", 60);
+        let (url, seen) = end_stub(code);
+        context(&hook_to(&p, &url, "session-start", &ss), "SessionStart");
+        assert_eq!(ended_patches(&seen), ["m-a"], "{code}");
+        assert!(
+            snap_file(&p, "endq", "m-a").is_none(),
+            "{code}: {}",
+            p.log()
+        );
+    }
+}
+
 /// §8а: `hooks.session_snapshot = false` — журнал агента не открывается: нет `snapst-*`,
 /// `snapq-*`, `PUT` и `Ev::Snapshot`, догоняющего снимка тоже нет (точка подмены
 /// `<журнал>.stall-ms` задержала бы хук на 4 с при сроке 5 с); `SessionEnd` ставит `ended`.

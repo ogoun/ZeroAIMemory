@@ -17,6 +17,10 @@
 //! задачи 3 M7.1 правила живут в `zam-secrets`, а не в клиенте). Затем пределы §8а: поля по
 //! отдельности, потом общий размер JSON — однозначный порядок сокращения.
 //!
+//! Даты сессии (M7.6 §9.4 п. 5): `started_at` — время первой строки журнала со временем (голова
+//! журнала, первые [`HEAD_LINE_MAX`] байт, тем же чтением, что первая строка Codex), `ended_at` —
+//! последней строки хвоста ([`line_time`]); обе — в потоке снимка и в его сроке.
+//!
 //! Форматы агентов знают только адаптеры; ядро (`zam_core::snapshot`) — нейтральный снимок.
 //! Модуль не зависит от остального клиента (`crate::…`): его исходник подключают и тесты
 //! (`tests/snapshot.rs`).
@@ -56,7 +60,8 @@ pub const SUMMARY_BYTES: usize = 8 * 1024;
 pub const MASK_MARGIN: usize = 4096;
 /// Окно конспекта до маскировки, байт: хвост — ключевые разделы Claude в конце.
 pub const SUMMARY_WINDOW: usize = 4 * SUMMARY_BYTES;
-/// Первая строка журнала (Codex `session_meta`), если она вне окна хвоста: одно чтение с нуля.
+/// Голова журнала вне окна хвоста — одно чтение с нуля этого размера: первая строка (Codex
+/// `session_meta`) и время начала сессии (M7.6 §9.4 п. 5).
 pub const HEAD_LINE_MAX: usize = 64 * 1024;
 /// Начало и конец длинной строки для предфильтра, байт: в пропуски идут только строки
 /// своего формата (огромный вывод инструмента — не повод для `partial`).
@@ -318,6 +323,10 @@ fn build(path: &Path, o: &TakeOpts, start: Instant) -> Taken {
     if let Some(t) = summary {
         data.compact_summary = Some(t.to_string());
     }
+    // даты сессии (M7.6 §9.4 п. 5): первая строка журнала со временем — из головы, последняя —
+    // из хвоста; хвост прочитан с начала файла — голова в нём же
+    data.started_at = tail.started.or_else(|| first_time(&tail.buf, false));
+    data.ended_at = first_time(&tail.buf, true);
     let snap = Snapshot {
         trigger: o.trigger,
         agent: o.agent,
@@ -341,8 +350,37 @@ struct Tail {
     /// Первая строка файла, если окно её не захватило: целиком (`false`) или только начало в
     /// [`HEAD_LINE_MAX`] байт без перевода строки (`true`, строка длиннее).
     head: Option<(String, bool)>,
+    /// Окно не с начала файла: время первой строки со временем в голове журнала (первые
+    /// [`HEAD_LINE_MAX`] байт), M7.6 §9.4 п. 5.
+    started: Option<String>,
     /// Срок вышел во время чтения.
     late: bool,
+}
+
+/// Время строки журнала агента — поле `timestamp` верхнего уровня (так у Claude Code и Codex),
+/// в UTC с точностью до секунды; нет поля, не JSON или не момент RFC 3339 — `None`.
+pub fn line_time(line: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Ts {
+        timestamp: Option<String>,
+    }
+    if !line.contains("\"timestamp\"") {
+        return None;
+    }
+    let t: Ts = serde_json::from_str(line.trim_end_matches('\r')).ok()?;
+    zam_core::time::unix_secs(t.timestamp?.trim()).map(zam_core::time::rfc3339_from_secs)
+}
+
+/// Время первой (`last = false`) или последней (`true`) строки `buf` со временем
+/// ([`line_time`]); недописанная или обрезанная строка не разбирается и пропускается.
+fn first_time(buf: &[u8], last: bool) -> Option<String> {
+    let time = |raw: &[u8]| std::str::from_utf8(raw).ok().and_then(line_time);
+    let mut lines = buf.split(|&b| b == b'\n');
+    if last {
+        lines.rev().find_map(time)
+    } else {
+        lines.find_map(time)
+    }
 }
 
 /// Хвост файла не больше `max` байт, начиная с целой строки; чтение с конца блоками по
@@ -376,7 +414,7 @@ fn read_tail(path: &Path, max: usize, soft: Instant, want_head: bool) -> Option<
         buf.extend_from_slice(b);
     }
     // начало окна не на границе строки — первая (обрезанная) строка отбрасывается
-    let mut head = None;
+    let (mut head, mut started) = (None, None);
     if pos > 0 {
         match buf.iter().position(|&b| b == b'\n') {
             Some(i) => {
@@ -384,22 +422,37 @@ fn read_tail(path: &Path, max: usize, soft: Instant, want_head: bool) -> Option<
             }
             None => buf.clear(),
         }
-        if want_head && !late {
-            head = read_head(&mut f, pos);
+        // голова журнала — одно короткое чтение с нуля: первая строка (Codex) и начало сессии
+        if !late && let Some(raw) = read_head_bytes(&mut f, pos) {
+            started = first_time(&raw, false);
+            if want_head {
+                head = head_line(raw);
+            }
         }
     }
-    Some(Tail { buf, head, late })
+    Some(Tail {
+        buf,
+        head,
+        started,
+        late,
+    })
 }
 
-/// Первая строка файла из первых `min(HEAD_LINE_MAX, limit)` байт (`limit` — начало окна хвоста):
-/// целиком, если перевод строки там есть, иначе начало строки (по границе символа) и `true`.
-/// У Codex `session_meta` с `instructions` (AGENTS.md) бывает длиннее 64 КиБ; `id` и `cwd` в ней
-/// идут раньше `instructions` — их достаёт [`codex::meta_from_prefix`].
-fn read_head(f: &mut File, limit: u64) -> Option<(String, bool)> {
+/// Первые `min(HEAD_LINE_MAX, limit)` байт файла (`limit` — начало окна хвоста).
+fn read_head_bytes(f: &mut File, limit: u64) -> Option<Vec<u8>> {
     let n = (HEAD_LINE_MAX as u64).min(limit) as usize;
     f.seek(SeekFrom::Start(0)).ok()?;
     let mut b = vec![0u8; n];
     f.read_exact(&mut b).ok()?;
+    Some(b)
+}
+
+/// Первая строка файла из его головы `b` ([`read_head_bytes`]): целиком, если перевод строки там
+/// есть, иначе начало строки (по границе символа) и `true`. У Codex `session_meta` с
+/// `instructions` (AGENTS.md) бывает длиннее 64 КиБ; `id` и `cwd` в ней идут раньше
+/// `instructions` — их достаёт [`codex::meta_from_prefix`].
+fn head_line(mut b: Vec<u8>) -> Option<(String, bool)> {
+    let n = b.len();
     let (end, cut) = match b.iter().position(|&c| c == b'\n') {
         Some(e) => (e, false),
         None => (n, true),

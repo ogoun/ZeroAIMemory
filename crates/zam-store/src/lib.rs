@@ -198,7 +198,7 @@ pub use sessions::{
 };
 pub use snapshots::{
     SnapTask, SnapshotRow, digest_snapshot, gc_snapshots, get_snapshot, put_snapshot,
-    snapshot_tasks, snapshot_times, writes_after,
+    session_claimed_task, snapshot_task, snapshot_tasks, snapshot_times, writes_after,
 };
 pub use solution_registry::{RegistryReport, register_user_solutions};
 pub use system::{

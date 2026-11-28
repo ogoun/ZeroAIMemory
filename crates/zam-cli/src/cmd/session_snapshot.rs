@@ -23,8 +23,10 @@
 //!   0, status: "empty"}`). Вывод — «снимок сессии <id>: N байт, <полнота>», `--json` —
 //!   `{session, bytes, status, trigger}`.
 //! - **Чтение** (`show`) — `GET /sessions/{id}/snapshot` (сервер маскирует поля заново):
-//!   строка `снимок сессии <id> · <taken_at> UTC · <повод> · <полнота> · N байт`, затем конспект,
-//!   запросы, файлы и команды; время — `agent_ts`. Снимка нет — код 5; `--json` — ответ как есть.
+//!   строка `снимок сессии <id> · <taken_at> UTC · <повод> · <полнота> · N байт`, с M7.6 (§9.4,
+//!   сервер с `snapshot_m76`) — строки `сессия: <начало> — <конец> UTC` (даты из журнала агента,
+//!   нет одной — «?») и `задача: k:<id>`, затем конспект, запросы, файлы и команды; время —
+//!   `agent_ts`. Снимка нет — код 5; `--json` — ответ как есть.
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -229,8 +231,8 @@ pub fn show(common: &Common, id: &str) -> Result<(), CliError> {
 }
 
 /// Снимок текстом: строка «снимок сессии <id> · <время> UTC · <повод> · <полнота> · N байт»
-/// (время — `agent_ts`), затем непустые части — конспект (с отступом), запросы, файлы и команды
-/// (у неудачной — пометка «ошибка»).
+/// (время — `agent_ts`), даты сессии и задача снимка (если есть), затем непустые части —
+/// конспект (с отступом), запросы, файлы и команды (у неудачной — пометка «ошибка»).
 pub fn show_text(id: &str, v: &Value) -> String {
     let s = |k: &str| v[k].as_str().unwrap_or("?").to_string();
     let taken = v["taken_at"].as_str().map_or_else(
@@ -248,6 +250,16 @@ pub fn show_text(id: &str, v: &Value) -> String {
     }
     out.push('\n');
     let d = &v["data"];
+    // даты сессии и задача снимка (M7.6 §9.4, сервер с `snapshot_m76`): у старого сервера их нет
+    let date = |k: &str| d[k].as_str().and_then(zam_core::time::agent_ts);
+    let (start, end) = (date("started_at"), date("ended_at"));
+    if start.is_some() || end.is_some() {
+        let or_q = |t: Option<String>| t.unwrap_or_else(|| "?".into());
+        out.push_str(&format!("сессия: {} — {} UTC\n", or_q(start), or_q(end)));
+    }
+    if let Some(t) = d["task_id"].as_str() {
+        out.push_str(&format!("задача: k:{t}\n"));
+    }
     let indent = |t: &str| -> String {
         t.lines()
             .map(|l| format!("  {l}\n"))

@@ -40,7 +40,8 @@
 //! остальным запросам хука, со сроком `hooks.snapshot_ms` на сборку и `PUT` в остатке бюджета:
 //! `decision: block` у `Stop` его не ждёт дольше этого. `PostCompact` и `SessionEnd` — без вывода;
 //! `SessionEnd` ставит сессии `ended_at` (`PATCH /sessions/{id} {ended: true}`) и при выключенном
-//! снимке.
+//! снимке; не удалось (сеть, срок, 5xx) — метка `endq-*`, её отправит следующий `session-start`
+//! (M7.6 §9.4 п. 2, [`snapshot_queue::end_session`]).
 use std::time::Duration;
 
 use serde_json::{Value, json};
