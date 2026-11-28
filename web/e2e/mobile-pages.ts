@@ -46,6 +46,18 @@ export const PAGES: MobilePage[] = [
   { name: 'задачи', path: (c) => `#/u/${c.user}/s/${c.solution}/j/tasks` },
   { name: 'идеи', path: (c) => `#/u/${c.user}/s/${IDEAS_GUID}/j/ideas` },
   { name: 'insights', path: (c) => `#/u/${c.user}/s/${c.solution}/j/insights` },
+  // M7.4 (§7.7 п. 5): у журналов Insights, Задачи и Changelog — корзина, карточка записи (запись
+  // из адреса) и форма правки (окно «Заменить», правка задачи в карточке, окно правки записи ленты)
+  { name: 'insights-корзина', path: (c) => `#/u/${c.user}/s/${c.solution}/j/insights`, buttons: ['Корзина'] },
+  { name: 'insights-карточка', path: (c) => `#/u/${c.user}/s/${c.solution}/j/insights/${c.env('E2E_INSIGHT_HYP')}`, buttons: ['Заменить'] },
+  { name: 'задачи-корзина', path: (c) => `#/u/${c.user}/s/${c.solution}/j/tasks`, buttons: ['Корзина'] },
+  { name: 'задачи-карточка', path: (c) => `#/u/${c.user}/s/${c.solution}/j/tasks/${c.env('E2E_CODE_TASK')}`, buttons: ['Изменить'] },
+  { name: 'changelog-корзина', path: (c) => `#/u/${c.user}/s/${c.solution}/j/changelog`, buttons: ['Корзина'] },
+  {
+    name: 'changelog-запись',
+    path: (c) => `#/u/${c.user}/s/${c.solution}/j/changelog/${c.env('E2E_CHANGELOG_DOCS')}`,
+    buttons: ['Изменить «Описан формат журналов»'],
+  },
   // прочие страницы (задача 3, §5.2 пп. 4, 7): все журналы решения и Knowledge, документ с широкой
   // таблицей и кодом, вложения и просмотрщики, страница отчёта, администрирование, «Аккаунт» и
   // «Мои решения» пользователя, «Подключение агента», «Кэш»
@@ -79,8 +91,11 @@ export const PAGES: MobilePage[] = [
   { name: 'мои-решения', path: () => '#/my/solutions', as: 'user' },
   // страницы M7.3 (задача 8, §6.9): «Внутренние работы» (очередь и журнал отправок — карточками на
   // телефоне), «Проверка памяти», «Кандидаты в Rules» с открытым кандидатом
+  // M7.4 (§7.7 пп. 1–3): блок администратора и страница пользователя глазами администратора; тренд и
+  // набор проб с окном «Добавить пробу»; фильтры «Аудита» — на странице «аудит» выше
   { name: 'внутренние-работы', path: () => '#/works' },
-  { name: 'проверка-памяти', path: () => '#/check' },
+  { name: 'внутренние-работы-пользователя', path: (c) => `#/works?user=${c.env('E2E_MEMBER_ID')}` },
+  { name: 'проверка-памяти', path: () => '#/check', buttons: ['Добавить пробу'] },
   { name: 'кандидаты-в-rules', path: (c) => `#/proposals/${c.env('E2E_PROPOSAL_FORMS')}` },
   { name: 'журнал', path: (c) => `#/u/${c.user}/s/${c.solution}/j/glossary` },
 ];

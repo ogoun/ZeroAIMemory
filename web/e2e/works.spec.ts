@@ -8,6 +8,8 @@
 // Плашка «вне LAN» — только по полю сервера `works.model.external` (ревью r1 задачи 8, I1): и после
 // перезагрузки, и у имени (ответ подставлен); текст — по действующему режиму, «Отключить модель».
 // Каждый сценарий готовит своё подключение сам (ревью r1, Minor 11).
+// M7.4 (§7.7 п. 2): `works_admin_block` — сводка `GET /admin/works` у администратора (таблица, на
+// телефоне — карточки), имя пользователя — его вид страницы (`#/works?user=<id>`): запросы — его.
 import { expect, test, type Page, type Request } from '@playwright/test';
 import { MOCK_REPLY_MARK, type MockRequest } from './mock-model';
 import { pageSnapshots } from './page-snaps';
@@ -40,6 +42,9 @@ pageSnapshots('works-external', () => '#/works', {
     await human(p, 'POST', 'works/model/test').catch(() => undefined);
   },
 });
+// M7.4 (§7.7 п. 2): страница пользователя глазами администратора (блок «Все пользователи» — и на
+// снимке `works`)
+pageSnapshots('works-user', () => `#/works?user=${env('E2E_MEMBER_ID')}`);
 pageSnapshots('insights-noisy', (c) => `#/u/${c.user}/s/${SOLUTION_GUID}/j/insights`, {
   after: (p) => p.getByLabel('Шумные', { exact: true }).check(),
 });
@@ -416,5 +421,64 @@ test('works_pause_dot_and_confirm_address', async ({ page }) => {
   // исходное состояние для прочих сценариев
   await setUrl('/v1');
   await resetWorks(page);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('works_admin_block', async ({ page }) => {
+  const problems = watch(page);
+  const member = env('E2E_MEMBER_ID');
+  const me = (await (await page.request.get(`${base()}api/v1/auth/me`)).json()) as { user_id: string };
+  // сводка — тем же кодом, что у сервера: строки пользователей и их логины
+  const summary = await human<{ users: { user: string; login: string }[] }>(page, 'GET', 'admin/works');
+  const login = summary.users.find((u) => u.user === member)!.login;
+  const own = summary.users.find((u) => u.user === me.user_id)!.login;
+  await page.goto(`${base()}#/works`);
+  const block = page.getByTestId('works-admin');
+  await expect(block.getByRole('heading', { name: 'Все пользователи', exact: true })).toBeVisible();
+  const table = block.getByRole('table', { name: 'Сводка по пользователям' });
+  await expect(table.locator('tbody tr')).toHaveCount(summary.users.length);
+  // своя строка — показана сейчас; у строки — режимы, очередь, проверка
+  const ownRow = table.locator(`tr[data-user="${me.user_id}"]`);
+  await expect(ownRow.getByRole('link', { name: own, exact: true })).toHaveAttribute('aria-current', 'page');
+  await expect(ownRow).toContainText('пробы: ');
+  const row = table.locator(`tr[data-user="${member}"]`);
+  await expect(row).toContainText('кандидаты в Rules: ');
+  await expect(row).toContainText(/пусто|в очереди|идёт/);
+
+  // имя — вид страницы пользователя: адрес `?user=`, запросы очереди, токенов, журнала и настроек — его
+  const asked: string[] = [];
+  page.on('request', (r) => {
+    const u = new URL(r.url());
+    if (u.pathname.includes('/api/v1/')) asked.push(`${r.method()} ${u.pathname.replace(/^.*\/api\/v1\//, '')}${u.search}`);
+  });
+  await row.getByRole('link', { name: login, exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`#/works\\?user=${member}$`));
+  await expect(page.getByRole('heading', { name: `Внутренние работы: ${login}`, exact: true })).toBeVisible();
+  await expect(page.getByTestId('works-viewing')).toContainText(`Страница пользователя ${login}`);
+  await expect(page.getByLabel(`Ночная проверка памяти пользователя ${login}`)).toBeVisible();
+  await expect(table.locator(`tr[data-user="${member}"]`).getByRole('link', { name: login, exact: true })).toHaveAttribute('aria-current', 'page');
+  await expect.poll(() => asked.filter((a) => a.startsWith('GET ')).sort()).toEqual(
+    expect.arrayContaining([
+      `GET admin/users/${member}/settings`,
+      `GET works?limit=30&user=${member}`,
+      `GET works/usage?user=${member}`,
+      `GET works/calls?days=7&user=${member}`,
+    ]),
+  );
+  // своих настроек и очереди страница пользователя не читает
+  expect(asked.filter((a) => a === 'GET auth/settings' || (a.startsWith('GET works?limit=30') && !a.includes('user=')))).toEqual([]);
+
+  // своя страница — по ссылке, точки паузы чужой страницы шапка не берёт
+  await page.getByRole('link', { name: 'Свои внутренние работы', exact: true }).click();
+  await expect(page).toHaveURL(/#\/works$/);
+  await expect(page.getByRole('heading', { name: 'Внутренние работы', exact: true })).toBeVisible();
+  await expect(page.getByTestId('works-viewing')).toHaveCount(0);
+
+  // телефон — карточки
+  await page.setViewportSize({ width: 390, height: 844 });
+  const cards = page.getByTestId('works-admin').getByRole('list', { name: 'Сводка по пользователям' });
+  await expect(cards).toBeVisible();
+  await expect(cards.locator(`li[data-user="${member}"]`).getByRole('link', { name: login })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   expect(problems, problems.join('\n')).toEqual([]);
 });

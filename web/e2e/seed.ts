@@ -199,6 +199,8 @@ export interface JournalSeed {
   oldInsight: string;
   /** Гипотеза для повышения до theorem. */
   hypothesis: string;
+  /** Запись changelog «Описан формат журналов» (обход узких экранов: запись из адреса и правка). */
+  changelogDocs: string;
   memberId: string;
   memberToken: string;
   guestToken: string;
@@ -228,7 +230,7 @@ export async function seedJournals(base: string, token: string, admin: AdminCall
     data: { version: '0.1.0', date: '2026-10-01' },
   });
   await changelog('Исправлен CRLF в хэше', 'fix', 'store');
-  await changelog('Описан формат журналов', 'docs', 'web');
+  const docs = await changelog('Описан формат журналов', 'docs', 'web');
   await post<EntryResp>(`${sp}/entries`, {
     kind: 'release',
     title: 'Релиз 0.2.0',
@@ -283,6 +285,7 @@ export async function seedJournals(base: string, token: string, admin: AdminCall
   return {
     oldInsight: old.id,
     hypothesis: hyp.id,
+    changelogDocs: docs.id,
     memberId: member.user.id,
     memberToken: member.token.plaintext,
     guestToken: guest.token.plaintext,

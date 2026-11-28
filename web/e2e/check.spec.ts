@@ -11,6 +11,10 @@ import { expect, test, type Page } from '@playwright/test';
 import { pageSnapshots } from './page-snaps';
 import { sectionItem } from './nav';
 import { RUN_M1, RUN_N1, agent, checkFixture, human, resetWorks, runsReply } from './seed-internal';
+// M7.4 (спецификация §7.7 п. 1): `check_trend_svg` — тренд своим SVG на подставленном `trend`
+// (пропуск и ухудшение на release-сборке не подготовить); `check_probe_add_retire` — ручная проба
+// и её снятие на настоящем сервере: окна формы, ошибки под полем, 409 повтора, фильтр «снятые»,
+// аудит `check.probe.retire`.
 import { ADMIN_STATE } from './session';
 
 const env = (k: string) => {
@@ -32,7 +36,8 @@ pageSnapshots('check', () => '#/check', {
   },
 });
 
-function watch(page: Page): string[] {
+/** Ошибки JS и CSP страницы и неожиданные HTTP-ответы; `allow` — ожидаемые (повтор пробы — 409). */
+function watch(page: Page, allow: (path: string, status: number) => boolean = () => false): string[] {
   const problems: string[] = [];
   page.on('console', (m) => {
     if (m.type() === 'error' && !m.text().startsWith('Failed to load resource')) problems.push(m.text());
@@ -40,7 +45,8 @@ function watch(page: Page): string[] {
   page.on('pageerror', (e) => problems.push(e.message));
   page.on('response', (r) => {
     const path = new URL(r.url()).pathname;
-    const expected = (r.status() === 401 && path.endsWith('/api/v1/auth/me')) || (r.status() === 404 && path.endsWith('/favicon.ico'));
+    const expected =
+      (r.status() === 401 && path.endsWith('/api/v1/auth/me')) || (r.status() === 404 && path.endsWith('/favicon.ico')) || allow(path, r.status());
     if (r.status() >= 400 && !expected) problems.push(`HTTP ${r.status()} ${r.request().method()} ${path}`);
   });
   return problems;
@@ -155,5 +161,182 @@ test('check_accept_new_norm', async ({ page }) => {
   await expect(page.getByTestId('check-dot')).toHaveCount(0);
   // проваленные пробы подстановки — с советом
   await expect(page.getByRole('table', { name: 'Проваленные пробы' })).toContainText('нет слов спрашивающего');
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+// ---- M7.4 (спецификация §7.7 п. 1): тренд и набор проб ----
+
+/** Строка тренда той же формы, что у сервера (`GET /check/status`, `trend`). */
+const trendRow = (n: number, x: Record<string, unknown>) => ({
+  run: `01KQ000000000000000000TR${String(n).padStart(2, '0')}`,
+  date: `2026-11-${String(10 + n).padStart(2, '0')}`,
+  trigger: 'nightly',
+  status: 'done',
+  verdict: 'ok',
+  hit_search: 0.6,
+  hit_prompt: 0.3,
+  negatives_shown: 0.1,
+  p95: 120,
+  ...x,
+});
+
+test('check_trend_svg', async ({ page }) => {
+  const problems = watch(page);
+  // пять прогонов (новые первыми, как у сервера): пропуск посередине, ухудшение у предпоследнего
+  const trend = [
+    trendRow(5, { trigger: 'manual', hit_search: 0.62, hit_prompt: 0.34, p95: 110 }),
+    trendRow(4, { verdict: 'regression', hit_search: 0.48, hit_prompt: 0.2, p95: 260 }),
+    trendRow(3, { hit_search: 0.6, hit_prompt: 0.31, p95: 130 }),
+    trendRow(2, { status: 'skipped', verdict: null, hit_search: null, hit_prompt: null, negatives_shown: null, p95: null }),
+    trendRow(1, { hit_search: 0.58, hit_prompt: 0.3, p95: 120 }),
+  ];
+  const f = checkFixture();
+  await page.route(/\/api\/v1\/check\/status$/, (r) => r.fulfill({ json: { ...f.status, trend } }));
+  await page.route(/\/api\/v1\/check\/runs(\?.*)?$/, (r) => r.fulfill({ json: runsReply(r.request().url(), f.runs) }));
+  await page.goto(`${base()}#/check`);
+  const sec = page.getByTestId('check-trend');
+  await expect(sec.getByRole('heading', { name: 'Тренд', exact: true })).toBeVisible();
+  const share = sec.getByRole('img', { name: 'Найдено поиском и среди подсказок к запросу (test), %' });
+  const ms = sec.getByRole('img', { name: 'Задержка поиска p95, мс' });
+  await expect(share).toBeVisible();
+  await expect(ms).toBeVisible();
+  // пропуск — разрыв: у каждого ряда два отрезка (1 и 3 точки), точек — 4 из 5 прогонов
+  await expect(share.locator('path.line.l-hit_search')).toHaveCount(2);
+  await expect(share.locator('path.line.l-hit_prompt')).toHaveCount(2);
+  await expect(ms.locator('path.line.l-p95')).toHaveCount(2);
+  // ухудшение — знаком ▼ (у всех рядов прогона), прочие точки — кружками
+  await expect(share.locator('path.worse')).toHaveCount(2);
+  await expect(share.locator('circle.dot')).toHaveCount(6);
+  await expect(ms.locator('path.worse')).toHaveCount(1);
+  await expect(ms.locator('circle.dot')).toHaveCount(3);
+  // оси: доли — 0–100 %, задержка — от нуля до «круглого» верха (260 → 500 мс); даты краёв
+  await expect(share.locator('text.tick')).toHaveText(['0 %', '50 %', '100 %', '2026-11-11', '2026-11-15']);
+  await expect(ms.locator('text.tick').filter({ hasText: '500 мс' })).toHaveCount(1);
+  // подпись для чтения с экрана — описание графиков, те же числа — в скрытой таблице
+  const described = await share.evaluate((s) => document.getElementById(s.getAttribute('aria-describedby') ?? '')?.textContent ?? '');
+  expect(described).toBe(
+    'Тренд за 5 прогонов (с 2026-11-11 по 2026-11-15): найдено поиском (test) — последний 62 %, от 48 % до 62 %; ' +
+      'среди подсказок к запросу (test) — последний 34 %, от 20 % до 34 %; задержка поиска p95 — последний 110 мс, ' +
+      'от 110 мс до 260 мс; прогонов с ухудшением — 1, пропусков — 1.',
+  );
+  const table = sec.getByRole('table', { name: 'Тренд по прогонам' });
+  await expect(table.locator('tbody tr')).toHaveCount(5);
+  await expect(table.locator('tbody tr').nth(1)).toContainText('пропущен');
+  await expect(table.locator('tbody tr').nth(3)).toContainText('ухудшение');
+  // графики — по ширине области, страница вбок не прокручивается
+  for (const g of [share, ms]) {
+    const fig = (await g.locator('xpath=..').boundingBox())!;
+    const box = (await g.boundingBox())!;
+    expect(box.width).toBeLessThanOrEqual(fig.width + 0.5);
+  }
+  expect(await wideOf(page), 'горизонтальная прокрутка страницы').toEqual([]);
+  // телефон: графики друг под другом во всю ширину; скрытая таблица страницу не раздвигает (таблица
+  // не бывает уже своего содержимого — раньше она расширяла раскладку на телефоне по кругу)
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(async () => Math.round((await share.boundingBox())!.width)).toBeLessThan(390);
+  const [a, b] = [(await share.boundingBox())!, (await ms.boundingBox())!];
+  expect(b.y).toBeGreaterThan(a.y + a.height - 1);
+  expect(await wideOf(page), 'горизонтальная прокрутка страницы на телефоне').toEqual([]);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+/** Страница шире окна — самые глубокие элементы за правым краем (вне прокручиваемого предка). */
+function wideOf(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const vw = document.documentElement.clientWidth;
+    if (document.documentElement.scrollWidth <= vw + 0.5) return [];
+    const clips = (e: Element) => ['auto', 'scroll', 'hidden', 'clip'].includes(getComputedStyle(e).overflowX);
+    const wide = [...document.body.querySelectorAll('*')]
+      .filter((e) => {
+        if (e.getBoundingClientRect().right <= vw + 0.5) return false;
+        for (let p = e.parentElement; p && p !== document.body; p = p.parentElement) if (clips(p)) return false;
+        return ![...e.children].some((ch) => ch.getBoundingClientRect().right > vw + 0.5);
+      })
+      .slice(0, 5)
+      .map((e) => `${e.tagName.toLowerCase()}.${(e.getAttribute('class') ?? '').trim().split(/\s+/).join('.')} → ${Math.round(e.getBoundingClientRect().right)}`);
+    // раздвигает то, что само себя обрезает (скрытая таблица), — хотя бы ширина страницы
+    return wide.length ? wide : [`страница ${document.documentElement.scrollWidth} > ${vw}`];
+  });
+}
+
+test('check_probe_add_retire', async ({ page }) => {
+  // ожидаемый отказ сервера — повтор вопроса (409 `probe-duplicate`)
+  const problems = watch(page, (path, status) => status === 409 && path.endsWith('/api/v1/check/probes'));
+  const stamp = Date.now().toString(36);
+  const target = await agent<{ id: string }>('POST', 'spaces/knowledge/entries', {
+    kind: 'insight',
+    title: `Цель ручной пробы ${stamp}`,
+    body: 'Сборщик мусора блобов удаляет файл через каталог .gc/ после фиксации строки.',
+    data: { kind: 'discovery' },
+  });
+  const ref = `i:${target.id}`;
+  const q = `Как сборщик мусора удаляет блоб без ссылок ${stamp}`;
+  await page.goto(`${base()}#/check`);
+  await expect(page.getByRole('heading', { name: 'Пробы', exact: true })).toBeVisible();
+
+  // «Добавить пробу» — окно формы: фокус на вопросе; цель не той формы — ошибка под полем, окно открыто
+  await page.getByRole('button', { name: 'Добавить пробу', exact: true }).click();
+  const add = page.getByRole('dialog', { name: 'Добавить пробу', exact: true });
+  await expect(add.getByLabel('Вопрос')).toBeFocused();
+  await add.getByLabel('Вопрос').fill(q);
+  await add.getByLabel('Цели').fill(`${target.id} ${ref}`);
+  await add.getByRole('button', { name: 'Добавить', exact: true }).click();
+  await expect(add.getByRole('alert')).toContainText(`«${target.id}» — не ссылка вида <буква>:<id>`);
+  await expect(add.getByLabel('Цели')).toBeFocused();
+  await expect(add.getByLabel('Цели')).toHaveAttribute('aria-invalid', 'true');
+  await expect(add.getByLabel('Вопрос')).toHaveValue(q);
+  // ссылка верна — проба добавлена: окно закрыто, итог в фокусе, строка в наборе
+  const created = page.waitForResponse((r) => r.request().method() === 'POST' && r.url().endsWith('/api/v1/check/probes'));
+  await add.getByLabel('Цели').fill(ref);
+  await add.getByRole('button', { name: 'Добавить', exact: true }).click();
+  const id = ((await (await created).json()) as { id: string }).id;
+  expect(id).toMatch(/^x:[0-9A-Z]{26}$/);
+  await expect(add).toBeHidden();
+  const notice = page.getByRole('status').filter({ hasText: `Проба ${id} добавлена` });
+  await expect(notice).toBeVisible();
+  await expect(notice).toBeFocused();
+  const row = page.locator(`[data-probe-set="${id}"]`);
+  await expect(row).toContainText(q);
+  await expect(row).toContainText('ручные');
+  await expect(row).toContainText('человек');
+  await expect(row.getByRole('button', { name: `Открыть ${ref}`, exact: true })).toBeVisible();
+
+  // повтор вопроса — 409: ошибка в окне, набранное цело; закрытие с набранным — вопрос в окне
+  await page.getByRole('button', { name: 'Добавить пробу', exact: true }).click();
+  await add.getByLabel('Вопрос').fill(q);
+  await add.getByLabel('Цели').fill(ref);
+  await add.getByRole('button', { name: 'Добавить', exact: true }).click();
+  await expect(add.getByRole('alert')).toContainText('Такой вопрос уже есть у активной пробы');
+  await expect(add.getByLabel('Вопрос')).toHaveValue(q);
+  await page.keyboard.press('Escape');
+  await add.getByTestId('fd-ask').getByRole('button', { name: 'Закрыть без сохранения' }).click();
+  await expect(add).toBeHidden();
+
+  // «Снять» — опасное подтверждение с причиной: короткая — ошибка под полем; верная — проба снята
+  await row.getByRole('button', { name: /^Снять пробу «/ }).click();
+  const retire = page.getByRole('dialog', { name: 'Снять пробу?', exact: true });
+  await expect(retire).toContainText(q);
+  await expect(retire.getByLabel('Причина снятия')).toBeFocused();
+  await retire.getByLabel('Причина снятия').fill('аб');
+  await retire.getByRole('button', { name: 'Снять', exact: true }).click();
+  await expect(retire.getByRole('alert')).toHaveText('Причина — от 3 символов: что в пробе неверно.');
+  const retired = page.waitForResponse((r) => r.request().method() === 'DELETE' && r.url().includes('/api/v1/check/probes/'));
+  await retire.getByLabel('Причина снятия').fill('цель замещена новой записью');
+  await retire.getByRole('button', { name: 'Снять', exact: true }).click();
+  expect((await retired).status()).toBe(204);
+  await expect(retire).toBeHidden();
+  await expect(page.getByRole('status').filter({ hasText: `Проба ${id} снята` })).toBeFocused();
+  await expect(row).toHaveCount(0);
+  // фильтр сервера «снятые» — проба с причиной, без «Снять»
+  const listed = page.waitForRequest((r) => r.url().includes('/api/v1/check/probes?') && r.url().includes('status=retired'));
+  await page.getByLabel('Состояние').selectOption('retired');
+  await listed;
+  await expect(row).toContainText('цель замещена новой записью');
+  await expect(row.getByRole('button', { name: /^Снять пробу/ })).toHaveCount(0);
+  // снятие — в аудите, с причиной
+  const audit = (await (await page.request.get(`${base()}api/v1/admin/audit?action=check.probe.retire&limit=5`)).json()) as {
+    items: { target: string; details: { reason: string } }[];
+  };
+  expect(audit.items.find((a) => a.target === id)?.details.reason).toBe('цель замещена новой записью');
   expect(problems, problems.join('\n')).toEqual([]);
 });
