@@ -29,7 +29,9 @@
 //! (`too_large`), остальное — `unsupported`. `GET /nodes/{id}/attachments` — список
 //! вложений заметки с `extract_state` и `ocr_needed` (доступ — как чтение узла);
 //! `DELETE /nodes/{id}/attachments/{sha256}/{filename}` — открепление (доступ — как запись
-//! узла): `refcount − 1`, чанки и точки вложения удаляются, блоб остаётся (GC — M7).
+//! узла): `refcount − 1`, чанки и точки вложения удаляются, блоб остаётся; последняя ссылка
+//! ставит файлу `mtime` «сейчас» — сборщик мусора уберёт его через `limits.blob_gc_days`
+//! (M7.4 §7.4). Загрузка держит замок блобов пользователя от записи файла до привязки.
 use axum::Json;
 use axum::body::Body;
 use axum::extract::multipart::{Field, MultipartError, MultipartRejection};
@@ -206,6 +208,8 @@ pub async fn upload(
     let mime = pick_mime(&filename, f.content_type());
     let limit = st.cfg.limits.blob_max_bytes as u64;
     let store = BlobStore::new(&st.data_dir.blobs_dir(), sc.owner);
+    // от записи файла до строки привязки сборщик мусора этого пользователя не работает (M7.4 §7.4)
+    let share = store.share().await;
     let reader = StreamReader::new(f.map_err(stream_err));
     let (sha, size) = store
         .put(reader, limit)
@@ -218,6 +222,7 @@ pub async fn upload(
         &sc.db, sc.node.id, &sha, size, &filename, &mime, intake, author,
     )
     .await?;
+    drop(share);
     st.render_gen.bump_user(sc.owner);
     // задание извлечения — конвейеру документов
     st.docs.notify();
@@ -297,7 +302,8 @@ pub async fn remove(
     let sc = node_scope(&st, &p, &headers, &id, Mode::Write).await?;
     live(&sc)?;
     let attrib = crate::attrib::attribution(&p, &headers, None)?;
-    detach(&sc.db, sc.node.id, &sha, &filename, &attrib).await?;
+    let store = BlobStore::new(&st.data_dir.blobs_dir(), sc.owner);
+    detach(&sc.db, &store, sc.node.id, &sha, &filename, &attrib).await?;
     st.render_gen.bump_user(sc.owner);
     tracing::info!(node = %sc.node.id, sha256 = %sha, "вложение откреплено");
     Ok(StatusCode::NO_CONTENT)

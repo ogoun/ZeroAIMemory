@@ -1559,6 +1559,8 @@ pub async fn create(
         )));
     }
     let store = BlobStore::new(&st.data_dir.blobs_dir(), sc.owner);
+    // от записи файлов до строк отчёта сборщик мусора этого пользователя не работает (M7.4 §7.4)
+    let share = store.share().await;
     let mut intake = Intake::new(refs, lim);
     let stored = match mp.as_mut() {
         Some(mp) => {
@@ -1601,6 +1603,7 @@ pub async fn create(
         refs: None,
     };
     let (entry, created) = create_report(&sc.db, new, files, &attrib).await?;
+    drop(share);
     tracing::info!(
         entry = %entry.id,
         files = stored.len(),

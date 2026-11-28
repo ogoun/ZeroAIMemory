@@ -428,10 +428,41 @@ pub async fn key_state(
     sys: &SystemStore,
     env_key: Option<&str>,
 ) -> anyhow::Result<VaultKeyState> {
-    match has_keys(sys).await? {
-        Ok(false) => return Ok(VaultKeyState::NoKeys),
-        Ok(true) => {}
-        Err(_) => return Ok(VaultKeyState::Mismatch),
+    let any = sys.vault_any_user_key().await?;
+    let check = sys.vault_key_check().await;
+    state_of(cfg, env_key, any, check)
+}
+
+/// [`key_state`] на соединении `c` с `system.db` — в том числе только для чтения
+/// (`zam-server doctor` без миграций и записи, M7.4 §7.5).
+pub fn key_state_in(
+    cfg: &ServerConfig,
+    c: &rusqlite::Connection,
+    env_key: Option<&str>,
+) -> anyhow::Result<VaultKeyState> {
+    let any = zam_store::vault::any_user_key_in(c)?;
+    let check = zam_store::vault::key_check_in(c);
+    state_of(cfg, env_key, any, check)
+}
+
+/// Состояние ключа по фактам `system.db`: любой обёрнутый ключ пользователя `any` и проверочный
+/// шифротекст `check` (одно правило у [`key_state`] и [`key_state_in`]).
+fn state_of(
+    cfg: &ServerConfig,
+    env_key: Option<&str>,
+    any: Option<(Id, Vec<u8>)>,
+    check: Result<Option<Vec<u8>>, StoreError>,
+) -> anyhow::Result<VaultKeyState> {
+    // есть ли ключи (как `has_keys`): обёрнутый ключ или проверочный шифротекст; повреждённая
+    // настройка — «не подходит», прочие сбои хранилища — ошибка
+    let has = match (&any, &check) {
+        (Some(_), _) => true,
+        (None, Ok(c)) => c.is_some(),
+        (None, Err(StoreError::Corrupt(_))) => return Ok(VaultKeyState::Mismatch),
+        (None, Err(e)) => anyhow::bail!("ключи Vault не прочитаны: {e}"),
+    };
+    if !has {
+        return Ok(VaultKeyState::NoKeys);
     }
     let key = match env_key.filter(|k| !k.trim().is_empty()) {
         Some(raw) => decode_key(raw),
@@ -443,9 +474,9 @@ pub async fn key_state(
     let Some(key) = key else {
         return Ok(VaultKeyState::Mismatch);
     };
-    let fits = match sys.vault_key_check().await {
+    let fits = match check {
         Ok(Some(blob)) => key_check_ok(&key, &blob),
-        _ => match sys.vault_any_user_key().await? {
+        _ => match any {
             Some((user, wrapped)) => unwrap_user_key(&key, user, &wrapped).is_ok(),
             None => true,
         },

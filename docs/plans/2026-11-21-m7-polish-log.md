@@ -7836,6 +7836,121 @@ parse`, `--all-targets`) и `cargo fmt --all --check` — чисто. `cargo xta
 about generate --target` для обеих платформ (таблица выше). `git diff main -- Cargo.lock` — без
 изменений (новых крейтов нет).
 
+### M7.4 · Задача 3 — Сборщик мусора блобов и `zam-server doctor`
+
+Спецификация §7.4, §7.5, решения 103–107. Worktree `.tmp/m74/wt-t3`, ветка `m7.4-t3` от
+`2a8d27a8` (слиты задачи 1 и 2); параллельно с задачей 4 (общие файлы — своими блоками).
+
+**Сделано.**
+- **`zam_store::blob_gc`**: `BlobGate` (замок блобов пользователя: `share` — разделяемый,
+  `try_exclusive` — исключительный без ожидания), `BlobShare`, `plan(conn, root, now, days) ->
+  GcPlan` (`rows`, `orphans`, `dangling`, `parts`, `missing`, `leftovers`, `incoming_*`; только
+  чтение — тот же отбор считает `doctor`), `sweep(db, root, now, days) -> GcReport` (`rows`,
+  `files`, `bytes`, `parts`, `restored`, `kept`, `errors`, `busy`), `recover` (разбор `.gc/`),
+  `remove_stale_parts`; константы `GC_DIR` = `.gc`, `PART_MAX_AGE` = 24 ч. Тестовые точки
+  (`test_hooks`): `set_gc_fail(root, "after_rename" | "after_commit")`, `pause_gc_after_plan`.
+- **`mtime`** (§7.4 п. 2): `BlobStore::put`/`put_blocking` ставят файлу на месте (новому и уже
+  бывшему) «сейчас» часов хранилища (`blobs::touch`: Windows — `FILE_WRITE_ATTRIBUTES`, unix —
+  дескриптор для чтения); `attachments::detach(db, store, …)` — при `refcount → 0` в той же
+  транзакции (`UPDATE … RETURNING refcount`).
+- **Замок** (§7.4 п. 3): `BlobStore::{gate, share}`; держат `api::blobs::upload` (от `put` до
+  `attach`), `api::reports::create` (от первого файла до `create_report`), импорт
+  (`api::transfer::import`: от `extract_blobs` до конца `apply_plan`; `extract_blobs(…,
+  &BlobShare)`).
+- **Копия** (§7.4 п. 5): `zam_store::backup::blob_list` — `WHERE refcount > 0`.
+- **Воркер** (§7.4 п. 6): `maintenance::{gc_blobs, BlobGcPass, BLOB_GC_FIRST_RUN}` — отдельная
+  задача при `blob_gc_days > 0`: первый проход через час, затем раз в сутки; пропуск при
+  признаке копии (`backup_flag_active`) или занятом `BackupRunner` (до прохода и перед каждым
+  пользователем); INFO `blob gc: user=… rows=… files=… bytes=…`, аудит `blobs.gc`.
+- **Конфигурация**: `LimitsSection::blob_gc_days` (7, 0..=365, `validate`, тест
+  `config::tests::blob_gc_days_range`), `deploy/config.example.toml` — с пояснением.
+- **`zam-server doctor`** (§7.5): `crates/zam-server/src/doctor.rs` — `run(cfg, DoctorOpts {full,
+  fix}, env_key) -> Report {checks, errors, warnings}` (`text`, `exit_code`), `DoctorError::Busy`;
+  `main.rs` — `Cmd::Doctor {full, fix, json}` (конфигурация не прочитана — код 2). Под него в
+  `zam-store`: `RoDb::{conn, immutable, opened_meanwhile}`, `backup::{FlagState (pub),
+  backup_flag_state}`, `vault::{any_user_key_in, key_check_in}`, `check::nightly_done_in` (pub);
+  в сервере: `vault::keys::key_state_in` (общий разбор `state_of` с `key_state`),
+  `backup::restore::STAGING` (pub).
+
+**Решения исполнителя.**
+- [решение исполнителя, задача 3] Замок блобов — реестр процесса по абсолютному пути корня
+  `blobs/<user>` (слабые ссылки: замок без держателей создаётся заново), а не поле `AppState`:
+  один корень — один замок, как бы ни был получен `BlobStore` (обработчики сервера, импорт в
+  `zam-store`, тесты).
+- [решение исполнителя, задача 3] Новый тип в сигнатуре — только у `extract_blobs` (замок едет в
+  блокирующий поток распаковки); `attach`, `create_report`, `apply_plan` сигнатур не меняют — у
+  них десятки вызовов в тестах `zam-store`, контракт «вызывающий держит `BlobShare`» — в
+  документации; держат его все обработчики записи блобов сервера.
+- [решение исполнителя, задача 3] `detach` ставит `mtime` без замка — внутри своей транзакции до
+  `COMMIT`: писатель базы один, повторная проверка сборщика идёт своей транзакцией после неё.
+  Ошибка `touch` — WARN, не отказ записи (запись защищает замок, время лишь откладывает удаление).
+- [решение исполнителя, задача 3] Вместе со строкой блоба удаляются документы `attachment_docs`
+  откреплённых пар без чанков: внешний ключ `attachment_docs.blob_sha256 → blobs` иначе не дал бы
+  удалить строку. Блоб, на который ссылаются `attachments`, `entry_attachments` или живой (или с
+  чанками) документ, не удаляется даже при `refcount = 0`.
+- [решение исполнителя, задача 3] Отбор — без замка (только чтение), удаление — под
+  исключительным с повторной проверкой в транзакции; точка теста между ними не держит замок, и
+  параллельная привязка того же sha проходит. Проход начинает и заканчивает разбором `.gc/`:
+  транзакция, откаченная после переименования (ошибка, а не смерть процесса), возвращает файл
+  сразу, а не через сутки. «Смерть процесса» в тестах — точки, обрывающие проход без итогового
+  разбора. Ошибка одного блоба — WARN и `errors`, проход продолжается.
+- [решение исполнителя, задача 3] `doctor --fix` сначала исправляет, потом проверяет (строки
+  `fix:…` — в конце). Проход сборщика в `--fix` — через `Db::open` и `blob_gc::sweep`, только у баз,
+  проверенных начисто (версия = программе, суммы `ok`/`adopted_pending`, схема без различий,
+  `quick_check`): мигратор там схему не меняет (у базы до 0.0.17 он примет суммы — то же сделал бы
+  старт сервера). FTS5 `rebuild` — соединением без мигратора. Аудит — `audit_closed` с `by:
+  "doctor"`.
+- [решение исполнителя, задача 3] Ложная тревога из-за `immutable` (замечание по задаче 1): база,
+  открытая `immutable=1`, с ошибкой проверяется второй раз, если рядом появились `-wal`/`-shm`
+  (сервер открыл её посреди чтения). Признак незавершённости с текстом `rollback …` — строка
+  `StoreError::RollbackIncomplete` («повторите ту же команду zam-server rollback»), иначе —
+  `RestoreIncomplete` (замечание по задаче 1: сервер 0.0.16 советовал бы `restore`).
+- [решение исполнителя, задача 3] `check:<user>` «двое суток без прогона» — только при активных
+  пробах (без проб проверять нечего); `links:<user>` — живые источники и цели этой базы
+  (`dst_space_id` пуст или пространство базы: рёбра к общему решению в чужой базе не сверяются).
+- [решение исполнителя, задача 3] `qdrant` управляемого режима — `zam_index::supervisor::inspect`
+  (как `qdrant status`, с пробой своего HTTP-порта); тесты `doctor` идут с `qdrant.mode = "edge"`
+  — без процесса и без обращений к порту 6333 на машине разработки.
+- [решение исполнителя, задача 3] Порча FTS в тесте — правка теневой таблицы `vault_fts_content`
+  (таблица с хранимым содержимым); у `chunks_fts` (внешнее содержимое `chunks`) сверку индекса с
+  таблицей содержимого `PRAGMA integrity_check(<таблица>)` не гарантирует, поэтому тест на ней не
+  строится.
+- Попутно: `zam-store/tests/reports.rs::migration_0022_keeps_entries_and_indexes` падал после
+  задачи 1 (число строк `zam_migrations` растёт с миграциями) — таблица исключена из сравнения,
+  как `meta`.
+
+**RED → GREEN.** Тесты писались вместе с кодом, поэтому RED подтверждён мутациями (исходники
+сохранены в `target/mut`, затем возвращены): без `touch` в `detach` —
+`gc_keeps_recently_detached` падает; замок, который всегда свободен, —
+`gc_skips_user_while_writer_holds_gate`; `delete_row` без повторной проверки —
+`gc_attach_race_keeps_file` (файл потерян); `blob_list` без `refcount > 0` —
+`backup_lists_only_referenced_blobs` (`MissingBlob`). Первый прогон `doctor` —
+`doctor_read_only_with_server_running` упал: `mtime` `system.db` сменил checkpoint сервера
+(интервал 1 с), а окно «сервер затих» было 0,7 с; теперь — два снимка подряд через 1,5 с.
+Ловушка прогона: исходники после мутаций вернул `Copy-Item`, а он сохраняет прежний `mtime` —
+cargo счёл сборку с мутацией свежей, и первый покрывающий прогон шёл на ней (упал
+`backup_lists_only_referenced_blobs`); после `touch` файлов — пересборка и зелёный прогон.
+
+**Прогоны** (Windows, dev, `CARGO_TARGET_DIR=target\m74-t3`, `-j 2`). `cargo test -p zam-store
+--lib --test attachments --test blobs --test reports` — 132 (1 ignored) + 18 + 5 + 21; `cargo
+test -p zam-server --features test-hooks --test blob_gc --test doctor --test backup --test
+transfer_import --test transfer_export --test reports --test blobs --test attachments_index` — 12
++ 14 + 59 + 49 + 17 + 27 + 11 + 17 = **206/206**; `--lib config::` — 51/51 (`blob_gc_days_range`,
+`example_config_parses_to_defaults`); весь прогон — 11 мин 21 с. После правки `--fix` (строка
+«пропущены» — только когда сборщику есть дело) — `doctor` 14/14 и `blob_gc` 12/12 повторно.
+Clippy `-D warnings`: `zam-store --all-targets` (с `test-hooks` и без), `zam-server
+--all-targets` — чисто; `cargo fmt -p zam-store -p zam-server --check` — чисто. `git diff
+2a8d27a8 -- Cargo.lock` и манифесты — без изменений.
+
+**`doctor` на каталоге данных e2e** (копия `.tmp/e2e/data` в `target/e2e-copy`, 108 файлов,
+96 МиБ: `system.db` с `-wal` и 16 баз пользователей v26; сборка dev; управляемый Qdrant на
+свободном порту): без флагов — код 0, 94 строки, ошибок 0, предупреждений 3 (бинарника Qdrant и
+модели в копии нет, копий нет), **1,9 с**; `--full` — то же, 1,7 с; `--fix` — код 0, исправлять
+нечего (базы v26 сборщик не трогает, дела ему нет — строк `fix:` нет), 1,8 с; `--json` — код 0.
+По базам: `info` «схема v26, программа v27: обновится при запуске» и «суммы миграций примет
+первое открытие сервером», `ok` сверки схемы, `blobs:` — у трёх пользователей 27, 1 и 1 блоб на
+месте, `links:` — одна неразрешённая wikilink.
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

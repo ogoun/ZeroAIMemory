@@ -785,16 +785,20 @@ pub async fn list_attachments(db: &Db, node: Id) -> Result<Vec<AttachmentDoc>, S
 
 /// Открепляет вложение (`sha`, `filename`) от живой заметки `node`: строка `attachments`
 /// удаляется, `blobs.refcount − 1`, чанки документа удаляются (FTS — триггером), документ
-/// получает метку открепления и `delete` (точки). Блоб при `refcount = 0` остаётся (GC — M7).
-/// Нет живой заметки или пары → `NotFound`; права — по матрице `certainty` (§7.5).
+/// получает метку открепления и `delete` (точки). Блоб при `refcount = 0` остаётся: его файл
+/// в `blobs` (`store`) получает `mtime` «сейчас» в той же транзакции, и сборщик мусора уберёт
+/// его не раньше `limits.blob_gc_days` (M7.4 §7.4 п. 2). Нет живой заметки или пары →
+/// `NotFound`; права — по матрице `certainty` (§7.5).
 pub async fn detach(
     db: &Db,
+    store: &crate::BlobStore,
     node: Id,
     sha: &str,
     filename: &str,
     attrib: &Attribution,
 ) -> Result<(), StoreError> {
     let (sha, name, author) = (sha.to_string(), filename.to_string(), attrib.author_kind);
+    let file = store.path_of(&sha);
     db.write(move |t| {
         let certainty: Option<Option<Certainty>> = t
             .query_row(
@@ -815,10 +819,19 @@ pub async fn detach(
         if gone == 0 {
             return Err(StoreError::NotFound);
         }
-        t.execute(
-            "UPDATE blobs SET refcount = max(refcount - 1, 0) WHERE sha256 = ?1",
-            [&sha],
-        )?;
+        let left: Option<i64> = t
+            .query_row(
+                "UPDATE blobs SET refcount = max(refcount - 1, 0) WHERE sha256 = ?1
+                 RETURNING refcount",
+                [&sha],
+                |r| r.get(0),
+            )
+            .optional()?;
+        // последняя ссылка: возраст блоба для сборщика — с этого момента (до COMMIT: проход
+        // сборщика, идущий следом, уже видит новое время)
+        if left == Some(0) && file.exists() {
+            crate::blobs::touch_logged(&file);
+        }
         let now = fmt_ts(crate::time::now());
         let doc: Option<Id> = t
             .query_row(

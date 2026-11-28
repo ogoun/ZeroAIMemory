@@ -1070,16 +1070,27 @@ pub struct LimitsSection {
     /// обработке одновременно (1..=8, по умолчанию 2; M7.4 §7.6 п. 6, решение 108): каждое тело
     /// держится в памяти целиком ([`crate::api::big_body`]); на малой машине — 1.
     pub big_body_permits: usize,
+    /// Возраст мусорного блоба, суток (0..=365, по умолчанию 7; M7.4 §7.4, решение 103): строку
+    /// `blobs` с `refcount = 0` и файл без строки, чей файл не менялся столько суток, удаляет
+    /// сборщик мусора воркера обслуживания (раз в сутки); 0 — сборщик выключен.
+    pub blob_gc_days: u32,
 }
 
 impl LimitsSection {
     fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |key: &str, message: &str| ConfigError::Invalid {
+            key: format!("limits.{key}"),
+            source_name: "итог".into(),
+            message: message.into(),
+        };
         if !(1..=8).contains(&self.big_body_permits) {
-            return Err(ConfigError::Invalid {
-                key: "limits.big_body_permits".into(),
-                source_name: "итог".into(),
-                message: "от 1 до 8".into(),
-            });
+            return Err(bad("big_body_permits", "от 1 до 8"));
+        }
+        if self.blob_gc_days > 365 {
+            return Err(bad(
+                "blob_gc_days",
+                "от 0 до 365 суток (0 — сборщик мусора блобов выключен)",
+            ));
         }
         Ok(())
     }
@@ -1818,6 +1829,7 @@ impl Default for ServerConfig {
                 note_max_bytes: 5_242_880,
                 blob_max_bytes: 209_715_200,
                 big_body_permits: 2,
+                blob_gc_days: 7,
             },
             vault: VaultSection::default(),
             docs: DocsSection::default(),
@@ -2280,6 +2292,24 @@ note_max_bytes = 1000
             let e = vec![env("ZAM_LIMITS__BIG_BODY_PERMITS", bad)];
             let err = load(None, &e, &Default::default()).unwrap_err().to_string();
             assert!(err.contains("limits.big_body_permits"), "{bad}: {err}");
+        }
+    }
+
+    /// M7.4 §7.4: `limits.blob_gc_days` — 7 по умолчанию, 0..=365 (0 — сборщик выключен); вне
+    /// диапазона — ошибка с ключом.
+    #[test]
+    fn blob_gc_days_range() {
+        let d = load(None, &[], &Default::default()).unwrap();
+        assert_eq!(d.limits.blob_gc_days, 7);
+        for ok in ["0", "1", "365"] {
+            let e = vec![env("ZAM_LIMITS__BLOB_GC_DAYS", ok)];
+            let c = load(None, &e, &Default::default()).unwrap();
+            assert_eq!(c.limits.blob_gc_days.to_string(), ok);
+        }
+        for bad in ["366", "-1"] {
+            let e = vec![env("ZAM_LIMITS__BLOB_GC_DAYS", bad)];
+            let err = load(None, &e, &Default::default()).unwrap_err().to_string();
+            assert!(err.contains("limits.blob_gc_days"), "{bad}: {err}");
         }
     }
 

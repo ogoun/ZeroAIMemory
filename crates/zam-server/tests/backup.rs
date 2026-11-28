@@ -839,6 +839,62 @@ async fn backup_missing_blob_fails_listed() {
     stop(a).await;
 }
 
+/// Копия и её опись берут только блобы со ссылками (M7.4 §7.4 п. 5): откреплённый блоб
+/// (`refcount = 0`) в копию не идёт, а его пропавший файл копию не роняет.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_lists_only_referenced_blobs() {
+    let _g = CHUNKER.read().await;
+    let (a, shas) = seeded("bk-referenced").await;
+    let cfg = cfg_of(&a);
+    let user = uid(&a);
+    let node = a.note("knowledge", "docs/c", "# В\n").await;
+    let node = node["id"].as_str().unwrap();
+    let data: Vec<u8> = (0..1700usize).map(|i| (i * 13 % 241) as u8).collect();
+    let j = common::attach::upload(&a, &a.token, node, "c.bin", &data).await;
+    let gone = j["sha256"].as_str().unwrap().to_string();
+    let r = a
+        .t(
+            Method::DELETE,
+            &format!("/api/v1/nodes/{node}/attachments/{gone}/c.bin"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT, "{}", r.text());
+    // файл мусора пропал (сборщик или руками) — копия всё равно снимается
+    std::fs::remove_file(
+        cfg.data_dir
+            .join("blobs")
+            .join(user.to_string())
+            .join(&gone[..2])
+            .join(&gone),
+    )
+    .unwrap();
+    let rep = run_backup(&cfg, BackupOpts::default()).await.unwrap();
+    let m = read_manifest(&rep.path);
+    let blobs: Vec<String> = m
+        .files
+        .iter()
+        .filter(|f| f.path.starts_with("blobs/"))
+        .map(|f| f.sha256.clone())
+        .collect();
+    let mut want = shas.clone();
+    want.sort();
+    let mut got = blobs.clone();
+    got.sort();
+    assert_eq!(got, want, "только блобы со ссылками");
+    assert!(m.missing_blobs.is_empty(), "{:?}", m.missing_blobs);
+    // строка мусора в копии базы осталась (её уберёт сборщик после восстановления)
+    let copy_db = rep.path.join("users").join(format!("{user}.db"));
+    assert_eq!(
+        count(
+            &copy_db,
+            &format!("SELECT count(*) FROM blobs WHERE sha256 = '{gone}' AND refcount = 0")
+        ),
+        1
+    );
+    stop(a).await;
+}
+
 // ---------------------------------------------------------------- отказы restore
 
 /// Готовая копия остановленного сервера и её конфигурация.

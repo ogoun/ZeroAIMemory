@@ -7,6 +7,9 @@
 //! «0 из N» на любой машине, а не только если перенарезка медленнее запроса.
 //!
 //! [`crate::time::freeze_now`] замораживает часы хранилища и сервера (`time::now()`, M6 §4.4).
+//!
+//! Сборщик мусора блобов (M7.4 §7.4): [`set_gc_fail`] — «сбой процесса» прохода в точке,
+//! [`pause_gc_after_plan`] — остановка прохода между отбором и удалением.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -125,6 +128,70 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
             return v;
         }
         std::thread::park();
+    }
+}
+
+// ---------- точки сборщика мусора блобов (M7.4 §7.4) ----------
+
+/// Ключ точек сборщика — корень блобов пользователя (абсолютный путь, как у
+/// [`crate::blob_gc::BlobGate`]): параллельные тесты не мешают друг другу.
+fn gc_key(root: &Path) -> PathBuf {
+    std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf())
+}
+
+static GC_FAIL: LazyLock<Mutex<HashMap<PathBuf, &'static str>>> = LazyLock::new(Default::default);
+
+/// Остановки прохода после отбора: «дошёл» и «продолжай».
+type GcPauseSlot = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+static GC_PAUSE: LazyLock<Mutex<HashMap<PathBuf, GcPauseSlot>>> = LazyLock::new(Default::default);
+
+/// «Сбой процесса» прохода сборщика корня `root` в точке `point` (`after_rename` — файл уже в
+/// `.gc/`, транзакция не зафиксирована; `after_commit` — строка удалена, файл ещё в `.gc/`):
+/// проход обрывается на месте без итогового разбора `.gc/`. `None` — снять.
+pub fn set_gc_fail(root: &Path, point: Option<&'static str>) {
+    let mut g = GC_FAIL.lock().unwrap_or_else(|e| e.into_inner());
+    match point {
+        Some(p) => g.insert(gc_key(root), p),
+        None => g.remove(&gc_key(root)),
+    };
+}
+
+pub(crate) fn gc_fails(root: &Path, point: &str) -> bool {
+    GC_FAIL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&gc_key(root))
+        == Some(&point)
+}
+
+/// Остановка следующего прохода сборщика корня `root` между отбором и удалением (замок блобов
+/// свободен): тест ждёт [`GcPause::reached`], делает своё и отпускает [`GcPause::release`].
+pub struct GcPause {
+    pub reached: tokio::sync::oneshot::Receiver<()>,
+    pub release: tokio::sync::oneshot::Sender<()>,
+}
+
+pub fn pause_gc_after_plan(root: &Path) -> GcPause {
+    let (reached_tx, reached) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    GC_PAUSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(gc_key(root), (reached_tx, release_rx));
+    GcPause { reached, release }
+}
+
+pub(crate) async fn gc_after_plan(root: &Path) {
+    let slot = GC_PAUSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&gc_key(root));
+    if let Some((reached, release)) = slot {
+        let _ = reached.send(());
+        let _ = release.await;
     }
 }
 

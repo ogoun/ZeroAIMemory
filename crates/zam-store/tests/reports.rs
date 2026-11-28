@@ -374,7 +374,11 @@ async fn migration_0022_keeps_entries_and_indexes() {
     assert_eq!(violations, 0, "foreign_key_check не пуст");
     assert!(sql.contains("'report'"), "{sql}");
     assert!(!after.contains_key("entries_new"));
-    for (t, n) in before.iter().filter(|(t, _)| t.as_str() != "meta") {
+    // `meta` и суммы миграций (`zam_migrations`, M7.4 §7.1) растут вместе с миграциями
+    for (t, n) in before
+        .iter()
+        .filter(|(t, _)| !matches!(t.as_str(), "meta" | "zam_migrations"))
+    {
         assert_eq!(after.get(t), Some(n), "таблица {t}");
     }
     assert_eq!(after.get("entry_attachments"), Some(&0));

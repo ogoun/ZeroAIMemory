@@ -50,6 +50,8 @@ pub enum ChecksumStatus {
 pub struct RoDb {
     conn: Connection,
     path: PathBuf,
+    /// Открыта `immutable=1` (рядом не было `-wal` и `-shm`).
+    immutable: bool,
 }
 
 /// Путь `<база><suffix>` (`-wal`, `-shm`).
@@ -91,6 +93,7 @@ pub fn open_ro(path: &Path) -> Result<RoDb, StoreError> {
     Ok(RoDb {
         conn,
         path: path.to_path_buf(),
+        immutable: closed,
     })
 }
 
@@ -111,6 +114,24 @@ impl RoDb {
     /// Путь файла базы.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Открыта `immutable=1` (база была закрыта). Если за время чтения её открыл сервер (рядом
+    /// появились `-wal`/`-shm`), прочитанное может быть несогласованным — проверку стоит
+    /// повторить новым [`open_ro`] (`zam-server doctor`).
+    pub fn immutable(&self) -> bool {
+        self.immutable
+    }
+
+    /// Рядом с файлом базы появились `-wal` или `-shm` после открытия `immutable=1`.
+    pub fn opened_meanwhile(&self) -> bool {
+        self.immutable && (side(&self.path, "-wal").exists() || side(&self.path, "-shm").exists())
+    }
+
+    /// Соединение только для чтения (`query_only`): запросы потребителей (`doctor`, отбор
+    /// сборщика мусора [`crate::blob_gc::plan`]).
+    pub fn conn(&self) -> &Connection {
+        &self.conn
     }
 
     /// `PRAGMA user_version`.
