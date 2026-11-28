@@ -33,6 +33,12 @@
 //! хранилища). Сверка и правка — одна транзакция писателя (`zam_store::create_note_keyed` и
 //! соседние). У папки ключа нет — 400.
 //!
+//! **Отказ при секрете** (M7.5 §8.9 п. 5, признак `reject_secrets`): поле тела `reject_secrets:
+//! true` у создания заметки, `PUT` и `PATCH` — находки сканера в итоговом тексте, которые ответ
+//! назвал бы в `secrets_detected` (у правки агента по маске — только новые), дают 422
+//! `/problems/secrets-detected` с `secrets_detected: [{kind, line}]` до записи: ревизия с секретом
+//! не появляется. Нет поля или `false` — как 0.0.17.
+//!
 //! Пределы: текст заметки при создании и замене и итог PATCH — не больше
 //! `limits.note_max_bytes` (иначе 413, ничего не записано); тело запроса ограничено
 //! слоем `DefaultBodyLimit` (см. `api::router`).
@@ -76,6 +82,9 @@ pub struct Create {
     content: Option<String>,
     l0: Option<String>,
     message: Option<String>,
+    /// Отказ при секрете (M7.5 §8.9 п. 5): находки сканера — 422, ничего не пишется; нет поля
+    /// — как 0.0.17 (текст пишется, находки — в `secrets_detected`).
+    reject_secrets: Option<bool>,
 }
 
 /// Предупреждение: ключ `certainty`/`evidence` во frontmatter написан так, что не распознан.
@@ -212,6 +221,10 @@ pub async fn create(
             key,
         },
     };
+    // отказ при секрете — до записи: у новой заметки новые все находки (M7.5 §8.9 п. 5)
+    if req.reject_secrets == Some(true) {
+        crate::api::secrets::reject(&note.content, None)?;
+    }
     let (_, status, v) = create_note_in(&st, &p, &headers, &sc, note).await?;
     Ok((status, Json(v)))
 }
@@ -288,6 +301,8 @@ pub struct Replace {
     content: String,
     l0: Option<String>,
     message: Option<String>,
+    /// Отказ при секрете (M7.5 §8.9 п. 5): новые находки итогового текста — 422 до записи.
+    reject_secrets: Option<bool>,
 }
 
 /// `PUT /nodes/{id}` с `If-Match: <rev>` → 200 `Node`; без заголовка — 428;
@@ -305,6 +320,7 @@ pub async fn replace(
     let base = if_match(&headers)?;
     let req: Replace = json_body(body)?;
     check_size(&st, &req.content)?;
+    let reject = req.reject_secrets == Some(true);
     let key = idempotency_key(&headers)?;
     let attrib = attribution(&p, &headers, req.message)?;
     // агент правил вид ревизии `If-Match` (M7 §4.3.2): значения под `‹secret-T-N›`
@@ -342,6 +358,11 @@ pub async fn replace(
     };
     // предел — и по итоговому тексту
     check_size(&st, &content)?;
+    // отказ при секрете — по итоговому тексту, находки — как в ответе (у агента по маске — новые
+    // относительно ревизии `If-Match`), до записи (M7.5 §8.9 п. 5)
+    if reject {
+        crate::api::secrets::reject(&content, base_text.as_deref())?;
+    }
     let r = update_note_keyed(
         &sc.db,
         sc.node.id,
@@ -404,6 +425,8 @@ pub struct Patch {
     base_rev: i64,
     ops: Vec<PatchOp>,
     message: Option<String>,
+    /// Отказ при секрете (M7.5 §8.9 п. 5): новые находки текста после операций — 422 до записи.
+    reject_secrets: Option<bool>,
 }
 
 /// `PATCH /nodes/{id} {base_rev, ops, message?}` → 200 `Node` / 409 / 413 / 422; повтор с тем же
@@ -426,6 +449,14 @@ pub async fn patch(
     // хранилища тот же)
     if agent_view::masks(&p) && sc.node.kind == zam_store::NodeKind::Note {
         return patch_by_view(&st, &p, &sc, req, attrib, max, key).await;
+    }
+    // отказ при секрете (M7.5 §8.9 п. 5): итог операций к текущему тексту — до записи, находки —
+    // как в ответе (у сессии WebUI — все); операция с ошибкой — ошибку даст сама правка
+    if req.reject_secrets == Some(true) && sc.node.kind == zam_store::NodeKind::Note {
+        let (cur_rev, current) = node_content(&sc.db, sc.node.id, None).await?;
+        if let Ok(text) = zam_store::apply_ops(None, &current, cur_rev, &req.ops) {
+            crate::api::secrets::reject(&text, None)?;
+        }
     }
     let r = patch_note_keyed(&sc.db, sc.node.id, req.base_rev, req.ops, attrib, max, key).await;
     match r {
@@ -538,6 +569,11 @@ async fn patch_by_view(
         let mut ex = secret_restore::Exposed::default();
         ex.add(None, &restored);
         ex.check()?;
+        // отказ при секрете (M7.5 §8.9 п. 5): новые находки итога относительно текущей ревизии —
+        // те, что ответ назвал бы в `secrets_detected`; до записи
+        if req.reject_secrets == Some(true) {
+            crate::api::secrets::reject(&restored.text, Some(&current))?;
+        }
         let from = secret_restore::from_revs(&restored.from, &pairs, req.base_rev);
         #[cfg(feature = "test-hooks")]
         patch_race(&sc.db, id, cur_rev, &attrib).await;

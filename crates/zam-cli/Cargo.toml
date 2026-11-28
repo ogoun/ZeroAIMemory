@@ -32,6 +32,9 @@ zam-code = { path = "../zam-code", features = ["parse"] }
 zip.workspace = true
 # маскировка снимка сессии (M6 §8а): сканер секретов без comrak и tokio
 zam-secrets = { path = "../zam-secrets" }
+# сопоставление `file_glob` хука `pre-tool` — тот же модуль, что у пакета `brief` сервера
+# (`zam_search::triggers`, M7.5 §8.9 п. 2); чистые функции без tokio и SQLite
+zam-search = { path = "../zam-search" }
 
 # цепочка предков процесса (привязка `zam mcp` к сессии, M6 §7.1): ToolHelp32 (MIT OR
 # Apache-2.0, крейт workspace, уже у xtask)

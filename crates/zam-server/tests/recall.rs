@@ -3927,3 +3927,106 @@ async fn recall_timeout_ms_over_max_400() {
         assert_eq!(r.status, want, "{t}: {}", r.text());
     }
 }
+
+// ---------- M7.5 §8.9 п. 1: корни решения в дайджесте ----------
+
+/// Папка `path` пространства `space` токеном `tok`; id.
+async fn folder_as(a: &Api, tok: &str, space: &str, path: &str) -> String {
+    let r = a
+        .tok(
+            tok,
+            Method::POST,
+            "/api/v1/nodes",
+            Some(json!({"space": space, "path": path, "kind": "folder"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    r.json()["id"].as_str().unwrap().to_string()
+}
+
+/// Строки раздела `### Решение` дайджеста решения `G` сессии `session`.
+async fn roots_section(a: &Api, session: &str) -> (Vec<String>, String) {
+    let j = ok(
+        a,
+        &a.token,
+        Some(session),
+        json!({"event": "session_start", "solution": G}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap().to_string();
+    (section(&text, "### Решение"), text)
+}
+
+/// M7.5 §8.9 п. 1: корневые заметки решения (точка входа — обзор, статус) — раньше папок, внутри
+/// — прежний порядок; при корнях не больше предела строки «ещё N» нет.
+#[tokio::test]
+async fn digest_root_notes_before_folders() {
+    let a = server("roots-order").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    let folders = [
+        folder_as(&a, &a.token, G, "AAA").await,
+        folder_as(&a, &a.token, G, "BBB").await,
+    ];
+    let notes = [
+        note_as(&a, &a.token, G, "обзор", "# Обзор\n\nЧто где.\n").await,
+        note_as(&a, &a.token, G, "статус", "# Статус\n\nЧто в работе.\n").await,
+    ];
+    let (lines, text) = roots_section(&a, "ro-1").await;
+    let at = |id: &str| {
+        lines
+            .iter()
+            .position(|l| l.ends_with(&format!("n:{id}")))
+            .unwrap_or_else(|| panic!("нет n:{id}: {text}"))
+    };
+    let (n1, n2, f1, f2) = (
+        at(&notes[0]),
+        at(&notes[1]),
+        at(&folders[0]),
+        at(&folders[1]),
+    );
+    assert!(n1.max(n2) < f1.min(f2), "заметки — раньше папок: {text}");
+    assert!(f1 < f2, "внутри — прежний порядок: {text}");
+    assert_eq!(lines.len(), 4, "строки «ещё N» нет: {text}");
+}
+
+/// M7.5 §8.9 п. 1: корней больше `SOLUTION_ROOT_MAX` — предел общий для заметок и папок, корневая
+/// заметка не теряется за папками, в конце раздела — «ещё N корней — memory_tree».
+#[tokio::test]
+async fn digest_roots_more_line() {
+    let a = server("roots-more").await;
+    assert_eq!(register(&a, &a.token).await.status, StatusCode::CREATED);
+    for i in 0..12 {
+        folder_as(&a, &a.token, G, &format!("F{i:02}")).await;
+    }
+    let note = note_as(&a, &a.token, G, "обзор", "# Обзор\n\nТочка входа.\n").await;
+    let max = zam_server::api::recall::SOLUTION_ROOT_MAX;
+    let (lines, text) = roots_section(&a, "rm-1").await;
+    assert_eq!(lines.len(), max + 1, "{text}");
+    assert!(lines[0].ends_with(&format!("n:{note}")), "{text}");
+    assert_eq!(
+        lines.last().unwrap(),
+        "ZeroAIMemory: ещё 3 корня — memory_tree",
+        "{text}"
+    );
+    assert_eq!(
+        zam_server::api::recall::solution_roots_more(1, zam_server::agent_setup::Lang::Ru),
+        "ZeroAIMemory: ещё 1 корень — memory_tree"
+    );
+    assert_eq!(
+        zam_server::api::recall::solution_roots_more(5, zam_server::agent_setup::Lang::En),
+        "ZeroAIMemory: 5 more roots — memory_tree"
+    );
+    // строка — в бюджете раздела: у малого бюджета вместе с корнями уходит и она
+    let j = ok(
+        &a,
+        &a.token,
+        Some("rm-2"),
+        json!({"event": "session_start", "solution": G, "budget_tokens": 40}),
+    )
+    .await;
+    let t = j["text"].as_str().unwrap();
+    assert!(
+        zam_store::fits_budget(&without_section(t, "### Правила"), 40),
+        "{t}"
+    );
+}

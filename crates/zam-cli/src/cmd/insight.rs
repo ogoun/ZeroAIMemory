@@ -43,6 +43,10 @@
 //! `certify`, `append`, `revisit` и `triggers` правят запись с ревизией (§11.3): `rev` — из
 //! `GET /entries/{id}`, запрос — с `If-Match`; запись изменилась между чтением и правкой (409) —
 //! «запись изменилась (rev N → M): перечитайте», код 4.
+//!
+//! `log insight` с `--trigger` или `--supersedes`, `insight supersede` и `insight triggers` после
+//! записи помечают кэш триггеров проекта устаревшим (`fetched_at` — начало эпохи): ближайший хук
+//! `prompt` сверит его с сервером (M7.5 §8.9 п. 3).
 use std::path::Path;
 
 use serde_json::{Value, json};
@@ -370,8 +374,22 @@ pub fn log(ctx: &Ctx, o: &Log) -> Result<(), CliError> {
         ctx.note_write("insight");
     }
     let e = read_json(r)?;
+    // триггеры новой записи или снятые с замещённой — хукам (M7.5 §8.9 п. 3)
+    if !o.fields.triggers.is_empty() || o.supersedes.is_some() {
+        triggers_changed();
+    }
     note_default_certainty(&o.fields, &e);
     emit_entry(ctx, &e, created)
+}
+
+/// Набор действующих триггеров изменился записью через `zam` (`log insight` с `--trigger` или
+/// `--supersedes`, `insight supersede`, `insight triggers`): кэш `triggers.json` проекта
+/// помечается устаревшим — хук `prompt` сверит его с сервером, не дожидаясь пяти минут (M7.5
+/// §8.9 п. 3, [`super::hook::cache::mark_triggers_stale`]).
+fn triggers_changed() {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let root = super::hook::project_root(&cwd, &super::home_dir());
+    super::hook::cache::mark_triggers_stale(&root);
 }
 
 /// Строка [`DEFAULT_CERTAINTY_NOTE`] в stderr (и с `--json`): `--certainty` не задан, а сервер
@@ -553,6 +571,7 @@ pub fn triggers(ctx: &Ctx, id: &str, raw: &[String]) -> Result<(), CliError> {
         .collect::<Result<Vec<_>, _>>()?;
     let rev = rev_of(&get_entry(ctx, id)?)?;
     let e = patch_entry(ctx, id, rev, &json!({ "triggers": set }))?;
+    triggers_changed();
     if ctx.json {
         return emit_json(&e);
     }
@@ -592,6 +611,8 @@ pub fn supersede(ctx: &Ctx, id: &str, f: &Fields, rev: Option<i64>) -> Result<()
     let created = r.status().as_u16() == 201;
     let v = read_json(r)?;
     ctx.note_write("insight");
+    // у замещённой записи триггеры больше не действуют, у новой — свои
+    triggers_changed();
     note_default_certainty(f, &v["entry"]);
     if ctx.json {
         return emit_json(

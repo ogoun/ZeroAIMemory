@@ -34,11 +34,18 @@
 //! `on_conflict=revision` такой архив — 422 [`MASKED_REVISION`] до записи: ревизия поверх живой
 //! заметки затёрла бы значения метками (круг правок 1 задачи 6 M7.1).
 //!
+//! **Отказ при секрете** (`reject_secrets=true`, M7.5 §8.9 п. 5, признак `reject_secrets`):
+//! заметки и записи, в тексте или истории которых сканер нашёл значения, похожие на секреты, не
+//! пишутся — конфликт на файл `secrets: <вид> (строка N)` первым в `conflicts` итога; остальные
+//! пишутся ([`reject_secret_items`]). Без параметра — как 0.0.17 (предупреждение
+//! `secrets_detected`, значения — в исходнике).
+//!
 //! **Аудит** — без текста: `space.import {space, user, owner, own, on_conflict, axioms,
 //! dry_run}` до тела и `space.import.done {space, user, owner, job?, complete, reason?,
 //! created, revised, skipped, conflicts, bytes}` по окончании (`reason`: `client`, `too_large`,
 //! `stall`, `deadline`, `slow`, `rejected`, `stop`, `error`). Причина сбоя — кодом ([`Recv`]),
 //! не по тексту.
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
@@ -172,6 +179,10 @@ pub struct ImportQuery {
     /// Имя каталога «папки `.md`» (`zam import <каталог>`): входит в источник id назначения —
     /// две разные папки не делят id.
     folder: Option<String>,
+    /// Отказ при секрете (M7.5 §8.9 п. 5): заметка или запись, в тексте которой (или в ревизии
+    /// истории) сканер нашёл секрет, не пишется — конфликт `secrets` на файл ([`reject_secret_items`]),
+    /// остальные пишутся. Нет — как 0.0.17.
+    reject_secrets: Option<bool>,
 }
 
 fn options_of(q: &ImportQuery) -> Result<ImportOptions, ApiError> {
@@ -657,6 +668,89 @@ struct Target {
     db: Db,
     owner: Id,
     space: Id,
+    /// `reject_secrets=true` запроса (M7.5 §8.9 п. 5).
+    reject_secrets: bool,
+}
+
+/// Отказ при секрете в импорте (M7.5 §8.9 п. 5): заметки и записи плана, в тексте которых
+/// (заметка — текст и ревизии `_history`, запись — заголовок с телом и ревизии истории) сканер
+/// нашёл значения, похожие на секреты, убираются из плана — конфликт на файл с причиной
+/// `secrets: <вид> (строка N)[, …]` (у ревизии истории — `ревизия K, строка N`), без значений;
+/// вложения, на которые больше никто не ссылается, — тоже. Остальное пишется как обычно.
+fn reject_secret_items(plan: &mut Plan) -> Vec<zam_store::import::Conflict> {
+    let mut out = Vec::new();
+    plan.notes.retain(|n| {
+        let texts = std::iter::once((None, Cow::Borrowed(n.content.as_str()))).chain(
+            n.history
+                .iter()
+                .enumerate()
+                .map(|(k, h)| (Some(k + 1), Cow::Borrowed(h.content.as_str()))),
+        );
+        match secrets_reason(texts) {
+            Some(reason) => {
+                out.push(zam_store::import::Conflict {
+                    id: n.src.map(|s| s.to_string()),
+                    path: Some(n.path.clone()),
+                    reason,
+                });
+                false
+            }
+            None => true,
+        }
+    });
+    plan.entries.retain(|e| {
+        let texts = std::iter::once((None, Cow::Owned(format!("{}\n{}", e.title, e.body)))).chain(
+            e.history
+                .iter()
+                .enumerate()
+                .map(|(k, h)| (Some(k + 1), Cow::Owned(format!("{}\n{}", h.title, h.body)))),
+        );
+        match secrets_reason(texts) {
+            Some(reason) => {
+                out.push(zam_store::import::Conflict {
+                    id: Some(e.src.to_string()),
+                    path: Some(e.file.clone()),
+                    reason,
+                });
+                false
+            }
+            None => true,
+        }
+    });
+    if !out.is_empty() {
+        // вложения убранных — только если на файл архива больше никто не ссылается
+        let used: HashSet<String> = plan
+            .notes
+            .iter()
+            .flat_map(|n| n.attachments.iter())
+            .chain(plan.entries.iter().flat_map(|e| e.files.iter()))
+            .filter_map(|f| f.file.clone())
+            .collect();
+        plan.blobs.retain(|name, _| used.contains(name));
+    }
+    out
+}
+
+/// Причина конфликта `secrets` по первому тексту с находками (`(ревизия истории, текст)`; `None`
+/// — текущий текст); находок нет — `None`.
+fn secrets_reason<'a>(
+    texts: impl Iterator<Item = (Option<usize>, Cow<'a, str>)>,
+) -> Option<String> {
+    for (rev, t) in texts {
+        let hits = zam_markdown::scan_secrets(&t);
+        if hits.is_empty() {
+            continue;
+        }
+        let list: Vec<String> = hits
+            .iter()
+            .map(|h| match rev {
+                Some(r) => format!("{} (ревизия {r}, строка {})", h.kind.as_str(), h.line),
+                None => format!("{} (строка {})", h.kind.as_str(), h.line),
+            })
+            .collect();
+        return Some(format!("secrets: {}", list.join(", ")));
+    }
+    None
 }
 
 /// Резерв места на диске под приём: снимается при уничтожении (приём не удался, обработчик
@@ -888,6 +982,7 @@ pub async fn import(
         db: sc.db.clone(),
         owner: sc.owner,
         space: sc.space.id,
+        reject_secrets: q.reject_secrets == Some(true),
     };
     let st2 = st.clone();
     let running = st.import_tasks.clone().enter();
@@ -1061,6 +1156,13 @@ async fn run(
         plan.warnings
             .insert(0, super::archive::SECRETS_MASKED_WARNING.to_string());
     }
+    // отказ при секрете (M7.5 §8.9 п. 5) — до id назначения и распаковки: файл с секретом не
+    // пишется ни заметкой, ни ревизией
+    let secret_conflicts = if t.reject_secrets {
+        reject_secret_items(&mut plan)
+    } else {
+        Vec::new()
+    };
     let own = plan.is_own(t.owner, opts.own);
     opts.own = own;
     let mut warnings = Vec::new();
@@ -1126,6 +1228,8 @@ async fn run(
         .await
         .map_err(|e| import_err(e, out))?;
     drop(share);
+    // конфликты `secrets` — первыми: список итога урезается с конца
+    report.conflicts.splice(0..0, secret_conflicts);
     for u in remap.unresolved {
         if !report.unresolved.contains(&u) {
             report.unresolved.push(u);
@@ -1247,6 +1351,7 @@ mod tests {
             dry_run: None,
             user: None,
             folder: None,
+            reject_secrets: None,
         }
     }
 
