@@ -32,9 +32,29 @@
   `works::kinds::sifted`): отправленное в запуске и итоги прежних работ считаются в начале запуска
   и передаются сборщику каждого пространства, а не собираются на каждом.
 
+### Добавлено — подсказки без модели, слова ошибок, даты в FTS (M7.5, задача 3)
+
+- **Даты в FTS** (спецификация M7 §8.4, `zam_store::query_dates`): дата запроса `ДД.ММ.ГГГГ`,
+  `Д.М.ГГГГ` или `ГГГГ-ММ-ДД` (с проверкой календаря, до 4; `/` и двузначный год — нет) ищется в
+  любой из трёх форм — ISO, с точками и без ведущих нулей: в строгом и ослабленном `bm25` и в
+  `alias` три её слова заменяются группой фраз `("2021 03 15" OR "15 03 2021" OR "15 3 2021")`,
+  trigram ищет каждую форму с её разделителями, подсветка — все формы. Без переиндексации; запрос
+  без даты — побайтово прежний; Vault и карта кода — без изменений.
+- **Ключ `[recall] prompt_fts_coverage`** (§8.3 п. 1; правило покрытия `{divisor, cap,
+  word_match, common_pct}`, как `post_tool_coverage`; по умолчанию ключа нет — как 0.0.17): когда
+  поиск подсказок к запросу деградировал до FTS, подсказка проходит, только если предметные слова
+  запроса покрыты её заголовком и фрагментом не меньше `need(n)`; на гибриде не действует.
+- **Ключ `[recall] post_tool_diag_words`** (§8.3 п. 4, `false`): `true` — покрытие подсказок к
+  ошибке считается только по словам строк-диагностик (`error`, `fatal`, `failed`, `panic`,
+  `exception`, `traceback` в начале строки или код ошибки в строке), если они есть, и к строгой
+  выдаче присоединяются insight с кодом ошибки целиком (`zam_search::recall::diagnostic_lines`).
+
 ### Изменения ответа
 
-- `/health`: флаг `search_m75` в конце `features` (M7.5 §8.1–§8.2; `docs/api-compat.md`).
+- `/health`: флаг `search_m75` в конце `features` (M7.5 §8.1–§8.4; `docs/api-compat.md`).
+- `POST /search`, `memory_search`, подсказки: запрос с датой находит её и в другой форме записи
+  (`2021-03-15` ↔ `15.03.2021` ↔ `15.3.2021`) и больше не находит те же числа вразброс; запрос из
+  одной даты — без ослабленного «любое слово». Форма ответа прежняя.
 - `POST /search` и `memory_search`: запись, которую порядок по `contradicts` ставит сразу перед
   менее надёжной (гипотеза против `theorem`/`axiom`), получает балл
   `min(предыдущий, следующий + 0,0001)` — на шаг округления выше следующего элемента (до M7.5 —
@@ -65,6 +85,21 @@
   честном бюджете); правило выбрало `search.max_per_node = 1` (Н1 `fts_stop_words = false`
   отсеяна по `reliable_first` наборов вида и recall@5), holdout его не подтвердил (`s-43`), а
   режим `chunks` с ним теряет 16 п. п. chunk-recall@5.
+- Сетки подсказок M7.5 (задача 3): `eval/grid-m75-hints-fts.toml` (`--hints --mode fts`,
+  `recall.prompt_fts_coverage`) и `eval/grid-m75-post-tool-diag.toml`
+  (`recall.post_tool_diag_words`); правила `xtask` — `GridRule::{PromptFtsCoverage,
+  PostToolDiagWords}`, `choose_prompt_coverage`, `choose_diag_words`, потеря — пары «случай —
+  ожидаемая подсказка» (`lost_pairs`; в отчётах всех сеток подсказок). Итог —
+  `eval/results/2026-11-28-m75-hints.md`: умолчания прежние — тишина без модели 0,382 → до 1,000,
+  но каждая точка теряет 5–11 ожидаемых подсказок; слова ошибок — Δ точности −0,001, потеря 7. Даты
+  в FTS: срез `date` eval документов — recall@5 0,667 → 1,000, Δ nDCG@10 основного 0,000.
+- Тесты задачи 3: `date_forms_parsed`, `fts_date_iso_finds_dotted`, `fts_date_dotted_finds_iso`,
+  `fts_date_not_scattered_numbers`, `trigram_date_alternatives`,
+  `fts_query_without_dates_unchanged`, `search_dates`, `prompt_fts_coverage_gates_degraded_only`,
+  `prompt_fts_coverage_absent_keeps_017`, `prompt_fts_coverage_ignored_on_hybrid`,
+  `config_prompt_fts_coverage_range`, `post_tool_diag_lines_only_when_present`,
+  `post_tool_error_code_joins_strict`, `diagnostic_lines_pick_error_lines`,
+  `prompt_coverage_choice_follows_rule`, `diag_choice_follows_rule`.
 - Тесты: `order_by_contradicts_moved_strictly_above_next`, `order_by_contradicts_tie_with_prev`,
   `lift_moved_scores`, `contradicts_window_notes_by_targets`, `eval_keeps_server_order_on_ties`,
   `fts_query_drops_stop_words_when_others_remain`, `fts_query_keeps_stop_word_only_query`,

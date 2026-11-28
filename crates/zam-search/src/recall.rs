@@ -4,9 +4,11 @@
 //! [`term_coverage`], [`coverage_enough`] по правилу [`CoverageRule`]: слова как есть или
 //! основы [`StemWord`] — общий код с подсказками-идеями сервера, M6 §9; с M7.1 §4.6 п. 3 —
 //! по предметным словам ошибки: [`strip_exit_header`], [`subject_error_terms`],
-//! [`is_error_code`], [`is_common`], [`CoverageQuery::subject`]), предметные слова
-//! запроса пользователя ([`subject_terms`], M6.6 §3.1), строка подсказки ([`hint_line`]) и
-//! упаковка дайджеста в бюджет токенов ([`pack_sections`]).
+//! [`is_error_code`], [`is_common`], [`CoverageQuery::subject`]; с M7.5 §8.3 п. 4 — по словам
+//! строк-диагностик [`diagnostic_lines`]), предметные слова запроса пользователя
+//! ([`subject_terms`], M6.6 §3.1; для покрытия без модели — [`prompt_subject_words`], M7.5 §8.3
+//! п. 1), строка подсказки ([`hint_line`]) и упаковка дайджеста в бюджет токенов
+//! ([`pack_sections`]).
 //!
 //! Сервер собирает кандидатов (SQLite, поиск), здесь — только то, что от данных не зависит.
 
@@ -252,6 +254,39 @@ pub fn is_error_code(w: &str) -> bool {
         && w.bytes().skip(letters).all(|b| b.is_ascii_digit())
 }
 
+/// Начала строк-диагностик вывода (M7.5 §8.3 п. 4, **[решение координатора]**): строка, которая
+/// после пробелов начинается с одного из них без учёта регистра (`error[E0425]`, `Error:`,
+/// `FAILED`, `panicked at`, `Exception in thread`, `Traceback (most recent call last)`), —
+/// диагностика; `ERR!` и `Error:` в середине строки — нет (решение 120).
+pub const DIAG_LINE_STARTS: [&str; 6] = [
+    "error",
+    "fatal",
+    "failed",
+    "panic",
+    "exception",
+    "traceback",
+];
+
+/// Строки-диагностики ошибки инструмента (M7.5 §8.3 п. 4): строки `s`, начинающиеся после
+/// пробелов с [`DIAG_LINE_STARTS`] (без учёта регистра) или содержащие код ошибки
+/// ([`is_error_code`] у слова строки в нижнем регистре), по порядку через перевод строки; таких
+/// нет — `None` (покрытие — по всей ошибке, как прежде). Строку `Exit code <N>` снимает
+/// вызывающий ([`strip_exit_header`]).
+pub fn diagnostic_lines(s: &str) -> Option<String> {
+    let starts = |l: &str| {
+        let t = l.trim_start();
+        DIAG_LINE_STARTS
+            .iter()
+            .any(|p| t.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p)))
+    };
+    let has_code = |l: &str| {
+        l.split(|c: char| !c.is_alphanumeric())
+            .any(|w| is_error_code(&w.to_ascii_lowercase()))
+    };
+    let lines: Vec<&str> = s.lines().filter(|l| starts(l) || has_code(l)).collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 /// Наименьшее число insight со словом, при котором оно может быть частым ([`is_common`]): на
 /// малом корпусе доля документов ничего не говорит (у решения из двух записей каждое их слово —
 /// в половине) **[решение исполнителя, задача 8 M7.1]**.
@@ -486,6 +521,17 @@ pub fn subject_terms(prompt: &str) -> Vec<String> {
     out
 }
 
+/// Предметные слова запроса для покрытия подсказок `prompt` без модели (M7.5 §8.3 п. 1,
+/// [`CoverageQuery::subject`]): слова [`error_terms`] (от 3 символов, нижний регистр, без
+/// повторов, до 32) без служебных слов ru/en и слов-реплик [`PROMPT_REPLY_WORDS`] — как
+/// [`subject_terms`], но слова как есть (их готовит правило: `plain` — как есть, `stems` —
+/// основы).
+pub fn prompt_subject_words(head: &str) -> Vec<String> {
+    let mut out = error_terms(head);
+    out.retain(|w| !is_stop_word(w) && !is_reply_word(&norm_word(w)));
+    out
+}
+
 /// Предметных слов ([`subject_terms`]), при которых запрос к подсказкам «короткий» (M6.6 §3.2,
 /// **[решение координатора]** — константа, не ключ конфигурации): у одного-двух слов векторный
 /// сигнал самый слабый, поэтому подсказка поиска — только с лексическим совпадением
@@ -557,9 +603,13 @@ pub fn prompt_gate(prompt: &str, head_chars: usize) -> PromptGate {
 /// `need = clamp(⌈n / divisor⌉, 2, cap)`, не больше `n` — иначе общие слова ошибки («file»,
 /// «error») поднимали бы случайные записи, а длинная ошибка (stack trace) требовала бы от
 /// короткой записи десятков совпадений. Ключ `recall.post_tool_coverage` (M6 §9); с M7.1 §4.6
-/// п. 3 — и порог частого слова `common_pct` ([`is_common`], [`CoverageQuery::subject`]).
+/// п. 3 — и порог частого слова `common_pct` ([`is_common`], [`CoverageQuery::subject`]). С
+/// M7.5 §8.3 то же правило — у подсказок `prompt` без модели (`recall.prompt_fts_coverage`).
+/// Поле, которого нет в конфигурации, — из умолчания [`CoverageRule::M71`] (у ключа-таблицы без
+/// умолчания, `recall.prompt_fts_coverage`, иначе нельзя задать поля по одному: загрузчик
+/// проверяет каждый лист отдельно).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub struct CoverageRule {
     /// Делитель числа слов запроса, 1..=10.
     pub divisor: u32,
@@ -1274,6 +1324,67 @@ mod tests {
             ..rule
         };
         assert!(CoverageQuery::subject(&q, &stems, all).enough("ошибка lnk1104"));
+    }
+
+    /// M7.5 §8.3 п. 4: строки-диагностики — начала `error`, `fatal`, `failed`, `panic`,
+    /// `exception`, `traceback` после пробелов (без учёта регистра) или код ошибки в строке; нет
+    /// таких строк — `None`; `ERR!` и `Error:` в середине строки — не диагностика.
+    #[test]
+    fn diagnostic_lines_pick_error_lines() {
+        let out = "   Compiling serde v1.0\nwarning: unused variable\nerror[E0433]: failed to \
+                   resolve\n  --> src/lib.rs:3:5\n    FAILED tests/a.rs\nthread 'main' panicked \
+                   at x\npanicked at src/main.rs\nException in thread main\nTraceback (most \
+                   recent call last):\nLINK : fatal error LNK1104: cannot open file\nnpm ERR! \
+                   code 1\nBuild: Error: boom\nFatal: not a git repository";
+        assert_eq!(
+            diagnostic_lines(out).as_deref(),
+            Some(
+                "error[E0433]: failed to resolve\n    FAILED tests/a.rs\npanicked at \
+                 src/main.rs\nException in thread main\nTraceback (most recent call last):\nLINK \
+                 : fatal error LNK1104: cannot open file\nFatal: not a git repository"
+            )
+        );
+        assert_eq!(
+            diagnostic_lines("   Compiling zam\nwarning: unused\nnpm ERR! code 1"),
+            None
+        );
+        assert_eq!(diagnostic_lines(""), None);
+        // код ошибки — 1–4 латинские буквы и 4–6 цифр, слово целиком
+        assert_eq!(
+            diagnostic_lines("see TS2307 here\nsha256 x86_64\nv1.2.3").as_deref(),
+            Some("see TS2307 here")
+        );
+    }
+
+    /// M7.5 §8.3 п. 1: предметные слова запроса для покрытия без модели — слова от 3 символов без
+    /// служебных и реплик, как есть (без основ), без повторов.
+    #[test]
+    fn prompt_subject_words_drop_stops_and_replies() {
+        assert_eq!(
+            prompt_subject_words("Да, давай: как настроить квазар и квазар для тестов"),
+            ["настроить", "квазар", "тестов"]
+        );
+        assert!(prompt_subject_words("согласен, продолжай").is_empty());
+        let mut stems = prompt_subject_words("Квазары светят");
+        stems.sort();
+        let mut subject = subject_terms("Квазары светят");
+        subject.sort();
+        assert_eq!(prepared_terms(&stems, WordMatch::Stems), subject);
+    }
+
+    /// M7.5 §8.3: поле правила покрытия, которого нет в конфигурации, — из умолчания `M71`
+    /// (ключ без умолчания `recall.prompt_fts_coverage` задаётся полями по одному).
+    #[test]
+    fn coverage_rule_missing_fields_default_m71() {
+        let r: CoverageRule = serde_json::from_value(serde_json::json!({"divisor": 3})).unwrap();
+        assert_eq!(
+            r,
+            CoverageRule {
+                divisor: 3,
+                ..CoverageRule::M71
+            }
+        );
+        assert!(serde_json::from_value::<CoverageRule>(serde_json::json!({"x": 1})).is_err());
     }
 
     /// M6 §4.3: `ZeroAIMemory: <заголовок> [<вид>·<cert>] i:<id>`, надёжность сокращена.
