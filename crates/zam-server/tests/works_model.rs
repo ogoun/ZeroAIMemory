@@ -6,7 +6,9 @@
 //! `test-hooks`), второй скан пакета; проводка (этап 2): `PATCH works.model` (422,
 //! предупреждение «вне LAN», закрепление адреса), выполнение пакета `run_payload` (режим, окно
 //! ночи, пределы, стоп по журналу, пауза, аудит `key_use`), журнал отправок `work_calls`,
-//! `POST /works/model/test`, `GET /works/calls`, срок хранения журнала.
+//! `POST /works/model/test`, `GET /works/calls`, срок хранения журнала. M7.6 (§9.2): родной
+//! протокол Anthropic Messages на той же подставной модели — заголовки и тело, адрес с `/v1` и
+//! без, зарезервированные ключи, поле предела, классы ошибок, повтор JSON, проверка подключения.
 //!
 //! Сроки обращения и ожидания повторов — тестовые точки `works::exec::test_hooks` (мс); часы не
 //! замораживаются (ночь — окно с началом за 10 минут до «сейчас»): тесты файла идут параллельно.
@@ -27,7 +29,7 @@ use zam_server::works::egress::{
 };
 use zam_server::works::exec::{self, JsonStep, ModelOutcome, Payload, PayloadItem, RunKey};
 use zam_server::works::model::{
-    self, CallClass, CallError, ChatMessage, ModelAuth, ModelConn, ModelReply, TokenField,
+    self, CallClass, CallError, ChatMessage, ModelAuth, ModelConn, ModelReply, Protocol, TokenField,
 };
 use zam_server::works::settings::{self as works_settings, Pause};
 use zam_store::works::WorkKind;
@@ -1168,25 +1170,539 @@ fn body_extra_client() {
     assert_eq!(body["seed"], 7);
 }
 
-/// Протокол — пока только `openai` (и `PATCH` — 422 с версией, где появится иной).
+/// M7.6 §9.2 п. 1: протокол — `openai` или `anthropic` (регистр важен); иное — 422 со списком обоих
+/// (прежний `protocol_not_openai_422` обещал `anthropic` в 0.0.19-m7.6 — обещание исполнено).
 #[tokio::test]
-async fn protocol_not_openai_422() {
-    assert!(model::check_protocol("openai").is_ok());
-    for p in ["anthropic", "OpenAI", "", "gemini"] {
+async fn protocol_unknown_422_lists_both() {
+    assert_eq!(model::check_protocol("openai"), Ok(Protocol::OpenAi));
+    assert_eq!(model::check_protocol("anthropic"), Ok(Protocol::Anthropic));
+    for p in ["OpenAI", "Anthropic", "", "gemini"] {
         let e = model::check_protocol(p).unwrap_err();
-        assert!(e.contains("0.0.19-m7.6"), "{p}: {e}");
+        assert!(
+            e.contains("\"openai\"") && e.contains("\"anthropic\"") && !e.contains("0.0.19"),
+            "{p}: {e}"
+        );
     }
     let a = server("protocol", |_| {}).await;
     vault_item(&a, "llm", "https://203.0.113.10/v1", &key()).await;
     let mut c = conn_input("llm");
-    c["protocol"] = json!("anthropic");
+    c["protocol"] = json!("gemini");
     let r = patch(&a, json!({"works": {"model": c}})).await;
     ok(&r, StatusCode::UNPROCESSABLE_ENTITY);
+    let t = r.text();
     assert!(
-        r.text().contains("works.model.protocol") && r.text().contains("0.0.19-m7.6"),
-        "{}",
-        r.text()
+        t.contains("works.model.protocol") && t.contains("openai") && t.contains("anthropic"),
+        "{t}"
     );
+    // `anthropic` — принимается и хранится как есть
+    let mut c = conn_input("llm");
+    c["protocol"] = json!("anthropic");
+    let r = patch(&a, json!({"works": {"model": c}})).await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["works"]["model"]["protocol"], "anthropic");
+}
+
+// ---------- Anthropic Messages (M7.6, спецификация §9.2) ----------
+
+/// Подключение Anthropic Messages к подставной модели (тот же `ModelConn`, иной протокол).
+fn aconn() -> ModelConn {
+    ModelConn {
+        protocol: "anthropic".into(),
+        model: "claude-mock".into(),
+        ..conn()
+    }
+}
+
+/// Маршрут к подставной модели по корню (`http://127.0.0.1:<порт>`, без `/v1` — как у SDK).
+fn route_root(m: &MockModel) -> Route {
+    egress::route(&egress::parse_base_url(&m.root_url()).unwrap(), ADMIN).unwrap()
+}
+
+fn acall_with(m: &MockModel, c: &ModelConn) -> Result<ModelReply, CallError> {
+    model::call_blocking(
+        c,
+        &route_root(m),
+        Some(&key()),
+        "система",
+        "пользователь",
+        T,
+    )
+}
+
+fn acall(m: &MockModel) -> Result<ModelReply, CallError> {
+    acall_with(m, &aconn())
+}
+
+/// Вход `works.model` протокола `anthropic` к записи `vault`.
+fn aconn_input(vault: &str) -> Value {
+    json!({"protocol": "anthropic", "vault": vault, "model": "claude-mock", "max_tokens": 4000})
+}
+
+/// §9.2 пп. 1–2: `POST <база>/v1/messages`, `x-api-key` (чувствительный, как `Authorization`),
+/// `anthropic-version: 2026-10-21`, `content-type: application/json`; тело — `model`,
+/// `max_tokens`, `system` отдельной строкой, `messages` без системного, `stream: false`; нет
+/// параметров выборки и `max_completion_tokens`; `body_extra` — верхним уровнем, зарезервированные
+/// ключи даже непроверенного `body_extra` поля сервера не перекрывают; `auth = "none"` — без ключа.
+#[test]
+fn anthropic_request_headers_and_body() {
+    let m = MockModel::start();
+    m.set_default(MockReply::messages("ок"));
+    m.push(MockReply::messages("готово"));
+    let r = acall(&m).unwrap();
+    assert_eq!(r.text, "готово");
+    assert_eq!(
+        (r.input_tokens, r.output_tokens, r.estimated, r.reasoning),
+        (11, 7, false, false)
+    );
+    let seen = m.last();
+    assert_eq!(
+        (seen.method.as_str(), seen.path.as_str()),
+        ("POST", "/v1/messages")
+    );
+    assert_eq!(seen.header("x-api-key"), Some(key().as_str()));
+    assert_eq!(seen.header("authorization"), None);
+    assert_eq!(seen.header("anthropic-version"), Some("2026-10-21"));
+    assert!(
+        seen.header("content-type")
+            .is_some_and(|c| c.starts_with("application/json"))
+    );
+    let body = seen.json();
+    assert_eq!(
+        keys(&body),
+        ["max_tokens", "messages", "model", "stream", "system"]
+    );
+    assert_eq!(body["model"], "claude-mock");
+    assert_eq!(body["max_tokens"], 4000);
+    assert_eq!(body["stream"], false);
+    assert_eq!(body["system"], "система");
+    assert_eq!(
+        body["messages"],
+        json!([{"role": "user", "content": "пользователь"}])
+    );
+
+    // рецепт глубины — верхним уровнем; параметры выборки и поля сервера из body_extra не уходят
+    let mut c = aconn();
+    c.body_extra = json!({"output_config": {"effort": "low"}, "temperature": 0.2, "top_k": 5,
+                          "system": "чужое", "model": "чужая", "stream": true})
+    .as_object()
+    .unwrap()
+    .clone();
+    acall_with(&m, &c).unwrap();
+    let body = m.last().json();
+    assert_eq!(body["output_config"], json!({"effort": "low"}));
+    assert_eq!(body["system"], "система");
+    assert_eq!(body["model"], "claude-mock");
+    assert_eq!(body["stream"], false);
+    for k in ["temperature", "top_p", "top_k", "max_completion_tokens"] {
+        assert!(body.get(k).is_none(), "{k}: {body}");
+    }
+
+    // локальный сервер со входом Messages без ключа: заголовка ключа нет
+    let mut c = aconn();
+    c.auth = ModelAuth::None;
+    acall_with(&m, &c).unwrap();
+    let seen = m.last();
+    assert_eq!(seen.header("x-api-key"), None);
+    assert_eq!(seen.header("authorization"), None);
+    assert_eq!(seen.header("anthropic-version"), Some("2026-10-21"));
+    assert_eq!(m.count(), 3);
+
+    // ключ — чувствительный заголовок у обоих протоколов (в отладочный журнал `ureq` не попадает)
+    let (name, v) = model::auth_header(Protocol::Anthropic, &key()).unwrap();
+    assert_eq!(name, "x-api-key");
+    assert!(v.is_sensitive());
+    let (name, v) = model::auth_header(Protocol::OpenAi, &key()).unwrap();
+    assert_eq!(name, "authorization");
+    assert!(v.is_sensitive());
+}
+
+/// §9.2 п. 1: адрес как у SDK — с `/v1` на конце и без; запрос — `<база>/v1/messages`, `/v1` не
+/// удваивается; путь прокси перед `/v1` сохраняется.
+#[test]
+fn anthropic_url_with_or_without_v1() {
+    let m = MockModel::start();
+    let root = m.root_url();
+    for (base, path) in [
+        (root.clone(), "/v1/messages"),
+        (format!("{root}/"), "/v1/messages"),
+        (format!("{root}/v1"), "/v1/messages"),
+        (format!("{root}/v1/"), "/v1/messages"),
+        (format!("{root}/proxy"), "/proxy/v1/messages"),
+        (format!("{root}/proxy/v1"), "/proxy/v1/messages"),
+    ] {
+        m.push(MockReply::messages("ок"));
+        let route = egress::route(&egress::parse_base_url(&base).unwrap(), ADMIN).unwrap();
+        model::call_blocking(&aconn(), &route, Some(&key()), "с", "п", T).unwrap();
+        assert_eq!(m.last().path, path, "{base}");
+    }
+    // OpenAI-совместимый — как в 0.0.18: `<база>/chat/completions`
+    m.push(MockReply::chat("ок"));
+    call(&m).unwrap();
+    assert_eq!(m.last().path, "/v1/chat/completions");
+}
+
+/// §9.2 п. 2: у `anthropic` зарезервированы `model`, `messages`, `system`, `stream`, `max_tokens`
+/// и параметры выборки (`PATCH` — 422 с именем ключа; у выборки — пояснение про версию
+/// `2026-10-21`); рецепты глубины и размышлений принимаются; у `openai` прежний список.
+#[tokio::test]
+async fn anthropic_body_extra_reserved_422() {
+    let a = server("anthropic-extra", |_| {}).await;
+    vault_item(&a, "claude", "https://203.0.113.10", &key()).await;
+    vault_item(&a, "llm", "https://203.0.113.10/v1", &key()).await;
+    for k in model::ANTHROPIC_RESERVED_BODY_KEYS {
+        let mut c = aconn_input("claude");
+        c["body_extra"] = json!({ k: 1 });
+        let r = patch(&a, json!({"works": {"model": c}})).await;
+        ok(&r, StatusCode::UNPROCESSABLE_ENTITY);
+        let t = r.text();
+        assert!(
+            t.contains("works.model.body_extra") && t.contains(k),
+            "{k}: {t}"
+        );
+        if ["temperature", "top_p", "top_k"].contains(&k) {
+            assert!(t.contains("2026-10-21"), "{k}: {t}");
+        }
+    }
+    for recipe in [
+        json!({"output_config": {"effort": "low"}}),
+        json!({"thinking": {"type": "disabled"}}),
+    ] {
+        let mut c = aconn_input("claude");
+        c["body_extra"] = recipe;
+        ok(
+            &patch(&a, json!({"works": {"model": c}})).await,
+            StatusCode::OK,
+        );
+    }
+    // у `openai` — как в 0.0.18: `system` и `temperature` не зарезервированы
+    let mut c = conn_input("llm");
+    c["body_extra"] = json!({"system": "x", "temperature": 0.2});
+    ok(
+        &patch(&a, json!({"works": {"model": c}})).await,
+        StatusCode::OK,
+    );
+    let mut c = aconn_input("claude");
+    c["body_extra"] = json!({"max_completion_tokens": 1});
+    ok(
+        &patch(&a, json!({"works": {"model": c}})).await,
+        StatusCode::OK,
+    );
+    // проверка клиента — та же
+    let mut m = serde_json::Map::new();
+    m.insert("top_p".into(), json!(0.9));
+    assert!(
+        Protocol::Anthropic
+            .check_body_extra(&m)
+            .unwrap_err()
+            .contains("top_p")
+    );
+    assert!(Protocol::OpenAi.check_body_extra(&m).is_ok());
+}
+
+/// §9.2 п. 1: у `anthropic` поле предела — только `auto` (иное — 422 «предел — всегда
+/// max_tokens»); у `openai` явный выбор — как раньше.
+#[tokio::test]
+async fn anthropic_token_field_non_auto_422() {
+    let a = server("anthropic-token-field", |_| {}).await;
+    vault_item(&a, "claude", "https://203.0.113.10", &key()).await;
+    vault_item(&a, "llm", "https://203.0.113.10/v1", &key()).await;
+    for tf in ["max_tokens", "max_completion_tokens"] {
+        let mut c = aconn_input("claude");
+        c["token_field"] = json!(tf);
+        let r = patch(&a, json!({"works": {"model": c}})).await;
+        ok(&r, StatusCode::UNPROCESSABLE_ENTITY);
+        let t = r.text();
+        assert!(
+            t.contains("works.model.token_field")
+                && t.contains("у протокола anthropic предел — всегда max_tokens"),
+            "{tf}: {t}"
+        );
+    }
+    let mut c = aconn_input("claude");
+    c["token_field"] = json!("auto");
+    ok(
+        &patch(&a, json!({"works": {"model": c}})).await,
+        StatusCode::OK,
+    );
+    let mut c = conn_input("llm");
+    c["token_field"] = json!("max_completion_tokens");
+    ok(
+        &patch(&a, json!({"works": {"model": c}})).await,
+        StatusCode::OK,
+    );
+    assert!(model::check_token_field(Protocol::Anthropic, TokenField::Auto).is_ok());
+    assert!(model::check_token_field(Protocol::Anthropic, TokenField::MaxTokens).is_err());
+    assert!(model::check_token_field(Protocol::OpenAi, TokenField::MaxTokens).is_ok());
+}
+
+/// §9.2 п. 4: тело ошибки `{"type": "error", "error": {"type", "message"}}`; классы — 401, 403
+/// `auth`; 402 `quota`; 404 `not_found`; 400, 413 `bad_request`; 429 с `retry-after` — `rate`, без
+/// него и с `enforced_spend_limit_reached` — `quota`; 500, 504, 529 — `unavailable`. Текст ответа в
+/// ошибку (журнал, аудит) не попадает.
+#[test]
+fn anthropic_error_classes() {
+    let m = MockModel::start();
+    // код HTTP, тип ошибки, `retry-after`, класс, `retry_after` ошибки
+    type Row = (
+        u16,
+        &'static str,
+        Option<&'static str>,
+        CallClass,
+        Option<u64>,
+    );
+    let rows: &[Row] = &[
+        (401, "authentication_error", None, CallClass::Auth, None),
+        (403, "permission_error", None, CallClass::Auth, None),
+        (402, "billing_error", None, CallClass::Quota, None),
+        (404, "not_found_error", None, CallClass::NotFound, None),
+        (
+            400,
+            "invalid_request_error",
+            None,
+            CallClass::BadRequest,
+            None,
+        ),
+        (413, "request_too_large", None, CallClass::BadRequest, None),
+        (429, "rate_limit_error", Some("7"), CallClass::Rate, Some(7)),
+        (429, "rate_limit_error", None, CallClass::Quota, None),
+        (500, "api_error", None, CallClass::Unavailable, None),
+        (504, "timeout_error", None, CallClass::Unavailable, None),
+        (529, "overloaded_error", None, CallClass::Unavailable, None),
+    ];
+    for &(status, kind, ra, class, retry) in rows {
+        let mut r = MockReply::anthropic_error(status, kind);
+        if let Some(v) = ra {
+            r = r.header("retry-after", v);
+        }
+        m.push(r);
+        let e = acall(&m).expect_err("ожидалась ошибка вызова");
+        assert_eq!(
+            (e.class, e.http_status, e.retry_after),
+            (class, Some(status), retry),
+            "{status} {kind} {ra:?}"
+        );
+        assert!(!e.to_string().contains("mock"), "{e}");
+    }
+    // месячный предел расходов: 429 без `retry-after` с кодом — `quota`, и даже с `retry-after`
+    let spend = json!({"type": "error", "error": {"type": "rate_limit_error",
+        "message": "You have reached your API usage limits",
+        "details": {"error_code": "enforced_spend_limit_reached"}}, "request_id": "req_mock"});
+    m.push(MockReply::json(429, spend.clone()));
+    assert_eq!(class_of(acall(&m)), (CallClass::Quota, Some(429), None));
+    m.push(MockReply::json(429, spend).header("retry-after", "5"));
+    assert_eq!(class_of(acall(&m)), (CallClass::Quota, Some(429), None));
+    // 200 с ошибкой или не Messages — иной ответ
+    m.push(MockReply::json(
+        200,
+        json!({"type": "error", "error": {"type": "api_error"}}),
+    ));
+    assert_eq!(
+        class_of(acall(&m)),
+        (CallClass::BadResponse, Some(200), None)
+    );
+    m.push(MockReply::chat("ответ Chat Completions"));
+    assert_eq!(class_of(acall(&m)).0, CallClass::BadResponse);
+}
+
+/// §9.2 п. 2 и §6.2 п. 4: повтор после не-JSON — `user`, `assistant` с прежним ответом текстом,
+/// `user` с просьбой; `system` — отдельно, тот же.
+#[test]
+fn anthropic_json_retry_conversation() {
+    let m = MockModel::start();
+    m.push(MockReply::messages("это не JSON"));
+    m.push(MockReply::messages(
+        "```json\n{\"items\": [{\"n\": 1}]}\n```",
+    ));
+    let route = route_root(&m);
+    let convo = vec![
+        ChatMessage::system("инструкция"),
+        ChatMessage::user("элементы"),
+    ];
+    let r1 = model::call_chat_blocking(&aconn(), &route, Some(&key()), &convo, T).unwrap();
+    let JsonStep::Retry(convo2) = exec::json_step(&convo, &r1, false) else {
+        panic!("после первого сбоя — повтор");
+    };
+    let r2 = model::call_chat_blocking(&aconn(), &route, Some(&key()), &convo2, T).unwrap();
+    let JsonStep::Done(v) = exec::json_step(&convo2, &r2, true) else {
+        panic!("итог разобран");
+    };
+    assert_eq!(v, json!({"items": [{"n": 1}]}));
+    assert_eq!(m.count(), 2);
+    let second = m.requests()[1].json();
+    assert_eq!(second["system"], "инструкция");
+    let msgs = second["messages"].as_array().unwrap();
+    let roles: Vec<&str> = msgs.iter().map(|x| x["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, ["user", "assistant", "user"]);
+    assert_eq!(msgs[0]["content"], "элементы");
+    assert_eq!(msgs[1]["content"], "это не JSON");
+    let repair = msgs[2]["content"].as_str().unwrap();
+    assert!(
+        repair.starts_with("ответ не JSON: ") && repair.ends_with("; верни только JSON по схеме"),
+        "{repair}"
+    );
+}
+
+/// §9.2 п. 5: проверка подключения (`POST /works/model/test`) — тот же фиксированный запрос
+/// протоколом подключения: `/v1/messages`, `x-api-key`, без данных памяти; размышления —
+/// подсказка про `effort`, а не про `chat_template_kwargs`; `auth` — пауза; строки журнала —
+/// `kind = test`.
+#[tokio::test]
+async fn anthropic_connection_test() {
+    let m = MockModel::start();
+    let a = server("anthropic-test", |_| {}).await;
+    vault_item(&a, "claude", &m.root_url(), &key()).await;
+    let r = patch(
+        &a,
+        json!({"works": {"model": aconn_input("claude"), "mode": "model"}}),
+    )
+    .await;
+    ok(&r, StatusCode::OK);
+    assert_eq!(r.json()["works"]["model"]["protocol"], "anthropic");
+    assert_eq!(r.json()["works"]["model"]["token_field"], "auto");
+
+    m.push(MockReply::messages("{\"ok\": true}"));
+    let v = a.adm(Method::POST, TEST, None, None).await.json();
+    assert_eq!(v["ok"], true, "{v}");
+    assert!(
+        v.get("hint").is_none() && v.get("thinking").is_none(),
+        "{v}"
+    );
+    let seen = m.last();
+    assert_eq!(seen.path, "/v1/messages");
+    assert_eq!(seen.header("x-api-key"), Some(key().as_str()));
+    assert_eq!(seen.header("anthropic-version"), Some("2026-10-21"));
+    let body = seen.json();
+    assert_eq!(body["system"], zam_server::works::conn::TEST_SYSTEM);
+    assert_eq!(
+        body["messages"],
+        json!([{"role": "user", "content": zam_server::works::conn::TEST_USER}])
+    );
+
+    // предел съели размышления: ни одного блока text, блок thinking — класс `thinking`
+    m.push(MockReply::messages_with(
+        json!([{"type": "thinking", "thinking": "", "signature": "sig"}]),
+        "max_tokens",
+    ));
+    let v = a.adm(Method::POST, TEST, None, None).await.json();
+    assert_eq!(
+        (v["ok"].clone(), v["class"].clone(), v["thinking"].clone()),
+        (json!(false), json!("thinking"), json!(true)),
+        "{v}"
+    );
+    let hint = v["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("effort") && !hint.contains("chat_template_kwargs"),
+        "{hint}"
+    );
+
+    // ответ с размышлениями — `ok`, признак `thinking`, совет снизить глубину
+    m.push(MockReply::messages_with(
+        json!([{"type": "thinking", "thinking": "", "signature": "sig"},
+               {"type": "text", "text": "{\"ok\": true}"}]),
+        "end_turn",
+    ));
+    let v = a.adm(Method::POST, TEST, None, None).await.json();
+    assert_eq!(
+        (v["ok"].clone(), v["thinking"].clone()),
+        (json!(true), json!(true)),
+        "{v}"
+    );
+    assert!(v["hint"].as_str().unwrap().contains("output_config"), "{v}");
+
+    // ключ не принят — `auth` и пауза
+    m.push(MockReply::anthropic_error(401, "authentication_error"));
+    let v = a.adm(Method::POST, TEST, None, None).await.json();
+    assert_eq!(
+        (v["ok"].clone(), v["class"].clone()),
+        (json!(false), json!("auth"))
+    );
+    assert_eq!(pause_of(&a).await.unwrap().class, "auth");
+
+    let rows = journal(&a).await;
+    assert_eq!(rows.len(), 4);
+    assert!(rows.iter().all(|r| r.kind == "test" && r.items.is_none()));
+    let mut outcomes: Vec<&str> = rows.iter().map(|r| r.outcome.as_str()).collect();
+    outcomes.sort_unstable();
+    assert_eq!(outcomes, ["auth", "ok", "ok", "thinking"]);
+}
+
+/// Решение 169: неудачная проверка подключения — с полным адресом запроса (`url`); у 404 сервер
+/// спрашивает список моделей (`GET <база>/models`, у Anthropic — `/v1/models` с теми же
+/// заголовками): список есть — `models` и подсказка «модели нет», нет — подсказка про адрес;
+/// у прочих классов списка не спрашивает; удача — без `url`.
+#[tokio::test]
+async fn model_test_failure_url_and_models() {
+    let m = MockModel::start();
+    let a = server("test-url-models", |_| {}).await;
+    connect(&a, &m).await;
+    let models = || {
+        MockReply::json(
+            200,
+            json!({"object": "list", "data": [{"id": "qwen3-30b"}, {"id": "llama-3"},
+                                               {"id": "bad\nname"}]}),
+        )
+    };
+    // 404, список отдан: API по адресу есть, нет модели
+    m.push(MockReply::json(
+        404,
+        json!({"error": {"code": "model_not_found"}}),
+    ));
+    m.push(models());
+    let v = a.adm(Method::POST, TEST, None, None).await.json();
+    assert_eq!(v["class"], "not_found", "{v}");
+    assert_eq!(v["url"], format!("{}/chat/completions", m.base_url()));
+    assert_eq!(v["models"], json!(["qwen3-30b", "llama-3"]));
+    assert!(v["hint"].as_str().unwrap().contains("«mock-model»"), "{v}");
+    let seen = m.last();
+    assert_eq!(
+        (seen.method.as_str(), seen.path.as_str()),
+        ("GET", "/v1/models")
+    );
+    assert_eq!(
+        seen.header("authorization"),
+        Some(format!("Bearer {}", key()).as_str())
+    );
+    // 404 и списка нет — подсказка про адрес, без `models`
+    m.push(MockReply::json(404, json!({"error": "not found"})));
+    m.push(MockReply::json(404, json!({"error": "not found"})));
+    let v = a.adm(Method::POST, TEST, None, None).await.json();
+    assert!(v.get("models").is_none(), "{v}");
+    assert!(v["hint"].as_str().unwrap().contains("/v1"), "{v}");
+    // ключ не подошёл — адрес есть, списка не спрашивали
+    let n = m.count();
+    m.push(MockReply::json(
+        401,
+        json!({"error": {"message": "bad key"}}),
+    ));
+    let v = a.adm(Method::POST, TEST, None, None).await.json();
+    assert_eq!((v["class"].clone(), v.get("models")), (json!("auth"), None));
+    assert_eq!(v["url"], format!("{}/chat/completions", m.base_url()));
+    assert_eq!(m.count(), n + 1);
+    // удача — без адреса
+    let v = a.adm(Method::POST, TEST, None, None).await.json();
+    assert_eq!(v["ok"], true, "{v}");
+    assert!(v.get("url").is_none() && v.get("models").is_none(), "{v}");
+
+    // Anthropic: список — `/v1/models` с `x-api-key` и `anthropic-version`
+    vault_item(&a, "claude", &m.root_url(), &key()).await;
+    ok(
+        &patch(&a, json!({"works": {"model": aconn_input("claude")}})).await,
+        StatusCode::OK,
+    );
+    m.push(MockReply::anthropic_error(404, "not_found_error"));
+    m.push(models());
+    let v = a.adm(Method::POST, TEST, None, None).await.json();
+    assert_eq!(v["url"], format!("{}/v1/messages", m.root_url()));
+    assert_eq!(v["models"], json!(["qwen3-30b", "llama-3"]));
+    let seen = m.last();
+    assert_eq!(
+        (seen.method.as_str(), seen.path.as_str()),
+        ("GET", "/v1/models")
+    );
+    assert_eq!(seen.header("x-api-key"), Some(key().as_str()));
+    assert_eq!(seen.header("anthropic-version"), Some("2026-10-21"));
+    // журнал отправок — только обращения к модели (список моделей — без токенов, не строка)
+    assert_eq!(journal(&a).await.len(), 5);
 }
 
 /// Второй скан тела: элемент с находкой сканера выброшен, остальное ушло; в теле запроса

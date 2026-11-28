@@ -61,7 +61,7 @@ pub const BODY_EXTRA_MAX_BYTES: usize = 4096;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelAuth {
-    /// `Authorization: Bearer <значение записи Vault>`.
+    /// `Authorization: Bearer <значение записи Vault>` (у `anthropic` — `x-api-key: <значение>`).
     #[default]
     Key,
     /// Без заголовка (локальный сервер без ключа).
@@ -101,7 +101,9 @@ pub type PinnedAddr = BaseUrl;
 /// (`api::user_settings`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelConn {
-    /// Протокол; в M7.3 — `openai` (OpenAI-совместимый Chat Completions).
+    /// Протокол: `openai` (OpenAI-совместимый Chat Completions) или с M7.6 `anthropic` (родной
+    /// Anthropic Messages, §9.2) — [`super::model::Protocol`]. Строкой: незнакомое значение
+    /// (записала более новая версия) читается, а вызов не отправляется.
     pub protocol: String,
     #[serde(with = "vault_ref")]
     pub vault: Id,
@@ -112,9 +114,12 @@ pub struct ModelConn {
     /// Предел ответа (256..=32000).
     #[serde(default = "max_tokens_default")]
     pub max_tokens: u32,
+    /// Поле предела; у `anthropic` — только `auto` (предел — всегда `max_tokens`; проверка —
+    /// на входе `PATCH`).
     #[serde(default)]
     pub token_field: TokenField,
-    /// Слияние в тело запроса верхним уровнем (до 4 КиБ).
+    /// Слияние в тело запроса верхним уровнем (до 4 КиБ); зарезервированные ключи — по
+    /// протоколу ([`super::model::Protocol::reserved_body_keys`]).
     #[serde(default)]
     pub body_extra: Map<String, Value>,
     /// Закреплённый адрес записи Vault (заполняет клиент модели, задача 2 плана).

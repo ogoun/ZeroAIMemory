@@ -2,8 +2,10 @@
 //! журнал отправок — только человеку (сессия WebUI пользователя или администратор; по токену —
 //! 403: агент не проверяет и не читает подключение владельца).
 //!
-//! - `POST /works/model/test[?user=<id>]` → `{ok, ms, class?, hint?, thinking?}`: фиксированный
-//!   запрос без данных памяти ([`crate::works::conn::test_connection`]); строка журнала
+//! - `POST /works/model/test[?user=<id>]` → `{ok, ms, class?, hint?, thinking?, url?, models?}`:
+//!   фиксированный запрос без данных памяти протоколом подключения
+//!   ([`crate::works::conn::test_connection`]; неудача после отправки — с полным адресом запроса
+//!   `url`, у `not_found` — имена моделей сервера `models`, M7.6 решение 169); строка журнала
 //!   `kind = test`; успешная проверка снимает паузу (кроме `vault_changed`). На паузе
 //!   `vault_changed` (и при адресе записи Vault, изменённом после сохранения) — 409 «адрес
 //!   изменён: был <хост> → стал <хост> — подтвердите» `{code: vault_changed, was, now}` **без
@@ -65,7 +67,7 @@ async fn target_user(
     super::works::works_user(st, p, headers, user).await
 }
 
-/// `POST /works/model/test[?user=]` → `{ok, ms, class?, hint?, thinking?}`.
+/// `POST /works/model/test[?user=]` → `{ok, ms, class?, hint?, thinking?, url?, models?}`.
 pub async fn test(
     State(st): State<AppState>,
     client: Client,

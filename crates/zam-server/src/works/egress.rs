@@ -403,6 +403,17 @@ pub fn endpoint(base: &BaseUrl, tail: &str) -> String {
     )
 }
 
+/// Точка входа `<база>/v1<tail>`, а если путь базы уже кончается на `/v1` (регистр не важен), —
+/// `<база><tail>`: адрес как у SDK Anthropic, с `/v1` и без, `/v1` не удваивается (M7.6 §9.2
+/// п. 1, решение координатора 147).
+pub fn v1_endpoint(base: &BaseUrl, tail: &str) -> String {
+    if base.path.to_ascii_lowercase().ends_with("/v1") {
+        endpoint(base, tail)
+    } else {
+        endpoint(base, &format!("/v1{tail}"))
+    }
+}
+
 /// IPv4-в-IPv6 (`::ffff:a.b.c.d`) — как IPv4 (и для соединения: сокет IPv6 Windows по
 /// умолчанию — только IPv6).
 fn canonical(ip: IpAddr) -> IpAddr {
@@ -986,6 +997,39 @@ mod tests {
             endpoint(&b, "/chat/completions"),
             "http://192.0.2.5:11434/chat/completions"
         );
+        // Anthropic Messages (M7.6 §9.2 п. 1): база с `/v1` и без — `/v1` не удваивается
+        for (s, want) in [
+            (
+                "https://api.anthropic.com",
+                "https://api.anthropic.com/v1/messages",
+            ),
+            (
+                "https://api.anthropic.com/",
+                "https://api.anthropic.com/v1/messages",
+            ),
+            (
+                "https://api.anthropic.com/v1",
+                "https://api.anthropic.com/v1/messages",
+            ),
+            (
+                "https://api.anthropic.com/V1/",
+                "https://api.anthropic.com/V1/messages",
+            ),
+            (
+                "http://192.0.2.5:8080/gw",
+                "http://192.0.2.5:8080/gw/v1/messages",
+            ),
+            (
+                "http://192.0.2.5:8080/gwv1",
+                "http://192.0.2.5:8080/gwv1/v1/messages",
+            ),
+        ] {
+            assert_eq!(
+                v1_endpoint(&parse_base_url(s).unwrap(), "/messages"),
+                want,
+                "{s}"
+            );
+        }
         let b = parse_base_url("https://model.example.com./compatible-mode/v1").unwrap();
         assert_eq!(b.host, "model.example.com");
         for bad in [
