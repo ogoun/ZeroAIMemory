@@ -11,6 +11,11 @@
 //! (питание, `kill`): пока он есть, [`DataDir::open`] отказывает
 //! ([`StoreError::RestoreIncomplete`]) — сервер не примет полувосстановленный каталог (иначе
 //! создал бы пустую `system.db` и нового администратора), а `backup` не снимет его копию.
+//!
+//! **Откат (M7.4 §7.2).** `zam-server rollback` держит лок с меткой `rollback` (дубль — тот же
+//! `.zam-restore` с текстом `rollback <pid>`; [`LockMark::Rollback`]) и пишет тот же признак
+//! незавершённости с текстом `rollback …`: [`DataDir::open`] тогда отказывает
+//! [`StoreError::RollbackIncomplete`] — с советом повторить откат, а не восстановление.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -31,9 +36,15 @@ pub const RESTORE_MARK_FILE: &str = ".zam-restore";
 /// Признак незавершённого восстановления (см. документацию модуля).
 pub const RESTORE_INCOMPLETE_FILE: &str = ".zam-restore-incomplete";
 
-/// Восстановление в каталог `root` начато и не завершено.
+/// Восстановление (или откат) в каталог `root` начато и не завершено.
 pub fn restore_incomplete(root: &Path) -> bool {
     root.join(RESTORE_INCOMPLETE_FILE).exists()
+}
+
+/// Незавершённый признак оставил `zam-server rollback` (текст признака — `rollback …`).
+pub fn rollback_incomplete(root: &Path) -> bool {
+    std::fs::read_to_string(root.join(RESTORE_INCOMPLETE_FILE))
+        .is_ok_and(|t| t.starts_with("rollback"))
 }
 
 /// Кто держит `.zam.lock`.
@@ -43,6 +54,8 @@ pub enum LockMark {
     Serve,
     /// Идёт `zam-server restore`.
     Restore,
+    /// Идёт `zam-server rollback` (M7.4 §7.2).
+    Rollback,
 }
 
 /// Кто держит лок каталога данных `root`; `None` — лок свободен (или файла лока нет).
@@ -58,7 +71,13 @@ pub fn lock_mark(root: &Path) -> Option<LockMark> {
         Err(_) => {
             // Unix: содержимое читается и под flock; Windows — нет (берётся дубль)
             let text = std::fs::read_to_string(&path).unwrap_or_default();
-            if text.trim_start().starts_with("restore") || root.join(RESTORE_MARK_FILE).exists() {
+            let dup = std::fs::read_to_string(root.join(RESTORE_MARK_FILE)).ok();
+            let text = text.trim_start();
+            if text.starts_with("rollback")
+                || dup.as_deref().is_some_and(|d| d.starts_with("rollback"))
+            {
+                Some(LockMark::Rollback)
+            } else if text.starts_with("restore") || dup.is_some() {
                 Some(LockMark::Restore)
             } else {
                 Some(LockMark::Serve)
@@ -98,7 +117,8 @@ pub fn try_lock_dir(root: &Path) -> Option<DirLock> {
 pub struct DataDir {
     root: PathBuf,
     _lock: File,
-    /// Снять `.zam-restore` при уничтожении (открыт [`DataDir::open_for_restore`]).
+    /// Снять `.zam-restore` при уничтожении (открыт [`DataDir::open_for_restore`] или
+    /// [`DataDir::open_for_rollback`]).
     restore_mark: bool,
 }
 
@@ -156,7 +176,11 @@ impl DataDir {
         // дубль метки прерванного restore больше не нужен: лок теперь у этого процесса
         let _ = std::fs::remove_file(root.join(RESTORE_MARK_FILE));
         if restore_incomplete(root) {
-            return Err(StoreError::RestoreIncomplete(root.to_path_buf()));
+            return Err(if rollback_incomplete(root) {
+                StoreError::RollbackIncomplete(root.to_path_buf())
+            } else {
+                StoreError::RestoreIncomplete(root.to_path_buf())
+            });
         }
         Ok(dd)
     }
@@ -165,6 +189,13 @@ impl DataDir {
     /// ([`lock_mark`] — [`LockMark::Restore`]). Дубль снимается при уничтожении значения.
     pub fn open_for_restore(root: &Path) -> Result<DataDir, StoreError> {
         Self::open_marked(root, Some("restore"))
+    }
+
+    /// Лок для `zam-server rollback` (M7.4 §7.2): метка `rollback` в `.zam.lock` и в
+    /// `.zam-restore` ([`LockMark::Rollback`]); признак незавершённости не проверяется — его
+    /// разбирает откат (повтор после сбоя). Дубль снимается при уничтожении значения.
+    pub fn open_for_rollback(root: &Path) -> Result<DataDir, StoreError> {
+        Self::open_marked(root, Some("rollback"))
     }
 
     fn open_marked(root: &Path, mark: Option<&str>) -> Result<DataDir, StoreError> {
@@ -200,14 +231,10 @@ impl DataDir {
             _lock: file,
             restore_mark: mark.is_some(),
         };
-        if mark.is_some() {
+        if let Some(m) = mark {
             std::fs::write(
                 root.join(RESTORE_MARK_FILE),
-                format!(
-                    "restore {}
-",
-                    std::process::id()
-                ),
+                format!("{m} {}\n", std::process::id()),
             )?;
         }
         Ok(dd)

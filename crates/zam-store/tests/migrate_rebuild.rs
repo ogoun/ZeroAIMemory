@@ -193,13 +193,15 @@ fn entry_ref(id: Id) -> TargetRef {
     }
 }
 
-/// Таблицы базы (кроме служебных SQLite) и число строк.
+/// Таблицы базы (кроме служебных SQLite и таблицы сумм мигратора `zam_migrations`, M7.4: в ней
+/// строка на каждую применённую миграцию) и число строк.
 fn table_counts(c: &Connection) -> BTreeMap<String, i64> {
     let names: Vec<String> = {
         let mut st = c
             .prepare(
                 "SELECT name FROM sqlite_master
-                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'zam_migrations'
+                 ORDER BY name",
             )
             .unwrap();
         st.query_map([], |r| r.get(0))
@@ -1460,6 +1462,15 @@ fn historic_list(rev: &str) -> &'static [Migration] {
     Box::leak(v.into_boxed_slice())
 }
 
+/// Закрытая база, открытая списком `historic_list(…)`, — такой, какой её оставила промежуточная
+/// сборка M6: без таблицы сумм мигратора (её создаёт только M7.4; с ней итоговая сборка
+/// отказала бы изменённой 0025 — `migrate_checksum::checksum_changed_rejected`).
+fn as_m6_build(path: &Path) {
+    conn(path)
+        .execute_batch("DROP TABLE zam_migrations")
+        .unwrap();
+}
+
 /// Список итоговых миграций и фиктивной 0028 (только в тесте: досборка до следующих миграций).
 fn with_fake_0028() -> &'static [Migration] {
     let mut v = USER_MIGRATIONS.to_vec();
@@ -1526,6 +1537,7 @@ async fn reopen_historic_0025_versions_repaired() {
             };
             touch_session(&db, &s).await.unwrap();
         }
+        as_m6_build(&path);
         {
             let c = conn(&path);
             assert_ne!(master_objects(&c), want, "{rev}: исходная схема другая");
@@ -1568,6 +1580,7 @@ async fn repair_runs_before_next_migration() {
     let want = fresh_schema(&dir, list);
     let path = dir.join("u.db");
     drop(Db::open(&path, historic_list("61c5c14")).unwrap());
+    as_m6_build(&path);
     drop(Db::open(&path, list).unwrap());
     let c = conn(&path);
     assert_eq!(user_version(&c), 28);

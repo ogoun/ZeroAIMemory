@@ -66,6 +66,28 @@ enum Cmd {
         #[arg(long)]
         no_reindex: bool,
     },
+    /// Откатить базы на остановленном сервере к копиям перед миграцией (bak-v<N>): базы
+    /// пользователей — к схеме N, system.db — только с --system; прежние базы переносятся в
+    /// backups/pre-rollback-… (ничего не удаляется)
+    Rollback {
+        #[command(flatten)]
+        opts: Opts,
+        /// Схема баз пользователей: v<N> (копии users/<id>.db.bak-v<N>)
+        #[arg(long, value_name = "vN", value_parser = parse_schema)]
+        to: u32,
+        /// Схема system.db: v<M> (копия system.db.bak-v<M>); без флага system.db не меняется
+        #[arg(long, value_name = "vM", value_parser = parse_schema)]
+        system: Option<u32>,
+        /// Только план: что откатится и что потеряется; ничего не меняет
+        #[arg(long)]
+        dry_run: bool,
+        /// Подтверждение: без него — план и код 1
+        #[arg(long)]
+        yes: bool,
+        /// Итог в JSON в stdout
+        #[arg(long)]
+        json: bool,
+    },
     /// Управляемый Qdrant: загрузка бинарника, состояние, сброс хранилища
     Qdrant {
         #[command(subcommand)]
@@ -266,6 +288,11 @@ fn load_for_models(o: Opts) -> anyhow::Result<ServerConfig> {
     Ok(cfg)
 }
 
+/// Номер схемы `v<N>` или `N` (`rollback --to`, `--system`).
+fn parse_schema(s: &str) -> Result<u32, String> {
+    zam_server::backup::rollback::parse_version(s)
+}
+
 fn read_password() -> anyhow::Result<String> {
     if std::io::stdin().is_terminal() {
         // Приглашение в stderr: в stdout только хэш.
@@ -398,8 +425,46 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
             match zam_server::backup::restore(&cfg, &src, &ro).await {
                 Ok(rep) => {
                     println!("{}", rep.text());
-                    if !rep.vault_ok {
-                        eprintln!("{}", zam_server::backup::restore::VAULT_WARNING);
+                    if let Some(w) = &rep.vault_warning {
+                        eprintln!("{w}");
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("ошибка: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Cmd::Rollback {
+            opts,
+            to,
+            system,
+            dry_run,
+            yes,
+            json,
+        } => {
+            let cfg = load(opts)?;
+            let ro = zam_server::backup::rollback::RollbackOpts {
+                to,
+                system,
+                dry_run,
+                yes,
+            };
+            let res = tokio::task::spawn_blocking(move || {
+                zam_server::backup::rollback::rollback(&cfg, &ro)
+            })
+            .await?;
+            match res {
+                Ok(rep) => {
+                    if json {
+                        println!("{}", serde_json::to_string(&rep)?);
+                    } else {
+                        println!("{}", rep.text());
+                    }
+                    if rep.needs_yes() {
+                        eprintln!("ничего не изменено: проверьте план и повторите команду с --yes");
+                        std::process::exit(1);
                     }
                     Ok(())
                 }

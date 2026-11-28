@@ -222,7 +222,7 @@ fn open_source(src: &Path, mode: OpenMode) -> Result<Connection, StoreError> {
 }
 
 /// `file:<путь>?immutable=1` с процент-кодированием (`%`, `?`, `#`, пробелы, не-ASCII).
-fn immutable_uri(p: &Path) -> String {
+pub(crate) fn immutable_uri(p: &Path) -> String {
     let s = p.to_string_lossy().replace('\\', "/");
     let mut out = String::from("file:");
     // абсолютный путь Windows `C:/…` — как `file:/C:/…`

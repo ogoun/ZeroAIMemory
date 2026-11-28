@@ -247,6 +247,23 @@ pub(crate) fn audit_tx(
     Ok(())
 }
 
+/// Запись аудита в закрытый файл `system.db` без миграций (`zam-server rollback`, M7.4 §7.2
+/// п. 5: база может быть откачена к старой схеме, мигратор этой сборки её снова обновил бы;
+/// таблица `audit` — с 0001).
+pub fn audit_closed(
+    path: &std::path::Path,
+    actor: &str,
+    action: &str,
+    details: &serde_json::Value,
+) -> Result<(), StoreError> {
+    let c = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    c.busy_timeout(std::time::Duration::from_secs(5))?;
+    audit_tx(&c, actor, None, action, None, None, details)
+}
+
 impl SystemStore {
     /// Открывает `system.db` в каталоге данных.
     pub fn open(dir: &DataDir) -> Result<SystemStore, StoreError> {

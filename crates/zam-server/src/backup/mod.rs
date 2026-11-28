@@ -36,6 +36,7 @@
 
 pub mod manifest;
 pub mod restore;
+pub mod rollback;
 pub mod runner;
 pub mod schedule;
 
@@ -113,6 +114,20 @@ pub enum BackupError {
         reason: String,
         moved_to: Option<PathBuf>,
     },
+    #[error("идёт откат (zam-server rollback): дождитесь его конца")]
+    RollbackInProgress,
+    /// Проверка копий или версий до первого изменения не прошла (M7.4 §7.2 п. 3): каталог
+    /// данных не тронут.
+    #[error("откат не начат, каталог данных не тронут:\n{0}")]
+    RollbackRefused(String),
+    /// Сбой после начала изменений: каталог помечен незавершённым откатом, повтор той же
+    /// команды продолжает в тот же `pre-rollback-…`.
+    #[error(
+        "откат прерван: {reason}. Каталог данных помечен незавершённым — повторите ту же \
+         команду zam-server rollback; прежние базы — в {}",
+        .moved_to.display()
+    )]
+    RollbackFailed { reason: String, moved_to: PathBuf },
     #[error("ошибка ввода-вывода: {0}")]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -643,6 +658,94 @@ fn clean_zip_leftovers(zip: &Path, max_age: Duration) {
     }
 }
 
+// ---- общие переносы `restore` и `rollback` в `backups/pre-*` (ничего не удаляется) ----
+
+/// Путь `<file>-wal` / `-shm` (любой суффикс к имени файла).
+pub(crate) fn side(p: &Path, suffix: &str) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// Время для имён каталогов (`yyyy-MM-dd_HHmmss`, UTC).
+pub(crate) fn ts_name() -> String {
+    zam_store::time::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .strftime(NAME_FORMAT)
+        .to_string()
+}
+
+/// Новый каталог `backups/<prefix><время>/` (`pre-restore-`, `pre-rollback-`) для прежних
+/// данных; имя занято — с суффиксом `-2`, `-3`…
+pub(crate) fn new_pre_dir(root: &Path, prefix: &str) -> PathBuf {
+    let ts = ts_name();
+    let backups = root.join("backups");
+    let mut dst = backups.join(format!("{prefix}{ts}"));
+    let mut k = 2;
+    while dst.exists() {
+        dst = backups.join(format!("{prefix}{ts}-{k}"));
+        k += 1;
+    }
+    dst
+}
+
+/// Переносит `p` в каталог `to_dir` под тем же именем; имя там занято (остаток прерванной
+/// попытки) — в `remnants` (создаётся по нужде). Ничего не удаляется.
+pub(crate) fn move_into(p: &Path, to_dir: &Path, remnants: &Path) -> std::io::Result<()> {
+    let name = p.file_name().unwrap_or_default().to_os_string();
+    std::fs::create_dir_all(to_dir)?;
+    let mut to = to_dir.join(&name);
+    if to.exists() {
+        std::fs::create_dir_all(remnants)?;
+        to = remnants.join(&name);
+    }
+    rename_retry(p, &to)
+}
+
+/// Признак незавершённого восстановления или отката (`kind` — `restore`, `rollback`): пишется
+/// до первого изменения каталога данных и хранит каталог прежних данных — имя внутри
+/// `backups/` (`moved_to pre-…`, только ASCII: путь каталога данных в признак не попадает и не
+/// теряется на не-UTF-8). Повтор после сбоя дописывает в него. Запись — во временный файл,
+/// `fsync`, переименование поверх признака: прежний признак не усекается на месте и не
+/// пропадает при сбое посреди записи.
+pub(crate) fn mark_incomplete(
+    root: &Path,
+    kind: &str,
+    moved_to: Option<&Path>,
+) -> std::io::Result<()> {
+    let p = root.join(zam_store::RESTORE_INCOMPLETE_FILE);
+    let tmp = root.join(format!("{}.tmp", zam_store::RESTORE_INCOMPLETE_FILE));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        writeln!(
+            f,
+            "{kind} {} {}",
+            std::process::id(),
+            zam_store::time::now()
+        )?;
+        if let Some(name) = moved_to
+            .and_then(|m| m.file_name())
+            .and_then(|n| n.to_str())
+        {
+            writeln!(f, "moved_to {name}")?;
+        }
+        f.sync_all()?;
+    }
+    rename_retry(&tmp, &p)?;
+    sync_dir(root)
+}
+
+/// Каталог прежних данных прерванного восстановления или отката (из признака; имя — с
+/// `prefix`), если он есть.
+pub(crate) fn incomplete_moved_to(root: &Path, prefix: &str) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(root.join(zam_store::RESTORE_INCOMPLETE_FILE)).ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("moved_to "))
+        .filter(|n| n.starts_with(prefix) && !n.contains(['/', '\\']))
+        .map(|n| root.join("backups").join(n))
+        .filter(|p| p.is_dir())
+}
+
 /// `rename` с повтором на Windows ([`zam_core::fsx::rename_retry`]); каждая пауза — WARN с
 /// номером попытки и кодом.
 pub(crate) fn rename_retry(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -735,22 +838,35 @@ pub fn backup(cfg: &ServerConfig, opts: &BackupOpts) -> Result<BackupReport, Bac
     if !root.join("system.db").is_file() {
         return Err(BackupError::NoData(root.to_path_buf()));
     }
-    if zam_store::lock_mark(root) == Some(LockMark::Restore) {
-        return Err(BackupError::RestoreInProgress);
+    let busy = |m: Option<LockMark>| match m {
+        Some(LockMark::Restore) => Some(BackupError::RestoreInProgress),
+        Some(LockMark::Rollback) => Some(BackupError::RollbackInProgress),
+        _ => None,
+    };
+    if let Some(e) = busy(zam_store::lock_mark(root)) {
+        return Err(e);
     }
     if zam_store::restore_incomplete(root) {
-        return Err(StoreError::RestoreIncomplete(root.to_path_buf()).into());
+        let root = root.to_path_buf();
+        return Err(if zam_store::rollback_incomplete(&root) {
+            StoreError::RollbackIncomplete(root)
+        } else {
+            StoreError::RestoreIncomplete(root)
+        }
+        .into());
     }
     // сервер не запущен — лок берёт копия и держит до конца
     let own_lock = zam_store::try_lock_dir(root);
-    if own_lock.is_none() && zam_store::lock_mark(root) == Some(LockMark::Restore) {
-        // между проверкой метки и попыткой лока мог начаться restore
-        return Err(BackupError::RestoreInProgress);
+    if own_lock.is_none()
+        && let Some(e) = busy(zam_store::lock_mark(root))
+    {
+        // между проверкой метки и попыткой лока мог начаться restore или rollback
+        return Err(e);
     }
     let own = own_lock.is_some();
     let dest = opts.dir.clone().unwrap_or_else(|| cfg.backup.dir(root));
     std::fs::create_dir_all(&dest)?;
-    let max_age = Duration::from_secs(u64::from(cfg.backup.flag_max_hours) * 3600);
+    let max_age = cfg.backup.flag_max_age();
     clean_partials(&dest, max_age);
     let prev = list_copies(&dest).pop();
     let now = zam_store::time::now();
