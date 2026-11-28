@@ -10,14 +10,17 @@
 // индекс; задачи 8 — страницы M7.3 (подключение модели, «Подтвердить адрес», «Отключить модель»,
 // «Запустить сейчас», «Принять как норму», «Принять» и «Отклонить» кандидата); M7.4 задачи 4 —
 // «Добавить пробу» и «Снять» набора проб «Проверки памяти»; M7.5 задачи 5 — «Применить» (с полем
-// текста и подтверждение отзыва) и «Отклонить» предложения уборки. Задачи дописывают
+// текста и подтверждение отзыва) и «Отклонить» предложения уборки; M7.6 задачи 2 — окно записи
+// Vault («Новая запись», «Изменить», «Удалить» страницы Vault; то же окно поверх окна подключения
+// модели — сценарии `works.spec.ts`: строки перечня рассчитаны на одно окно над страницей).
+// Задачи дописывают
 // свои строки — перед последним элементом массива (не в хвост: параллельные задачи иначе правят
 // одну строку). Данные строк — `E2E_FORMS_*` (наполнение — `seedForms` в `forms.spec.ts`) и `E2E_*`
 // global-setup.
 import { expect, type Locator, type Page } from '@playwright/test';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { IDEAS_GUID } from './seed';
+import { IDEAS_GUID, SOLUTION_GUID } from './seed';
 import { TIDY_MERGE, TIDY_RETRACT, checkFixture, routeTidy, runsReply } from './seed-internal';
 import type { PageCtx } from './mobile-pages';
 
@@ -1057,6 +1060,45 @@ export const FORM_CASES: FormCase[] = [
     route: { method: 'POST', url: /\/api\/v1\/proposals\/[^/?]+\/decline$/ },
     after: 'notice',
     added: true,
+  },
+  // ---- M7.6 задачи 2 (решение 167): окно записи Vault ----
+  {
+    id: 'vault-new',
+    name: 'Новая запись Vault',
+    page: (c) => journal(c, 'vault'),
+    open: (p) => press(p, 'Новая запись'),
+    first: 'Название',
+    fill: async (p) => {
+      await type(p, 'Новая запись Vault', 'Название', `Запись форм ${stamp()}`);
+      await type(p, 'Новая запись Vault', 'Значение', ['e2e', 'forms', 'value'].join('-'));
+    },
+    route: { method: 'POST', url: /\/api\/v1\/spaces\/[^/?]+\/vault$/ },
+    after: 'notice',
+    added: true,
+  },
+  {
+    id: 'vault-edit',
+    name: 'Изменить запись Vault',
+    page: (c) => journal(c, 'vault', '', SOLUTION_GUID),
+    open: (p) => press(p, 'Изменить E2E токен деплоя'),
+    first: 'Название',
+    fill: (p) => type(p, 'Изменить запись Vault', 'Описание', `правка форм ${stamp()}`),
+    route: { method: 'PATCH', url: /\/api\/v1\/vault\/[^/?]+$/ },
+    after: 'notice',
+    added: true,
+  },
+  {
+    id: 'vault-delete',
+    name: 'Удалить запись Vault',
+    page: (c) => journal(c, 'vault', '', SOLUTION_GUID),
+    open: (p) => press(p, 'Удалить E2E токен деплоя'),
+    route: { method: 'DELETE', url: /\/api\/v1\/vault\/[^/?]+$/ },
+    after: 'none',
+    confirm: true,
+    danger: true,
+    added: true,
+    // запись на месте: «Удалить» у неё по-прежнему на странице
+    kept: (p) => expect(p.getByRole('button', { name: 'Удалить E2E токен деплоя', exact: true })).toBeVisible(),
   },
   {
     id: 'idea-delete',

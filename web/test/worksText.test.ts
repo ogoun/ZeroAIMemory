@@ -1,7 +1,8 @@
 // Запуск: npm run test:build (node --test, встроенная поддержка TypeScript).
 // Внутренние работы и кандидаты в Rules в WebUI (M7.3, спецификация §6.1–§6.3, §6.7, §6.9): класс
 // адреса записи Vault (те же диапазоны, что у сервера, §6.2 п. 6), `body_extra` и рецепты, время
-// ночи в поясе сервера и местное, журнал отправок, итог работы, тексты кандидатов.
+// ночи в поясе сервера и местное, журнал отправок, итог работы, тексты кандидатов. M7.6 (§9.2,
+// решения 166–169): протокол Anthropic, выбор записи с адресом API, путь адреса, итог проверки.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
@@ -15,8 +16,14 @@ import {
   num,
   pinnedHost,
   pinnedUrl,
+  isModelUrl,
   nextSlot,
   nightText,
+  pathWarning,
+  recipesOf,
+  requestUrlOf,
+  testFailText,
+  vaultChoiceLabel,
   outcomeText,
   parseBodyExtra,
   proposalAuthorText,
@@ -183,4 +190,66 @@ test('works_admin_summary_texts', () => {
   assert.equal(adminCheckText({ status: 'done', verdict: 'regression' }), 'ухудшение');
   assert.equal(adminCheckText({ status: 'skipped', verdict: null }), 'пропущен');
   assert.equal(adminCheckText({ status: null, verdict: null }), 'не было');
+});
+
+test('works_anthropic_body_extra_and_recipes', () => {
+  // у Anthropic зарезервированы system и параметры выборки — с пояснением про версию API
+  assert.match((parseBodyExtra('{"temperature": 0.2}', 'anthropic') as { error: string }).error, /temperature.*2026-10-21/);
+  assert.match((parseBodyExtra('{"system": "x"}', 'anthropic') as { error: string }).error, /system задаёт сервер/);
+  assert.deepEqual(parseBodyExtra('{"output_config": {"effort": "low"}}', 'anthropic'), { value: { output_config: { effort: 'low' } } });
+  // у OpenAI-совместимого — как раньше: system и temperature не зарезервированы
+  assert.deepEqual(parseBodyExtra('{"system": "x", "temperature": 0.2}'), { value: { system: 'x', temperature: 0.2 } });
+  assert.match((parseBodyExtra('{"max_completion_tokens": 1}', 'openai') as { error: string }).error, /max_completion_tokens/);
+  assert.ok(recipesOf('anthropic').some((r) => JSON.stringify(r.value).includes('effort')));
+  assert.ok(recipesOf('openai').some((r) => JSON.stringify(r.value).includes('enable_thinking')));
+});
+
+test('works_model_url_choices', () => {
+  // решение 166: в выборе — только http(s)-адреса; описания хостов — нет
+  for (const ok of ['https://api.openai.com/v1', 'http://192.0.2.5:8080/v1', 'https://api.anthropic.com', 'HTTP://host.example.com']) {
+    assert.equal(isModelUrl(ok), true, ok);
+  }
+  for (const bad of ['192.0.2.10 (SSH, ключ в агенте)', 'локальная машина', 'ssh://host', 'https:// пробел', '', 'https://']) {
+    assert.equal(isModelUrl(bad), false, bad);
+  }
+  assert.equal(vaultChoiceLabel('llm', ' http://192.0.2.5:8080/v1 '), 'llm — http://192.0.2.5:8080/v1');
+});
+
+test('works_request_url_and_path_warning', () => {
+  // куда уйдёт запрос: как `request_url` сервера (у Anthropic /v1 не удваивается)
+  assert.equal(requestUrlOf('openai', 'http://192.0.2.5:8080/v1/'), 'http://192.0.2.5:8080/v1/chat/completions');
+  assert.equal(requestUrlOf('anthropic', 'https://api.anthropic.com'), 'https://api.anthropic.com/v1/messages');
+  assert.equal(requestUrlOf('anthropic', 'https://api.anthropic.com/v1'), 'https://api.anthropic.com/v1/messages');
+  // решение 168: OpenAI-совместимый без пути — предупреждение и исправление «+ /v1»
+  const w = pathWarning('openai', 'http://192.0.2.5:8080/');
+  assert.ok(w && w.text.includes('Адрес без /v1') && w.text.includes('http://192.0.2.5:8080/chat/completions'), w?.text);
+  assert.equal(w?.fixed, 'http://192.0.2.5:8080/v1');
+  assert.equal(pathWarning('openai', 'http://192.0.2.5:8080/v1'), null);
+  assert.equal(pathWarning('openai', 'https://dashscope.example.com/compatible-mode/v1'), null);
+  // полная точка входа вместо базы — путь удвоится
+  assert.equal(pathWarning('openai', 'https://api.example.com/v1/chat/completions')?.fixed, 'https://api.example.com/v1');
+  // Anthropic: база без пути — нормально, точка входа /v1/messages — исправить
+  assert.equal(pathWarning('anthropic', 'https://api.anthropic.com'), null);
+  assert.equal(pathWarning('anthropic', 'https://api.anthropic.com/v1'), null);
+  assert.equal(pathWarning('anthropic', 'https://api.anthropic.com/v1/messages')?.fixed, 'https://api.anthropic.com/v1');
+  assert.equal(pathWarning('openai', 'описание хоста'), null);
+});
+
+test('works_test_fail_text', () => {
+  // решение 169: понятная причина и полный адрес запроса
+  const url = 'http://192.0.2.5:8080/v1/chat/completions';
+  assert.equal(
+    testFailText({ ok: false, ms: 5, class: 'auth', url }, 'm'),
+    `Подключение не работает: ключ не подошёл — проверьте значение записи Vault. Адрес запроса: ${url}`,
+  );
+  assert.match(testFailText({ ok: false, ms: 5, class: 'not_found', url }, 'm'), /по адресу нет API — проверьте адрес/);
+  assert.match(
+    testFailText({ ok: false, ms: 5, class: 'not_found', url, models: ['a', 'b'] }, 'qwen'),
+    /модели «qwen» на нём нет — есть: a, b\./,
+  );
+  assert.match(testFailText({ ok: false, ms: null, class: 'unavailable', url }, 'm'), /сервер не отвечает/);
+  assert.equal(
+    testFailText({ ok: false, ms: 5, class: 'bad_json', hint: 'модель ответила не JSON' }, 'm'),
+    'Подключение не работает: ответ не JSON (bad_json). модель ответила не JSON.',
+  );
 });

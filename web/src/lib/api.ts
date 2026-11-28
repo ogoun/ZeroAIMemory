@@ -1604,6 +1604,29 @@ export async function revealVault(user: string, id: string): Promise<string | nu
   return r.secret;
 }
 
+/** Открытые поля записи Vault (`data`): тип и поля, которые видны без значения. */
+export type VaultData = VaultItem['data'];
+
+/** Метаданные записи Vault без значения (свежая ревизия после 409). */
+export const getVault = (user: string, id: string) => call<VaultItem>('GET', `vault/${q(id)}`, undefined, user);
+
+/** Новая запись Vault в области `space` (M7.6, решение 167): `secret` обязателен, кроме типов
+ * `host` и `environment`; имя занято — 409. */
+export const createVault = (user: string, space: string, body: { title: string; data: VaultData; secret?: string }) =>
+  call<VaultItem>('POST', `spaces/${q(space)}/vault`, body, user);
+
+/** Правка записи Vault с `If-Match` ревизии: без `secret` сервер сохраняет прежнее значение
+ * (перешифровывает под новую ревизию); запись изменилась или имя занято — 409. */
+export const patchVault = async (
+  user: string,
+  id: string,
+  rev: number,
+  body: { title?: string; data?: VaultData; secret?: string },
+) => (await (await request('PATCH', `vault/${q(id)}`, { body, user, headers: ifMatch(rev) })).json()) as VaultItem;
+
+/** Удаление записи Vault (мягкое; аудит `vault.delete`). */
+export const deleteVault = (user: string, id: string) => call<void>('DELETE', `vault/${q(id)}`, undefined, user);
+
 // ---- решения и совместный доступ (§11.6) ----
 
 export interface SolutionItem {
