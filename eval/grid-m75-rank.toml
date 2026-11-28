@@ -1,0 +1,35 @@
+# Сетка M7.5 §8.1 (задача 1): ранжирование выдачи — полнота ТС-1. Закрытый список кандидатов
+# спецификации M7 §8.1 п. 2: Н1 `search.fts_stop_words = false` (служебные слова не идут в
+# запросы bm25, ослабленный и alias); Н2 заменён по разбору п. 1 (журнал этапа, «M7.5 · Задача 1»:
+# единственная потеря dev — s-04, нужная заметка 9-я у B4 и у 0.0.17 с тем же порядком, выше неё —
+# по 2–3 карточки трёх узлов, честный бюджет 800 даёт 6 карточек; бусты и служебные слова ни при
+# чём) точкой Н2′ `search.max_per_node = 1` (не больше одного фрагмента с узла); Н3′ = Н1 + Н2′.
+# Первая точка — умолчание (как 0.0.17), вторая — она же (A/A-гейт: на одном индексе выдача
+# обязана совпасть).
+#   cargo xtask eval --tokens --via mcp --split dev --device cpu --strict-l0 \
+#     --targets-of 0.0.5-m4 --grid eval/grid-m75-rank.toml --label m75-rank-r<k>
+# CPU int8 (решение координатора 114), вариант Б (цели корпуса — как у v0.0.5-m4: без вложений
+# eval/docs и связей contradicts), K = 3 — три прогона сетки (три индексации) против трёх
+# прогонов B4 на dev (`--arm` ×3 `--compare` ×3, `compare_reps`). Правило выбора (§8.1 п. 3) и
+# список точек — копией в журнале этапа до прогона; Δ nDCG@10, Δ recall@5 и reliable_first тех
+# же точек — сеткой `eval/grid-m75-rank-hybrid.toml` (`eval --mode hybrid`).
+
+[[point]]
+name = "default"
+env = { ZAM_SEARCH__FTS_STOP_WORDS = "true", ZAM_SEARCH__MAX_PER_NODE = "3" }
+
+[[point]]
+name = "default-aa"
+env = { ZAM_SEARCH__FTS_STOP_WORDS = "true", ZAM_SEARCH__MAX_PER_NODE = "3" }
+
+[[point]]
+name = "n1"
+env = { ZAM_SEARCH__FTS_STOP_WORDS = "false", ZAM_SEARCH__MAX_PER_NODE = "3" }
+
+[[point]]
+name = "n2-node1"
+env = { ZAM_SEARCH__FTS_STOP_WORDS = "true", ZAM_SEARCH__MAX_PER_NODE = "1" }
+
+[[point]]
+name = "n3-node1"
+env = { ZAM_SEARCH__FTS_STOP_WORDS = "false", ZAM_SEARCH__MAX_PER_NODE = "1" }

@@ -1,0 +1,40 @@
+# Сетка M7.5 §8.1 п. 3 (задача 1): качество поиска точек `eval/grid-m75-rank.toml` (Н1, Н2′,
+# Н3′) — Δ nDCG@10 и Δ recall@5 к умолчанию (нижняя граница ≥ −0,01) и reliable_first = 1,000
+# (после §8.2).
+#   cargo xtask eval --grid eval/grid-m75-rank-hybrid.toml
+# Гибрид CPU int8 (решение координатора 114). Части: main — eval/queries.toml (в нём запросы
+# certainty, в том числе r-08), kind, kind_b, kind_c — наборы вида eval/kind-queries{,-b,-c}.toml
+# (их reliable_first — пересчёт §8.2 п. 3). Первая конфигурация — умолчание (как 0.0.17),
+# снимается дважды (A/A-гейт). Правило выбора — журнал этапа, «M7.5 · Задача 1» (до прогона).
+model = "bge-m3-int8"
+device = "cpu"
+mode = "hybrid"
+aa = true
+
+[[part]]
+name = "kind"
+queries = "eval/kind-queries.toml"
+
+[[part]]
+name = "kind_b"
+queries = "eval/kind-queries-b.toml"
+
+[[part]]
+name = "kind_c"
+queries = "eval/kind-queries-c.toml"
+
+[[config]]
+name = "default"
+set = { "search.fts_stop_words" = "true", "search.max_per_node" = "3" }
+
+[[config]]
+name = "n1"
+set = { "search.fts_stop_words" = "false", "search.max_per_node" = "3" }
+
+[[config]]
+name = "n2-node1"
+set = { "search.fts_stop_words" = "true", "search.max_per_node" = "1" }
+
+[[config]]
+name = "n3-node1"
+set = { "search.fts_stop_words" = "false", "search.max_per_node" = "1" }
