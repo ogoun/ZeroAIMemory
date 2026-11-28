@@ -132,6 +132,13 @@ fn health_features_documented() {
         "admin_works",
         "check_probes_manage",
         "health_components",
+        // нативные клиенты: Vault, `/recall`, строгий query, `_meta` MCP, `[[пространство:путь]]`
+        // (задача 3 M7.6)
+        "vault_agent",
+        "recall_m76",
+        "strict_list_query",
+        "mcp_error_meta",
+        "link_space_path",
     ] {
         assert!(built.contains(f), "{f}");
     }

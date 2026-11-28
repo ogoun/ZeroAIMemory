@@ -4030,3 +4030,183 @@ async fn digest_roots_more_line() {
         "{t}"
     );
 }
+
+// ---- Rules в бюджете (M7.6 §9.3 п. 2, CR-22, признак `recall_m76`) ----
+
+/// Мир правил: 8 длинных правил, задача в работе и ловушки; бюджеты по умолчанию.
+async fn rules_world(name: &str) -> (Api, String, Vec<String>) {
+    let a = server(name).await;
+    let long = "Длинное пояснение правила с подробностями и примерами. ".repeat(12);
+    let mut rules = Vec::new();
+    for i in 0..8 {
+        let n = a
+            .note(
+                "rules",
+                &format!("правило-{i:02}"),
+                &format!("# Правило {i}\n\n{long}\n"),
+            )
+            .await;
+        rules.push(format!("n:{}", n["id"].as_str().unwrap()));
+    }
+    let task = entry(
+        &a,
+        &a.token,
+        "knowledge",
+        json!({"kind": "task", "title": "Задача в работе для бюджета",
+               "data": {"next_step": "шаг"}}),
+    )
+    .await;
+    let r = a
+        .tok_rev(
+            &a.token,
+            Method::PATCH,
+            &format!("/api/v1/entries/{task}"),
+            Some(json!({"status": "in_progress"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    for i in 0..3 {
+        insight(
+            &a,
+            &a.token,
+            "knowledge",
+            &format!("Ловушка бюджета {i} про сборку и окружение"),
+            "текст",
+            "gotcha",
+        )
+        .await;
+    }
+    (a, format!("k:{task}"), rules)
+}
+
+/// `rules_in_budget: true`: весь текст (с Rules) — в `budget_tokens`; задачи остаются, правила
+/// с конца приоритета снимаются раньше, строка «не показано — правил: N» — прежняя; резерва
+/// нет (`rules_tokens: 0`). Дайджест и пакет восстановления.
+#[tokio::test]
+async fn recall_rules_in_budget_tasks_first() {
+    let (a, task, rules) = rules_world("rules-in-budget").await;
+    for (k, event) in ["session_start", "recovery"].into_iter().enumerate() {
+        let j = ok(
+            &a,
+            &a.token,
+            Some(&format!("rib-{k}")),
+            json!({"event": event, "budget_tokens": 200, "rules_in_budget": true}),
+        )
+        .await;
+        let text = j["text"].as_str().unwrap();
+        assert!(
+            zam_store::fits_budget(text, 200),
+            "{event}: {} > 200: {text}",
+            zam_store::count_tokens(text)
+        );
+        assert_eq!(j["rules_tokens"], 0, "{event}: {j}");
+        assert!(text.contains(&task), "{event}: задача на месте: {text}");
+        let got = ids(&j);
+        let shown: Vec<&String> = rules.iter().filter(|r| got.contains(r)).collect();
+        assert!(
+            shown.len() < rules.len(),
+            "{event}: все правила в 200: {text}"
+        );
+        // правила снимаются с конца приоритета: показанные — первые по порядку
+        assert_eq!(
+            shown,
+            rules.iter().take(shown.len()).collect::<Vec<_>>(),
+            "{event}: {text}"
+        );
+        let line = format!(
+            "ZeroAIMemory: не показано — правил: {} (memory_tree Rules)",
+            rules.len() - shown.len()
+        );
+        assert!(text.contains(&line), "{event}: {line}: {text}");
+    }
+}
+
+/// Без поля (и с `false`) — как 0.0.18: Rules — резерв сверх бюджета, все на месте,
+/// `rules_tokens > 0`, остальное — в бюджете.
+#[tokio::test]
+async fn recall_rules_in_budget_absent_keeps_018() {
+    let (a, task, rules) = rules_world("rules-in-budget-018").await;
+    for (k, extra) in [json!({}), json!({"rules_in_budget": false})]
+        .into_iter()
+        .enumerate()
+    {
+        let mut body = json!({"event": "session_start", "budget_tokens": 400});
+        for (key, v) in extra.as_object().unwrap() {
+            body[key] = v.clone();
+        }
+        let j = ok(&a, &a.token, Some(&format!("r018-{k}")), body).await;
+        let text = j["text"].as_str().unwrap();
+        let got = ids(&j);
+        for r in &rules {
+            assert!(got.contains(r), "{r}: {text}");
+        }
+        assert!(!text.contains("не показано — правил"), "{text}");
+        assert!(j["rules_tokens"].as_u64().unwrap() > 400, "{j}");
+        assert!(text.contains(&task), "{text}");
+        let rest = without_section(text, "### Правила");
+        assert!(zam_store::fits_budget(&rest, 400), "{rest}");
+    }
+}
+
+/// `rules_in_budget` и `output_limit`: весь текст — в пределе, задачи остаются, правила
+/// снимаются раньше задач со строкой о непоказанных.
+#[tokio::test]
+async fn recall_rules_in_budget_output_limit() {
+    let (a, task, rules) = rules_world("rules-in-budget-limit").await;
+    let j = ok(
+        &a,
+        &a.token,
+        Some("ribl-1"),
+        json!({"event": "session_start", "budget_tokens": 20000, "rules_in_budget": true,
+               "output_limit": {"unit": "bytes", "max": 1200}}),
+    )
+    .await;
+    let text = j["text"].as_str().unwrap();
+    assert!(text.len() <= 1200, "{} > 1200: {text}", text.len());
+    assert!(text.contains(&task), "задача на месте: {text}");
+    let got = ids(&j);
+    let shown = rules.iter().filter(|r| got.contains(r)).count();
+    assert!(shown < rules.len(), "{text}");
+    let line = format!(
+        "ZeroAIMemory: не показано — правил: {} (memory_tree Rules)",
+        rules.len() - shown
+    );
+    assert!(text.contains(&line), "{line}: {text}");
+    assert_eq!(j["rules_tokens"], 0, "{j}");
+    // без поля при том же пределе правила — первыми (как 0.0.18): задача уступает им место
+    let old = ok(
+        &a,
+        &a.token,
+        Some("ribl-2"),
+        json!({"event": "session_start", "budget_tokens": 20000,
+               "output_limit": {"unit": "bytes", "max": 1200}}),
+    )
+    .await;
+    assert!(old["rules_tokens"].as_u64().unwrap() > 0, "{old}");
+}
+
+/// `rules_in_budget: true` у событий, кроме `session_start` и `recovery`, — 400; `false` — как
+/// без поля.
+#[tokio::test]
+async fn recall_rules_in_budget_other_event_400() {
+    let a = server("rules-in-budget-400").await;
+    for body in [
+        json!({"event": "prompt", "prompt": "сборка падает", "rules_in_budget": true}),
+        json!({"event": "post_tool", "tool": "Bash", "error": "error: boom",
+               "rules_in_budget": true}),
+        json!({"event": "brief", "rules_in_budget": true}),
+        json!({"event": "idea_review", "rules_in_budget": true}),
+    ] {
+        let r = recall(&a, &a.token, Some("rib-400"), body.clone()).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{body}: {}", r.text());
+        assert!(r.text().contains("rules_in_budget"), "{body}: {}", r.text());
+    }
+    let r = recall(
+        &a,
+        &a.token,
+        Some("rib-400"),
+        json!({"event": "brief", "rules_in_budget": false}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}

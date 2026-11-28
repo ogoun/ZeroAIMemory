@@ -239,6 +239,11 @@ impl ApiError {
         }
     }
 
+    /// Статус ответа problem.
+    pub fn status(&self) -> StatusCode {
+        self.parts().0
+    }
+
     fn parts(&self) -> (StatusCode, &'static str, &'static str) {
         match self {
             ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, "about:blank", "Bad Request"),

@@ -466,8 +466,20 @@ pub(crate) fn json_body<T: DeserializeOwned>(
     }
 }
 
-/// Параметры запроса; ошибка разбора → 400 problem+json.
+/// Параметры запроса; ошибка разбора → 400 problem+json. Неизвестный параметр структуры с
+/// `deny_unknown_fields` — 400 «неизвестный параметр: <имя>» (M7.6 §9.3 п. 4).
 pub(crate) fn query<T>(q: Result<Query<T>, QueryRejection>) -> Result<T, ApiError> {
-    q.map(|Query(v)| v)
-        .map_err(|e| ApiError::BadRequest(format!("некорректный запрос: {e}")))
+    q.map(|Query(v)| v).map_err(|e| {
+        let text = e.body_text();
+        match unknown_param(&text) {
+            Some(name) => ApiError::BadRequest(format!("неизвестный параметр: {name}")),
+            None => ApiError::BadRequest(format!("некорректный запрос: {e}")),
+        }
+    })
+}
+
+/// Имя из ошибки serde «unknown field `<имя>`, expected …».
+fn unknown_param(text: &str) -> Option<&str> {
+    let rest = &text[text.find("unknown field `")? + "unknown field `".len()..];
+    Some(&rest[..rest.find('`')?])
 }

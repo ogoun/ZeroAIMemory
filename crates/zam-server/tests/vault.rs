@@ -2060,3 +2060,234 @@ async fn vault_move_same_scope_no_rev() {
     assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text());
     assert_eq!(revs(&a, &a.token, &id).await, [1]);
 }
+
+// ---- Vault для рантайма агента (M7.6 §9.3 п. 1, CR-21, признак `vault_agent`) ----
+
+/// Подробности аудита `vault.reveal`.
+async fn reveal_audit(a: &Api) -> Vec<serde_json::Value> {
+    a.st.system
+        .list_audit(100, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|x| x.action == "vault.reveal")
+        .map(|x| x.details)
+        .collect()
+}
+
+/// `?reveal=1&purpose=<цель>` — цель в аудите `vault.reveal`; без цели — аудит прежний (поля
+/// `purpose` нет); цель без `reveal` раскрытия и аудита не даёт.
+#[tokio::test]
+async fn vault_reveal_purpose_in_audit() {
+    let a = api("vault-purpose", |_| {}).await;
+    let v = value("purpose");
+    let id = id_of(&set(&a, &a.token, "knowledge", "github", &v).await);
+    let r = reveal(&a, &a.token, &id).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let rows = reveal_audit(&a).await;
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].get("purpose").is_none(), "{}", rows[0]);
+    let purpose = "deploy:ci/run-1.2_A";
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::GET,
+            &format!("/api/v1/vault/{id}?reveal=1&purpose={purpose}"),
+            None,
+            &attrib_h(),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["secret"], v);
+    let rows = reveal_audit(&a).await;
+    assert_eq!(rows.len(), 2);
+    let row = rows
+        .iter()
+        .find(|d| d.get("purpose").is_some())
+        .expect("цель в аудите");
+    assert_eq!(row["purpose"], purpose, "{row}");
+    assert_eq!(row["item"], id.as_str());
+    assert_eq!(row["session"], SESSION);
+    // цель без раскрытия — метаданные, аудита нет
+    let r = a
+        .t(
+            Method::GET,
+            &format!("/api/v1/vault/{id}?purpose={purpose}"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(r.json().get("secret").is_none(), "{}", r.text());
+    assert_eq!(reveal_audit(&a).await.len(), 2);
+}
+
+/// Цель вне формата (пустая, длиннее 64, недопустимые символы) — 400 без значения и аудита.
+#[tokio::test]
+async fn vault_reveal_purpose_invalid_400() {
+    let a = api("vault-purpose-bad", |_| {}).await;
+    let v = value("purpose-bad");
+    let id = id_of(&set(&a, &a.token, "knowledge", "github", &v).await);
+    let long = "a".repeat(65);
+    let bad = [
+        "",
+        long.as_str(),
+        "deploy%20ci",
+        "%D1%86%D0%B5%D0%BB%D1%8C",
+        "a%3Fb",
+        "a%26b",
+    ];
+    for b in bad {
+        let r = a
+            .tok_h(
+                &a.token,
+                Method::GET,
+                &format!("/api/v1/vault/{id}?reveal=1&purpose={b}"),
+                None,
+                &attrib_h(),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{b}: {}", r.text());
+        assert!(!r.text().contains(&v), "{b}: значение в ответе");
+        assert!(r.text().contains("purpose"), "{b}: {}", r.text());
+    }
+    assert!(reveal_audit(&a).await.is_empty());
+    // 64 символа — можно
+    let ok = "b".repeat(64);
+    let r = a
+        .t(
+            Method::GET,
+            &format!("/api/v1/vault/{id}?reveal=1&purpose={ok}"),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(reveal_audit(&a).await.len(), 1);
+}
+
+/// Элемент списка по id.
+fn item_of(r: &Resp, id: &str) -> serde_json::Value {
+    r.json()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == id)
+        .cloned()
+        .unwrap_or_else(|| panic!("нет {id}: {}", r.text()))
+}
+
+/// `has_value` у элементов списка и метаданных записи: значение есть — `true`; `host` и
+/// `environment` без значения — `false`.
+#[tokio::test]
+async fn vault_list_has_value() {
+    let a = api("vault-has-value", |_| {}).await;
+    let tok = id_of(&set(&a, &a.token, "knowledge", "github", &value("hv")).await);
+    let host = id_of(&post_env(&a, "box", "host", json!({"address": "192.0.2.10"}), None).await);
+    let env_with = id_of(
+        &post_env(
+            &a,
+            "stage",
+            "environment",
+            json!({"description": "стенд"}),
+            Some(&value("env")),
+        )
+        .await,
+    );
+    let r = a
+        .t(Method::GET, "/api/v1/spaces/knowledge/vault", None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    for (id, want) in [(&tok, true), (&host, false), (&env_with, true)] {
+        assert_eq!(item_of(&r, id)["has_value"], want, "{}", r.text());
+        let m = a.t(Method::GET, &format!("/api/v1/vault/{id}"), None).await;
+        assert_eq!(m.status, StatusCode::OK, "{}", m.text());
+        assert_eq!(m.json()["has_value"], want, "{}", m.text());
+    }
+}
+
+/// Заблокированный Vault: `has_value` — по наличию шифротекста, без расшифровки (ключ подменён —
+/// расшифровка невозможна, а ответ 200 с верным `has_value`).
+#[tokio::test]
+async fn vault_has_value_when_locked() {
+    let dir = common::tmp("vault-has-value-locked");
+    let c = common::cfg_in(dir.clone());
+    let a = api_with(c.clone()).await;
+    let id = id_of(&set(&a, &a.token, "knowledge", "github", &value("hvl")).await);
+    let host = id_of(&post_env(&a, "box", "host", json!({"address": "192.0.2.11"}), None).await);
+    let token = a.token.clone();
+    a.st.shutdown().await;
+    drop(a);
+    std::fs::write(
+        dir.join("master.key"),
+        "QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=\n",
+    )
+    .unwrap();
+    let b = api_with(c).await;
+    let r = b
+        .tok(&token, Method::GET, "/api/v1/spaces/knowledge/vault", None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["locked"], true, "{}", r.text());
+    assert_eq!(item_of(&r, &id)["has_value"], true, "{}", r.text());
+    assert_eq!(item_of(&r, &host)["has_value"], false, "{}", r.text());
+    let m = b
+        .tok(&token, Method::GET, &format!("/api/v1/vault/{id}"), None)
+        .await;
+    assert_eq!(m.status, StatusCode::OK, "{}", m.text());
+    assert_eq!(m.json()["has_value"], true, "{}", m.text());
+    assert!(!m.text().contains("\"secret\""), "{}", m.text());
+}
+
+async fn list_vault(a: &Api, q: &str) -> Resp {
+    a.t(
+        Method::GET,
+        &format!("/api/v1/spaces/knowledge/vault?{q}"),
+        None,
+    )
+    .await
+}
+
+/// `?title=<имя>` — точное имя (без пробелов по краям, регистр важен — как у удаления по имени).
+#[tokio::test]
+async fn vault_list_title_exact() {
+    let a = api("vault-title-exact", |_| {}).await;
+    for t in ["github", "github-2", "GitHub", "my github"] {
+        id_of(&set(&a, &a.token, "knowledge", t, &value(t)).await);
+    }
+    let r = list_vault(&a, "title=github").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(titles(&r), ["github"]);
+    assert_eq!(r.json()["locked"], false);
+    assert_eq!(
+        titles(&list_vault(&a, "title=%20github%20").await),
+        ["github"]
+    );
+    assert_eq!(titles(&list_vault(&a, "title=GitHub").await), ["GitHub"]);
+    assert_eq!(
+        titles(&list_vault(&a, "title=my%20github").await),
+        ["my github"]
+    );
+    assert!(titles(&list_vault(&a, "title=git").await).is_empty());
+    // пустое имя — 400
+    let r = list_vault(&a, "title=%20").await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}
+
+/// `title` вместе с `q` — оба условия.
+#[tokio::test]
+async fn vault_list_title_with_q() {
+    let a = api("vault-title-q", |_| {}).await;
+    for t in ["github", "github-2"] {
+        id_of(&set(&a, &a.token, "knowledge", t, &value(t)).await);
+    }
+    let both =
+        |q: &str, t: &str| format!("q={}&title={}", common::api::enc(q), common::api::enc(t));
+    let r = list_vault(&a, &both("деплой", "github")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(titles(&r), ["github"]);
+    assert!(titles(&list_vault(&a, &both("нетакого", "github")).await).is_empty());
+    assert!(titles(&list_vault(&a, &both("деплой", "gitlab")).await).is_empty());
+    assert_eq!(
+        titles(&list_vault(&a, &both("git", "github-2")).await),
+        ["github-2"]
+    );
+}

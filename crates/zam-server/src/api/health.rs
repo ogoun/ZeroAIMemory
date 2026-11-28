@@ -76,6 +76,11 @@ pub const FEATURES: &[&str] = &[
     "snapshot_m76",
     "agent_setup_local",
     "idea_adopt_token",
+    "vault_agent",
+    "recall_m76",
+    "strict_list_query",
+    "mcp_error_meta",
+    "link_space_path",
 ];
 
 /// Версии компонентов, которые узнаются один раз при старте (`AppState::components`).

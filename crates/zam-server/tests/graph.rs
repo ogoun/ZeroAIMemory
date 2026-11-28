@@ -805,3 +805,144 @@ async fn render_and_edges_agree_on_resolution() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     check(early).await;
 }
+
+// ---- `[[пространство:путь]]` в связях (M7.6 §9.3 п. 7, признак `link_space_path`) ----
+
+/// `POST /edges` с `[[<пространство>:<путь>]]` у `dst` и `src`: префикс по правилу CLI, заметка
+/// — в этом пространстве базы пользователя; `[[Имя]]` без префикса — в пространстве источника.
+#[tokio::test]
+async fn edges_space_path_dst() {
+    let a = api("graph-space-path", |_| {}).await;
+    let tok = a.token.clone();
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/solutions",
+            Some(json!({"agent_solution_id": G, "name": "Своё"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let common = id(&a.note("knowledge", "заметки/общая", "# Общая\n").await);
+    let step = id(&note_by(&a, &tok, G, "план/шаг", "# Шаг\n").await);
+    let src = id(&note_by(&a, &tok, G, "исток", "# Исток\n").await);
+    let dst_of = |r: &Resp| {
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        r.json()["dst"].as_str().unwrap().to_string()
+    };
+    // из решения — в Knowledge той же базы; косые по краям пути не мешают
+    let r = edge(
+        &a,
+        &tok,
+        &format!("n:{src}"),
+        "relates_to",
+        "[[knowledge:заметки/общая]]",
+    )
+    .await;
+    assert_eq!(dst_of(&r), format!("n:{common}"));
+    let r = edge(
+        &a,
+        &tok,
+        &format!("n:{src}"),
+        "mentions",
+        "[[knowledge:/заметки/общая/]]",
+    )
+    .await;
+    assert_eq!(dst_of(&r), format!("n:{common}"));
+    // GUID решения (любой регистр) и имя без косой — по имени в пространстве
+    let up = G.to_uppercase();
+    let r = edge(
+        &a,
+        &tok,
+        &format!("n:{common}"),
+        "depends_on",
+        &format!("[[{up}:шаг]]"),
+    )
+    .await;
+    assert_eq!(dst_of(&r), format!("n:{step}"));
+    // `solution:` — решение из X-Zam-Solution
+    let r = a
+        .tok_h(
+            &tok,
+            Method::POST,
+            "/api/v1/edges",
+            Some(json!({"src": format!("n:{common}"), "type": "fixes",
+                        "dst": "[[solution:план/шаг]]"})),
+            &[("x-zam-solution", G)],
+        )
+        .await;
+    assert_eq!(dst_of(&r), format!("n:{step}"));
+    // `src` — тоже `[[пространство:путь]]`
+    let r = edge(
+        &a,
+        &tok,
+        &format!("[[{G}:план/шаг]]"),
+        "part_of",
+        &format!("n:{src}"),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    assert_eq!(r.json()["src"], format!("n:{step}"));
+    // `[[Имя]]` без префикса — по-прежнему в пространстве источника; неизвестный префикс — имя
+    let r = edge(&a, &tok, &format!("n:{src}"), "caused_by", "[[шаг]]").await;
+    assert_eq!(dst_of(&r), format!("n:{step}"));
+    let r = edge(
+        &a,
+        &tok,
+        &format!("n:{src}"),
+        "derived_from",
+        "[[план:шаг]]",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    // источник `[[Имя]]` без пространства — 400, как раньше
+    let r = edge(&a, &tok, "[[шаг]]", "relates_to", &format!("n:{src}")).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text());
+}
+
+/// Не найдено — 422 с подсказкой «укажите n:<id> или [[пространство:путь]]»; пространство
+/// недоступно или не в базе пользователя (участнику — решение в базе владельца) — 422.
+#[tokio::test]
+async fn edges_space_path_not_found_hint() {
+    let w = world("space-path-hint").await;
+    let s = id(&note_by(&w.a, &w.a_tok, G, "решение", "# Р\n").await);
+    note_by(&w.a, &w.a_tok, G, "решение-2", "# Р2\n").await;
+    let hint = "укажите n:<id> или [[пространство:путь]]";
+    let detail = |r: &Resp| {
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+        r.json()["detail"].as_str().unwrap().to_string()
+    };
+    let src = format!("n:{s}");
+    for dst in [
+        "[[Нет такой]]",
+        "[[knowledge:нет/такой]]",
+        &format!("[[{G}:нет]]"),
+    ] {
+        let d = detail(&edge(&w.a, &w.a_tok, &src, "relates_to", dst).await);
+        assert!(d.contains(hint), "{dst}: {d}");
+    }
+    // недоступное пространство: чужое незарегистрированное решение, Human по токену
+    let other = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9eff";
+    for dst in [format!("[[{other}:x]]"), "[[human:x]]".to_string()] {
+        let d = detail(&edge(&w.a, &w.a_tok, &src, "relates_to", &dst).await);
+        assert!(d.contains("недоступно"), "{dst}: {d}");
+    }
+    // `solution:` без X-Zam-Solution — 422
+    let d = detail(&edge(&w.a, &w.a_tok, &src, "relates_to", "[[solution:решение-2]]").await);
+    assert!(d.contains("X-Zam-Solution"), "{d}");
+    // участник: решение — в базе владельца, `[[пространство:путь]]` его не адресует
+    let d = detail(
+        &edge(
+            &w.a,
+            &w.b_tok,
+            &src,
+            "relates_to",
+            &format!("[[{G}:решение-2]]"),
+        )
+        .await,
+    );
+    assert!(d.contains("недоступно"), "{d}");
+    // своё Knowledge участника — другая база: 422 «связи между базами»
+    note_by(&w.a, &w.b_tok, "knowledge", "моё", "# М\n").await;
+    let d = detail(&edge(&w.a, &w.b_tok, &src, "relates_to", "[[knowledge:моё]]").await);
+    assert!(d.contains("связи между базами"), "{d}");
+}
