@@ -12,12 +12,14 @@
 //! (`works`, `usage_opened`; M7.3), журнал отправок подключённой модели (`work_calls`; M7.3), пробы
 //! ночной проверки памяти, её прогоны и результаты (`probes`, `check_runs`, `check_results`; M7.3),
 //! предложения человеку — кандидаты в Rules (`proposals`; M7.3), контрольные суммы миграций
-//! (`zam_migrations`), открытие без изменений и сверка схемы с эталоном ([`inspect`]; M7.4).
+//! (`zam_migrations`), открытие без изменений и сверка схемы с эталоном ([`inspect`]; M7.4),
+//! сборщик мусора блобов и замок блобов пользователя ([`blob_gc`]; M7.4).
 
 pub mod access;
 pub mod archive;
 pub mod attachments;
 pub mod backup;
+pub mod blob_gc;
 pub mod blobs;
 pub mod cache;
 pub mod certainty;
@@ -78,6 +80,7 @@ pub use backup::{
     backup_flag_path, hold_backup_flag, integrity_ok, meta_value, set_backup_flag_max_age,
     vacuum_into,
 };
+pub use blob_gc::{BlobGate, BlobShare, GcPlan, GcReport};
 pub use blobs::{
     AttachScope, BlobStore, attach, attachment_link, blob_meta, blob_meta_by_sha,
     blob_meta_by_sha_in_space, blob_meta_in_space, resolve_attachment,

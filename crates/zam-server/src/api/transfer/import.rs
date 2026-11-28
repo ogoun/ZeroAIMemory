@@ -1088,16 +1088,20 @@ async fn run(
     for e in &mut plan.entries {
         e.files.iter_mut().for_each(fix);
     }
+    // замок блобов пользователя — от распаковки до записи строк плана (M7.4 §7.4 п. 3)
+    let mut share = None;
     if !opts.dry_run {
         st.imports.stage(job, "extracting");
         let store = BlobStore::new(&st.data_dir.blobs_dir(), t.owner);
+        let held = Arc::new(store.share().await);
+        share = Some(held.clone());
         let blobs = std::mem::take(&mut plan.blobs);
         let (path, s2) = (part.0.clone(), store.clone());
         tokio::task::spawn_blocking(move || {
             let f = std::fs::File::open(&path).map_err(|e| ImportError::Store(e.into()))?;
             let mut z = zip::ZipArchive::new(std::io::BufReader::new(f))
                 .map_err(|e| ImportError::Rejected(format!("тело — не архив zip: {e}")))?;
-            extract_blobs(&mut z, &blobs, &s2)
+            extract_blobs(&mut z, &blobs, &s2, &held)
         })
         .await
         .map_err(|e| ApiError::Internal(format!("распаковка вложений: {e}")))?
@@ -1121,6 +1125,7 @@ async fn run(
     let mut report = apply_plan(&t.db, t.space, t.owner, plan, &opts, &attrib)
         .await
         .map_err(|e| import_err(e, out))?;
+    drop(share);
     for u in remap.unresolved {
         if !report.unresolved.contains(&u) {
             report.unresolved.push(u);

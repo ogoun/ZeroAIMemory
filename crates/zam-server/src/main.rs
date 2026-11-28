@@ -88,6 +88,24 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Проверить каталог данных: базы (суммы миграций, схема, FTS5), блобы, связи, Vault,
+    /// Qdrant, модели, копии. Без --fix только читает (и при запущенном сервере); коды выхода:
+    /// 0 — без ошибок, 1 — есть ошибки, 2 — конфигурация не прочитана
+    Doctor {
+        #[command(flatten)]
+        opts: Opts,
+        /// integrity_check вместо quick_check и SHA-256 моделей (долго на больших базах)
+        #[arg(long)]
+        full: bool,
+        /// Безопасные исправления на остановленном сервере: остатки .restore-staging,
+        /// брошенный признак копии, .incoming/*.part старше суток, FTS5 rebuild, файлы .gc/,
+        /// проход сборщика мусора блобов
+        #[arg(long)]
+        fix: bool,
+        /// Итог в JSON в stdout
+        #[arg(long)]
+        json: bool,
+    },
     /// Управляемый Qdrant: загрузка бинарника, состояние, сброс хранилища
     Qdrant {
         #[command(subcommand)]
@@ -467,6 +485,40 @@ async fn async_main(cmd: Cmd) -> anyhow::Result<()> {
                         std::process::exit(1);
                     }
                     Ok(())
+                }
+                Err(e) => {
+                    eprintln!("ошибка: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Cmd::Doctor {
+            opts,
+            full,
+            fix,
+            json,
+        } => {
+            // конфигурация не прочитана — код 2 (M7.4 §7.5 п. 4)
+            let cfg = match load(opts) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("ошибка: конфигурация не прочитана: {e:#}");
+                    std::process::exit(2);
+                }
+            };
+            let env = std::env::var(zam_server::vault::keys::MASTER_KEY_ENV)
+                .ok()
+                .map(zeroize::Zeroizing::new);
+            let opts = zam_server::doctor::DoctorOpts { full, fix };
+            let env = env.as_deref().map(String::as_str);
+            match zam_server::doctor::run(&cfg, opts, env).await {
+                Ok(rep) => {
+                    if json {
+                        println!("{}", serde_json::to_string(&rep)?);
+                    } else {
+                        println!("{}", rep.text());
+                    }
+                    std::process::exit(rep.exit_code());
                 }
                 Err(e) => {
                     eprintln!("ошибка: {e}");

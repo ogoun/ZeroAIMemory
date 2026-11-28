@@ -570,7 +570,9 @@ async fn detach_removes_chunks() {
         .unwrap();
     drop_jobs(&env.db).await;
 
-    detach(&env.db, n, &sha, "doc.txt", &human()).await.unwrap();
+    detach(&env.db, &env.bs, n, &sha, "doc.txt", &human())
+        .await
+        .unwrap();
     assert!(list_attachments(&env.db, n).await.unwrap().is_empty());
     assert!(of_attachment(&chunks_of(&env.db, n).await, d.id).is_empty());
     assert_eq!(
@@ -604,7 +606,7 @@ async fn detach_removes_chunks() {
     );
     // повторное открепление — NotFound
     assert!(matches!(
-        detach(&env.db, n, &sha, "doc.txt", &human()).await,
+        detach(&env.db, &env.bs, n, &sha, "doc.txt", &human()).await,
         Err(zam_store::StoreError::NotFound)
     ));
     // повторная привязка — тот же документ, снова `pending`
@@ -774,7 +776,7 @@ async fn too_large_failed_and_reattach_moves_to_end() {
         names(list_attachments(&env.db, n).await.unwrap()),
         ["big.pdf", "cat.png", "first.txt", "second.txt"]
     );
-    detach(&env.db, n, &sha, "first.txt", &human())
+    detach(&env.db, &env.bs, n, &sha, "first.txt", &human())
         .await
         .unwrap();
     put_attach(&env, n, b"first", "first.txt", Some(DocKind::Text)).await;

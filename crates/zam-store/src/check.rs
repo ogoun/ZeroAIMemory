@@ -355,7 +355,8 @@ pub async fn nightly_done(db: &Db, limit: usize) -> Result<Vec<CheckRun>, StoreE
     db.read(move |c| nightly_done_in(c, limit)).await
 }
 
-fn nightly_done_in(c: &Connection, limit: usize) -> Result<Vec<CheckRun>, StoreError> {
+/// [`nightly_done`] на соединении `c` (в том числе только для чтения — `zam-server doctor`).
+pub fn nightly_done_in(c: &Connection, limit: usize) -> Result<Vec<CheckRun>, StoreError> {
     let mut st = c.prepare_cached(&format!(
         "SELECT {COLS} FROM check_runs WHERE trigger_kind = 'nightly' AND status = 'done'
          ORDER BY started_at DESC, rowid DESC LIMIT ?1"
