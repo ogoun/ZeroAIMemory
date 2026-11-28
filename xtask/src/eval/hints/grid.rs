@@ -11,7 +11,17 @@
 //!   число сравнений > 0, и Δ `hint_precision` ≥ 0 в каждой части [`STABLE_PARTS`] (при
 //!   равенстве — точка раньше в файле: «как есть» и `plain` идут первыми); (3) иначе база;
 //! - `rule = "prompt_min_score_fts"` — порог FTS-only на случаях `prompt` (только `--mode fts`):
-//!   наибольшее значение, при котором `hint_recall` ≥ 0,5 и `silence_rate` ≥ 0,7; иначе 0,6.
+//!   наибольшее значение, при котором `hint_recall` ≥ 0,5 и `silence_rate` ≥ 0,7; иначе 0,6;
+//! - `rule = "prompt_fts_coverage"` — правило покрытия подсказок `prompt` без модели
+//!   (`recall.prompt_fts_coverage`, M7.5 §8.3 п. 3; только `--mode fts`, первая точка — без
+//!   ключа): по всем случаям `prompt` — наибольший `silence_rate` при `hint_recall` ≥ 0,5, потере
+//!   не больше одной ожидаемой подсказки ([`PartResult::lost_pairs`]) и росте `silence_rate` к
+//!   первой точке не меньше 0,10; равный — больший `hint_recall`, затем `plain`; иначе — первая
+//!   точка ([`choose_prompt_coverage`]);
+//! - `rule = "post_tool_diag_words"` — слова строк-диагностик `post_tool`
+//!   (`recall.post_tool_diag_words`, M7.5 §8.3 п. 4; первая точка — `false`): на решающей части
+//!   [`DECISION_SOURCES`] нижняя граница Δ `hint_precision` с поправкой Бонферрони > 0 и ни одной
+//!   потерянной ожидаемой подсказки — точка; иначе первая ([`choose_diag_words`]).
 //!
 //! Методика (план M6, «Методика замера при недетерминизме», правила 1–2): корпус загружается и
 //! индексируется **один раз**, каждая точка — свежая копия каталога и сервер с `ZAM_*` точки;
@@ -51,6 +61,19 @@ pub const FTS_FALLBACK: f64 = 0.6;
 const FTS_ENV: &str = "ZAM_RECALL__PROMPT_MIN_SCORE_FTS";
 /// Префикс ключей правила покрытия в точках.
 const COVERAGE_ENV: &str = "ZAM_RECALL__POST_TOOL_COVERAGE__";
+/// Префикс ключей правила покрытия подсказок `prompt` без модели (M7.5 §8.3 п. 1).
+const PROMPT_COVERAGE_ENV: &str = "ZAM_RECALL__PROMPT_FTS_COVERAGE__";
+/// Ключ слов строк-диагностик `post_tool` (M7.5 §8.3 п. 4).
+const DIAG_ENV: &str = "ZAM_RECALL__POST_TOOL_DIAG_WORDS";
+/// Условия правила покрытия `prompt` (M7.5 §8.3 п. 3): `hint_recall` не ниже, потерянных
+/// ожидаемых подсказок не больше, рост `silence_rate` к первой точке не меньше.
+pub const PROMPT_COVERAGE_MIN_RECALL: f64 = 0.5;
+pub const PROMPT_COVERAGE_MAX_LOST: usize = 1;
+pub const PROMPT_COVERAGE_MIN_SILENCE_GAIN: f64 = 0.10;
+/// Признак сервера с ключами M7.5 (`recall.prompt_fts_coverage`, `recall.post_tool_diag_words`).
+const FEATURE_M75: &str = "search_m75";
+/// Равенство долей при выборе (одни случаи — одинаковые доли).
+const TIE_EPS: f64 = 1e-9;
 
 /// Правило выбора сетки (§9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -58,15 +81,27 @@ const COVERAGE_ENV: &str = "ZAM_RECALL__POST_TOOL_COVERAGE__";
 pub enum GridRule {
     PostToolCoverage,
     PromptMinScoreFts,
+    /// M7.5 §8.3 пп. 1–3.
+    PromptFtsCoverage,
+    /// M7.5 §8.3 п. 4.
+    PostToolDiagWords,
 }
 
 impl GridRule {
     /// Событие случаев правила.
     pub fn event(self) -> Event {
         match self {
-            GridRule::PostToolCoverage => Event::PostTool,
-            GridRule::PromptMinScoreFts => Event::Prompt,
+            GridRule::PostToolCoverage | GridRule::PostToolDiagWords => Event::PostTool,
+            GridRule::PromptMinScoreFts | GridRule::PromptFtsCoverage => Event::Prompt,
         }
+    }
+
+    /// Правило мерит поиск без модели: только `--mode fts`.
+    fn fts_only(self) -> bool {
+        matches!(
+            self,
+            GridRule::PromptMinScoreFts | GridRule::PromptFtsCoverage
+        )
     }
 }
 
@@ -108,7 +143,36 @@ pub fn load(path: &Path) -> Result<(GridRule, Vec<Point>)> {
                     errs.push(format!("{}: нужен ровно {FTS_ENV} в 0..=1", p.name));
                 }
             }
+            GridRule::PromptFtsCoverage => {
+                for k in p.env.keys().filter(|k| !k.starts_with(PROMPT_COVERAGE_ENV)) {
+                    errs.push(format!(
+                        "{}: {k} — у сетки покрытия prompt только {PROMPT_COVERAGE_ENV}*",
+                        p.name
+                    ));
+                }
+            }
+            GridRule::PostToolDiagWords => {
+                let ok = p.env.len() == 1
+                    && p.env
+                        .get(DIAG_ENV)
+                        .is_some_and(|v| v == "true" || v == "false");
+                if !ok {
+                    errs.push(format!("{}: нужен ровно {DIAG_ENV} = true | false", p.name));
+                }
+            }
         }
+    }
+    // первая точка — умолчание (M7.5 §8, «Eval»): без ключа покрытия `prompt`, слова ошибок выкл.
+    match (f.rule, f.point.first()) {
+        (GridRule::PromptFtsCoverage, Some(p)) if !p.env.is_empty() => {
+            errs.push(format!("{}: первая точка — без ключей (умолчание)", p.name));
+        }
+        (GridRule::PostToolDiagWords, Some(p))
+            if p.env.get(DIAG_ENV).is_none_or(|v| v != "false") =>
+        {
+            errs.push(format!("{}: первая точка — {DIAG_ENV} = false", p.name));
+        }
+        _ => {}
     }
     if !errs.is_empty() {
         bail!("сетка {}:\n  {}", path.display(), errs.join("\n  "));
@@ -144,6 +208,9 @@ pub struct PartResult {
     pub delta: Deltas,
     /// Чистая потеря ожидаемых подсказок к базе (Σ попаданий базы − Σ точки; < 0 — прирост).
     pub lost: f64,
+    /// Потерянные пары «случай — ожидаемая подсказка»: показана у базы, у точки — нет (прибавка в
+    /// одном случае потерю в другом не гасит; M7.5 §8.3 пп. 3–4).
+    pub lost_pairs: usize,
     /// Релевантных случаев.
     pub relevant: usize,
 }
@@ -165,8 +232,10 @@ pub struct PointResult {
     /// Нижняя граница Δ `hint_precision` решающей части с поправкой Бонферрони на число
     /// сравнений (`0,05 / k`, `k` — точек кроме базы).
     pub precision_lo_bonf: Option<f64>,
-    /// Решающая часть: чистая потеря ожидаемых подсказок и релевантных случаев.
+    /// Решающая часть: чистая потеря ожидаемых подсказок, потерянные пары
+    /// ([`PartResult::lost_pairs`]) и релевантных случаев.
     pub lost: f64,
+    pub lost_pairs: usize,
     pub relevant: usize,
     /// Части набора по происхождению (`m4`, `task9`, `independent`) и `all`.
     pub parts: BTreeMap<String, PartResult>,
@@ -306,6 +375,109 @@ fn coverage_passes(p: &PointResult) -> bool {
     recall_ok(&p.delta, p.lost, p.relevant) && precision_up && parts_ok
 }
 
+/// Точка правила покрытия `prompt` прошла условия M7.5 §8.3 п. 3 — по всем случаям (часть
+/// `all`): `hint_recall` ≥ 0,5, потерянных пар не больше одной, рост `silence_rate` к первой точке
+/// ≥ 0,10 (выбор — наибольший `silence_rate`, поэтому условие роста у точек равносильно правилу
+/// «рост меньше 0,10 — не включается»).
+fn prompt_coverage_passes(p: &PointResult) -> bool {
+    let Some(all) = p.parts.get("all") else {
+        return false;
+    };
+    let recall = all.metrics.hint_recall.map_or(0.0, |e| e.mean);
+    let gain = all.delta.silence_rate.map_or(0.0, |e| e.mean);
+    recall >= PROMPT_COVERAGE_MIN_RECALL
+        && all.lost_pairs <= PROMPT_COVERAGE_MAX_LOST
+        && gain >= PROMPT_COVERAGE_MIN_SILENCE_GAIN - TIE_EPS
+}
+
+/// Выбор правила покрытия `prompt` (M7.5 §8.3 п. 3): из прошедших — наибольший `silence_rate`
+/// (все случаи), равный — больший `hint_recall`, затем `word_match = plain`, затем раньше в файле;
+/// ни одна не прошла — первая точка (ключа нет).
+pub fn choose_prompt_coverage(points: &[PointResult]) -> (usize, String) {
+    let mean = |p: &PointResult, f: fn(&HintMetrics) -> Option<Estimate>| {
+        p.parts
+            .get("all")
+            .and_then(|a| f(&a.metrics))
+            .map_or(0.0, |e| e.mean)
+    };
+    let silence = |p: &PointResult| mean(p, |m| m.silence_rate);
+    let recall = |p: &PointResult| mean(p, |m| m.hint_recall);
+    let plain = |p: &PointResult| {
+        p.env
+            .get(&format!("{PROMPT_COVERAGE_ENV}WORD_MATCH"))
+            .is_some_and(|v| v == "plain")
+    };
+    let mut best: Option<usize> = None;
+    for (i, p) in points.iter().enumerate().skip(1).filter(|(_, p)| p.passes) {
+        let better = best.is_none_or(|b| {
+            let q = &points[b];
+            let (ds, dr) = (silence(p) - silence(q), recall(p) - recall(q));
+            if ds.abs() >= TIE_EPS {
+                ds > 0.0
+            } else if dr.abs() >= TIE_EPS {
+                dr > 0.0
+            } else {
+                plain(p) && !plain(q)
+            }
+        });
+        if better {
+            best = Some(i);
+        }
+    }
+    match best {
+        Some(i) => (
+            i,
+            format!(
+                "все случаи prompt: наибольший silence_rate ({:.3}) при hint_recall ≥ \
+                 {PROMPT_COVERAGE_MIN_RECALL} ({:.3}), потере ≤ {PROMPT_COVERAGE_MAX_LOST} \
+                 ожидаемой подсказки и росте silence_rate ≥ {PROMPT_COVERAGE_MIN_SILENCE_GAIN} к \
+                 первой точке (M7.5 §8.3 п. 3)",
+                silence(&points[i]),
+                recall(&points[i])
+            ),
+        ),
+        None => (
+            0,
+            format!(
+                "ни одна точка не прошла условия M7.5 §8.3 п. 3 (hint_recall ≥ \
+                 {PROMPT_COVERAGE_MIN_RECALL}, потеря ≤ {PROMPT_COVERAGE_MAX_LOST}, рост \
+                 silence_rate ≥ {PROMPT_COVERAGE_MIN_SILENCE_GAIN}) — правило не включается \
+                 (первая точка)"
+            ),
+        ),
+    }
+}
+
+/// Точка слов ошибок прошла правило M7.5 §8.3 п. 4 (как M7.1 §4.6 п. 3): на решающей части
+/// нижняя граница Δ `hint_precision` с поправкой Бонферрони > 0 и ни одной потерянной пары.
+fn diag_passes(p: &PointResult) -> bool {
+    p.precision_lo_bonf.is_some_and(|lo| lo > 0.0) && p.lost_pairs == 0
+}
+
+/// Выбор слов ошибок (M7.5 §8.3 п. 4): первая прошедшая точка после первой, иначе первая
+/// (`false`).
+pub fn choose_diag_words(points: &[PointResult]) -> (usize, String) {
+    match points.iter().enumerate().skip(1).find(|(_, p)| p.passes) {
+        Some((i, p)) => (
+            i,
+            format!(
+                "решающая часть {DECISION_SOURCES:?}: Δ hint_precision {:+.3}, нижняя граница \
+                 (Бонферрони) {:+.3} > 0, потерянных ожидаемых подсказок 0 (M7.5 §8.3 п. 4)",
+                p.delta.hint_precision.map_or(0.0, |e| e.mean),
+                p.precision_lo_bonf.unwrap_or(0.0)
+            ),
+        ),
+        None => (
+            0,
+            format!(
+                "на решающей части {DECISION_SOURCES:?} нет точки с нижней границей Δ \
+                 hint_precision (Бонферрони) > 0 без потерь ожидаемых подсказок — умолчание \
+                 (первая точка, M7.5 §8.3 п. 4)"
+            ),
+        ),
+    }
+}
+
 /// Точка порога FTS-only прошла условия §9.
 fn fts_passes(m: &HintMetrics) -> bool {
     let r = m.hint_recall.map_or(0.0, |e| e.mean);
@@ -367,8 +539,23 @@ fn part(base: &[&CaseRun], runs: &[&CaseRun]) -> PartResult {
         metrics: hint_metrics(&b),
         delta: deltas_one_sided(&a, &b),
         lost: hits(&a) - hits(&b),
+        lost_pairs: lost_pairs(&a, &b),
         relevant: b.iter().filter(|o| !o.expected.is_empty()).count(),
     }
+}
+
+/// Потерянные пары «случай — ожидаемая подсказка» ([`PartResult::lost_pairs`]): одни случаи в
+/// одном порядке.
+fn lost_pairs(base: &[Outcome], point: &[Outcome]) -> usize {
+    base.iter()
+        .zip(point)
+        .map(|(a, b)| {
+            a.shown
+                .iter()
+                .filter(|s| a.expected.contains(s) && !b.shown.contains(s))
+                .count()
+        })
+        .sum()
 }
 
 /// Запуски из частей `src`.
@@ -430,7 +617,7 @@ fn point_result(
         .map(|e| e.lo)
     };
     let (mut by_bucket, mut delta_by_bucket) = (BTreeMap::new(), BTreeMap::new());
-    if rule == GridRule::PostToolCoverage {
+    if rule.event() == Event::PostTool {
         for b in LEN_BUCKETS {
             let (pa, pb) = (of_bucket(&base_all, b), of_bucket(&all, b));
             by_bucket.insert(b.to_string(), hint_metrics(&outcomes_of(&pb)));
@@ -449,6 +636,7 @@ fn point_result(
         delta_by_bucket,
         precision_lo_bonf,
         lost: decision.lost,
+        lost_pairs: decision.lost_pairs,
         relevant: decision.relevant,
         parts,
         passes: false,
@@ -460,6 +648,8 @@ fn point_result(
     r.passes = match rule {
         GridRule::PostToolCoverage => base.is_some() && coverage_passes(&r),
         GridRule::PromptMinScoreFts => fts_passes(&r.metrics),
+        GridRule::PromptFtsCoverage => base.is_some() && prompt_coverage_passes(&r),
+        GridRule::PostToolDiagWords => base.is_some() && diag_passes(&r),
     };
     r
 }
@@ -514,8 +704,8 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, grid_path: &Path) -> Result
     validate_hints(&set, corpus)?;
     let full = with_hint_insights(corpus, &set);
     let only_fts = a.modes.iter().all(|m| *m == Mode::Fts);
-    if rule == GridRule::PromptMinScoreFts && !only_fts {
-        bail!("сетка порога FTS-only — только --mode fts (поиск без модели деградирует до FTS)");
+    if rule.fts_only() && !only_fts {
+        bail!("сетка {rule:?} — только --mode fts (поиск без модели деградирует до FTS)");
     }
     let server = run::server_dir(a, p)?;
     let model = (!only_fts).then(|| {
@@ -548,6 +738,14 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, grid_path: &Path) -> Result
     let caps = caps::probe(&s.base)?;
     if !caps.features.iter().any(|f| f == "hint_thresholds") {
         bail!("сервер {}: нет hint_thresholds (M6, задача 9)", caps.tag());
+    }
+    // без признака ключи M7.5 серверу не шлются (`caps::filter_overrides`) — точки совпали бы
+    if matches!(
+        rule,
+        GridRule::PromptFtsCoverage | GridRule::PostToolDiagWords
+    ) && !caps.features.iter().any(|f| f == FEATURE_M75)
+    {
+        bail!("сервер {}: нет {FEATURE_M75} (M7.5 §8.3)", caps.tag());
     }
     let index_secs = s.index_secs;
     let index_dir = s.data.parent().context("каталог прогона")?.to_path_buf();
@@ -637,6 +835,8 @@ pub fn run(a: &EvalArgs, p: &Paths, corpus: &Corpus, grid_path: &Path) -> Result
     let (ci, reason) = match rule {
         GridRule::PostToolCoverage => choose_coverage(&results),
         GridRule::PromptMinScoreFts => choose_fts(&results),
+        GridRule::PromptFtsCoverage => choose_prompt_coverage(&results),
+        GridRule::PostToolDiagWords => choose_diag_words(&results),
     };
     let result = GridResult {
         info: GridInfo {
@@ -746,14 +946,15 @@ pub fn render_md(r: &GridResult) -> String {
         s.push_str(&row(&format!("`{}`", p.name), &p.metrics, &p.delta, mark));
     }
     s.push_str(
-        "\nРешающая часть: потеря ожидаемых подсказок к базе / релевантных; нижняя граница Δ \
-         precision с поправкой Бонферрони:\n\n",
+        "\nРешающая часть: потеря ожидаемых подсказок к базе (чистая и пар «случай — подсказка») / \
+         релевантных; нижняя граница Δ precision с поправкой Бонферрони:\n\n",
     );
     for p in r.points.iter().skip(1) {
         s.push_str(&format!(
-            "- `{}`: потеря {:+.0} из {}, Δ precision lo (Бонферрони) {}\n",
+            "- `{}`: потеря {:+.0} (пар {}) из {}, Δ precision lo (Бонферрони) {}\n",
             p.name,
             p.lost,
+            p.lost_pairs,
             p.relevant,
             p.precision_lo_bonf
                 .map_or("—".to_string(), |v| format!("{v:+.3}"))
@@ -768,7 +969,10 @@ pub fn render_md(r: &GridResult) -> String {
         s.push_str(&format!("\n## Часть «{part}»\n\n{HEAD}"));
         for p in &r.points {
             if let Some(x) = p.parts.get(part) {
-                let mark = format!(" ({} сл., потеря {:+.0})", x.cases, x.lost);
+                let mark = format!(
+                    " ({} сл., потеря {:+.0}, пар {})",
+                    x.cases, x.lost, x.lost_pairs
+                );
                 s.push_str(&row(&format!("`{}`", p.name), &x.metrics, &x.delta, &mark));
             }
         }
@@ -846,6 +1050,7 @@ mod tests {
             delta: d,
             delta_by_bucket: BTreeMap::new(),
             lost: 0.0,
+            lost_pairs: 0,
             relevant: 40,
             parts: BTreeMap::new(),
             passes,
@@ -921,6 +1126,100 @@ mod tests {
         assert_eq!(choose_fts(&none).0, 1, "иначе 0,6");
     }
 
+    /// M7.5 §8.3 п. 3: прошли — `hint_recall` ≥ 0,5, потеря ≤ 1 пары, рост тишины ≥ 0,10; выбор —
+    /// наибольшая тишина, равная — больший `hint_recall`, затем `plain`, затем раньше в файле;
+    /// никто — первая точка. Потерянные пары не гасятся прибавкой в другом случае.
+    #[test]
+    fn prompt_coverage_choice_follows_rule() {
+        let wm = format!("{PROMPT_COVERAGE_ENV}WORD_MATCH");
+        let p = |name: &str, word: &str, recall: f64, silence: f64, gain: f64, lost: usize| {
+            let env: Vec<(&str, &str)> = if word.is_empty() {
+                Vec::new()
+            } else {
+                vec![(wm.as_str(), word)]
+            };
+            let mut r = pr(name, &env, Deltas::default(), false);
+            r.parts.insert(
+                "all".into(),
+                PartResult {
+                    metrics: HintMetrics {
+                        hint_recall: est(recall, recall),
+                        silence_rate: est(silence, silence),
+                        ..HintMetrics::default()
+                    },
+                    delta: Deltas {
+                        silence_rate: est(gain, gain),
+                        ..Deltas::default()
+                    },
+                    lost_pairs: lost,
+                    ..PartResult::default()
+                },
+            );
+            r.passes = prompt_coverage_passes(&r);
+            r
+        };
+        assert!(p("a", "plain", 0.5, 0.4, 0.10, 1).passes);
+        assert!(!p("a", "plain", 0.49, 0.4, 0.2, 0).passes, "полнота");
+        assert!(!p("a", "plain", 0.6, 0.4, 0.2, 2).passes, "потеря двух");
+        assert!(
+            !p("a", "plain", 0.6, 0.4, 0.099, 0).passes,
+            "рост тишины < 0,10"
+        );
+        let pts = vec![
+            p("off", "", 0.8, 0.2, 0.0, 0),
+            p("m6-plain", "plain", 0.6, 0.5, 0.3, 0),
+            p("m6-stems", "stems", 0.7, 0.5, 0.3, 1),
+            p("m4-stems", "stems", 0.9, 0.6, 0.4, 3),
+        ];
+        assert_eq!(
+            choose_prompt_coverage(&pts).0,
+            2,
+            "равная тишина — больший recall"
+        );
+        let tie = vec![
+            pts[0].clone(),
+            p("s", "stems", 0.6, 0.5, 0.3, 0),
+            p("p", "plain", 0.6, 0.5, 0.3, 0),
+            p("p2", "plain", 0.6, 0.5, 0.3, 0),
+        ];
+        assert_eq!(
+            choose_prompt_coverage(&tie).0,
+            2,
+            "затем plain, затем раньше"
+        );
+        let none = vec![pts[0].clone(), pts[3].clone()];
+        assert_eq!(choose_prompt_coverage(&none).0, 0, "не включается");
+        // пары: у базы показаны x (ожидалась) и y; у точки — только y: потеря одной пары, хотя
+        // во втором случае точка нашла ожидаемую z
+        let a = [o(&["x", "y"], &["x", "y"]), o(&[], &["z"])];
+        let b = [o(&["y"], &["x", "y"]), o(&["z"], &["z"])];
+        assert_eq!(lost_pairs(&a, &b), 1);
+    }
+
+    /// M7.5 §8.3 п. 4: слова ошибок включаются при нижней границе Δ точности (Бонферрони) > 0 и
+    /// без потерянных пар; иначе — первая точка.
+    #[test]
+    fn diag_choice_follows_rule() {
+        let p = |lo: f64, lost: usize| {
+            let d = Deltas {
+                hint_precision: est(lo + 0.05, lo),
+                ..Deltas::default()
+            };
+            let mut r = pr("on", &[(DIAG_ENV, "true")], d, false);
+            r.lost_pairs = lost;
+            r.passes = diag_passes(&r);
+            r
+        };
+        let base = pr("off", &[(DIAG_ENV, "false")], Deltas::default(), false);
+        assert_eq!(choose_diag_words(&[base.clone(), p(0.01, 0)]).0, 1);
+        assert_eq!(
+            choose_diag_words(&[base.clone(), p(0.0, 0)]).0,
+            0,
+            "граница не > 0"
+        );
+        assert_eq!(choose_diag_words(&[base, p(0.05, 1)]).0, 0, "потеря одной");
+    }
+
     /// A/A: одинаковые снятия — гейт пройден, шум 0; расхождение называет случай.
     #[test]
     fn aa_gate_detects_difference() {
@@ -978,12 +1277,33 @@ mod tests {
         assert_eq!(rule, GridRule::PromptMinScoreFts);
         let vals: Vec<f64> = pts.iter().filter_map(fts_value).collect();
         assert_eq!(vals, [0.6, 0.2, 0.3, 0.4, 0.5]);
+        let (rule, pts) = load(&root.join("grid-m75-hints-fts.toml")).unwrap();
+        assert_eq!(rule, GridRule::PromptFtsCoverage);
+        let names: Vec<&str> = pts.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["off", "m6-plain", "m6-stems", "m4-stems"]);
+        assert!(pts[0].env.is_empty());
+        let (rule, pts) = load(&root.join("grid-m75-post-tool-diag.toml")).unwrap();
+        assert_eq!(rule, GridRule::PostToolDiagWords);
+        assert_eq!(pts.len(), 2);
         let bad = root.join("../target/test-tmp/xtask/hint-grid");
         fs::create_dir_all(&bad).unwrap();
         let f = bad.join("g.toml");
         fs::write(
             &f,
             "rule = \"prompt_min_score_fts\"\n[[point]]\nname = \"a\"\nenv = { ZAM_SEARCH__BUDGET_TOKENS = \"600\" }\n",
+        )
+        .unwrap();
+        assert!(load(&f).is_err());
+        // первая точка M7.5 — умолчание
+        fs::write(
+            &f,
+            "rule = \"post_tool_diag_words\"\n[[point]]\nname = \"on\"\nenv = { ZAM_RECALL__POST_TOOL_DIAG_WORDS = \"true\" }\n",
+        )
+        .unwrap();
+        assert!(load(&f).is_err());
+        fs::write(
+            &f,
+            "rule = \"prompt_fts_coverage\"\n[[point]]\nname = \"a\"\nenv = { ZAM_RECALL__PROMPT_FTS_COVERAGE__CAP = \"4\" }\n",
         )
         .unwrap();
         assert!(load(&f).is_err());

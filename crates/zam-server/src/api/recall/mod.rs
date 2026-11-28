@@ -152,7 +152,10 @@
 //!   ослабленный (любое слово) — если запись покрывает достаточно **предметных** слов ошибки
 //!   ([`CoverageQuery::subject`], правило `recall.post_tool_coverage`, M6 §9 и M7.1 §4.6 п. 3:
 //!   без фразы «No such file or directory», имён каталогов из команды `path_words` и частых в insight
-//!   области слов — `subject_cover`; одного совпадения кода ошибки достаточно). Не больше
+//!   области слов — `subject_cover`; одного совпадения кода ошибки достаточно). При
+//!   `recall.post_tool_diag_words` (M7.5 §8.3 п. 4) покрытие — только по словам строк-диагностик
+//!   ([`diagnostic_lines`]), если они есть, и к строгой выдаче (после неё, до ослабленной)
+//!   присоединяются записи, найденные по коду ошибки ([`is_error_code`]) целиком. Не больше
 //!   [`POST_TOOL_MAX`]; строка — «ZeroAIMemory: эта ошибка уже разбиралась: …»;
 //! - **без повторов**: подсказка `prompt` показывается не больше раза за сессию — по
 //!   `session_seen` с частью [`RECALL_PART`] (любая ревизия). Дайджест `session_start` не
@@ -269,9 +272,9 @@ use tokio::time::Instant;
 use zam_core::shell::PATH_WORDS_MAX;
 use zam_core::{AGENT_BLOCK_VERSION, Id, SolutionGuid, TargetKind, TargetRef};
 use zam_search::recall::{
-    CoverageQuery, CoverageRule, HINT_PREFIX, Section, error_regex_matches, error_terms, hint_line,
-    is_common, is_error_code, normalize_error, one_line, pack_sections, reserved_text,
-    strip_exit_header, subject_error_terms,
+    CoverageQuery, CoverageRule, HINT_PREFIX, Section, diagnostic_lines, error_regex_matches,
+    error_terms, hint_line, is_common, is_error_code, normalize_error, one_line, pack_sections,
+    reserved_text, strip_exit_header, subject_error_terms,
 };
 use zam_search::truncate_marked;
 use zam_store::{
@@ -2784,7 +2787,7 @@ async fn term_cands(
 /// FTS (`degraded`) — `recall.prompt_min_score_fts` (не задан — `prompt_min_score`), иначе
 /// `recall.prompt_min_score` (M6 §9).
 fn prompt_min_score(st: &AppState, search: &Value) -> f64 {
-    if search["degraded"].as_bool() == Some(true) {
+    if search_degraded(search) {
         st.cfg
             .recall
             .prompt_min_score_fts
@@ -2792,6 +2795,13 @@ fn prompt_min_score(st: &AppState, search: &Value) -> f64 {
     } else {
         st.cfg.recall.prompt_min_score
     }
+}
+
+/// Поиск подсказок деградировал до FTS: поле `degraded` ответа внутреннего `/search` (нет модели,
+/// ORT или Qdrant) — у порога [`prompt_min_score`] и правила покрытия `prompt` без модели
+/// (`recall.prompt_fts_coverage`, M7.5 §8.3 п. 1).
+fn search_degraded(search: &Value) -> bool {
+    search["degraded"].as_bool() == Some(true)
 }
 
 /// Внутренний `POST /search` подсказок (тело `body`): без сессии (показанное учитывает сам
@@ -2867,10 +2877,12 @@ async fn inner_search(
     Ok(Some(v))
 }
 
-/// `post_tool`: `error_regex`, затем FTS по insight (см. модуль).
+/// `post_tool`: `error_regex`, затем FTS по insight (см. модуль); `diag_words` —
+/// `recall.post_tool_diag_words` (M7.5 §8.3 п. 4).
 async fn error_hints(
     req: &RecallReq,
     rule: &CoverageRule,
+    diag_words: bool,
     health: &mut Health<'_>,
     deadline: &mut Deadline,
 ) -> Result<Vec<Cand>, ApiError> {
@@ -2954,7 +2966,8 @@ async fn error_hints(
 
     // 2. FTS по insight по нормализованной ошибке; строка `Exit code <N>` агента — служебная
     // (M7.1 §4.6 п. 3)
-    let normalized = normalize_error(strip_exit_header(raw));
+    let body = strip_exit_header(raw);
+    let normalized = normalize_error(body);
     let terms = error_terms(&normalized);
     if out.len() < POST_TOOL_MAX && !terms.is_empty() {
         let mut hits: Vec<(f64, usize, zam_store::FtsHit, bool)> = Vec::new();
@@ -2963,24 +2976,7 @@ async fn error_hints(
             if spaces.is_empty() || !health.alive[i] {
                 continue;
             }
-            let q = FtsQuery {
-                drop_stop_words: false,
-                alias_groups: Vec::new(),
-                text: normalized.clone(),
-                space_ids: spaces,
-                path_prefix: None,
-                top_k: 100,
-                targets: TargetFilter {
-                    kinds: vec!["insight".into()],
-                    statuses: vec!["active".into(), "revisit".into()],
-                    area: None,
-                    certainty: Vec::new(),
-                    decided_by: None,
-                    file: None,
-                    insight_kinds: Vec::new(),
-                    entry_ids: Vec::new(),
-                },
-            };
+            let q = error_fts_query(normalized.clone(), spaces);
             let Some(r) = deadline.step(search_fts_channels(&t.db, q)).await else {
                 break;
             };
@@ -2990,10 +2986,29 @@ async fn error_hints(
         }
         // bm25: меньше — лучше (слияние баз — по сырому баллу, как в поиске)
         hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // M7.5 §8.3 п. 4: записи с кодом ошибки целиком — к строгой выдаче (после неё, до
+        // ослабленной: строгие хиты не уступают место), без порога покрытия
+        if diag_words {
+            let codes: Vec<String> = terms.iter().filter(|t| is_error_code(t)).cloned().collect();
+            if !codes.is_empty() {
+                let found = code_hits(&codes, targets, health, deadline).await?;
+                let (strict, relaxed): (Vec<_>, Vec<_>) = hits.into_iter().partition(|h| !h.3);
+                hits = strict;
+                hits.extend(found.into_iter().map(|(raw, i, h)| (raw, i, h, false)));
+                hits.extend(relaxed);
+            }
+        }
         // порог покрытия ослабленного FTS — `recall.post_tool_coverage` (M6 §9) по предметным
-        // словам ошибки (M7.1 §4.6 п. 3); нужен, только если ослабленный запрос что-то нашёл
+        // словам ошибки (M7.1 §4.6 п. 3), при `post_tool_diag_words` — строк-диагностик, если они
+        // есть (M7.5 §8.3 п. 4); нужен, только если ослабленный запрос что-то нашёл
         let cover = if hits.iter().any(|h| h.3) {
-            Some(subject_cover(req, rule, &normalized, targets, health, deadline).await)
+            // строки — в первых `ERROR_SCAN_MAX` байтах, как у `error_regex`
+            let diag = diag_words
+                .then(|| diagnostic_lines(strip_exit_header(scan)))
+                .flatten()
+                .map(|d| normalize_error(&d));
+            let subject = diag.as_deref().unwrap_or(&normalized);
+            Some(subject_cover(req, rule, subject, targets, health, deadline).await)
         } else {
             None
         };
@@ -3041,14 +3056,76 @@ async fn error_hints(
     Ok(out)
 }
 
+/// Запрос FTS подсказки `post_tool` по insight `active | revisit` пространств `spaces`: текст
+/// `text` — нормализованная ошибка или её коды.
+fn error_fts_query(text: String, spaces: Vec<Id>) -> FtsQuery {
+    FtsQuery {
+        drop_stop_words: false,
+        alias_groups: Vec::new(),
+        text,
+        space_ids: spaces,
+        path_prefix: None,
+        top_k: 100,
+        targets: TargetFilter {
+            kinds: vec!["insight".into()],
+            statuses: vec!["active".into(), "revisit".into()],
+            area: None,
+            certainty: Vec::new(),
+            decided_by: None,
+            file: None,
+            insight_kinds: Vec::new(),
+            entry_ids: Vec::new(),
+        },
+    }
+}
+
+/// Записи с кодом ошибки целиком (M7.5 §8.3 п. 4, `recall.post_tool_diag_words`): FTS по insight
+/// по кодам `codes` ошибки (строгий — все коды, при пустом — любой), из находок — только те, у
+/// которых в заголовке или тексте есть код запроса **целым словом** (префиксный терм FTS
+/// `"e0425"*` нашёл бы и `E04251`); `(сырой балл bm25, цель, хит)` по баллу. Срок сбора вышел —
+/// собранное.
+async fn code_hits(
+    codes: &[String],
+    targets: &[SearchTarget],
+    health: &mut Health<'_>,
+    deadline: &mut Deadline,
+) -> Result<Vec<(f64, usize, zam_store::FtsHit)>, ApiError> {
+    let whole = |text: &str| {
+        let text = text.to_lowercase();
+        text.split(|c: char| !c.is_alphanumeric())
+            .any(|w| codes.iter().any(|c| c == w))
+    };
+    let mut out = Vec::new();
+    for (i, t) in targets.iter().enumerate() {
+        let spaces = entry_spaces(t);
+        if spaces.is_empty() || !health.alive[i] {
+            continue;
+        }
+        let q = error_fts_query(codes.join(" "), spaces);
+        let Some(r) = deadline.step(search_fts_channels(&t.db, q)).await else {
+            break;
+        };
+        if let Some(ch) = health.soft(i, r)? {
+            out.extend(
+                ch.bm25
+                    .into_iter()
+                    .filter(|h| {
+                        h.entry
+                            .as_ref()
+                            .is_some_and(|e| whole(&format!("{}\n{}", e.title, h.text)))
+                    })
+                    .map(|h| (h.raw_score, i, h)),
+            );
+        }
+    }
+    out.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok(out)
+}
+
 /// Покрытие `post_tool` по предметным словам ошибки (M7.1 §4.6 п. 3,
 /// [`CoverageQuery::subject`]): слова `normalized` без служебных фраз
 /// ([`subject_error_terms`]), без имён каталогов из команды (`path_words` запроса) и без частых слов —
-/// [`is_common`] по документной частоте среди действующих insight области поиска (пространства
-/// решения и Knowledge живых целей, [`insight_term_docs`]); коды ошибок не снимаются.
-/// `recall.post_tool_coverage.common_pct = 100` — частота не считается. Сбой чтения частоты (WARN
-/// в журнал) или срок сбора — без частых слов, как при `common_pct = 100`: подсказка не
-/// теряется из-за вспомогательного запроса.
+/// [`common_terms`]; коды ошибок не снимаются.
 async fn subject_cover(
     req: &RecallReq,
     rule: &CoverageRule,
@@ -3070,6 +3147,23 @@ async fn subject_cover(
         .filter(|t| !is_error_code(t) && !path.contains(*t))
         .cloned()
         .collect();
+    let common = common_terms(rule, counted, targets, health, deadline).await;
+    CoverageQuery::subject(&terms, rule, |t| path.contains(t) || common.contains(t))
+}
+
+/// Частые слова `counted` (M7.1 §4.6 п. 3): [`is_common`] по документной частоте среди
+/// действующих insight области поиска (пространства решения и Knowledge живых целей,
+/// [`insight_term_docs`]) — у покрытия `post_tool` и подсказок `prompt` без модели (M7.5 §8.3
+/// п. 1). `rule.common_pct = 100` — частота не считается. Сбой чтения частоты (WARN в журнал) или
+/// срок сбора — без частых слов, как при `common_pct = 100`: подсказка не теряется из-за
+/// вспомогательного запроса.
+async fn common_terms(
+    rule: &CoverageRule,
+    counted: Vec<String>,
+    targets: &[SearchTarget],
+    health: &Health<'_>,
+    deadline: &mut Deadline,
+) -> HashSet<String> {
     let mut common: HashSet<String> = HashSet::new();
     if rule.common_pct < 100 && !counted.is_empty() {
         let (mut docs, mut df) = (0usize, vec![0usize; counted.len()]);
@@ -3089,7 +3183,7 @@ async fn subject_cover(
                 Some(Err(e)) => {
                     tracing::warn!(
                         error = %e,
-                        "post_tool: частота слов ошибки не прочитана — покрытие без частых слов"
+                        "recall: частота слов покрытия не прочитана — покрытие без частых слов"
                     );
                     complete = false;
                     break;
@@ -3097,7 +3191,7 @@ async fn subject_cover(
                 None => {
                     tracing::warn!(
                         reason = "recall timeout",
-                        "post_tool: частота слов ошибки не посчитана до срока сбора — покрытие без \
+                        "recall: частота слов покрытия не посчитана до срока сбора — покрытие без \
                          частых слов"
                     );
                     complete = false;
@@ -3114,7 +3208,7 @@ async fn subject_cover(
                 .collect();
         }
     }
-    CoverageQuery::subject(&terms, rule, |t| path.contains(t) || common.contains(t))
+    common
 }
 
 /// Ключ показа подсказки в `session_seen`.
@@ -3940,7 +4034,8 @@ pub(crate) async fn recall_with(
         }
         Event::PostTool => {
             let rule = st.cfg.recall.post_tool_coverage;
-            let c = error_hints(&req, &rule, &mut health, &mut deadline).await?;
+            let diag = st.cfg.recall.post_tool_diag_words;
+            let c = error_hints(&req, &rule, diag, &mut health, &mut deadline).await?;
             (Lines::default(), vec![(None, c)], true)
         }
         // у субагента свой контекст: пакет повторяется (показ отмечается)

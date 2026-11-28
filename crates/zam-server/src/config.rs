@@ -819,6 +819,20 @@ pub struct RecallSection {
     /// `common_pct` (M7.1 §4.6 п. 3, 1..=100) — слово ошибки в большей доле insight области
     /// поиска частое и в покрытие не идёт; 100 — выключено ([`CoverageRule::M71`]).
     pub post_tool_coverage: CoverageRule,
+    /// Правило покрытия подсказок `prompt` без модели (M7.5 §8.3 п. 1): только когда поиск
+    /// подсказок к запросу деградировал до FTS (`degraded`), карточка проходит, если предметных слов
+    /// запроса (`zam_search::recall::prompt_subject_words` по первым 512 символам) покрыто в
+    /// заголовке и фрагменте не меньше `need(n)`; `common_pct` < 100 — частые в insight слова в
+    /// покрытие не идут, как у `post_tool_coverage`. Поля и диапазоны — как у
+    /// `post_tool_coverage`, незаданное поле — из его умолчания. Нет ключа — выключено, как 0.0.17.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_fts_coverage: Option<CoverageRule>,
+    /// Слова строк-диагностик `post_tool` (M7.5 §8.3 п. 4, `false`): покрытие ослабленного FTS —
+    /// только по словам строк, начинающихся с `error`, `fatal`, `failed`, `panic`, `exception`,
+    /// `traceback` или содержащих код ошибки (`zam_search::recall::diagnostic_lines`), если они
+    /// есть; к строгой выдаче присоединяются записи, найденные по коду ошибки целиком.
+    #[serde(default)]
+    pub post_tool_diag_words: bool,
     /// Бюджет сервера на сбор подсказок хуков, мс (1..=60000, 200): по превышении отдаётся
     /// собранное и `warnings: ["recall timeout"]`.
     pub timeout_ms: u64,
@@ -873,15 +887,21 @@ impl RecallSection {
         {
             return Err(bad("prompt_min_score_fts", "должно быть в 0..=1"));
         }
-        let cov = &self.post_tool_coverage;
-        if !(1..=10).contains(&cov.divisor) {
-            return Err(bad("post_tool_coverage.divisor", "от 1 до 10"));
-        }
-        if !(2..=32).contains(&cov.cap) {
-            return Err(bad("post_tool_coverage.cap", "от 2 до 32"));
-        }
-        if !(1..=100).contains(&cov.common_pct) {
-            return Err(bad("post_tool_coverage.common_pct", "от 1 до 100"));
+        let rules = std::iter::once(("post_tool_coverage", &self.post_tool_coverage)).chain(
+            self.prompt_fts_coverage
+                .as_ref()
+                .map(|r| ("prompt_fts_coverage", r)),
+        );
+        for (key, cov) in rules {
+            if !(1..=10).contains(&cov.divisor) {
+                return Err(bad(&format!("{key}.divisor"), "от 1 до 10"));
+            }
+            if !(2..=32).contains(&cov.cap) {
+                return Err(bad(&format!("{key}.cap"), "от 2 до 32"));
+            }
+            if !(1..=100).contains(&cov.common_pct) {
+                return Err(bad(&format!("{key}.common_pct"), "от 1 до 100"));
+            }
         }
         if !(1..=60_000).contains(&self.timeout_ms) {
             return Err(bad("timeout_ms", "от 1 до 60000"));
@@ -1822,6 +1842,8 @@ impl Default for ServerConfig {
                 prompt_min_score: 0.6,
                 prompt_min_score_fts: None,
                 post_tool_coverage: CoverageRule::M71,
+                prompt_fts_coverage: None,
+                post_tool_diag_words: false,
                 timeout_ms: 200,
                 max_timeout_ms: 2000,
                 snippet_tokens: 60,
@@ -3231,6 +3253,68 @@ master_key = \"x\"
             ("ZAM_RECALL__POST_TOOL_COVERAGE__WORD_MATCH", "snowball"),
             ("ZAM_RECALL__POST_TOOL_COVERAGE__COMMON_PCT", "0"),
             ("ZAM_RECALL__POST_TOOL_COVERAGE__COMMON_PCT", "101"),
+        ] {
+            assert!(
+                load(None, &[env(k, v)], &Default::default()).is_err(),
+                "{k}={v}"
+            );
+        }
+    }
+
+    /// M7.5 §8.3: `recall.prompt_fts_coverage` — нет ключа по умолчанию (как 0.0.17), поля через
+    /// `ZAM_*` (незаданные — из `M71`) и файл, диапазоны — как у `post_tool_coverage`;
+    /// `recall.post_tool_diag_words` — `false`.
+    #[test]
+    fn config_prompt_fts_coverage_range() {
+        use zam_search::recall::WordMatch;
+        let d = load(None, &[], &Default::default()).unwrap().recall;
+        assert_eq!(d.prompt_fts_coverage, None);
+        assert!(!d.post_tool_diag_words);
+        let e = vec![
+            env("ZAM_RECALL__PROMPT_FTS_COVERAGE__DIVISOR", "3"),
+            env("ZAM_RECALL__PROMPT_FTS_COVERAGE__CAP", "4"),
+            env("ZAM_RECALL__PROMPT_FTS_COVERAGE__WORD_MATCH", "stems"),
+            env("ZAM_RECALL__POST_TOOL_DIAG_WORDS", "true"),
+        ];
+        let r = load(None, &e, &Default::default()).unwrap().recall;
+        assert_eq!(
+            r.prompt_fts_coverage,
+            Some(CoverageRule {
+                divisor: 3,
+                cap: 4,
+                word_match: WordMatch::Stems,
+                common_pct: CoverageRule::M71.common_pct,
+            })
+        );
+        assert!(r.post_tool_diag_words);
+        assert_eq!(
+            r.post_tool_coverage,
+            CoverageRule::M71,
+            "покрытие post_tool — прежнее"
+        );
+        let f = write_in_target(
+            "prompt-fts-coverage.toml",
+            "[recall]\nprompt_fts_coverage = { divisor = 2, cap = 6, word_match = \"plain\", \
+             common_pct = 100 }\n",
+        );
+        let c = load(Some(&f), &[], &Default::default()).unwrap();
+        assert_eq!(
+            c.recall.prompt_fts_coverage,
+            Some(CoverageRule {
+                common_pct: 100,
+                ..CoverageRule::M6
+            })
+        );
+        for (k, v) in [
+            ("ZAM_RECALL__PROMPT_FTS_COVERAGE__DIVISOR", "0"),
+            ("ZAM_RECALL__PROMPT_FTS_COVERAGE__DIVISOR", "11"),
+            ("ZAM_RECALL__PROMPT_FTS_COVERAGE__CAP", "1"),
+            ("ZAM_RECALL__PROMPT_FTS_COVERAGE__CAP", "33"),
+            ("ZAM_RECALL__PROMPT_FTS_COVERAGE__WORD_MATCH", "snowball"),
+            ("ZAM_RECALL__PROMPT_FTS_COVERAGE__COMMON_PCT", "0"),
+            ("ZAM_RECALL__PROMPT_FTS_COVERAGE__COMMON_PCT", "101"),
+            ("ZAM_RECALL__PROMPT_FTS_COVERAGE__X", "1"),
+            ("ZAM_RECALL__POST_TOOL_DIAG_WORDS", "2"),
         ] {
             assert!(
                 load(None, &[env(k, v)], &Default::default()).is_err(),

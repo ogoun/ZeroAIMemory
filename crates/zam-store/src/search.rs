@@ -17,6 +17,14 @@
 //!   терминов словаря, заменены группами `("слово"* OR "имя"* OR "псевдоним"*)` ([`AliasGroup`],
 //!   строит сервер); строгий запрос, затем ослабленный, как у основного канала. Псевдоним короче
 //!   3 символов ищется только точным словом, без `*`. Без групп канал не строится.
+//! - **Даты** (M7.5 §8.4, [`query_dates`]): `ДД.ММ.ГГГГ`, `Д.М.ГГГГ` и `ГГГГ-ММ-ДД` запроса (с
+//!   проверкой календаря, до [`DATES_MAX`]) — расширение запроса без переиндексации, как группы
+//!   `alias`: три слова даты в строгом и ослабленном запросе (и в `alias`) заменяются группой фраз
+//!   `("2021 03 15" OR "15 03 2021" OR "15 3 2021")` — FTS5 `unicode61` режет дату по точкам и
+//!   дефисам на три слова, и фраза находит её в любой из форм, но не те же числа вразброс; группа —
+//!   одна часть запроса (запрос из одной даты — без ослабленного). Trigram — каждая форма с её
+//!   разделителями альтернативой идентификатора, подсветка ([`query_needles`]) — все формы. Запрос
+//!   без даты — побайтово прежний; [`sanitize_fts`] (Vault) дат не знает.
 //!
 //! Для гибридного поиска (M2) каналы отдаются раздельно — [`search_fts_channels`]: их
 //! сливает `zam-search` вместе с векторным каналом и весами из конфигурации; там же
@@ -43,6 +51,7 @@
 //! и `snippet()` читаются лишь для итоговых top_k. Фильтр области (пространства,
 //! префикс пути, живые узлы) действует до отсечения top-N канала.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use jiff::Timestamp;
@@ -429,6 +438,125 @@ pub fn query_terms(query: &str) -> Vec<&str> {
     terms(query)
 }
 
+/// Дат в запросе, не больше (M7.5 §8.4 п. 2): остальные — слова, как раньше.
+pub const DATES_MAX: usize = 4;
+
+/// Дата запроса (M7.5 §8.4): `ДД.ММ.ГГГГ`, `Д.М.ГГГГ` или `ГГГГ-ММ-ДД` с проверкой календаря.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryDate {
+    pub year: i16,
+    pub month: i8,
+    pub day: i8,
+    /// Номер первого из трёх слов даты среди всех слов запроса (`words`, без предела 32).
+    word: usize,
+}
+
+impl QueryDate {
+    /// Фразы FTS5 даты (слова через пробел): ISO `ГГГГ ММ ДД`, `ДД ММ ГГГГ` и без ведущих нулей
+    /// `Д М ГГГГ` — если отличается.
+    pub fn phrases(&self) -> Vec<String> {
+        let (y, m, d) = (self.year, self.month, self.day);
+        let mut out = vec![
+            format!("{y:04} {m:02} {d:02}"),
+            format!("{d:02} {m:02} {y:04}"),
+        ];
+        let short = format!("{d} {m} {y:04}");
+        if !out.contains(&short) {
+            out.push(short);
+        }
+        out
+    }
+
+    /// Те же формы с разделителями (trigram и подсветка): `ГГГГ-ММ-ДД`, `ДД.ММ.ГГГГ`, `Д.М.ГГГГ`
+    /// (если отличается).
+    pub fn literals(&self) -> Vec<String> {
+        let (y, m, d) = (self.year, self.month, self.day);
+        let mut out = vec![
+            format!("{y:04}-{m:02}-{d:02}"),
+            format!("{d:02}.{m:02}.{y:04}"),
+        ];
+        let short = format!("{d}.{m}.{y:04}");
+        if !out.contains(&short) {
+            out.push(short);
+        }
+        out
+    }
+
+    /// Группа FTS5 даты: `("2021 03 15" OR "15 03 2021" OR "15 3 2021")`.
+    fn group(&self) -> String {
+        let alts: Vec<String> = self.phrases().iter().map(|p| quote(p)).collect();
+        format!("({})", alts.join(" OR "))
+    }
+}
+
+/// Дата из одного токена (`15.03.2021`, `5.3.2021`, `2021-03-15`): цифры ASCII, у точек — день и
+/// месяц из 1–2 цифр, у ISO — ровно 2; год — 4 цифры; дата календаря (`jiff`: `31.02.2021` — не
+/// дата). `/` и двузначный год не распознаются: порядок дня и месяца неоднозначен.
+fn parse_date(tok: &str) -> Option<(i16, i8, i8)> {
+    let num = |s: &str, lens: std::ops::RangeInclusive<usize>| -> Option<i16> {
+        (lens.contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse().ok())
+            .flatten()
+    };
+    let (y, m, d) = if let [y, m, d] = tok.split('-').collect::<Vec<_>>()[..] {
+        (num(y, 4..=4)?, num(m, 2..=2)?, num(d, 2..=2)?)
+    } else if let [d, m, y] = tok.split('.').collect::<Vec<_>>()[..] {
+        (num(y, 4..=4)?, num(m, 1..=2)?, num(d, 1..=2)?)
+    } else {
+        return None;
+    };
+    let (m, d) = (i8::try_from(m).ok()?, i8::try_from(d).ok()?);
+    jiff::civil::Date::new(y, m, d).ok()?;
+    Some((y, m, d))
+}
+
+/// Байтовое начало каждого слова `words(query)` (тот же порядок).
+fn word_starts(query: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut prev = false;
+    for (i, ch) in query.char_indices() {
+        let w = ch.is_alphanumeric();
+        if w && !prev {
+            out.push(i);
+        }
+        prev = w;
+    }
+    out
+}
+
+/// Даты запроса (M7.5 §8.4 п. 1), не больше [`DATES_MAX`], по порядку: токены через пробелы без
+/// обрамляющей пунктуации (`(15.03.2021),` — дата), целиком — дата [`parse_date`]. У даты три
+/// слова подряд (`15`, `03`, `2021`), номер первого — среди всех слов запроса.
+pub fn query_dates(query: &str) -> Vec<QueryDate> {
+    let mut out = Vec::new();
+    let mut starts: Option<Vec<usize>> = None;
+    for tok in query.split(char::is_whitespace) {
+        let core = tok.trim_matches(|c: char| !c.is_alphanumeric());
+        if core.len() < 8 {
+            continue;
+        }
+        let Some((year, month, day)) = parse_date(core) else {
+            continue;
+        };
+        // смещение токена в запросе: `core` — срез `query`
+        let at = core.as_ptr() as usize - query.as_ptr() as usize;
+        let starts = starts.get_or_insert_with(|| word_starts(query));
+        let Ok(word) = starts.binary_search(&at) else {
+            continue;
+        };
+        out.push(QueryDate {
+            year,
+            month,
+            day,
+            word,
+        });
+        if out.len() == DATES_MAX {
+            break;
+        }
+    }
+    out
+}
+
 fn terms(query: &str) -> Vec<&str> {
     words(query).take(MAX_TERMS).collect()
 }
@@ -466,18 +594,38 @@ pub fn fts_terms(query: &str, drop_stop: bool) -> Vec<&str> {
 }
 
 /// Подстроки запроса для подсветки сниппета у хита без FTS-сниппета (векторный канал,
-/// замена сводки листом): идентификаторы, затем слова от 3 символов, без повторов.
+/// замена сводки листом): идентификаторы, затем слова от 3 символов, без повторов. За
+/// идентификатором-датой (M7.5 §8.4) — её остальные формы ([`QueryDate::literals`]).
 pub fn query_needles(query: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let words = terms(query)
         .into_iter()
         .filter(|t| t.chars().count() >= MIN_PREFIX_CHARS);
-    for t in identifiers(query).into_iter().chain(words) {
+    let mut push = |t: &str| {
         if !out.iter().any(|o| o == t) {
             out.push(t.to_string());
         }
+    };
+    for t in identifiers(query).into_iter().chain(words) {
+        push(t);
+        for lit in date_literals(t) {
+            push(&lit);
+        }
     }
     out
+}
+
+/// Формы даты с разделителями ([`QueryDate::literals`]), если токен `t` — дата; иначе пусто.
+fn date_literals(t: &str) -> Vec<String> {
+    parse_date(t).map_or_else(Vec::new, |(year, month, day)| {
+        QueryDate {
+            year,
+            month,
+            day,
+            word: 0,
+        }
+        .literals()
+    })
 }
 
 /// Строка в кавычках FTS5 (кавычки внутри удваиваются): операторы теряют смысл.
@@ -518,6 +666,55 @@ fn fts_query(query: &str, sep: &str, drop_stop: bool) -> Option<String> {
     Some(t.into_iter().map(quote_term).collect::<Vec<_>>().join(sep))
 }
 
+/// Части запроса `bm25` с датами (M7.5 §8.4 п. 3): термы FTS5 слов [`fts_terms`] и группа
+/// [`QueryDate::group`] вместо трёх слов каждой даты `dates` ([`query_dates`] того же запроса).
+/// Предел — те же 32 слова (дата — три); дата, не уместившаяся целиком, и всё после неё — вне
+/// запроса. Без дат — [`fts_terms`] как есть.
+fn fts_parts(query: &str, drop_stop: bool, dates: &[QueryDate]) -> Vec<String> {
+    if dates.is_empty() {
+        return fts_terms(query, drop_stop)
+            .into_iter()
+            .map(quote_term)
+            .collect();
+    }
+    let drop = drops_stop_words(query, drop_stop);
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    let mut skip = 0usize;
+    for (i, w) in words(query).enumerate() {
+        if skip > 0 {
+            skip -= 1;
+            continue;
+        }
+        if let Some(d) = dates.iter().find(|d| d.word == i) {
+            if used + 3 > MAX_TERMS {
+                break;
+            }
+            out.push(d.group());
+            used += 3;
+            skip = 2;
+        } else if !(drop && stop_word(w)) {
+            out.push(quote_term(w));
+            used += 1;
+        }
+        if used >= MAX_TERMS {
+            break;
+        }
+    }
+    out
+}
+
+/// [`fts_query`] с датами `dates` ([`fts_parts`]): у строгого запроса с группой даты слова — через
+/// `AND` (неявное «И» FTS5 перед скобкой не разбирает); без дат — побайтово [`fts_query`].
+fn fts_query_dated(query: &str, sep: &str, drop_stop: bool, dates: &[QueryDate]) -> Option<String> {
+    if dates.is_empty() {
+        return fts_query(query, sep, drop_stop);
+    }
+    let parts = fts_parts(query, drop_stop, dates);
+    let sep = if sep == " " { " AND " } else { sep };
+    (!parts.is_empty()).then(|| parts.join(sep))
+}
+
 /// Имя или псевдоним термина как терм FTS5: слова фразой; префикс (`*`) — только если последнее
 /// слово не короче [`MIN_PREFIX_CHARS`] символов, иначе точная фраза. `None` — в строке нет слов.
 fn phrase_term(s: &str) -> Option<String> {
@@ -537,17 +734,20 @@ fn phrase_term(s: &str) -> Option<String> {
 /// нет слов.
 #[cfg(test)]
 fn alias_fts(query: &str, groups: &[AliasGroup], sep: &str) -> Option<String> {
-    alias_fts_with(query, groups, sep, false)
+    alias_fts_with(query, groups, sep, false, &[])
 }
 
 /// [`alias_fts`] с флагом служебных слов ([`fts_terms`]): индексы групп — по словам
 /// [`query_terms`] (со служебными), служебное слово вне группы при `drop_stop` выпадает, если в
-/// запросе есть другое слово; слова группы остаются — группа — совпавший термин словаря.
+/// запросе есть другое слово; слова группы остаются — группа — совпавший термин словаря. Три
+/// слова даты `dates` (M7.5 §8.4, вне группы словаря — у группы приоритет) — группой
+/// [`QueryDate::group`]; без дат — как прежде.
 fn alias_fts_with(
     query: &str,
     groups: &[AliasGroup],
     sep: &str,
     drop_stop: bool,
+    dates: &[QueryDate],
 ) -> Option<String> {
     let t = terms(query);
     if t.is_empty() {
@@ -572,6 +772,9 @@ fn alias_fts_with(
             }
             parts.push(format!("({})", alts.join(" OR ")));
             i += g.len;
+        } else if let Some(d) = dates.iter().find(|d| d.word == i && i + 3 <= t.len()) {
+            parts.push(d.group());
+            i += 3;
         } else {
             if !(drop && stop_word(t[i])) {
                 parts.push(quote_term(t[i]));
@@ -597,22 +800,33 @@ fn identifiers(query: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Запрос канала trigram и подстроки для сниппета. Идентификаторы — через OR;
-/// без идентификаторов — вся фраза, если `bm25_empty` и в ней не меньше 3 символов
-/// (короче trigram не ищет). `None` — канал не запускается.
-fn trigram_query(query: &str, bm25_empty: bool) -> Option<(String, Vec<&str>)> {
+/// Запрос канала trigram и подстроки для сниппета. Идентификаторы — через OR; за
+/// идентификатором-датой (M7.5 §8.4 п. 3) — её остальные формы с их разделителями
+/// ([`QueryDate::literals`]) альтернативами; без идентификаторов — вся фраза, если `bm25_empty` и
+/// в ней не меньше 3 символов (короче trigram не ищет). `None` — канал не запускается.
+fn trigram_query(query: &str, bm25_empty: bool) -> Option<(String, Vec<Cow<'_, str>>)> {
     let ids = identifiers(query);
     if !ids.is_empty() {
-        let fts = ids
+        let mut needles: Vec<Cow<'_, str>> = Vec::with_capacity(ids.len());
+        for t in ids {
+            // идентификаторы — как прежде, с повторами (запрос без даты — побайтово прежний)
+            needles.push(Cow::Borrowed(t));
+            for lit in date_literals(t) {
+                if !needles.iter().any(|n| *n == lit) {
+                    needles.push(Cow::Owned(lit));
+                }
+            }
+        }
+        let fts = needles
             .iter()
             .map(|t| quote(t))
             .collect::<Vec<_>>()
             .join(" OR ");
-        return Some((fts, ids));
+        return Some((fts, needles));
     }
     let phrase = query.trim();
     (bm25_empty && phrase.chars().count() >= MIN_PREFIX_CHARS)
-        .then(|| (quote(phrase), vec![phrase]))
+        .then(|| (quote(phrase), vec![Cow::Borrowed(phrase)]))
 }
 
 /// Канал поиска.
@@ -854,7 +1068,8 @@ pub async fn search_fts(db: &Db, q: FtsQuery) -> Result<Vec<FtsHit>, StoreError>
             q.drop_stop_words,
         )?;
         let ranked = merge(ch.a, ch.b, q.top_k);
-        fetch_hits(&tx, &ranked, ch.a_fts.as_deref(), None, &ch.needles, true)
+        let needles: Vec<&str> = ch.needles.iter().map(AsRef::as_ref).collect();
+        fetch_hits(&tx, &ranked, ch.a_fts.as_deref(), None, &needles, true)
     })
     .await
 }
@@ -971,7 +1186,7 @@ async fn fts_channels(
             &all,
             ch.a_fts.as_deref(),
             ch.alias_fts.as_deref(),
-            &ch.needles,
+            &ch.needles.iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
             light.is_none_or(|l| l.snippets),
         )?
         .into_iter()
@@ -1215,12 +1430,15 @@ struct Channels<'q> {
     relaxed: bool,
     /// `alias` — по ослабленному запросу.
     alias_relaxed: bool,
-    needles: Vec<&'q str>,
+    /// Подстроки сниппета trigram-хитов (с формами дат — свои строки).
+    needles: Vec<Cow<'q, str>>,
 }
 
 /// Канал A (строгий запрос, при пустой выдаче — ослабленный; `any` — сразу ослабленный,
 /// [`LightSearch::any_terms`]) и канал B; `drop_stop` — без служебных слов в запросах `bm25` и
-/// `alias` ([`fts_terms`], [`FtsQuery::drop_stop_words`]).
+/// `alias` ([`fts_terms`], [`FtsQuery::drop_stop_words`]). Даты запроса ([`query_dates`], M7.5
+/// §8.4) — группами фраз в `bm25` и `alias` и формами в trigram; «одно слово — без ослабленного» —
+/// по частям запроса (дата — одна часть).
 #[allow(clippy::too_many_arguments)]
 fn run_channels<'q>(
     tx: &Connection,
@@ -1233,11 +1451,16 @@ fn run_channels<'q>(
     any: bool,
     drop_stop: bool,
 ) -> Result<Channels<'q>, StoreError> {
-    let n_terms = fts_terms(text, drop_stop).len();
+    let dates = query_dates(text);
+    let n_terms = if dates.is_empty() {
+        fts_terms(text, drop_stop).len()
+    } else {
+        fts_parts(text, drop_stop, &dates).len()
+    };
     let mut a_fts = if any {
         None
     } else {
-        fts_query(text, " ", drop_stop)
+        fts_query_dated(text, " ", drop_stop, &dates)
     };
     let mut relaxed = false;
     let mut a = match &a_fts {
@@ -1245,7 +1468,7 @@ fn run_channels<'q>(
         None => Vec::new(),
     };
     if a.is_empty() && (any || n_terms > 1) {
-        a_fts = fts_query(text, " OR ", drop_stop);
+        a_fts = fts_query_dated(text, " OR ", drop_stop, &dates);
         // запрос из одного слова и «любым словом» — строгий
         relaxed = n_terms > 1;
         if let Some(fts) = &a_fts {
@@ -1256,12 +1479,12 @@ fn run_channels<'q>(
     let mut alias_fts_q: Option<String> = None;
     let mut alias_relaxed = false;
     if !groups.is_empty() {
-        alias_fts_q = alias_fts_with(text, groups, " AND ", drop_stop);
+        alias_fts_q = alias_fts_with(text, groups, " AND ", drop_stop, &dates);
         if let Some(fts) = &alias_fts_q {
             alias = run_channel(tx, Channel::Bm25, fts, prefix, spaces, t, depth)?;
         }
         if alias.is_empty() && n_terms > 1 {
-            alias_fts_q = alias_fts_with(text, groups, " OR ", drop_stop);
+            alias_fts_q = alias_fts_with(text, groups, " OR ", drop_stop, &dates);
             alias_relaxed = true;
             if let Some(fts) = &alias_fts_q {
                 alias = run_channel(tx, Channel::Bm25, fts, prefix, spaces, t, depth)?;
@@ -2207,14 +2430,17 @@ mod tests {
             trigram_query("настройка mygit.core и a\"b.c", false),
             Some((
                 r#""mygit.core" OR "a""b.c""#.to_string(),
-                vec!["mygit.core", "a\"b.c"]
+                vec![Cow::from("mygit.core"), Cow::from("a\"b.c")]
             ))
         );
         // без идентификаторов — фраза, только при пустом bm25
         assert_eq!(trigram_query(" просто слова ", false), None);
         assert_eq!(
             trigram_query(" просто слова ", true),
-            Some((r#""просто слова""#.to_string(), vec!["просто слова"]))
+            Some((
+                r#""просто слова""#.to_string(),
+                vec![Cow::from("просто слова")]
+            ))
         );
         assert_eq!(trigram_query("ab", true), None);
     }
@@ -2309,7 +2535,7 @@ mod tests {
             with: vec!["Выжимка".into()],
         }];
         assert_eq!(
-            alias_fts_with("как файл summary для", &groups, " AND ", true).as_deref(),
+            alias_fts_with("как файл summary для", &groups, " AND ", true, &[]).as_deref(),
             Some(r#""файл"* AND ("summary"* OR "Выжимка"*)"#)
         );
         // служебное слово внутри группы остаётся: группа — совпавший термин словаря
@@ -2319,7 +2545,7 @@ mod tests {
             with: vec!["Кэш".into()],
         }];
         assert_eq!(
-            alias_fts_with("the cache файл", &groups, " AND ", true).as_deref(),
+            alias_fts_with("the cache файл", &groups, " AND ", true, &[]).as_deref(),
             Some(r#"("the cache"* OR "Кэш"*) AND "файл"*"#)
         );
     }
@@ -2339,7 +2565,7 @@ mod tests {
             with: vec!["x".into()],
         }];
         assert_eq!(
-            alias_fts_with("как для", &groups, " OR ", true).as_deref(),
+            alias_fts_with("как для", &groups, " OR ", true, &[]).as_deref(),
             Some(r#"("как"* OR "x") OR "для"*"#)
         );
     }
@@ -2366,16 +2592,259 @@ mod tests {
             with: vec!["Выжимка".into()],
         }];
         assert_eq!(
-            alias_fts_with("как файл summary для", &groups, " AND ", false).as_deref(),
+            alias_fts_with("как файл summary для", &groups, " AND ", false, &[]).as_deref(),
             Some(r#""как"* AND "файл"* AND ("summary"* OR "Выжимка"*) AND "для"*"#)
         );
         assert_eq!(
-            alias_fts_with("как файл summary для", &groups, " AND ", false),
+            alias_fts_with("как файл summary для", &groups, " AND ", false, &[]),
             alias_fts("как файл summary для", &groups, " AND ")
         );
         // предел слов — тот же: первые MAX_TERMS
         let long: String = (0..40).map(|i| format!("w{i} ")).collect();
         assert_eq!(fts_terms(&long, false).len(), MAX_TERMS);
         assert_eq!(fts_terms(&long, true).len(), MAX_TERMS);
+    }
+
+    // ---------- даты в FTS (M7.5 §8.4) ----------
+
+    /// База в памяти со схемой пользователя: пространство Knowledge и по заметке с одним листом на
+    /// текст `texts`; `(соединение, пространство, seq листов по порядку)`.
+    fn fts_world(texts: &[&str]) -> (Connection, Id, Vec<i64>) {
+        let c = Connection::open_in_memory().unwrap();
+        for m in crate::USER_MIGRATIONS {
+            c.execute_batch(m.sql).unwrap();
+        }
+        let space = Id::new();
+        c.execute(
+            "INSERT INTO spaces (id, kind, name, created_at) VALUES (?1, 'knowledge', 'k', 't')",
+            params![space],
+        )
+        .unwrap();
+        let mut seqs = Vec::new();
+        for (i, t) in texts.iter().enumerate() {
+            let node = Id::new();
+            c.execute(
+                "INSERT INTO nodes (id, space_id, kind, name, path, index_state, created_at,
+                   updated_at) VALUES (?1, ?2, 'note', ?3, ?3, 'indexed', 't', 't')",
+                params![node, space, format!("n{i}")],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO chunks (id, node_id, rev, level, ordinal, text, context_prefix,
+                   token_count, text_hash) VALUES (?1, ?2, 1, 'chunk', 0, ?3, '', 1, 'h')",
+                params![format!("c{i}"), node, t],
+            )
+            .unwrap();
+            seqs.push(c.last_insert_rowid());
+        }
+        (c, space, seqs)
+    }
+
+    /// Канал `bm25` (строгий, при пустом — ослабленный) по запросу `q`: seq листов и признак
+    /// ослабленного запроса.
+    fn bm25_seqs(c: &Connection, space: Id, q: &str) -> (Vec<i64>, bool) {
+        let t = TargetFilter::default().args();
+        let ch = run_channels(c, q, None, &[space], &t, &[], None, false, false).unwrap();
+        (ch.a.iter().map(|x| x.0).collect(), ch.relaxed)
+    }
+
+    /// M7.5 §8.4 п. 1–2: `ДД.ММ.ГГГГ`, `Д.М.ГГГГ`, `ГГГГ-ММ-ДД` — даты с проверкой календаря
+    /// (`31.02.2021` — нет, `29.02.2024` — да); `/`, двузначный год, ISO без ведущих нулей и токен
+    /// со словом — нет; номер первого слова — среди всех слов запроса; не больше четырёх; формы —
+    /// ISO, `ДД ММ ГГГГ` и `Д М ГГГГ` (если отличается).
+    #[test]
+    fn date_forms_parsed() {
+        let d = query_dates("отчёт за 15.03.2021, затем (2021-03-05) и 5.3.2021.");
+        let ymdw: Vec<_> = d.iter().map(|d| (d.year, d.month, d.day, d.word)).collect();
+        // слова: отчёт 0, за 1, 15 2, 03 3, 2021 4, затем 5, 2021 6, 03 7, 05 8, и 9, 5 10
+        assert_eq!(ymdw, [(2021, 3, 15, 2), (2021, 3, 5, 6), (2021, 3, 5, 10)]);
+        assert_eq!(d[0].phrases(), ["2021 03 15", "15 03 2021", "15 3 2021"]);
+        assert_eq!(d[0].literals(), ["2021-03-15", "15.03.2021", "15.3.2021"]);
+        assert_eq!(
+            d[0].group(),
+            r#"("2021 03 15" OR "15 03 2021" OR "15 3 2021")"#
+        );
+        assert_eq!(d[1].phrases(), ["2021 03 05", "05 03 2021", "5 3 2021"]);
+        assert_eq!(d[1].literals(), ["2021-03-05", "05.03.2021", "5.3.2021"]);
+        // без ведущих нулей форма та же — две
+        let nov = query_dates("12.11.2021");
+        assert_eq!(nov[0].phrases(), ["2021 11 12", "12 11 2021"]);
+        assert_eq!(nov[0].literals(), ["2021-11-12", "12.11.2021"]);
+        assert_eq!(query_dates("29.02.2024").len(), 1, "високосный");
+        for not in [
+            "31.02.2021",
+            "29.02.2021",
+            "32.01.2021",
+            "15.13.2021",
+            "15/03/2021",
+            "15.03.21",
+            "2021-3-15",
+            "2021.03.15",
+            "15-03-2021",
+            "1.1.20210",
+            "v15.03.2021",
+            "15.03.2021г",
+            "１５.03.2021",
+        ] {
+            assert!(query_dates(not).is_empty(), "{not}");
+        }
+        let many = "01.01.2021 02.01.2021 03.01.2021 04.01.2021 05.01.2021";
+        assert_eq!(query_dates(many).len(), DATES_MAX);
+    }
+
+    /// M7.5 §8.4: ISO в запросе находит дату с точками и без ведущих нулей.
+    #[test]
+    fn fts_date_iso_finds_dotted() {
+        let (c, sp, s) = fts_world(&[
+            "Совещание перенесли на 15.03.2021 из-за поставки.",
+            "Сдача пилота 5.3.2021, приёмка стенда.",
+            "Прочее.",
+        ]);
+        assert_eq!(bm25_seqs(&c, sp, "2021-03-15"), (vec![s[0]], false));
+        assert_eq!(bm25_seqs(&c, sp, "совещание 2021-03-15").0, [s[0]]);
+        assert_eq!(bm25_seqs(&c, sp, "2021-03-05"), (vec![s[1]], false));
+    }
+
+    /// M7.5 §8.4: дата с точками (с ведущими нулями и без) находит ISO.
+    #[test]
+    fn fts_date_dotted_finds_iso() {
+        let (c, sp, s) = fts_world(&["Выпуск прошёл 2021-03-05 после приёмки.", "Прочее за 2021."]);
+        for q in ["05.03.2021", "5.3.2021", "выпуск 05.03.2021"] {
+            assert_eq!(bm25_seqs(&c, sp, q).0, [s[0]], "{q}");
+        }
+    }
+
+    /// M7.5 §8.4 п. 3: строгий запрос с датой — группа фраз (через `AND`), а не три слова без
+    /// порядка: числа даты вразброс («15 строк 03 раза за 2021») не находятся; запрос из одной даты
+    /// — одна часть, без ослабленного; ослабленный — «слово OR группа»; `alias` — та же группа.
+    #[test]
+    fn fts_date_not_scattered_numbers() {
+        let scattered = "За 2021 год 15 строк и 03 раза.";
+        let (c, sp, s) = fts_world(&[scattered, "Встреча 15.03.2021 в зале."]);
+        // 0.0.17: строгий `"15" "03" "2021"*` находил оба листа (числа вразброс — тоже)
+        let old = sanitize_fts("15.03.2021").unwrap();
+        assert_eq!(old, r#""15" "03" "2021"*"#);
+        let t = TargetFilter::default().args();
+        let found = run_channel(&c, Channel::Bm25, &old, None, &[sp], &t, None).unwrap();
+        let mut found: Vec<i64> = found.iter().map(|x| x.0).collect();
+        found.sort_unstable();
+        assert_eq!(found, s, "0.0.17 — и разбросанные числа");
+        assert_eq!(bm25_seqs(&c, sp, "15.03.2021"), (vec![s[1]], false));
+        let (c, sp, _) = fts_world(&[scattered]);
+        assert_eq!(bm25_seqs(&c, sp, "15.03.2021"), (vec![], false));
+        assert_eq!(bm25_seqs(&c, sp, "собрание 15.03.2021"), (vec![], true));
+        let q = "Встреча как 15.03.2021";
+        let dates = query_dates(q);
+        assert_eq!(
+            fts_query_dated(q, " ", false, &dates).as_deref(),
+            Some(r#""Встреча"* AND "как"* AND ("2021 03 15" OR "15 03 2021" OR "15 3 2021")"#)
+        );
+        assert_eq!(
+            fts_query_dated(q, " OR ", true, &dates).as_deref(),
+            Some(r#""Встреча"* OR ("2021 03 15" OR "15 03 2021" OR "15 3 2021")"#)
+        );
+        assert_eq!(fts_parts(q, false, &dates).len(), 3);
+        let groups = [AliasGroup {
+            start: 0,
+            len: 1,
+            with: vec!["Собрание".into()],
+        }];
+        assert_eq!(
+            alias_fts_with(q, &groups, " AND ", true, &dates).as_deref(),
+            Some(
+                r#"("Встреча"* OR "Собрание"*) AND ("2021 03 15" OR "15 03 2021" OR "15 3 2021")"#
+            )
+        );
+        // дата за пределом 32 слов — вне запроса целиком (слова до неё — как прежде)
+        let long = format!("{}15.03.2021", "w ".repeat(30));
+        let dates = query_dates(&long);
+        assert_eq!(dates.len(), 1);
+        assert_eq!(fts_parts(&long, false, &dates).len(), 30);
+    }
+
+    /// M7.5 §8.4 п. 3: trigram — каждая форма даты с её разделителями альтернативой
+    /// идентификатора; подсветка — все формы сразу за датой запроса.
+    #[test]
+    fn trigram_date_alternatives() {
+        let (fts, needles) = trigram_query("отчёт 15.03.2021", false).unwrap();
+        assert_eq!(fts, r#""15.03.2021" OR "2021-03-15" OR "15.3.2021""#);
+        assert_eq!(needles, ["15.03.2021", "2021-03-15", "15.3.2021"]);
+        let (fts, _) = trigram_query("2021-11-12 core.autocrlf", true).unwrap();
+        assert_eq!(fts, r#""2021-11-12" OR "12.11.2021" OR "core.autocrlf""#);
+        assert_eq!(
+            query_needles("отчёт 5.3.2021"),
+            ["5.3.2021", "2021-03-05", "05.03.2021", "отчёт", "2021"]
+        );
+        let (c, sp, s) = fts_world(&[
+            "Ведомость 2021-03-15 закрыта.",
+            "Ведомость 15.3.2021 закрыта.",
+        ]);
+        let t = TargetFilter::default().args();
+        let ch = run_channels(&c, "15.03.2021", None, &[sp], &t, &[], None, false, false).unwrap();
+        let mut tri: Vec<i64> = ch.b.iter().map(|x| x.0).collect();
+        tri.sort_unstable();
+        assert_eq!(tri, s);
+        // сниппет trigram-хита — по любой форме
+        assert!(
+            text_snippet(
+                "Ведомость 2021-03-15 закрыта.",
+                &ch.needles.iter().map(AsRef::as_ref).collect::<Vec<&str>>()
+            )
+            .contains(MARK_START)
+        );
+    }
+
+    /// M7.5 §8.4 п. 3: запрос без даты (числа, версии, `/`, двузначный год, не дата календаря) —
+    /// строки FTS5 строгого, ослабленного, `alias`, trigram и подсветки побайтово как у 0.0.17
+    /// (эталоны — выход кода 0.0.17).
+    #[test]
+    fn fts_query_without_dates_unchanged() {
+        let groups = [AliasGroup {
+            start: 0,
+            len: 1,
+            with: vec!["Выжимка".into()],
+        }];
+        for q in [
+            "Как запустить полный прогон тестов с моделями",
+            "версия 0.0.17 от 15 03 2021",
+            "15/03/2021 и 15.03.21",
+            "31.02.2021 не дата",
+            "core.autocrlf LNK1104 2021-3-15",
+            "a",
+        ] {
+            assert!(query_dates(q).is_empty(), "{q}");
+            for drop in [false, true] {
+                for sep in [" ", " OR "] {
+                    assert_eq!(fts_query_dated(q, sep, drop, &[]), fts_query(q, sep, drop));
+                }
+                assert_eq!(fts_parts(q, drop, &[]).len(), fts_terms(q, drop).len());
+            }
+            assert_eq!(
+                alias_fts_with(q, &groups, " AND ", false, &[]),
+                alias_fts(q, &groups, " AND ")
+            );
+            // trigram 0.0.17: идентификаторы через OR (с повторами), без них — фраза
+            let ids = identifiers(q);
+            let old = if ids.is_empty() {
+                (q.trim().chars().count() >= MIN_PREFIX_CHARS).then(|| quote(q.trim()))
+            } else {
+                Some(
+                    ids.iter()
+                        .map(|t| quote(t))
+                        .collect::<Vec<_>>()
+                        .join(" OR "),
+                )
+            };
+            assert_eq!(trigram_query(q, true).map(|x| x.0), old, "{q}");
+        }
+        assert_eq!(
+            fts_query_dated("версия 0.0.17 от 15 03 2021", " ", false, &[]).as_deref(),
+            Some(r#""версия"* "0" "0" "17" "от" "15" "03" "2021"*"#)
+        );
+        assert_eq!(query_needles("версия 0.0.17"), ["0.0.17", "версия"]);
+        assert_eq!(
+            trigram_query("a.b a.b", false).map(|x| x.0).as_deref(),
+            Some(r#""a.b" OR "a.b""#)
+        );
     }
 }

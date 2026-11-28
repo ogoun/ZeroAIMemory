@@ -1685,6 +1685,203 @@ async fn prompt_fts_only_uses_fts_threshold() {
     assert!(counts[1].0 < 3, "{}", counts[1].1);
 }
 
+/// Мир правила покрытия подсказок `prompt` без модели (M7.5 §8.3 п. 1): порог балла FTS-only — 0
+/// (проходит любая карточка поиска), ключ `recall.prompt_fts_coverage` — `rule`. Запрос «квазар
+/// пульсар магнетар»: строгий FTS пуст, ослабленный находит `full` (квазар и пульсар в заголовке —
+/// 2 из 3 слов) и `one` (одно «квазар» во фрагменте). Ответ, `full`, `one`.
+async fn prompt_coverage_world(
+    name: &str,
+    rule: Option<zam_search::recall::CoverageRule>,
+) -> (Value, String, String) {
+    let a = api(&format!("recall-prompt-cov-{name}"), |c| {
+        roomy(c);
+        c.recall.prompt_min_score_fts = Some(0.0);
+        c.recall.prompt_fts_coverage = rule;
+    })
+    .await;
+    let full = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "Квазар и пульсар в одном поле",
+        "Наблюдение: квазар рядом с пульсаром, магнитное поле слабое.",
+        "discovery",
+    )
+    .await;
+    let one = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "Калибровка телескопа",
+        "Калибровка зеркала перед сезоном; квазар не наблюдался.",
+        "discovery",
+    )
+    .await;
+    let j = ok(
+        &a,
+        &a.token,
+        None,
+        json!({"event": "prompt", "prompt": "квазар пульсар магнетар"}),
+    )
+    .await;
+    // поиск подсказок деградировал: сервер без модели
+    let s = a
+        .t(
+            Method::POST,
+            "/api/v1/search",
+            Some(json!({"query": "квазар"})),
+        )
+        .await;
+    assert_eq!(s.json()["degraded"], true, "{}", s.text());
+    (j, full, one)
+}
+
+/// M7.5 §8.3 п. 1: без модели (`degraded`) балл лучшего FTS ≈ 1 на любой запрос, и порог балла
+/// мусор не отделяет; правило покрытия `recall.prompt_fts_coverage` (`M6`: ⌈n/2⌉, 2–6, `plain`)
+/// пропускает карточку, только если предметные слова запроса покрыты заголовком и фрагментом не
+/// меньше `need(n)`: `full` (2 из 3) остаётся, `one` (1 из 3) снимается. На гибриде правило не
+/// действует — `recall_prompt_ml::prompt_fts_coverage_ignored_on_hybrid`.
+#[tokio::test]
+async fn prompt_fts_coverage_gates_degraded_only() {
+    use zam_search::recall::CoverageRule;
+    let rule = CoverageRule {
+        common_pct: 100,
+        ..CoverageRule::M6
+    };
+    let (j, full, one) = prompt_coverage_world("m6", Some(rule)).await;
+    let got = ids(&j);
+    assert!(got.contains(&format!("i:{full}")), "{j}");
+    assert!(
+        !got.contains(&format!("i:{one}")),
+        "одно слово из трёх: {j}"
+    );
+}
+
+/// M7.5 §8.3 п. 1: ключа нет (умолчание) — как 0.0.17: отбор подсказок `prompt` без модели —
+/// только порог балла (обе карточки ослабленного FTS проходят), а умолчание конфигурации —
+/// без правила и без слов ошибок `post_tool`.
+#[tokio::test]
+async fn prompt_fts_coverage_absent_keeps_017() {
+    let d = ServerConfig::default().recall;
+    assert_eq!(d.prompt_fts_coverage, None);
+    assert!(!d.post_tool_diag_words);
+    let (j, full, one) = prompt_coverage_world("absent", None).await;
+    let got = ids(&j);
+    assert!(got.contains(&format!("i:{full}")), "{j}");
+    assert!(
+        got.contains(&format!("i:{one}")),
+        "без ключа — порог балла: {j}"
+    );
+}
+
+/// Ссылки подсказок `post_tool` на сервере с `recall.post_tool_diag_words = diag` для ошибок
+/// `errors` (insight мира — `mk`).
+async fn post_tool_diag_ids(
+    name: &str,
+    diag: bool,
+    insights: &[(&str, &str)],
+    errors: &[&str],
+) -> (Vec<String>, Vec<Vec<String>>) {
+    let a = api(&format!("recall-post-tool-diag-{name}"), |c| {
+        roomy(c);
+        c.recall.post_tool_diag_words = diag;
+    })
+    .await;
+    let mut ins = Vec::new();
+    for (title, body) in insights {
+        ins.push(format!(
+            "i:{}",
+            insight(&a, &a.token, "knowledge", title, body, "failure").await
+        ));
+    }
+    let mut got = Vec::new();
+    for e in errors {
+        got.push(post_tool_ids(&a, e, json!({})).await);
+    }
+    (ins, got)
+}
+
+/// M7.5 §8.3 п. 4: при `recall.post_tool_diag_words` покрытие ослабленного FTS — по словам
+/// строк-диагностик (строка начинается с `error`, `fatal`, `failed`, `panic`, `exception`,
+/// `traceback` или содержит код ошибки), если они есть: запись о предупреждениях сборки,
+/// совпавшая со строками `Compiling`/`warning`, к ошибке `error[E0433]` не приходит, запись о самой
+/// ошибке — приходит; ошибка без строк-диагностик — как без ключа.
+#[tokio::test]
+async fn post_tool_diag_lines_only_when_present() {
+    let insights = [
+        (
+            "Не найден крейт tokio_util",
+            "failed to resolve: use of undeclared crate or module tokio_util — добавь tokio-util \
+             в Cargo.toml зависимостью.",
+        ),
+        (
+            "Предупреждения сборки zam-store",
+            "Compiling zam-store: warning unused variable budget — префикс подчёркивания у \
+             переменной.",
+        ),
+    ];
+    let with_diag = "   Compiling serde v1.0.200\n   Compiling zam-store v0.0.18\nwarning: unused \
+                     variable: `budget`\nerror[E0433]: failed to resolve: use of undeclared crate \
+                     or module `tokio_util`";
+    let no_diag = "   Compiling zam-store v0.0.18\nwarning: unused variable: `budget`\nwarning: \
+                   `zam-store` generated 1 warning";
+    let errors = [with_diag, no_diag];
+    let (ins, off) = post_tool_diag_ids("off", false, &insights, &errors).await;
+    let (ins_on, on) = post_tool_diag_ids("on", true, &insights, &errors).await;
+    let (crate_off, warn_off) = (&ins[0], &ins[1]);
+    let (crate_on, warn_on) = (&ins_on[0], &ins_on[1]);
+    // без ключа — покрытие по всем словам вывода: обе записи
+    assert!(
+        off[0].contains(crate_off) && off[0].contains(warn_off),
+        "{off:?}"
+    );
+    // с ключом — по строке `error[E0433]: …`: только запись об ошибке
+    assert!(on[0].contains(crate_on), "{on:?}");
+    assert!(
+        !on[0].contains(warn_on),
+        "слова строк Compiling/warning: {on:?}"
+    );
+    // строк-диагностик нет — как без ключа
+    assert_eq!(off[1], std::slice::from_ref(warn_off), "{off:?}");
+    assert_eq!(on[1], std::slice::from_ref(warn_on), "{on:?}");
+}
+
+/// M7.5 §8.3 п. 4: под ключом `recall.post_tool_diag_words` к строгой выдаче `post_tool`
+/// присоединяются записи, найденные по коду ошибки целиком: строгий запрос (все слова) находит
+/// запись `S`, и ослабленный не идёт — запись `C` с тем же кодом `E0425`, но без остальных слов,
+/// без ключа не приходит, с ключом — приходит.
+#[tokio::test]
+async fn post_tool_error_code_joins_strict() {
+    let insights = [
+        (
+            "E0425 в main.rs",
+            "error E0425: cannot find value budget in this scope — переменная объявлена ниже.",
+        ),
+        (
+            "E0425 у макроса",
+            "Ошибка E0425 внутри macro_rules: имя из другого модуля — импортируй через $crate.",
+        ),
+        (
+            "E0426 у метки цикла",
+            "Ошибка E04251 и E0426: метка цикла не объявлена — проверь имя метки.",
+        ),
+    ];
+    let errors = ["error[E0425]: cannot find value `budget` in this scope"];
+    let (ins, off) = post_tool_diag_ids("code-off", false, &insights, &errors).await;
+    assert_eq!(
+        off[0],
+        [ins[0].clone()],
+        "без ключа — только строгий: {off:?}"
+    );
+    let (ins, on) = post_tool_diag_ids("code-on", true, &insights, &errors).await;
+    assert_eq!(on[0][0], ins[0], "строгий — первым: {on:?}");
+    assert!(on[0].contains(&ins[1]), "код ошибки целиком: {on:?}");
+    assert!(
+        !on[0].contains(&ins[2]),
+        "E04251 — не E0425 (код — целиком): {on:?}"
+    );
+}
+
 // ---- замер бюджета (§10.3, §17) ----
 
 /// Корпус eval (`eval/corpus`, `eval/insights.toml`) в Knowledge и решении; запросы — из
