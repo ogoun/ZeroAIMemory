@@ -67,6 +67,7 @@ pub const FEATURES: &[&str] = &[
     "admin_works",
     "check_probes_manage",
     "health_components",
+    "search_m75",
 ];
 
 /// Версии компонентов, которые узнаются один раз при старте (`AppState::components`).

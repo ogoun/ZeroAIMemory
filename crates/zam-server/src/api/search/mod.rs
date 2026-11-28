@@ -2615,6 +2615,7 @@ pub(crate) async fn search_with(
                 Vec::new()
             };
             let q = FtsQuery {
+                drop_stop_words: !st.cfg.search.fts_stop_words,
                 text: req.query.clone(),
                 space_ids: tg.space_ids(),
                 path_prefix: prefix.clone(),

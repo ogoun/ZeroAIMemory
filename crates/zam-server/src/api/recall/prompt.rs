@@ -290,6 +290,7 @@ async fn task_prompt_cands(
             continue;
         }
         let q = FtsQuery {
+            drop_stop_words: false,
             alias_groups: Vec::new(),
             text: query.to_string(),
             space_ids: spaces,

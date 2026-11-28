@@ -47,6 +47,7 @@ use std::collections::{HashMap, HashSet};
 
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, ToSql, params, params_from_iter};
+use zam_core::text::is_stop_word;
 use zam_core::{Id, TargetKind, TargetRef};
 
 use crate::time::ts_at;
@@ -205,6 +206,10 @@ pub struct FtsQuery {
     /// Расширение запроса словарём (канал `alias`, только [`search_fts_channels`]); пусто —
     /// канал не строится.
     pub alias_groups: Vec<AliasGroup>,
+    /// Без служебных слов в запросах `bm25` (строгом и ослабленном) и `alias` ([`fts_terms`],
+    /// M7.5 §8.1, ключ сервера `search.fts_stop_words = false`); `false` — как 0.0.17. Trigram и
+    /// подсветка — без изменений.
+    pub drop_stop_words: bool,
 }
 
 /// Облегчение [`search_fts_channels_light`] для выдачи с малым `top_k` (M6 §16, задача 16:
@@ -425,11 +430,39 @@ pub fn query_terms(query: &str) -> Vec<&str> {
 }
 
 fn terms(query: &str) -> Vec<&str> {
+    words(query).take(MAX_TERMS).collect()
+}
+
+fn words(query: &str) -> impl Iterator<Item = &str> {
     query
         .split(|ch: char| !ch.is_alphanumeric())
         .filter(|t| !t.is_empty())
-        .take(MAX_TERMS)
-        .collect()
+}
+
+/// Служебное слово запроса ([`is_stop_word`] без учёта регистра: «Как», «THE»).
+fn stop_word(w: &str) -> bool {
+    is_stop_word(&w.to_lowercase())
+}
+
+/// Выпадают ли служебные слова из запроса `query` при флаге `drop_stop`: только если в нём есть
+/// другое слово — запрос из одних служебных слов ищется целиком.
+fn drops_stop_words(query: &str, drop_stop: bool) -> bool {
+    drop_stop && words(query).any(|w| !stop_word(w))
+}
+
+/// Слова запросов FTS `bm25` (строгого и ослабленного) и `alias` (M7.5 §8.1, Н1): при
+/// `drop_stop` — без служебных слов ([`zam_core::text::is_stop_word`], без учёта регистра), если
+/// в запросе остаётся другое слово; не больше 32 слов. `drop_stop = false` — [`query_terms`]
+/// (как 0.0.17). Trigram, вектор и подсветка берут слова без этого правила.
+pub fn fts_terms(query: &str, drop_stop: bool) -> Vec<&str> {
+    if drops_stop_words(query, drop_stop) {
+        words(query)
+            .filter(|w| !stop_word(w))
+            .take(MAX_TERMS)
+            .collect()
+    } else {
+        terms(query)
+    }
 }
 
 /// Подстроки запроса для подсветки сниппета у хита без FTS-сниппета (векторный канал,
@@ -467,16 +500,18 @@ fn quote_term(t: &str) -> String {
 /// (`"слово"*`), слова через пробел (неявный AND). Синтаксис FTS5 во входе
 /// (`"`, `*`, `AND`, `-`, `:`, `(`, `NEAR`) не действует. `None` — в запросе нет слов.
 pub fn sanitize_fts(query: &str) -> Option<String> {
-    join_terms(query, " ")
+    fts_query(query, " ", false)
 }
 
 /// Ослабленный вариант [`sanitize_fts`]: слова через `OR`.
+#[cfg(test)]
 fn sanitize_fts_any(query: &str) -> Option<String> {
-    join_terms(query, " OR ")
+    fts_query(query, " OR ", false)
 }
 
-fn join_terms(query: &str, sep: &str) -> Option<String> {
-    let t = terms(query);
+/// Запрос FTS5 из слов [`fts_terms`] через `sep` (`" "` — строгий, `" OR "` — ослабленный).
+fn fts_query(query: &str, sep: &str, drop_stop: bool) -> Option<String> {
+    let t = fts_terms(query, drop_stop);
     if t.is_empty() {
         return None;
     }
@@ -500,11 +535,25 @@ fn phrase_term(s: &str) -> Option<String> {
 /// Запрос канала `alias`: слова запроса, группы вместо совпавших слов; `sep` — `" AND "` (все
 /// слова; неявное «И» FTS5 перед скобкой не разбирает) или `" OR "` (любое). `None` — в запросе
 /// нет слов.
+#[cfg(test)]
 fn alias_fts(query: &str, groups: &[AliasGroup], sep: &str) -> Option<String> {
+    alias_fts_with(query, groups, sep, false)
+}
+
+/// [`alias_fts`] с флагом служебных слов ([`fts_terms`]): индексы групп — по словам
+/// [`query_terms`] (со служебными), служебное слово вне группы при `drop_stop` выпадает, если в
+/// запросе есть другое слово; слова группы остаются — группа — совпавший термин словаря.
+fn alias_fts_with(
+    query: &str,
+    groups: &[AliasGroup],
+    sep: &str,
+    drop_stop: bool,
+) -> Option<String> {
     let t = terms(query);
     if t.is_empty() {
         return None;
     }
+    let drop = drops_stop_words(query, drop_stop);
     let mut parts: Vec<String> = Vec::with_capacity(t.len());
     let mut i = 0;
     while i < t.len() {
@@ -524,11 +573,13 @@ fn alias_fts(query: &str, groups: &[AliasGroup], sep: &str) -> Option<String> {
             parts.push(format!("({})", alts.join(" OR ")));
             i += g.len;
         } else {
-            parts.push(quote_term(t[i]));
+            if !(drop && stop_word(t[i])) {
+                parts.push(quote_term(t[i]));
+            }
             i += 1;
         }
     }
-    Some(parts.join(sep))
+    (!parts.is_empty()).then(|| parts.join(sep))
 }
 
 /// Идентификаторы и код в запросе: токены через пробелы без обрамляющей
@@ -800,6 +851,7 @@ pub async fn search_fts(db: &Db, q: FtsQuery) -> Result<Vec<FtsHit>, StoreError>
             &[],
             None,
             false,
+            q.drop_stop_words,
         )?;
         let ranked = merge(ch.a, ch.b, q.top_k);
         fetch_hits(&tx, &ranked, ch.a_fts.as_deref(), None, &ch.needles, true)
@@ -897,6 +949,7 @@ async fn fts_channels(
             &q.alias_groups,
             light.map(|l| l.channel_depth),
             light.is_some_and(|l| l.any_terms),
+            q.drop_stop_words,
         )?;
         let in_a: HashSet<i64> = ch.a.iter().map(|c| c.0).collect();
         let in_alias: HashSet<i64> = ch.alias.iter().map(|c| c.0).collect();
@@ -1166,7 +1219,8 @@ struct Channels<'q> {
 }
 
 /// Канал A (строгий запрос, при пустой выдаче — ослабленный; `any` — сразу ослабленный,
-/// [`LightSearch::any_terms`]) и канал B.
+/// [`LightSearch::any_terms`]) и канал B; `drop_stop` — без служебных слов в запросах `bm25` и
+/// `alias` ([`fts_terms`], [`FtsQuery::drop_stop_words`]).
 #[allow(clippy::too_many_arguments)]
 fn run_channels<'q>(
     tx: &Connection,
@@ -1177,17 +1231,23 @@ fn run_channels<'q>(
     groups: &[AliasGroup],
     depth: Option<usize>,
     any: bool,
+    drop_stop: bool,
 ) -> Result<Channels<'q>, StoreError> {
-    let mut a_fts = if any { None } else { sanitize_fts(text) };
+    let n_terms = fts_terms(text, drop_stop).len();
+    let mut a_fts = if any {
+        None
+    } else {
+        fts_query(text, " ", drop_stop)
+    };
     let mut relaxed = false;
     let mut a = match &a_fts {
         Some(fts) => run_channel(tx, Channel::Bm25, fts, prefix, spaces, t, depth)?,
         None => Vec::new(),
     };
-    if a.is_empty() && (any || terms(text).len() > 1) {
-        a_fts = sanitize_fts_any(text);
+    if a.is_empty() && (any || n_terms > 1) {
+        a_fts = fts_query(text, " OR ", drop_stop);
         // запрос из одного слова и «любым словом» — строгий
-        relaxed = terms(text).len() > 1;
+        relaxed = n_terms > 1;
         if let Some(fts) = &a_fts {
             a = run_channel(tx, Channel::Bm25, fts, prefix, spaces, t, depth)?;
         }
@@ -1196,12 +1256,12 @@ fn run_channels<'q>(
     let mut alias_fts_q: Option<String> = None;
     let mut alias_relaxed = false;
     if !groups.is_empty() {
-        alias_fts_q = alias_fts(text, groups, " AND ");
+        alias_fts_q = alias_fts_with(text, groups, " AND ", drop_stop);
         if let Some(fts) = &alias_fts_q {
             alias = run_channel(tx, Channel::Bm25, fts, prefix, spaces, t, depth)?;
         }
-        if alias.is_empty() && terms(text).len() > 1 {
-            alias_fts_q = alias_fts(text, groups, " OR ");
+        if alias.is_empty() && n_terms > 1 {
+            alias_fts_q = alias_fts_with(text, groups, " OR ", drop_stop);
             alias_relaxed = true;
             if let Some(fts) = &alias_fts_q {
                 alias = run_channel(tx, Channel::Bm25, fts, prefix, spaces, t, depth)?;
@@ -2222,5 +2282,100 @@ mod tests {
             alias_fts("x", &groups, " AND ").as_deref(),
             Some(r#"("x" OR "Plan B" OR "Q A" OR "db" OR "Plan Bar"*)"#)
         );
+    }
+
+    /// M7.5 §8.1 п. 2 (Н1): служебные слова (`zam_core::text::is_stop_word`, без учёта регистра)
+    /// не идут в строгий, ослабленный запросы `bm25` и в `alias`, если в запросе есть другое слово.
+    #[test]
+    fn fts_query_drops_stop_words_when_others_remain() {
+        let q = "Как запустить полный прогон тестов с моделями";
+        // «с» в стоп-список не входит (короткие слова потребители отбрасывают сами) — остаётся
+        assert_eq!(
+            fts_terms(q, true),
+            ["запустить", "полный", "прогон", "тестов", "с", "моделями"]
+        );
+        assert_eq!(
+            fts_query(q, " ", true).as_deref(),
+            Some(r#""запустить"* "полный"* "прогон"* "тестов"* "с" "моделями"*"#)
+        );
+        assert_eq!(
+            fts_query("what is the cache for", " OR ", true).as_deref(),
+            Some(r#""is" OR "cache"*"#)
+        );
+        // alias: индексы групп — по словам запроса со служебными, служебное вне группы выпадает
+        let groups = [AliasGroup {
+            start: 2,
+            len: 1,
+            with: vec!["Выжимка".into()],
+        }];
+        assert_eq!(
+            alias_fts_with("как файл summary для", &groups, " AND ", true).as_deref(),
+            Some(r#""файл"* AND ("summary"* OR "Выжимка"*)"#)
+        );
+        // служебное слово внутри группы остаётся: группа — совпавший термин словаря
+        let groups = [AliasGroup {
+            start: 0,
+            len: 2,
+            with: vec!["Кэш".into()],
+        }];
+        assert_eq!(
+            alias_fts_with("the cache файл", &groups, " AND ", true).as_deref(),
+            Some(r#"("the cache"* OR "Кэш"*) AND "файл"*"#)
+        );
+    }
+
+    /// Запрос только из служебных слов — как прежде, целиком (иначе он не нашёл бы ничего).
+    #[test]
+    fn fts_query_keeps_stop_word_only_query() {
+        assert_eq!(fts_terms("как для the", true), ["как", "для", "the"]);
+        assert_eq!(
+            fts_query("Как для THE", " ", true).as_deref(),
+            Some(r#""Как"* "для"* "THE"*"#)
+        );
+        assert_eq!(fts_query("—", " ", true), None);
+        let groups = [AliasGroup {
+            start: 0,
+            len: 1,
+            with: vec!["x".into()],
+        }];
+        assert_eq!(
+            alias_fts_with("как для", &groups, " OR ", true).as_deref(),
+            Some(r#"("как"* OR "x") OR "для"*"#)
+        );
+    }
+
+    /// `search.fts_stop_words = true` (служебные слова в запросе) — строки FTS5 побайтово как у
+    /// 0.0.17: эталоны ниже сняты с кода 0.0.17 (`join_terms`, `alias_fts` без флага).
+    #[test]
+    fn fts_stop_words_true_byte_equal_017() {
+        let q = "Как запустить полный прогон тестов с моделями";
+        assert_eq!(fts_terms(q, false), query_terms(q));
+        assert_eq!(
+            fts_query(q, " ", false).as_deref(),
+            Some(r#""Как"* "запустить"* "полный"* "прогон"* "тестов"* "с" "моделями"*"#)
+        );
+        assert_eq!(
+            fts_query("what is the cache for", " OR ", false).as_deref(),
+            Some(r#""what"* OR "is" OR "the"* OR "cache"* OR "for"*"#)
+        );
+        assert_eq!(fts_query(q, " ", false), sanitize_fts(q));
+        assert_eq!(fts_query(q, " OR ", false), sanitize_fts_any(q));
+        let groups = [AliasGroup {
+            start: 2,
+            len: 1,
+            with: vec!["Выжимка".into()],
+        }];
+        assert_eq!(
+            alias_fts_with("как файл summary для", &groups, " AND ", false).as_deref(),
+            Some(r#""как"* AND "файл"* AND ("summary"* OR "Выжимка"*) AND "для"*"#)
+        );
+        assert_eq!(
+            alias_fts_with("как файл summary для", &groups, " AND ", false),
+            alias_fts("как файл summary для", &groups, " AND ")
+        );
+        // предел слов — тот же: первые MAX_TERMS
+        let long: String = (0..40).map(|i| format!("w{i} ")).collect();
+        assert_eq!(fts_terms(&long, false).len(), MAX_TERMS);
+        assert_eq!(fts_terms(&long, true).len(), MAX_TERMS);
     }
 }

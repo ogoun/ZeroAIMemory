@@ -583,6 +583,11 @@ pub struct SearchSection {
     /// экономит 0,16 %, но выбрасывает находки только канала `alias` (его вес 0,5 — балл вдвое
     /// ниже: приёмка M4.5 `glossary_ru_en`), поэтому остаётся значение v0.0.9.
     pub brief_min_rel: f64,
+    /// Служебные слова в полнотекстовом поиске (M7.5 §8.1): `true` — слова стоп-списка
+    /// (`zam_core::text::is_stop_word`: «как», «для», «the») идут в запросы `bm25` (строгий и
+    /// ослабленный) и `alias`, как в 0.0.17; `false` — не идут, если в запросе есть другое слово
+    /// (`zam_store::fts_terms`). Trigram, вектор и подсветка — без изменений. По умолчанию `true`.
+    pub fts_stop_words: bool,
 }
 
 impl SearchSection {
@@ -1788,6 +1793,7 @@ impl Default for ServerConfig {
                 w_attach: 1.0,
                 budget_tokens: 800,
                 brief_min_rel: 0.0,
+                fts_stop_words: true,
             },
             insights: InsightsSection {
                 dedup_threshold: 0.90,
@@ -2224,6 +2230,32 @@ mod tests {
                 assert_eq!(c.search.w_attach, v.parse::<f64>().unwrap());
             }
         }
+    }
+
+    /// M7.5 §8.1: `search.fts_stop_words` — по умолчанию `true` (служебные слова в запросе FTS,
+    /// как 0.0.17), из файла и `ZAM_SEARCH__FTS_STOP_WORDS`; не логическое значение — ошибка.
+    #[test]
+    fn config_fts_stop_words() {
+        let c = load(None, &[], &Default::default()).unwrap();
+        assert!(c.search.fts_stop_words);
+        let c = load(
+            None,
+            &[env("ZAM_SEARCH__FTS_STOP_WORDS", "false")],
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(!c.search.fts_stop_words);
+        let f = write_in_target("fts-stop-words.toml", "[search]\nfts_stop_words = false\n");
+        let c = load(Some(&f), &[], &Default::default()).unwrap();
+        assert!(!c.search.fts_stop_words);
+        assert!(
+            load(
+                None,
+                &[env("ZAM_SEARCH__FTS_STOP_WORDS", "sometimes")],
+                &Default::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]

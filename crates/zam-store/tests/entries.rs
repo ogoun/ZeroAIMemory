@@ -112,6 +112,7 @@ async fn chunks_of(db: &Db, id: Id) -> Vec<(String, String, i64)> {
 
 fn query(text: &str, space: Id, targets: TargetFilter) -> FtsQuery {
     FtsQuery {
+        drop_stop_words: false,
         alias_groups: Vec::new(),
         text: text.into(),
         space_ids: vec![space],

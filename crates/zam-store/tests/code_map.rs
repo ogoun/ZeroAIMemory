@@ -1384,6 +1384,7 @@ async fn code_tables_not_in_search_or_jobs() {
     let hits = search_fts(
         &db,
         FtsQuery {
+            drop_stop_words: false,
             alias_groups: Vec::new(),
             text: "квазиуникальныйСимвол".into(),
             space_ids: spaces,

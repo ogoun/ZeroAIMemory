@@ -2493,6 +2493,7 @@ async fn fts_entry_ids_filter() {
     let a = new_idea(&db, sol, "Экспорт отчётов в PDF", "human", "normal").await;
     let b = new_idea(&db, sol, "Экспорт отчётов в PDF архивом", "human", "normal").await;
     let q = |ids: Vec<Id>| FtsQuery {
+        drop_stop_words: false,
         alias_groups: Vec::new(),
         text: "экспорт отчётов".into(),
         space_ids: vec![sol],
@@ -2531,6 +2532,7 @@ async fn fts_light_search_depth_and_snippets() {
         .await;
     }
     let q = |text: &str| FtsQuery {
+        drop_stop_words: false,
         alias_groups: Vec::new(),
         text: text.into(),
         space_ids: vec![sol],
@@ -2611,6 +2613,7 @@ async fn fts_light_any_terms_relaxed_first() {
     let me = new_idea(&db, sol, text, "human", "normal").await;
     let other = new_idea(&db, sol, "Печать продаж", "human", "normal").await;
     let q = |text: &str| FtsQuery {
+        drop_stop_words: false,
         alias_groups: Vec::new(),
         text: text.into(),
         space_ids: vec![sol],

@@ -2964,6 +2964,7 @@ async fn error_hints(
                 continue;
             }
             let q = FtsQuery {
+                drop_stop_words: false,
                 alias_groups: Vec::new(),
                 text: normalized.clone(),
                 space_ids: spaces,

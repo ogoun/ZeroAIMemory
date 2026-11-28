@@ -1116,3 +1116,61 @@ async fn search_reports_omitted_by_budget() {
     assert!(!r.text().contains("не поместилось"), "{}", r.text());
     assert_eq!(r.header("x-zam-omitted"), format!("budget=0; weak={weak}"));
 }
+
+/// Живой пример M7.5 §8.1 п. 4 (FTS без моделей): «как запустить полный прогон тестов с моделями»
+/// — заметка-ответ без «как» и восемь insight `theorem`, совпавших по «прогон», «тестов» и
+/// служебным «как», «с». Со служебными словами (`search.fts_stop_words = true`, как 0.0.17)
+/// строгий запрос «все слова» не находит никого, ослабленный («любое слово») ставит заметку первой
+/// по bm25, а буст `theorem` 1,10 к баллу RRF поднимает insight со 2–7-го места выше неё. Без
+/// служебных слов строгий запрос находит заметку-ответ — она первая.
+#[tokio::test]
+async fn search_note_answer_above_stopword_insights() {
+    let query = "как запустить полный прогон тестов с моделями";
+    let world = |name: &'static str, stop_words: bool| async move {
+        let a = api(name, |c| {
+            c.search.brief_min_rel = 0.0;
+            c.search.fts_stop_words = stop_words;
+        })
+        .await;
+        a.note(
+            "knowledge",
+            "Тесты/Полный прогон",
+            "# Полный прогон тестов с моделями\n\nЗапустить: `ZAM_REQUIRE_ML=1 cargo test` с \
+             каталогом моделями из `ZAM_TEST_MODELS_DIR` — полный прогон тестов.\n",
+        )
+        .await;
+        for i in 1..=8 {
+            let body = json!({"kind": "insight", "certainty": "theorem", "force": true,
+                "title": format!("Как ускорить прогон тестов {i}"),
+                "body": format!("Как ускорить прогон тестов: шаг {i} — кэш сборки с общим \
+                                 каталогом."),
+                "data": {"kind": "discovery", "evidence": {"checked": "прогон", "method": "замер",
+                                                           "result": "быстрее"}}});
+            let r = a
+                .t(Method::POST, "/api/v1/spaces/knowledge/entries", Some(body))
+                .await;
+            assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        }
+        let r = search(&a, json!({"query": query, "top_k": 20})).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let j = r.json();
+        let order: Vec<String> = j["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| match i["entry_id"].as_str() {
+                Some(_) => "insight".to_string(),
+                None => i["path"].as_str().unwrap().to_string(),
+            })
+            .collect();
+        (order, j)
+    };
+    let note = "Тесты/Полный прогон";
+    // как 0.0.17: заметка-ответ ниже insight, совпавших по служебным словам
+    let (order, j) = world("search-stopwords-017", true).await;
+    let at = order.iter().position(|p| p == note).expect("заметка в выдаче");
+    assert!(at >= 3, "заметка на месте {at}: {j}");
+    // без служебных слов — заметка первая
+    let (order, j) = world("search-stopwords-drop", false).await;
+    assert_eq!(order.first().map(String::as_str), Some(note), "{j}");
+}
