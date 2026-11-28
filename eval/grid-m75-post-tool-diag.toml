@@ -1,0 +1,19 @@
+# Сетка слов ошибок `post_tool` — `recall.post_tool_diag_words` (M7.5 §8.3 п. 4, задача 3):
+#   cargo xtask eval --hints --grid eval/grid-m75-post-tool-diag.toml --mode fts
+# `true`: покрытие ослабленного FTS — только по словам строк-диагностик (строка начинается после
+# пробелов с `error`, `fatal`, `failed`, `panic`, `exception`, `traceback` без учёта регистра или
+# содержит код ошибки), если они есть; к строгой выдаче присоединяются записи, найденные по коду
+# ошибки целиком. Первая точка — умолчание (`false`, как 0.0.17), снимается дважды (A/A —
+# побайтово); покрытие — умолчание `recall.post_tool_coverage` (M7.1). Случаи — `post_tool`
+# eval/hints.toml; правило выбора (`choose_diag_words`) — как M7.1 §4.6 п. 3, записано в журнал
+# этапа до прогона.
+
+rule = "post_tool_diag_words"
+
+[[point]]
+name = "diag-off"
+env = { ZAM_RECALL__POST_TOOL_DIAG_WORDS = "false" }
+
+[[point]]
+name = "diag-on"
+env = { ZAM_RECALL__POST_TOOL_DIAG_WORDS = "true" }
