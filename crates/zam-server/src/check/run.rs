@@ -146,7 +146,7 @@ fn max_run(st: &AppState) -> Duration {
     if let Some(d) = *super::test_hooks::lock(&super::test_hooks::MAX_RUN) {
         return d;
     }
-    Duration::from_secs(60 * u64::from(st.cfg.works.check_max_min))
+    Duration::from_secs(60 * u64::from(st.works().check_max_min))
 }
 
 fn pause() -> Duration {

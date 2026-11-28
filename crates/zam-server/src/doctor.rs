@@ -34,7 +34,7 @@ use zam_core::Id;
 use zam_store::inspect::{ChecksumStatus, RoDb, open_ro};
 use zam_store::{LockMark, Migration, SYSTEM_MIGRATIONS, StoreError, USER_MIGRATIONS};
 
-use crate::config::{CheckMode, ServerConfig};
+use crate::config::{CheckMode, ServerConfig, WorksSection};
 
 /// Свободного места меньше — `error`.
 pub const DISK_ERROR_BYTES: u64 = 512 * 1024 * 1024;
@@ -205,6 +205,7 @@ pub async fn run(
             None
         };
         side_files(root, &mut out);
+        let works = works_effective(cfg, sys_ro.as_ref());
         vault_key(cfg, sys_ro.as_ref(), env_key, &mut out);
         qdrant(cfg, sys_ro.as_ref(), &mut out).await;
         models(cfg, opts.full, &mut out);
@@ -215,7 +216,7 @@ pub async fn run(
             if let Some(ro) = &view {
                 blobs(cfg, user, ro, now, &mut out);
                 links(user, ro, &mut out);
-                check(cfg, user, ro, now, &mut out);
+                check(&works, user, ro, now, &mut out);
             }
         }
     }
@@ -1049,9 +1050,29 @@ fn links(user: &str, ro: &RoDb, out: &mut Out) {
     }
 }
 
+/// Действующая секция `[works]`, как у сервера (M7.6 §9.9): файл конфигурации и значения из
+/// WebUI администратора (строка `works.server` в `settings` `system.db`); строки нет или она не
+/// читается — файл.
+fn works_effective(cfg: &ServerConfig, sys: Option<&RoDb>) -> WorksSection {
+    use crate::works::server_settings::{SETTING_KEY, Stored, effective};
+    let row: Option<Value> = sys.and_then(|s| {
+        s.conn()
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                [SETTING_KEY],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+    });
+    effective(&cfg.works, &Stored::from_row(row.as_ref()).values).0
+}
+
 /// `check:<user>`: последний законченный ночной прогон — открытая регрессия (`warn`); при
 /// `works.check = nightly` и активных пробах нет законченного прогона двое суток (`warn`).
-fn check(cfg: &ServerConfig, user: &str, ro: &RoDb, now: Timestamp, out: &mut Out) {
+fn check(works: &WorksSection, user: &str, ro: &RoDb, now: Timestamp, out: &mut Out) {
     let code = format!("check:{user}");
     let c = ro.conn();
     let has_table: bool = c
@@ -1108,7 +1129,7 @@ fn check(cfg: &ServerConfig, user: &str, ro: &RoDb, now: Timestamp, out: &mut Ou
             json!({ "run": run.id, "verdict": run.verdict }),
         );
     }
-    if cfg.works.check == CheckMode::Nightly
+    if works.check == CheckMode::Nightly
         && probes > 0
         && last
             .as_ref()

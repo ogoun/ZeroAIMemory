@@ -221,7 +221,7 @@ pub async fn status(
             "by_kind": counts_json(&counts.by_kind),
             "by_split": counts_json(&counts.by_split),
         },
-        "check": check_json(&st.cfg.works, &works),
+        "check": check_json(&st.works(), &works),
     })))
 }
 

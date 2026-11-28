@@ -48,6 +48,10 @@ pub const OFF_MODEL_ACCESS: &str = "model_access_off";
 pub const OFF_NO_MODEL: &str = "no_model";
 /// Причина `off` режима `model`: исполнитель на паузе (§6.2 п. 5).
 pub const OFF_PAUSED: &str = "paused";
+/// Причина `off` режима `model`: администратор запретил адрес сохранённого подключения
+/// (`model_access`, `allow_loopback` изменены после сохранения; M7.6 §9.9, решение 173) —
+/// подключение не удаляется, обращений нет, разрешит снова — пойдут.
+pub const OFF_BLOCKED: &str = "blocked";
 
 /// Предел ответа модели по умолчанию и диапазон (§6.2 п. 1).
 pub const MAX_TOKENS_DEFAULT: u32 = 4000;
@@ -287,9 +291,11 @@ impl UserWorks {
     }
 
     /// Подключение для ответа настроек: хранимые поля и для показа (не хранятся, в `PATCH` не
-    /// принимаются) — `host` (хост адреса, как в предупреждении `works_model_external`) и
-    /// `external` (вне LAN), см. [`Self::model_reach`]. Нет подключения — `null`.
-    fn model_view(&self) -> Value {
+    /// принимаются) — `host` (хост адреса, как в предупреждении `works_model_external`),
+    /// `external` (вне LAN), см. [`Self::model_reach`], и с M7.6 `blocked` — причина запрета
+    /// адреса политикой сервера ([`Self::model_blocked`]: `model_access_off`, `model_access_lan`,
+    /// `loopback_requires_admin`, `http_external`) или `null`. Нет подключения — `null`.
+    fn model_view(&self, s: &WorksSection) -> Value {
         let Some(m) = &self.model else {
             return Value::Null;
         };
@@ -297,7 +303,24 @@ impl UserWorks {
         let (host, external) = self.model_reach(m);
         v["host"] = json!(host);
         v["external"] = json!(external);
+        v["blocked"] = json!(
+            self.model_blocked(s)
+                .map(super::egress::BlockReason::as_str)
+        );
         v
+    }
+
+    /// Запрещает ли политика сервера `s` закреплённый адрес сохранённого подключения — без DNS
+    /// (M7.6 §9.9, решение 173: администратор сузил `model_access` или снял `allow_loopback`
+    /// после сохранения): класс — [`super::egress::assumed_reach`], проверка — та же
+    /// [`super::egress::check`], что перед обращением. Имя, которое теперь разрешается в
+    /// запрещённый адрес, ловит проверка маршрута обращения (пауза `blocked`). Подключения или
+    /// закреплённого адреса нет — `None`.
+    pub fn model_blocked(&self, s: &WorksSection) -> Option<super::egress::BlockReason> {
+        let m = self.model.as_ref()?;
+        let p = m.pinned.as_ref()?;
+        let reach = super::egress::assumed_reach(&p.host, m.external);
+        super::egress::check(reach, &p.scheme, super::egress::Policy::of(s)).err()
     }
 
     /// Хост и «вне LAN» подключения без DNS (WebUI: постоянная плашка «данные уходят за пределы
@@ -350,7 +373,7 @@ impl UserWorks {
         json!({
             "mode": self.value(WORKS_MODE, s),
             "kinds": kinds,
-            "model": self.model_view(),
+            "model": self.model_view(s),
             "limits": self.value(WORKS_LIMITS, s),
             "check": self.value(WORKS_CHECK, s),
             "pause": self.value(WORKS_PAUSE, s),
@@ -361,8 +384,9 @@ impl UserWorks {
 
 /// Действующий режим вида `kind` (§6.1 п. 2): вид пользователя → общий режим пользователя →
 /// `[works] default_mode`; `enabled = false` — `off` у всех; `model` при `model_access = "off"`,
-/// без подключения или на паузе исполнителя — `off`. Второе — причина `off` (`None` — режим
-/// выбран или `off` выбран явно).
+/// без подключения, при адресе подключения, запрещённом политикой сервера (M7.6, решение 173:
+/// [`UserWorks::model_blocked`], причина [`OFF_BLOCKED`]), или на паузе исполнителя — `off`.
+/// Второе — причина `off` (`None` — режим выбран или `off` выбран явно).
 pub fn effective_mode(
     kind: WorkKind,
     u: &UserWorks,
@@ -385,6 +409,9 @@ pub fn effective_mode(
     }
     if u.model.is_none() {
         return (WorksMode::Off, Some(OFF_NO_MODEL));
+    }
+    if u.model_blocked(s).is_some() {
+        return (WorksMode::Off, Some(OFF_BLOCKED));
     }
     if u.pause.is_some() {
         return (WorksMode::Off, Some(OFF_PAUSED));
@@ -632,6 +659,75 @@ mod tests {
     /// Задача 8, ревью r1 (I1): «вне LAN» подключения в ответе настроек — без DNS: литерал LAN и
     /// внешний — по диапазонам, имя — по классу, сохранённому при закреплении (нет поля — имя
     /// считается внешним), на паузе `vault_changed` — по «стал»; поле и хост — только в ответе.
+    /// M7.6 (решение 173): запрет адреса сохранённого подключения политикой сервера — без DNS:
+    /// литерал — по диапазонам, `localhost` — петля, имя — по классу закрепления (нет — внешнее);
+    /// действующий режим `model` — `off` с причиной `blocked`, у `model_access = "off"` — своя.
+    #[test]
+    fn model_blocked_by_policy_without_dns() {
+        use crate::config::ModelAccess::{Lan, Off};
+        let u = |host: &str, scheme: &str, external: Option<bool>| UserWorks {
+            mode: Some(WorksMode::Model),
+            model: Some(ModelConn {
+                pinned: Some(pinned(scheme, host, 8080)),
+                external,
+                ..conn()
+            }),
+            ..UserWorks::default()
+        };
+        let s = |access, allow_loopback| WorksSection {
+            model_access: access,
+            allow_loopback,
+            ..WorksSection::default()
+        };
+        let reason = |u: &UserWorks, s: &WorksSection| u.model_blocked(s).map(|r| r.as_str());
+        let any = WorksSection::default();
+        // петля: литерал и `localhost` — только с `allow_loopback`
+        for host in ["127.0.0.1", "localhost"] {
+            let w = u(host, "http", None);
+            assert_eq!(reason(&w, &any), Some("loopback_requires_admin"), "{host}");
+            assert_eq!(reason(&w, &s(ModelAccess::Any, true)), None, "{host}");
+        }
+        // вне LAN: литерал и имя с классом закрепления «вне LAN» или без него — не при `lan`
+        for w in [
+            u("203.0.113.10", "https", Some(true)),
+            u("api.example.com", "https", Some(true)),
+            u("api.example.com", "https", None),
+        ] {
+            assert_eq!(reason(&w, &any), None);
+            assert_eq!(reason(&w, &s(Lan, false)), Some("model_access_lan"));
+        }
+        // имя, закреплённое в LAN, и литерал LAN — можно при `lan`
+        assert_eq!(
+            reason(&u("llm.example.com", "http", Some(false)), &s(Lan, false)),
+            None
+        );
+        assert_eq!(
+            reason(&u("10.203.113.7", "http", None), &s(Lan, false)),
+            None
+        );
+        // `off` — у любого адреса; действующий режим — своя причина раньше запрета адреса
+        let w = u("10.203.113.7", "http", None);
+        assert_eq!(reason(&w, &s(Off, false)), Some("model_access_off"));
+        assert_eq!(
+            effective_mode(WorkKind::Probes, &w, &s(Off, false)),
+            (WorksMode::Off, Some(OFF_MODEL_ACCESS))
+        );
+        let ext = u("203.0.113.10", "https", Some(true));
+        assert_eq!(
+            effective_mode(WorkKind::Probes, &ext, &s(Lan, false)),
+            (WorksMode::Off, Some(OFF_BLOCKED))
+        );
+        assert_eq!(
+            effective_mode(WorkKind::Probes, &ext, &any),
+            (WorksMode::Model, None)
+        );
+        assert_eq!(
+            ext.to_json(&s(Lan, false))["model"]["blocked"],
+            json!("model_access_lan")
+        );
+        assert_eq!(ext.to_json(&any)["model"]["blocked"], Value::Null);
+    }
+
     #[test]
     fn model_external_view_without_dns() {
         let s = WorksSection::default();

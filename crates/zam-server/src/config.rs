@@ -1588,7 +1588,9 @@ impl WorksSection {
         crate::schedule::parse_tz(&self.tz).unwrap_or(jiff::tz::TimeZone::UTC)
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// Проверка секции: время `at`, пояс `tz`, диапазоны [`WORKS_RANGES`] — одна у файла
+    /// конфигурации и у настроек сервера из WebUI ([`crate::works::server_settings`]).
+    pub fn validate(&self) -> Result<(), ConfigError> {
         let bad = |key: &str, message: &str| ConfigError::Invalid {
             key: format!("works.{key}"),
             source_name: "итог".into(),
@@ -1600,31 +1602,40 @@ impl WorksSection {
         if let Err(e) = crate::schedule::parse_tz(&self.tz) {
             return Err(bad("tz", &e));
         }
-        if !(10..=720).contains(&self.window_min) {
-            return Err(bad("window_min", "от 10 до 720"));
-        }
-        if !(1..=240).contains(&self.check_max_min) {
-            return Err(bad("check_max_min", "от 1 до 240"));
-        }
-        const TOKENS_MAX: u64 = 1_000_000_000;
-        if self.max_daily_tokens > TOKENS_MAX {
-            return Err(bad("max_daily_tokens", "от 0 до 1000000000"));
-        }
-        if self.max_monthly_tokens > TOKENS_MAX {
-            return Err(bad("max_monthly_tokens", "от 0 до 1000000000"));
-        }
-        if !(1..=4).contains(&self.max_parallel) {
-            return Err(bad("max_parallel", "от 1 до 4"));
-        }
-        if !(10..=3600).contains(&self.call_timeout_s) {
-            return Err(bad("call_timeout_s", "от 10 до 3600"));
-        }
-        if !(1..=50).contains(&self.batch_records) {
-            return Err(bad("batch_records", "от 1 до 50"));
+        for &(key, lo, hi) in WORKS_RANGES {
+            if self.number(key).is_some_and(|v| !(lo..=hi).contains(&v)) {
+                return Err(bad(key, &format!("от {lo} до {hi}")));
+            }
         }
         Ok(())
     }
+
+    /// Числовое значение ключа из [`WORKS_RANGES`] (`None` — ключ не числовой).
+    pub fn number(&self, key: &str) -> Option<u64> {
+        Some(match key {
+            "window_min" => u64::from(self.window_min),
+            "check_max_min" => u64::from(self.check_max_min),
+            "max_daily_tokens" => self.max_daily_tokens,
+            "max_monthly_tokens" => self.max_monthly_tokens,
+            "max_parallel" => u64::from(self.max_parallel),
+            "call_timeout_s" => u64::from(self.call_timeout_s),
+            "batch_records" => u64::from(self.batch_records),
+            _ => return None,
+        })
+    }
 }
+
+/// Числовые ключи `[works]` и их диапазоны (включительно) — одна таблица для проверки файла
+/// конфигурации и настроек сервера из WebUI (M7.6, решение 171): границы не дублируются.
+pub const WORKS_RANGES: &[(&str, u64, u64)] = &[
+    ("window_min", 10, 720),
+    ("check_max_min", 1, 240),
+    ("max_daily_tokens", 0, 1_000_000_000),
+    ("max_monthly_tokens", 0, 1_000_000_000),
+    ("max_parallel", 1, 4),
+    ("call_timeout_s", 10, 3600),
+    ("batch_records", 1, 50),
+];
 
 /// Секция `[export]` (M6 §12б.5): экспорт пространства `GET /spaces/{space}/export`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

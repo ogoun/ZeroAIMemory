@@ -192,7 +192,7 @@ pub async fn collect(
     limit: usize,
     exclude: &HashSet<(String, i64)>,
 ) -> Result<Vec<Candidate>, StoreError> {
-    let (night, _) = current_night(zam_store::time::now(), &ctx.st().cfg.works);
+    let (night, _) = current_night(zam_store::time::now(), &ctx.st().works());
     collect_on(ctx, user, space, night, limit, exclude).await
 }
 
@@ -398,7 +398,7 @@ pub fn quota(origin: Origin, now: Timestamp, w: &WorksSection) -> (Timestamp, u3
 /// ([`quota`]) и активных ([`PROBES_MAX`]) — меньший. Ноль — ночь или ручной запуск вида
 /// кандидатов не ставит.
 pub async fn room(st: &AppState, db: &Db, origin: Origin) -> Result<usize, StoreError> {
-    let (since, cap) = quota(origin, zam_store::time::now(), &st.cfg.works);
+    let (since, cap) = quota(origin, zam_store::time::now(), &st.works());
     let made = zam_store::probes::new_probes_since(db, origin.as_str(), since).await?;
     let active = zam_store::probes::active_targeted(db).await?;
     Ok(cap
@@ -470,7 +470,7 @@ pub async fn accept(
         return Err(Reject::new(REASON_DUPLICATE));
     }
     let now = zam_store::time::now();
-    let (since, limit) = quota(ctx.work.origin, now, &ctx.st.cfg.works);
+    let (since, limit) = quota(ctx.work.origin, now, &ctx.st.works());
     let made = zam_store::probes::new_probes_since(ctx.db, ctx.work.origin.as_str(), since)
         .await
         .map_err(store_reject)?;

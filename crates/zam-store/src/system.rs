@@ -1065,6 +1065,48 @@ impl SystemStore {
             .await
     }
 
+    /// Настройка `key` с проверкой прежнего значения одной транзакцией (M7.6, настройки сервера
+    /// внутренних работ): пишет `value` (`None` — удаляет строку), только если сохранённое
+    /// сейчас — `expected` (`None` — строки нет); иначе ничего не пишет и возвращает `false`:
+    /// правка поверх чужой, вызывающий отвечает 409.
+    pub async fn swap_setting(
+        &self,
+        key: &str,
+        expected: Option<serde_json::Value>,
+        value: Option<serde_json::Value>,
+    ) -> Result<bool, StoreError> {
+        let key = key.to_string();
+        let json = value
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(json_err)?;
+        self.db
+            .write(move |tx| {
+                let raw: Option<String> = tx
+                    .query_row("SELECT value FROM settings WHERE key = ?1", [&key], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
+                let stored = raw
+                    .map(|s| serde_json::from_str::<serde_json::Value>(&s).map_err(json_err))
+                    .transpose()?;
+                if stored != expected {
+                    return Ok(false);
+                }
+                match json {
+                    Some(j) => tx.execute(
+                        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        params![key, j],
+                    )?,
+                    None => tx.execute("DELETE FROM settings WHERE key = ?1", [&key])?,
+                };
+                Ok(true)
+            })
+            .await
+    }
+
     pub async fn set_setting<T: Serialize + ?Sized>(
         &self,
         key: &str,

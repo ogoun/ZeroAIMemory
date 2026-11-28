@@ -78,7 +78,7 @@ pub async fn test(
     let q = query(q)?;
     let user = target_user(&st, &p, &headers, q.user.as_deref()).await?;
     // общий выключатель — тот же ответ, что у ручных запусков (решение координатора 76)
-    if !st.cfg.works.enabled {
+    if !st.works().enabled {
         return Err(ApiError::WorksDisabled(
             crate::api::works::WORKS_DISABLED_DETAIL.into(),
         ));

@@ -183,8 +183,10 @@ impl NightRunner {
     }
 
     /// Запускает задачу в текущем рантайме tokio: шаги старта в фоне (при любом `[works]
-    /// enabled`), затем — при `enabled` — ночной цикл. Повторный запуск, запуск после
-    /// [`Self::stop`] и запуск у отвязанного двойника ничего не делают.
+    /// enabled`), затем ночной цикл. Выключатель `[works] enabled` читается на каждом тике
+    /// (M7.6 §9.9: администратор меняет его в WebUI без перезапуска) — при `false` тик ничего не
+    /// делает. Повторный запуск, запуск после [`Self::stop`] и запуск у отвязанного двойника
+    /// ничего не делают.
     pub fn start(&self, ctx: NightCtx) {
         if self.detached {
             tracing::warn!("ночной исполнитель: start у отвязанного раннера клона ночи пропущен");
@@ -194,10 +196,9 @@ impl NightRunner {
         if task.is_some() || self.shared.stop.is_cancelled() {
             return;
         }
-        let enabled = ctx.st.cfg.works.enabled;
-        if !enabled {
+        if !ctx.st.works().enabled {
             tracing::debug!(
-                "ночные работы выключены ([works] enabled = false): только шаги старта"
+                "ночные работы выключены ([works] enabled = false): тик ждёт включения"
             );
         }
         let NightCtx { mut st, .. } = ctx;
@@ -220,7 +221,6 @@ impl NightRunner {
             self.shared.clone(),
             self.tracked.clone(),
             period,
-            enabled,
         )));
     }
 
@@ -363,14 +363,8 @@ async fn step(tracked: &Tracked, fut: impl Future<Output = ()> + Send + 'static)
     }
 }
 
-/// Задача раннера: шаги старта, затем (при `enabled`) тик, «пора ли», ночь.
-async fn run(
-    weak: Weak<NightCtx>,
-    shared: Arc<Shared>,
-    tracked: Arc<Tracked>,
-    period: Duration,
-    enabled: bool,
-) {
+/// Задача раннера: шаги старта, затем тик, «пора ли» (при `[works] enabled` этого тика), ночь.
+async fn run(weak: Weak<NightCtx>, shared: Arc<Shared>, tracked: Arc<Tracked>, period: Duration) {
     let started = match weak.upgrade() {
         Some(ctx) => match step(&tracked, async move { startup(&ctx).await }).await {
             StepEnd::Done => Startup::Done,
@@ -388,9 +382,6 @@ async fn run(
         None => Startup::Done,
     };
     shared.startup.send_replace(started);
-    if !enabled {
-        return;
-    }
     let mut last: Option<civil::Date> = None;
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -402,7 +393,7 @@ async fn run(
         let Some(ctx) = weak.upgrade() else {
             return;
         };
-        let works = &ctx.st.cfg.works;
+        let works = &ctx.st.works();
         let tz = works.time_zone();
         let Some((night, until)) = super::schedule::tick(zam_store::time::now(), last, works, &tz)
         else {
@@ -442,7 +433,7 @@ async fn startup(ctx: &NightCtx) {
 /// Одна ночь: проверка всех пользователей (при `[works] check = "nightly"`), затем работы.
 async fn run_night(ctx: &NightCtx, night: civil::Date, until: Timestamp) {
     tracing::info!(%night, until = %until, "ночная часть: начало ночи");
-    if ctx.st.cfg.works.check == CheckMode::Nightly
+    if ctx.st.works().check == CheckMode::Nightly
         && let Err(e) = check_job(ctx, night, until).await
     {
         tracing::warn!(%night, error = %e, "ночная проверка памяти не завершилась");

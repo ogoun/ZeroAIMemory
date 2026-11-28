@@ -44,6 +44,7 @@ pub mod triggers;
 pub mod user_settings;
 pub mod vault;
 pub mod works;
+pub mod works_admin;
 pub mod works_model;
 
 use axum::Router;
@@ -428,6 +429,11 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
         .route("/api/v1/admin/audit", get(admin::list_audit))
         // сводка внутренних работ по всем пользователям (M7.4 §7.6 п. 2)
         .route("/api/v1/admin/works", get(works::admin_summary))
+        // настройки сервера `[works]` из WebUI администратора (M7.6 §9.9)
+        .route(
+            "/api/v1/admin/works/settings",
+            get(works_admin::get_settings).patch(works_admin::patch_settings),
+        )
         // копии из WebUI (M7 §5.6): копия в процессе сервера, список, удаление готовой копии
         .route(
             "/api/v1/admin/backups",

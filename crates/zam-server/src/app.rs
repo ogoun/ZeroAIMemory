@@ -25,7 +25,12 @@ pub const GIT_SHA: &str = env!("ZAM_GIT_SHA");
 /// Общее состояние; дёшево клонируется.
 #[derive(Clone)]
 pub struct AppState {
+    /// Конфигурация запуска. Секцию `[works]` читают через [`AppState::works`]: значения из
+    /// WebUI администратора сильнее файла (M7.6 §9.9), `cfg.works` — только файл.
     pub cfg: Arc<ServerConfig>,
+    /// Действующая секция `[works]`: файл и значения из WebUI администратора
+    /// ([`crate::works::server_settings::LiveWorks`], M7.6 §9.9).
+    pub works_cfg: Arc<crate::works::server_settings::LiveWorks>,
     /// Владелец лока каталога данных: живёт, пока жив любой клон состояния.
     pub data_dir: Arc<DataDir>,
     pub admin_hash: Arc<String>,
@@ -119,6 +124,12 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Действующая секция `[works]` — снимок на одно обращение (файл конфигурации и значения из
+    /// WebUI администратора, M7.6 §9.9): новое значение действует со следующего снимка.
+    pub fn works(&self) -> Arc<crate::config::WorksSection> {
+        self.works_cfg.get()
+    }
+
     /// Штатная остановка фоновых частей. Фоновые задачи, держащие `Db` (соединения SQLite), и как
     /// каждая останавливается (финальное ревью M4, M-5):
     /// - ночной исполнитель ([`crate::works::NightRunner::stop`], M7.3) — **первым**: признак
@@ -428,10 +439,28 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     // ночной исполнитель — до состояния (поле), запуск — после него: ночи нужны поиск и
     // `/recall` с `State<AppState>` (M7.3 §6.1 п. 5)
     let night = crate::works::NightRunner::idle();
+    // `[works]`: файл и значения из WebUI администратора (M7.6 §9.9) — до слотов модели
+    let works_cfg = {
+        use crate::works::server_settings::{LiveWorks, SETTING_KEY, Stored};
+        let row = system
+            .get_setting::<serde_json::Value>(SETTING_KEY)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "настройки сервера внутренних работ (WebUI) не прочитаны: действует файл конфигурации");
+                None
+            });
+        Arc::new(LiveWorks::new(
+            cfg.works.clone(),
+            Stored::from_row(row.as_ref()),
+        ))
+    };
     let state = AppState {
         maintenance,
         night,
-        model_calls: Arc::new(crate::works::exec::CallSlots::new(cfg.works.max_parallel)),
+        model_calls: Arc::new(crate::works::exec::CallSlots::new(
+            works_cfg.get().max_parallel,
+        )),
+        works_cfg,
         backups,
         glossary: Arc::default(),
         user_flags: Arc::default(),

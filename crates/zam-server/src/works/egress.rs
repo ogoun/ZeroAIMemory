@@ -597,6 +597,19 @@ pub fn assumed_external(host: &str) -> bool {
     }
 }
 
+/// Класс закреплённого адреса подключения без DNS (M7.6 §9.9, решение 173): литерал — по
+/// диапазонам ([`classify_ip`]), `localhost` — петля, имя — по признаку «вне LAN», сохранённому
+/// при закреплении (`external`; нет — внешнее, как у [`assumed_external`]).
+pub fn assumed_reach(host: &str, external: Option<bool>) -> Reach {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    match h.parse::<IpAddr>() {
+        Ok(ip) => classify_ip(ip),
+        Err(_) if is_localhost_name(h) => Reach::Loopback,
+        Err(_) if external.unwrap_or(true) => Reach::External,
+        Err(_) => Reach::Lan,
+    }
+}
+
 /// Худший класс адресов имени (§6.2 п. 6); имя не разрешилось — `unavailable`.
 pub fn resolve_reach(host: &str, port: u16) -> Result<Reach, CallClass> {
     resolve(host, port)

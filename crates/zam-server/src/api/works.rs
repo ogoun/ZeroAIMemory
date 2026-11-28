@@ -16,7 +16,11 @@
 //! - `GET /admin/works` (M7.4 §7.6 п. 2, признак `admin_works`; только администратор) →
 //!   `{users: [{user, login, modes, paused?, queued, running, failed_7d, last_night, tokens:
 //!   {day, month}, check: {status, verdict}}]}` — сводка по всем пользователям тем же кодом, что
-//!   `GET /works/usage` и `GET /check/status` ([`admin_summary`]).
+//!   `GET /works/usage` и `GET /check/status` ([`admin_summary`]). С M7.6 (§9.9, признак
+//!   `admin_works_settings`) в строке — личный предел `limits` (`works.limits` или `null`) и
+//!   действующий `limit: {daily, monthly}`, в ответе — потолки `ceiling: {daily, monthly}` и
+//!   действующие настройки сервера `settings` (как `GET /admin/works/settings`,
+//!   [`super::works_admin`]).
 //! - `POST /works/run {kind, space?}` — ручной запуск вида (§6.3 п. 2), **только человек**
 //!   (токену — 403); `[works] enabled = false` — 409 `/problems/works-disabled` (решение 76);
 //!   действующий режим вида `off` — 409 `code: works_off` с причиной; предел ручных запусков
@@ -159,7 +163,7 @@ pub fn work_json(w: &Work, mask: bool) -> Value {
 /// Действующие режимы видов `{<вид>: {mode, reason}}`.
 fn modes_json(u: &settings::UserWorks, st: &AppState) -> Value {
     let m: Map<String, Value> = u
-        .effective(&st.cfg.works)
+        .effective(&st.works())
         .into_iter()
         .map(|(k, mode, why)| {
             (
@@ -291,6 +295,8 @@ async fn admin_row(st: &AppState, u: &zam_store::User) -> Result<Value, ApiError
     let (day, month) = tokens_used(&db).await?;
     let w = settings::load(&st.system, u.id).await?;
     let last = store::last_night(&db).await?;
+    // действующие пределы — те же, по которым сервер отказывает (M7.6 §9.9, решение 172)
+    let (daily, monthly) = crate::works::exec::token_limits(&w, &st.works());
     let mut row = json!({
         "user": u.id,
         "login": u.name,
@@ -300,6 +306,8 @@ async fn admin_row(st: &AppState, u: &zam_store::User) -> Result<Value, ApiError
         "failed_7d": c.failed_since,
         "last_night": last.map(|d| d.to_string()),
         "tokens": {"day": day, "month": month},
+        "limits": w.value(settings::WORKS_LIMITS, &st.works()),
+        "limit": {"daily": daily, "monthly": monthly},
         "check": super::check::last_brief(st, u.id, &db).await?,
     });
     if let Some(pz) = pause_json(&w) {
@@ -326,7 +334,13 @@ pub async fn admin_summary(
             }
         });
     }
-    Ok(Json(json!({"users": users})))
+    let cfg = st.works();
+    Ok(Json(json!({
+        "users": users,
+        // M7.6 §9.9: потолки и действующие настройки сервера (`GET /admin/works/settings`)
+        "ceiling": {"daily": cfg.max_daily_tokens, "monthly": cfg.max_monthly_tokens},
+        "settings": st.works_cfg.to_json(),
+    })))
 }
 
 /// `GET /works/usage?user=` → `{day, month, ceiling, last_night, night, modes, check, paused?}`.
@@ -341,7 +355,7 @@ pub async fn usage(
     let db = st.users.get(user).await?;
     let (day, month) = tokens_used(&db).await?;
     let u = settings::load(&st.system, user).await?;
-    let cfg = &st.cfg.works;
+    let cfg = &st.works();
     // те же пределы, по которым сервер отказывает (финальное ревью M7.3, Minor 6)
     let (daily, monthly) = crate::works::exec::token_limits(&u, cfg);
     let last = store::last_night(&db).await?;
@@ -406,7 +420,7 @@ pub async fn run(
         // агент не запускает работы (и обращения к модели) сам — решение координатора 35
         return Err(ApiError::Forbidden);
     }
-    if !st.cfg.works.enabled {
+    if !st.works().enabled {
         return Err(ApiError::WorksDisabled(WORKS_DISABLED_DETAIL.into()));
     }
     let b: RunBody = json_body(body)?;
@@ -418,7 +432,7 @@ pub async fn run(
         Some(s) => Some(run_space(&db, kind, s).await?),
     };
     let u = settings::load(&st.system, user).await?;
-    let (mode, why) = settings::effective_mode(kind, &u, &st.cfg.works);
+    let (mode, why) = settings::effective_mode(kind, &u, &st.works());
     if mode == WorksMode::Off {
         return Err(ApiError::conflict_code(
             "works_off",
@@ -779,12 +793,12 @@ pub(crate) async fn package(
     let works = settings::load(&st.system, user).await?;
     let mut claimed: Option<(Id, String)> = None;
     // общий выключатель — «ничего»: работы не выдаются и не снимаются (включат — продолжатся)
-    while st.cfg.works.enabled
+    while st.works().enabled
         && let Some(w) = store::claim_next(&db, &spaces, kind, &s.touch.id, LEASE).await?
     {
         let id = w.id;
         // действующий режим — перед выдачей (снятие при смене режима могло не пройти)
-        if settings::effective_mode(w.kind, &works, &st.cfg.works).0 != WorksMode::Agent {
+        if settings::effective_mode(w.kind, &works, &st.works()).0 != WorksMode::Agent {
             store::finish(
                 &db,
                 id,

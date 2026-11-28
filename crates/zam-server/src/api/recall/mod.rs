@@ -3779,7 +3779,7 @@ async fn works_line(
     session: Option<&RequestSession>,
     deadline: &mut Deadline,
 ) -> Option<(String, Id)> {
-    if !st.cfg.works.enabled {
+    if !st.works().enabled {
         return None;
     }
     if let Some(s) = session {

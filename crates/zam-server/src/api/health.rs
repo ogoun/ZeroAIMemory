@@ -81,6 +81,7 @@ pub const FEATURES: &[&str] = &[
     "strict_list_query",
     "mcp_error_meta",
     "link_space_path",
+    "admin_works_settings",
 ];
 
 /// Версии компонентов, которые узнаются один раз при старте (`AppState::components`).
