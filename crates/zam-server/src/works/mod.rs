@@ -14,6 +14,8 @@
 //!   вопроса и пределы проб (задача 4).
 //! - [`rules`] — вид `rules` и проверка кандидата в Rules, общая со спонтанным кандидатом агента
 //!   (задача 7).
+//! - [`tidy`] — вид `tidy` (M7.5 §8.7): уборка памяти — кандидаты сборщика `zam_store::tidy`,
+//!   инструкция, схема и проверка операции; итог — предложения человеку.
 
 pub mod conn;
 pub mod egress;
@@ -28,5 +30,6 @@ pub mod queue;
 pub mod rules;
 pub mod schedule;
 pub mod settings;
+pub mod tidy;
 
 pub use night::{NightCtx, NightRunner, Stopping};

@@ -330,7 +330,7 @@ async fn candidate_rule_via_write() {
     assert_eq!(list[0]["path"], "process/tests");
     assert_eq!(list[0]["author_kind"], "agent");
     assert_eq!(list[0]["session"], S1);
-    assert_eq!(counts(&a).await, json!({"rules": 1}));
+    assert_eq!(counts(&a).await, json!({"rules": 1, "tidy": 0}));
     let id = o.trim_start_matches("o:");
     let r = a
         .adm(Method::GET, &format!("{PROPOSALS}/{id}"), None, None)
@@ -407,7 +407,7 @@ async fn candidate_limits_and_dedup() {
         )
         .await;
     }
-    assert_eq!(counts(&a).await, json!({"rules": 50}));
+    assert_eq!(counts(&a).await, json!({"rules": 50, "tidy": 0}));
     let r = propose(&a, &a.token, "r/50", "Правило номер 50 для всех.", REASON).await;
     problem(&r, StatusCode::CONFLICT, "proposals-full");
     // повтор того же пути и текста и при полном списке — прежнее предложение
@@ -431,7 +431,7 @@ async fn candidate_limits_and_dedup() {
         .await;
     ok(&r, StatusCode::OK);
     assert_eq!(r.json()["status"], "declined");
-    assert_eq!(counts(&a).await, json!({"rules": 49}));
+    assert_eq!(counts(&a).await, json!({"rules": 49, "tidy": 0}));
     proposed(&a, "r/50", "Правило номер 50 для всех.").await;
     // отклонённый путь и текст — всё ещё прежнее предложение (решение человека)
     let r = propose(
@@ -459,7 +459,7 @@ async fn candidate_token_ro_403() {
         "{}",
         r.text()
     );
-    assert_eq!(counts(&a).await, json!({"rules": 0}));
+    assert_eq!(counts(&a).await, json!({"rules": 0, "tidy": 0}));
     // чтение `ro` — можно
     ok(
         &a.tok(&ro, Method::GET, PROPOSALS, None).await,
@@ -889,7 +889,7 @@ async fn accept_creates_rules_note_by_human() {
         msg.contains(&format!("из предложения {o}")) && msg.contains(S1),
         "{msg}"
     );
-    assert_eq!(counts(&a).await, json!({"rules": 0}));
+    assert_eq!(counts(&a).await, json!({"rules": 0, "tidy": 0}));
     let r = a.adm(Method::GET, "/api/v1/admin/audit", None, None).await;
     let row = r.json()["items"]
         .as_array()
@@ -983,7 +983,7 @@ async fn accept_token_403() {
             r.text()
         );
     }
-    assert_eq!(counts(&a).await, json!({"rules": 1}));
+    assert_eq!(counts(&a).await, json!({"rules": 1, "tidy": 0}));
 }
 
 /// §6.7 п. 4: путь занят к моменту принятия — 409 с подсказкой, предложение открыто.
@@ -1005,7 +1005,7 @@ async fn accept_path_taken_409() {
     let v = r.json();
     assert_eq!(v["code"], "path_taken", "{v}");
     assert!(v["detail"].as_str().unwrap().contains("path"), "{v}");
-    assert_eq!(counts(&a).await, json!({"rules": 1}));
+    assert_eq!(counts(&a).await, json!({"rules": 1, "tidy": 0}));
 }
 
 /// §6.7 п. 4: автор отзывает своё — токен того же пользователя; человек — 403 (он отклоняет);
@@ -1278,6 +1278,7 @@ async fn rules_item_existing_source_reported() {
         title: "Аксиома".into(),
         text: "текст".into(),
         signals: Vec::new(),
+        refs: Vec::new(),
     };
     let enqueue = || {
         store::enqueue(
@@ -1350,7 +1351,7 @@ async fn rules_item_existing_source_reported() {
         .result
         .unwrap();
     assert_eq!(res["warnings"], json!(warnings), "{res}");
-    assert_eq!(counts(&a).await, json!({"rules": 1}));
+    assert_eq!(counts(&a).await, json!({"rules": 1, "tidy": 0}));
 }
 
 /// Ревью r1, Minor 6: элемент `rules`, которому нет места (открытых кандидатов 50) или у
@@ -1403,6 +1404,7 @@ async fn rules_item_full_or_existing_reported() {
                 title: "Аксиома".into(),
                 text: "текст".into(),
                 signals: Vec::new(),
+                refs: Vec::new(),
             }],
         },
     )
@@ -1445,7 +1447,7 @@ async fn rules_item_full_or_existing_reported() {
     let w = store::get(&db, w.id).await.unwrap().unwrap();
     let res = w.result.unwrap();
     assert_eq!(res["response"]["warnings"], json!(warnings), "{res}");
-    assert_eq!(counts(&a).await, json!({"rules": 50}));
+    assert_eq!(counts(&a).await, json!({"rules": 50, "tidy": 0}));
 }
 
 /// §6 «Общее» (маскировка): ответы `/proposals` токену — с маской `‹secret›`, человеку — исходник.
@@ -1518,18 +1520,18 @@ async fn proposals_skip_member_records() {
     assert_eq!(last_targets(&a).await, [owner]);
 }
 
-/// Схема 0027 без CHECK типа (§6 «Общее»): строка `proposals.type = 'tidy'` (и тестового `echo`)
-/// в выборке и счёте не участвует, по id — 404 (WARN).
+/// Схема 0027 без CHECK типа (§6 «Общее»): строка неизвестного типа (`future`; с M7.5 `tidy` —
+/// известный тип уборки) и тестового `echo` в выборке и счёте не участвует, по id — 404 (WARN).
 #[tokio::test]
 async fn unknown_proposal_type_skipped_on_read() {
     let _g = SERIAL.lock().await;
     let a = server("unknown-type", |_| {}).await;
     let rules = space_id(&a, zam_store::SpaceKind::Rules).await;
-    let tidy = Id::new();
+    let future = Id::new();
     db(&a)
         .await
         .write(move |t| {
-            for (id, ty) in [(tidy, "tidy"), (Id::new(), "echo")] {
+            for (id, ty) in [(future, "future"), (Id::new(), "echo")] {
                 t.execute(
                     "INSERT INTO proposals (id, space_id, type, status, payload, author_kind,
                                             created_at)
@@ -1552,14 +1554,14 @@ async fn unknown_proposal_type_skipped_on_read() {
     let list = r.json()["proposals"].as_array().unwrap().clone();
     assert_eq!(list.len(), 1, "{list:?}");
     assert_eq!(list[0]["type"], "rule");
-    assert_eq!(counts(&a).await, json!({"rules": 1}));
+    assert_eq!(counts(&a).await, json!({"rules": 1, "tidy": 0}));
     ok(
-        &a.adm(Method::GET, &format!("{PROPOSALS}/{tidy}"), None, None)
+        &a.adm(Method::GET, &format!("{PROPOSALS}/{future}"), None, None)
             .await,
         StatusCode::NOT_FOUND,
     );
     ok(
-        &a.adm(Method::GET, &format!("{PROPOSALS}?type=tidy"), None, None)
+        &a.adm(Method::GET, &format!("{PROPOSALS}?type=future"), None, None)
             .await,
         StatusCode::BAD_REQUEST,
     );
@@ -1620,6 +1622,7 @@ async fn rules_secret_dropped_not_reoffered() {
         title: "т".into(),
         text,
         signals: Vec::new(),
+        refs: Vec::new(),
     };
     let s = secret();
     store::enqueue(
@@ -1669,7 +1672,9 @@ async fn rules_secret_dropped_not_reoffered() {
         a.st.admin_id,
         rules,
         10,
-        &std::collections::HashSet::new(),
+        &zam_server::works::kinds::settled(&db(&a).await, WorkKind::Rules)
+            .await
+            .unwrap(),
     )
     .await
     .unwrap();

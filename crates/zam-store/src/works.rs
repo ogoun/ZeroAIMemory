@@ -2,8 +2,8 @@
 //! миграция 0027).
 //!
 //! В схеме у `works.kind` и `proposals.type` CHECK нет: допустимые значения — эти перечисления.
-//! Строку неизвестного значения читатель пропускает с WARN ([`WorkKind::parse`] — `None`), так
-//! виды уборки M7.5 добавятся без миграции. Тестовый вид `echo` есть только с фичей
+//! Строку неизвестного значения читатель пропускает с WARN ([`WorkKind::parse`] — `None`): так
+//! вид уборки `tidy` и тип предложения `tidy` M7.5 (§8.7) добавлены без миграции. Тестовый вид `echo` есть только с фичей
 //! `test-hooks` (решение координатора 73): `test` занят видом строки журнала отправок проверки
 //! подключения (§6.2 п. 9).
 //!
@@ -38,30 +38,38 @@ pub enum WorkKind {
     Probes,
     /// Кандидаты в Rules (§6.7 п. 3).
     Rules,
+    /// Уборка памяти: почти-дубли, противоречия, устаревшее, шумное, непроходящие пробы —
+    /// предложения человеку (M7.5 §8.7 п. 2).
+    Tidy,
     /// Тестовый вид: пакет и итог без смысла вида (только `test-hooks`).
     #[cfg(feature = "test-hooks")]
     Echo,
 }
 
 impl WorkKind {
-    /// Все виды в порядке ночи (пробы, затем кандидаты в Rules; §6.3 п. 2).
+    /// Все виды в порядке ночи (пробы, кандидаты в Rules, уборка; §6.3 п. 2).
     #[cfg(not(feature = "test-hooks"))]
-    pub const ALL: &'static [WorkKind] = &[WorkKind::Probes, WorkKind::Rules];
-    /// Все виды в порядке ночи (пробы, затем кандидаты в Rules; §6.3 п. 2) и тестовый `echo`.
+    pub const ALL: &'static [WorkKind] = &[WorkKind::Probes, WorkKind::Rules, WorkKind::Tidy];
+    /// Все виды в порядке ночи (пробы, кандидаты в Rules, уборка; §6.3 п. 2) и тестовый `echo`.
     #[cfg(feature = "test-hooks")]
-    pub const ALL: &'static [WorkKind] = &[WorkKind::Probes, WorkKind::Rules, WorkKind::Echo];
+    pub const ALL: &'static [WorkKind] = &[
+        WorkKind::Probes,
+        WorkKind::Rules,
+        WorkKind::Tidy,
+        WorkKind::Echo,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             WorkKind::Probes => "probes",
             WorkKind::Rules => "rules",
+            WorkKind::Tidy => "tidy",
             #[cfg(feature = "test-hooks")]
             WorkKind::Echo => "echo",
         }
     }
 
-    /// Вид по строке; неизвестная строка (в том числе `tidy` до M7.5 и тип предложения
-    /// `rule`) — `None`.
+    /// Вид по строке; неизвестная строка (в том числе тип предложения `rule`) — `None`.
     pub fn parse(s: &str) -> Option<WorkKind> {
         WorkKind::ALL.iter().copied().find(|k| k.as_str() == s)
     }
@@ -73,14 +81,18 @@ impl WorkKind {
 pub enum ProposalType {
     /// Кандидат в Rules: `payload {path, content}` (§6.7 п. 1).
     Rule,
+    /// Кандидат уборки: `payload {candidate, signals, records, op}` (M7.5 §8.7 п. 2,
+    /// [`crate::tidy`]).
+    Tidy,
 }
 
 impl ProposalType {
-    pub const ALL: &'static [ProposalType] = &[ProposalType::Rule];
+    pub const ALL: &'static [ProposalType] = &[ProposalType::Rule, ProposalType::Tidy];
 
     pub fn as_str(self) -> &'static str {
         match self {
             ProposalType::Rule => "rule",
+            ProposalType::Tidy => "tidy",
         }
     }
 
@@ -215,8 +227,9 @@ impl WorkState {
 }
 
 /// Кандидат пакета в `works.items`: номер элемента `n` (как в `<record n="…">`), ссылка и
-/// ревизия записи, её вид, заголовок (исходник), текст вида агента (маска — до обрезки) и сигналы
-/// вида.
+/// ревизия записи, её вид, заголовок (исходник), текст вида агента (маска — до обрезки), сигналы
+/// вида и остальные записи кандидата `refs` (у кандидата уборки из нескольких записей — пары
+/// «ссылка, ревизия» после первой, M7.5 §8.7; у прочих видов пусто, в JSON не пишется).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkItem {
     pub n: usize,
@@ -228,6 +241,17 @@ pub struct WorkItem {
     pub text: String,
     #[serde(default)]
     pub signals: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<(String, i64)>,
+}
+
+impl WorkItem {
+    /// Все записи элемента: `(target, rev)`, затем [`WorkItem::refs`].
+    pub fn all_refs(&self) -> Vec<(String, i64)> {
+        std::iter::once((self.target.clone(), self.rev))
+            .chain(self.refs.iter().cloned())
+            .collect()
+    }
 }
 
 /// Работа — строка `works`.
@@ -526,6 +550,21 @@ pub enum ItemWrite {
         author: String,
         session: Option<String>,
     },
+    /// Кандидат уборки — элемент работы вида `tidy` (M7.5 §8.7 п. 2): строка `proposals` типа
+    /// `tidy` — `proposed` (операция ждёт человека) или `skipped` (операция `keep` и отказ
+    /// исполнителя `{n, skip}`: человеку не показывается, отсев до новой ревизии записей).
+    /// `targets` — записи кандидата с ревизиями, ключ отсева — [`crate::tidy::dedup_key`]. Повтор
+    /// по ключу или предел открытых к моменту записи — строки нет (предупреждение итога).
+    Tidy {
+        status: crate::proposals::ProposalStatus,
+        targets: Vec<crate::proposals::SourceRef>,
+        payload: Value,
+        reason: String,
+        dedup_key: String,
+        author_kind: crate::proposals::ProposalAuthor,
+        author: String,
+        session: Option<String>,
+    },
 }
 
 /// `proposals.type` записей тестового вида `echo`.
@@ -683,6 +722,54 @@ fn apply_write(
             // повтор по ключу (та же ревизия) — без второй строки
             pr::insert_tx(t, &p)?;
             Ok(None)
+        }
+        ItemWrite::Tidy {
+            status,
+            ref targets,
+            ref payload,
+            ref reason,
+            ref dedup_key,
+            author_kind,
+            ref author,
+            ref session,
+        } => {
+            use crate::proposals::{self as pr, InsertOutcome, NewProposal};
+            let first = targets
+                .first()
+                .map_or("", |x| x.target.as_str())
+                .to_string();
+            let p = NewProposal {
+                space: w.space_id,
+                ptype: ProposalType::Tidy,
+                status,
+                targets: targets.clone(),
+                payload: payload.clone(),
+                reason: Some(reason.clone()),
+                basis: targets.iter().map(|x| x.target.clone()).collect(),
+                dedup_key: Some(dedup_key.clone()),
+                author_kind,
+                author: Some(author.clone()),
+                work_id: Some(w.id),
+                session_id: session.clone(),
+            };
+            Ok(match pr::insert_tx(t, &p)? {
+                InsertOutcome::Inserted(_) => None,
+                // повтор по ключу у `skipped` — отсев уже есть, предупреждать не о чем
+                InsertOutcome::Existing(_) if status == pr::ProposalStatus::Skipped => None,
+                InsertOutcome::Existing(id) => {
+                    tracing::warn!(work = %w.id, target = %first, proposal = %id, "уборка: у кандидата уже есть предложение — не записан");
+                    Some(format!(
+                        "{first}: у кандидата уже есть предложение o:{id} — не записан"
+                    ))
+                }
+                InsertOutcome::Full => {
+                    tracing::warn!(work = %w.id, target = %first, "уборка: открытых предложений — предел, не записан");
+                    Some(format!(
+                        "{first}: открытых предложений уборки — {} — кандидат не записан",
+                        pr::PROPOSALS_OPEN_MAX
+                    ))
+                }
+            })
         }
     }
 }
@@ -953,6 +1040,37 @@ pub async fn count_packages(
     .await
 }
 
+/// Сколько кандидатов (элементов `items`) вида поставлено в запуске постановки: ночью — работы
+/// `origin = nightly` ночи `night`, у ручного запуска (`night` нет) — работы `origin` с `since`
+/// (сутки UTC), в любом состоянии. Предел кандидатов уборки за ночь (M7.5 §8.7 п. 1) — по нему.
+pub async fn count_items(
+    db: &Db,
+    kind: WorkKind,
+    origin: Origin,
+    night: Option<civil::Date>,
+    since: Timestamp,
+) -> Result<usize, StoreError> {
+    db.read(move |c| {
+        let n: i64 = c
+            .prepare_cached(
+                "SELECT coalesce(sum(json_array_length(items)), 0) FROM works
+                 WHERE kind = ?1 AND origin = ?2
+                   AND (CASE WHEN ?3 IS NOT NULL THEN night = ?3 ELSE created_at >= ?4 END)",
+            )?
+            .query_row(
+                params![
+                    kind.as_str(),
+                    origin.as_str(),
+                    night.map(|d| d.to_string()),
+                    fmt_ts(since)
+                ],
+                |r| r.get(0),
+            )?;
+        Ok(usize::try_from(n).unwrap_or(0))
+    })
+    .await
+}
+
 /// Пространства, где у вида уже была ночная постановка ночи `night` (§6.1 п. 4: постановка —
 /// если её не было; у режима агента — одна работа пространства за ночь).
 pub async fn nightly_spaces(
@@ -1194,7 +1312,8 @@ pub async fn offered_refs(
         let mut out = HashSet::new();
         for items in rows {
             let items: Vec<WorkItem> = serde_json::from_str(&items?).unwrap_or_default();
-            out.extend(items.into_iter().map(|i| (i.target, i.rev)));
+            // у кандидата уборки — все его записи (M7.5 §8.7)
+            out.extend(items.iter().flat_map(WorkItem::all_refs));
         }
         Ok(out)
     })
@@ -1335,14 +1454,16 @@ mod tests {
         }
         assert_eq!(WorkKind::parse("probes"), Some(WorkKind::Probes));
         assert_eq!(WorkKind::parse("rules"), Some(WorkKind::Rules));
-        for bad in ["tidy", "rule", "test", "", "Probes", " probes"] {
+        assert_eq!(WorkKind::parse("tidy"), Some(WorkKind::Tidy));
+        for bad in ["rule", "test", "", "Probes", " probes"] {
             assert_eq!(WorkKind::parse(bad), None, "{bad}");
         }
         for t in ProposalType::ALL {
             assert_eq!(ProposalType::parse(t.as_str()), Some(*t));
         }
         assert_eq!(ProposalType::parse("rule"), Some(ProposalType::Rule));
-        for bad in ["rules", "tidy", ""] {
+        assert_eq!(ProposalType::parse("tidy"), Some(ProposalType::Tidy));
+        for bad in ["rules", "Tidy", ""] {
             assert_eq!(ProposalType::parse(bad), None, "{bad}");
         }
     }

@@ -8140,6 +8140,82 @@ test -p zam-server --test boot`, `cargo fmt --all --check`. Живой приё�
 вывод `zam-server doctor` до и после обновления на обоих серверах, число и объём кандидатов
 сборщика до первого прохода — координатор при развёртывании.
 
+### M7.5 · Задача 2 — Уборка памяти: сервер
+
+Спецификация §8.7 (решения координатора 115, 125, 126); worktree `.tmp/m75/wt-t2`, ветка `m7.5-t2`
+от `508578ae`. Миграций нет: вид `WorkKind::Tidy` и тип `ProposalType::Tidy` — кодом, курсор —
+`meta` `tidy.cursor`.
+
+**Сборщик** (`crates/zam-store/src/tidy.rs`). `collect(db, Collect {owner, spaces, model,
+dedup_threshold, limit, exclude, declined})` → `Vec<TidyCandidate>`: записи — insight
+`active`/`revisit` и термины `active` пространств сбора, автор каждой ревизии — владелец (тот же
+SQL, что `owner_entries`); типы `CandidateType` в порядке среза (`contradiction`, `probe_fail`,
+`stale`, `near_duplicate`, `noisy`); `ops_for` — допустимые операции; `dedup_key` (тип, ссылки,
+ревизии) и `declined_key` (тип, ссылки) — `proposals::key_refs_rev` / `key_refs`; `window` — окно
+почти-дублей с курсором; `records(db, owner, ids)` — записи для проверки итога. В
+`zam_store::proposals`: `ProposalCounts.tidy`, `DecisionKind::Stale`, `declined_tidy_keys`,
+`mark_stale_tidy`; в `zam_store::works`: `WorkItem.refs` (остальные записи кандидата, в JSON —
+только непустой), `WorkItem::all_refs`, `ItemWrite::Tidy`, `count_items`; `offered_refs` и
+`live_refs` пакета — по всем записям элемента.
+
+**Вид `tidy`** (`crates/zam-server/src/works/tidy.rs`): `collect` (кандидаты запуска — один раз,
+кэш в отсеве запуска), `room` (20 за ночь за вычетом элементов работ запуска), инструкция ru/en
+(≤ 300 токенов, тест), схема, `check_op` и `accept` (строка `proposals` `proposed`, у `keep` —
+`skipped`), `skip`. `works::kinds`: `Sifted`, `settled`, `sifted`, `target_locates`; в `queue`
+отсев считается один раз в `agent_batch` и `run_model` (у модели выполненные работы дописывают свои
+записи — `Sifted::add_items`); `probes::collect_on` и `rules::collect` больше не собирают
+`excluded_refs` сами. Применение — `api/proposals.rs::accept_tidy`: сверка ревизий, операции через
+обработчики `insights::supersede`/`retract`/`create` и `entries::patch` от имени человека с
+`If-Match`, `merged_certainty`, решение, аудит. Признак `tidy` — в конец `FEATURES`.
+
+**Решения исполнителя.**
+- [решение исполнителя, задача 2] Принятое у `tidy` (как у `probes` и `rules`) отсеивается не
+  парами `accepted_refs`, а строками `proposals` по `dedup_key`: пара «ссылка, ревизия» основной
+  записи исключила бы запись из кандидатов **всех** типов на год после любого предложения о ней
+  (в том числе отклонённого или `keep`), а ключ кандидата отсеивает точно его. `accepted_refs` в
+  отсеве — только у `echo` (как было). Спецификация §8.7 п. 4 называет `accepted_refs` в общей
+  формуле — отступление записано здесь и в ТЗ §7.15.
+- [решение исполнителя, задача 2] Кандидаты запуска собираются **один раз** (первым
+  пространством, кэш `Sifted`): курсор почти-дублей сдвигается раз за запуск, срез 20 и порядок
+  типов — по всем решениям и Knowledge пользователя; пространство получает свои.
+- [решение исполнителя, задача 2] Запись — не больше чем в одном кандидате сбора (первый по
+  порядку типов): противоречивые предложения об одной записи в одну ночь не уходят.
+- [решение исполнителя, задача 2] Элемент итога `tidy` — только по `n`: `target` — цель операции
+  (любая запись кандидата), а не ссылка элемента (`kinds::target_locates`).
+- [решение исполнителя, задача 2] Набор операций по типу (`ops_for`): противоречие — `merge`,
+  `retract`, `revisit`, `append`; непроходящая проба insight — `triggers`, `append`, `term`,
+  термина — `term`, `append`; устаревшее — `retract`, `revisit`, `append`; почти-дубли insight —
+  `merge`, `retract`, терминов — `term`, `retract`; шумное — `triggers`, `retract`, `revisit`;
+  всегда `keep`. `revisit` — только у `active` insight, `triggers` — только у insight, `merge` —
+  только у двух insight (замещение — в одном пространстве).
+- [решение исполнителя, задача 2] Почти-дубли терминов — только термин решения против термина
+  Knowledge (в одном пространстве имена терминов уникальны); пространство кандидата — решения.
+  Непроходящая проба — только цели insight и термины (у заметок операций уборки нет).
+- [решение исполнителя, задача 2] Вектор записи — ключ чанка L1 (`note`), иначе первого листа;
+  модель — эмбеддер сервера, без него почти-дубли insight не ищутся (термины — ищутся); в тестах —
+  `works::tidy::test_hooks::set_model`.
+- [решение исполнителя, задача 2] «Сообщение ревизии» у записей журнала — причина ревизии (поля
+  сообщения у `entry_revisions` нет): довод и «из предложения o:<id> (…)»; новая запись `merge`
+  создаётся без причины, происхождение — в причине отзыва `drop`. Достоверность: запись без
+  статуса в минимуме не участвует; `merge` прошёл замещением, а отзыв `drop` нет — предложение
+  `accepted` с `warnings` (главное действие сделано).
+- [решение исполнителя, задача 2] Отказ исполнителя `{n, skip}` — как `keep` (строка `skipped`,
+  до новой ревизии записей); `stale` карточки считается при выдаче, статус `stale` ставят
+  «Применить» и сборщик ночи; `GET /proposals/counts` → `{rules, tidy}`; `POST /proposals` с
+  `type: tidy` — 400.
+
+**Прежние тесты.** Неизвестный вид и тип в `works::unknown_kind_skipped_on_read`,
+`proposals_rules::unknown_proposal_type_skipped_on_read`, `works_settings` и модульном тесте
+настроек — `future` вместо `tidy`; ответ `counts` в `proposals_rules` — `{rules, tidy: 0}`;
+прямые вызовы `kinds::collect` и `probes::collect_on` — с отсевом `kinds::settled` /
+`Sifted::of`; литералы `WorkItem` — с `refs`.
+
+**Прогоны.** `cargo test -p zam-store --lib` — 138 passed; `cargo test -p zam-server --lib` — 391
+passed; `--test proposals_tidy` — 17 passed (16 по §8.7 и `guide_tidy_line`), `proposals_rules` —
+26, `works` — 36, `works_model` — 42, `boot` — 16, `works_probes` — 17, `works_settings` и
+`agent_setup guide` — зелёные; clippy `-D warnings` по `zam-store`, `zam-server`, `cargo fmt --all
+--check`.
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

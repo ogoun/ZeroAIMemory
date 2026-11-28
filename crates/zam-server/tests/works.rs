@@ -1307,6 +1307,7 @@ async fn work_model_running_requeued_on_start() {
         title: "т".into(),
         text: String::new(),
         signals: Vec::new(),
+        refs: Vec::new(),
     };
     let w = store::enqueue(
         &db(&a).await,
@@ -1418,6 +1419,7 @@ async fn secret_dropped_stays_excluded_after_skip() {
         title: "т".into(),
         text,
         signals: Vec::new(),
+        refs: Vec::new(),
     };
     let s = secret();
     store::enqueue(
@@ -1465,7 +1467,9 @@ async fn secret_dropped_stays_excluded_after_skip() {
         a.st.admin_id,
         space,
         10,
-        &std::collections::HashSet::new(),
+        &zam_server::works::kinds::settled(&db(&a).await, WorkKind::Echo)
+            .await
+            .unwrap(),
     )
     .await
     .unwrap();
@@ -1527,6 +1531,7 @@ async fn works_retention_and_refs_horizon() {
                         title: "т".into(),
                         text: "т".into(),
                         signals: Vec::new(),
+                        refs: Vec::new(),
                     }],
                 },
             )
@@ -1806,8 +1811,8 @@ async fn works_disabled_manual_409() {
     assert_eq!(m.count(), 0);
 }
 
-/// §6.3 п. 1: строка неизвестного вида (`tidy` до M7.5), вставленная SQL, — `GET /works` и захват
-/// её пропускают (WARN), прочие работы — как обычно.
+/// §6.3 п. 1: строка неизвестного вида (`future`; `tidy` с M7.5 — известный вид), вставленная SQL,
+/// — `GET /works` и захват её пропускают (WARN), прочие работы — как обычно.
 #[tokio::test]
 async fn unknown_kind_skipped_on_read() {
     let _g = SERIAL.lock().await;
@@ -1816,7 +1821,7 @@ async fn unknown_kind_skipped_on_read() {
     insight(&a, "knowledge", "Известный вид", "текст").await;
     night(&a).await;
     let known = echo_works(&a).await.remove(0);
-    let tidy = Id::new();
+    let future = Id::new();
     let space = known.space_id;
     // старше известной: захват встречает её первой
     let created = zam_store::time::fmt_ts(zam_store::time::now() - SignedDuration::from_mins(1));
@@ -1825,8 +1830,8 @@ async fn unknown_kind_skipped_on_read() {
         .write(move |t| {
             t.execute(
                 "INSERT INTO works (id, kind, space_id, mode, origin, state, items, created_at)
-                 VALUES (?1, 'tidy', ?2, 'agent', 'manual', 'queued', '[]', ?3)",
-                rusqlite::params![tidy, space, created],
+                 VALUES (?1, 'future', ?2, 'agent', 'manual', 'queued', '[]', ?3)",
+                rusqlite::params![future, space, created],
             )?;
             Ok(())
         })

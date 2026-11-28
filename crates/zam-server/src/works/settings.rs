@@ -521,7 +521,7 @@ mod tests {
         let rows = vec![
             (WORKS_MODE.to_string(), json!("agent")),
             ("works.kind.probes".to_string(), json!("model")),
-            ("works.kind.tidy".to_string(), json!("agent")),
+            ("works.kind.future".to_string(), json!("agent")),
             ("works.kind.rules".to_string(), json!("bogus")),
             (WORKS_MODEL.to_string(), json!(c)),
             (
