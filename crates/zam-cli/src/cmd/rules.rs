@@ -1,5 +1,5 @@
 //! `zam rules` — кандидаты в Rules (M7.3 §6.7 п. 2): агент предлагает правило, человек решает
-//! в WebUI «Кандидаты в Rules».
+//! в WebUI «Предложения» (вкладка «Правила»).
 //!
 //! - `zam rules candidate <путь> --file F --reason R [--basis ID]…` — спонтанный кандидат
 //!   `POST /proposals {type: "rule", path, content, reason, basis}`: путь — `rules:/<путь>` или
@@ -74,9 +74,7 @@ pub fn candidate(
             v["status"].as_str().unwrap_or("?")
         )
     } else {
-        format!(
-            "{o} — кандидат в Rules rules:/{path}: решает человек (WebUI «Кандидаты в Rules»)\n"
-        )
+        format!("{o} — кандидат в Rules rules:/{path}: решает человек (WebUI «Предложения»)\n")
     };
     emit(line.as_bytes())
 }

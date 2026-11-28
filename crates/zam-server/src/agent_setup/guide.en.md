@@ -219,7 +219,7 @@ If a session broke off (a limit, a closed window) and the task's `next_step` was
 
 ## Rules candidates
 
-The human writes Rules; you **propose** a rule, and the human accepts or declines it in WebUI (“Кандидаты в Rules”, Rules candidates). A proposal (reference `o:`) changes nothing by itself: the human creates the Rules note by accepting it.
+The human writes Rules; you **propose** a rule, and the human accepts or declines it in WebUI (“Предложения”, proposals, tab “Правила”). A proposal (reference `o:`) changes nothing by itself: the human creates the Rules note by accepting it.
 
 - **When.** You noticed a rule for **all** of your projects — a behaviour, not a fact of one project (an owner's decision, a gotcha you hit again and again) — and Rules does not have it.
 - **How** — `memory_write {path: "rules:/<path>", content, candidate: {reason, basis?}}`; CLI — `zam rules candidate <path> --file F --reason R [--basis ID]…`; REST — `POST /proposals {type: "rule", path, content, reason, basis?}`. The reply is `o:<id>`; the same path and text — the earlier proposal.

@@ -1360,8 +1360,8 @@ async fn candidate(rest: &Rest, args: &JsonObject, c: &Value) -> Res {
             )
         } else {
             format!(
-                "Кандидат в Rules {o} rules:/{path} — решает человек (WebUI «Кандидаты в \
-                 Rules»); свои — GET /proposals?author=me"
+                "Кандидат в Rules {o} rules:/{path} — решает человек (WebUI «Предложения»); \
+                 свои — GET /proposals?author=me"
             )
         }
     })
