@@ -19,6 +19,12 @@
   // страница по его настройкам (`/admin/users/{id}/settings`), очереди, токенам, журналу и
   // Vault, правки — от имени администратора (аудит). Точку паузы в шапке ставит только своя
   // страница. Смену пользователя страница не переживает — оболочка монтирует её заново (`{#key}`).
+  // M7.6 (§9.2 п. 6; решения 166–170): «Протокол» — OpenAI-совместимый или Anthropic Messages (у
+  // Anthropic «Поле предела» скрыто, рецепты и подсказка адреса — свои); в выборе записи — только
+  // записи с адресом API (`http(s)://`), пункт «<имя> — <адрес>»; «Новая запись…», «Изменить
+  // запись» и «Исправить адрес» — окно записи Vault `VaultForm` (ленивый чанк) поверх окна
+  // подключения, после сохранения запись выбрана; куда уйдёт запрос — под выбором, адрес без /v1
+  // — предупреждение; неудачная проверка — понятная причина и полный адрес запроса.
   import { onMount } from 'svelte';
   import FormDialog from '../components/FormDialog.svelte';
   import Notice from '../components/Notice.svelte';
@@ -52,7 +58,8 @@
     MODE_TITLE,
     ORIGIN_TEXT,
     PAUSE_TITLE,
-    RECIPES,
+    PROTOCOLS,
+    PROTOCOL_TITLE,
     STATE_TEXT,
     WORKS_MODES,
     WORK_KINDS,
@@ -66,14 +73,22 @@
     num,
     outcomeText,
     parseBodyExtra,
+    isModelUrl,
+    pathWarning,
     pauseHint,
     pinnedUrl,
+    protocolOf,
     reachText,
     reasonText,
+    recipesOf,
+    requestUrlOf,
+    testFailText,
     usageText,
     vaultAddress,
+    vaultChoiceLabel,
     withRecipe,
     workResultText,
+    type Protocol,
     type WorkKind,
     type WorksMode,
   } from '../lib/worksText';
@@ -284,37 +299,47 @@
   // ---- подключение модели (окно формы, правило Б) ----
 
   let connOpen = $state(false);
+  let fProto = $state<Protocol>('openai');
   let fVault = $state('');
   let fModel = $state('');
   let fAuth = $state<ModelConn['auth']>('key');
   let fMax = $state(4000);
   let fField = $state<ModelConn['token_field']>('auto');
   let fExtra = $state('');
+  /** Адрес записи подключения, который человек сам поменял в окне записи Vault: при сохранении
+   * подключения он подтверждается (`confirm_url`) — иначе пауза «адрес изменён» на свою же правку. */
+  let fConfirm = $state('');
   let dlgNotice = $state('');
   let dlgError = $state('');
   type Fields = Record<string, unknown>;
   /** Поля при открытии окна (или после сохранения в окне) — с ними сравнивается набранное. */
   let base = $state.raw<Fields>({});
-  const fieldsNow = (): Fields => ({ vault: fVault, model: fModel, auth: fAuth, max: fMax, field: fField, extra: fExtra });
+  const fieldsNow = (): Fields => ({ proto: fProto, vault: fVault, model: fModel, auth: fAuth, max: fMax, field: fField, extra: fExtra, confirm: fConfirm });
   const connDirty = () => connOpen && isDirty(fieldsNow(), base);
 
-  /** Записи личного Vault с адресом — выбор подключения (§6.9 п. 1: «по именам»). */
-  let choices = $derived(vault.filter((v) => vaultAddress(v.data)));
+  /** Записи личного Vault с адресом API (`http(s)://…`) — выбор подключения (§6.9 п. 1; решение
+   * 166: описания хостов вроде «192.0.2.10 (SSH…)» не показываются). */
+  let choices = $derived(vault.filter((v) => isModelUrl(vaultAddress(v.data))));
   let chosen = $derived(vault.find((v) => v.id === fVault) ?? null);
   let chosenAddr = $derived(chosen ? vaultAddress(chosen.data) : '');
   let view = $derived(addressView(chosenAddr));
-  let extraCheck = $derived(parseBodyExtra(fExtra));
+  /** Куда уйдёт запрос и замечание о пути адреса (решение 168). */
+  let reqUrl = $derived(isModelUrl(chosenAddr) ? requestUrlOf(fProto, chosenAddr) : '');
+  let pathWarn = $derived(pathWarning(fProto, chosenAddr));
+  let extraCheck = $derived(parseBodyExtra(fExtra, fProto));
   let extraError = $derived('error' in extraCheck ? extraCheck.error : '');
 
   function openConn() {
     const m = settings?.model;
     const id = m?.vault.replace(/^v:/, '') ?? '';
+    fProto = protocolOf(m?.protocol);
     fVault = id || choices[0]?.id || '';
     fModel = m?.model ?? '';
     fAuth = m?.auth ?? 'key';
     fMax = m?.max_tokens ?? 4000;
     fField = m?.token_field ?? 'auto';
     fExtra = bodyExtraText(m?.body_extra);
+    fConfirm = '';
     base = fieldsNow();
     dlgNotice = '';
     dlgError = '';
@@ -328,11 +353,14 @@
     if (!model || model.length > 200) throw new Error('Модель — имя у поставщика, от 1 до 200 символов.');
     const max = Number(fMax);
     if (!Number.isInteger(max) || max < 256 || max > 32000) throw new Error('Предел ответа — от 256 до 32 000 токенов.');
-    const extra = parseBodyExtra(fExtra);
+    const extra = parseBodyExtra(fExtra, fProto);
     if ('error' in extra) throw new Error(`body_extra: ${extra.error}`);
     // запись — по id (`v:<id>`), а не по имени: переименованная запись не подменится другой с тем же
-    // именем (контракт задачи 2 после ревью r1–r2)
-    return { protocol: 'openai', vault: `v:${fVault}`, model, auth: fAuth, max_tokens: max, token_field: fField, body_extra: extra.value };
+    // именем (контракт задачи 2 после ревью r1–r2); у Anthropic предел — всегда max_tokens
+    const token_field = fProto === 'anthropic' ? 'auto' : fField;
+    // свой новый адрес записи подключения — подтверждён тем, кто его ввёл (решение 167)
+    const confirm = fConfirm && fConfirm === chosenAddr ? { confirm_url: fConfirm } : {};
+    return { protocol: fProto, vault: `v:${fVault}`, model, auth: fAuth, max_tokens: max, token_field, body_extra: extra.value, ...confirm };
   }
 
   /** 409 `vault_changed` при сохранении: адрес записи изменили после закрепления. */
@@ -356,6 +384,7 @@
       dlgError = changed ?? errorText(e);
       return false;
     }
+    fConfirm = '';
     base = fieldsNow();
     const text = `Подключение сохранено${had ? ', пауза снята' : ''}.`;
     if (close) {
@@ -370,11 +399,37 @@
     if (t !== null) fExtra = t;
   }
 
-  /** Итог проверки подключения — строкой. */
+  /** Итог проверки подключения — строкой; неудача — понятная причина и полный адрес запроса
+   * (решение 169). */
   function testText(r: Awaited<ReturnType<typeof testModel>>): string {
     if (r.ok) return `Подключение работает: ответ за ${r.ms ?? '?'} мс.`;
-    const cls = r.class ? outcomeText(r.class, null) : 'не работает';
-    return `Подключение не работает: ${cls}.${r.hint ? ` ${r.hint}` : ''}`;
+    return testFailText(r, settings?.model?.model ?? fModel.trim());
+  }
+
+  // ---- запись Vault из окна подключения (решение 167): поверх окна подключения ----
+
+  /** Окно записи Vault: создание (`item: null`) или правка; `url` — исправленный адрес. */
+  let vform = $state<{ item: VaultItem | null; url?: string } | null>(null);
+
+  /** «Исправить адрес» (решение 168): окно записи с исправленным адресом, значение не трогается. */
+  function fixAddress() {
+    const w = pathWarn;
+    if (chosen && w) vform = { item: chosen, url: w.fixed };
+  }
+
+  /** Запись сохранена: список — заново, запись выбрана; без ключа — «без ключа». */
+  async function vaultSaved(it: VaultItem, keyless: boolean) {
+    const was = vform?.item ? vaultAddress(vform.item.data) : null;
+    vform = null;
+    await loadVault();
+    fVault = it.id;
+    if (keyless) fAuth = 'none';
+    dlgError = '';
+    const now = vaultAddress(it.data);
+    const own = settings?.model?.vault === `v:${it.id}`;
+    // адрес записи сохранённого подключения поменял сам человек: подтвердится при сохранении
+    if (own && was !== null && was !== now) fConfirm = now;
+    dlgNotice = `Запись «${it.title}» сохранена и выбрана.${fConfirm ? ' Новый адрес подключения подтвердится при сохранении.' : ''}`;
   }
 
   /** «Проверить подключение»: на паузе `vault_changed` — 409 без обращения (сервер), страница
@@ -631,18 +686,19 @@
     {#if s.model}
       {@const m = s.model}
       <dl class="facts">
+        <div><dt>Протокол</dt><dd>{PROTOCOL_TITLE[protocolOf(m.protocol)]}</dd></div>
         <div><dt>Запись Vault</dt><dd title={m.vault}>{modelVault?.title ?? 'запись личного Vault'}</dd></div>
         <div><dt>Адрес</dt><dd><code class="path">{m.pinned ? pinnedUrl(m.pinned) : 'не закреплён'}</code></dd></div>
         <div><dt>Модель</dt><dd>{m.model}</dd></div>
         <div><dt>Ключ</dt><dd>{m.auth === 'key' ? 'значение записи Vault' : 'без ключа'}</dd></div>
-        <div><dt>Предел ответа</dt><dd>{num(m.max_tokens)} токенов{m.token_field !== 'auto' ? ` (${m.token_field})` : ''}</dd></div>
+        <div><dt>Предел ответа</dt><dd>{num(m.max_tokens)} токенов{m.token_field !== 'auto' && m.protocol !== 'anthropic' ? ` (${m.token_field})` : ''}</dd></div>
         <div><dt>body_extra</dt><dd>{Object.keys(m.body_extra).length ? Object.keys(m.body_extra).join(', ') : 'нет'}</dd></div>
       </dl>
     {:else}
       <p class="muted">
-        Модель не подключена. Подключение — OpenAI-совместимый Chat Completions (OpenAI, Anthropic через его
-        OpenAI-совместимый вход, Qwen, Kimi, DeepSeek, OpenRouter, Ollama, llama.cpp, vLLM, LM Studio): адрес и ключ —
-        запись вашего личного Vault.
+        Модель не подключена. Протокол — OpenAI-совместимый Chat Completions (OpenAI, Qwen, Kimi, DeepSeek, OpenRouter,
+        Ollama, llama.cpp, vLLM, LM Studio) или Anthropic Messages (Anthropic и локальные серверы с таким входом): адрес
+        API и ключ доступа — запись вашего личного Vault.
       </p>
     {/if}
     <div class="row actions">
@@ -824,9 +880,9 @@
 <FormDialog
   open={connOpen}
   title="Подключение модели"
-  description="OpenAI-совместимый Chat Completions. Адрес (поле url записи, с /v1, как у поставщика) и ключ — запись {target
+  description="Адрес API модели и ключ доступа — запись {target
     ? `личного Vault пользователя ${targetName}`
-    : 'вашего личного Vault'}."
+    : 'вашего личного Vault'}; ключ в окне не показывается."
   submit="Сохранить"
   wide
   busy={dlgTesting}
@@ -838,26 +894,53 @@
   }}
   onclose={() => (connOpen = false)}
 >
+  <label>
+    Протокол
+    <select bind:value={fProto}>
+      {#each PROTOCOLS as p (p)}<option value={p}>{PROTOCOL_TITLE[p]}</option>{/each}
+    </select>
+  </label>
   {#if choices.length}
-    <!-- адрес выбранной записи и его класс — подписью над выбором (видно до сохранения; описание
-         поля для чтения с экрана — `aria-describedby`, в имя поля не входит): поля окна идут плотно -->
+    <!-- что выбирать — строкой над выбором (решение 166); адрес выбранной записи, его класс и куда
+         уйдёт запрос — подписью (видно до сохранения; описание поля для чтения с экрана —
+         `aria-describedby`, в имя поля не входит): поля окна идут плотно -->
     <label>
       Запись Vault
+      <span class="field-note muted" id="works-vault-note" aria-hidden="true">
+        Запись вашего Vault, где хранятся адрес API модели и ключ доступа. Выберите сервер модели или создайте запись
+      </span>
       <span class="field-note" aria-hidden="true" id="works-addr" data-testid="works-address">
         адрес: <code class="path">{chosenAddr || 'нет адреса'}</code>{#if view}<span class="muted">{` — ${reachText(view.reach)}`}</span>{/if}
         {#if view?.problem}<span class="error-text">{view.problem}</span>{/if}
         {#if view?.reach === 'external' && !view.problem}<span class="warn note-ext">Данные памяти уйдут за пределы локальной сети: {view.host}</span>{/if}
+        {#if reqUrl}<span class="muted req-url" data-testid="works-request-url">запрос уйдёт на <code class="path">{reqUrl}</code></span>{/if}
       </span>
-      <select bind:value={fVault} data-autofocus aria-describedby="works-addr">
-        {#each choices as v (v.id)}<option value={v.id}>{v.title}</option>{/each}
+      <select bind:value={fVault} data-autofocus aria-describedby="works-vault-note works-addr">
+        {#each choices as v (v.id)}<option value={v.id}>{vaultChoiceLabel(v.title, vaultAddress(v.data))}</option>{/each}
       </select>
     </label>
   {:else}
     <p class="warn small" role="note">
-      {vaultLocked ? `${vaultLocked}. ` : ''}В личном Vault нет записей с адресом. Создайте запись: тип token, ссылка — адрес с /v1,
-      значение — ключ; например <code>zam vault set my-model --type token --link https://адрес/v1 --global</code>.
+      {vaultLocked ? `${vaultLocked}. ` : ''}В вашем Vault пока нет записи с адресом API модели. Создайте её здесь: название, адрес
+      API и ключ доступа.
     </p>
   {/if}
+  <!-- действия с записью — группой под выбором: предупреждение о пути адреса и кнопки окна записи
+       Vault (поля окна идут плотно — группа считается полем) -->
+  <fieldset class="vault-actions" aria-label="Создать или изменить запись">
+    {#if choices.length && pathWarn}
+      <div class="warn small row path-warn" role="note" data-testid="works-path-warning">
+        <span>{pathWarn.text}</span>
+        <button type="button" class="small-btn" onclick={() => fixAddress()}>Исправить адрес</button>
+      </div>
+    {/if}
+    <div class="row">
+      <button type="button" class="small-btn" onclick={() => (vform = { item: null })} disabled={!!vaultLocked}>Новая запись…</button>
+      {#if chosen}
+        <button type="button" class="small-btn" onclick={() => (vform = { item: chosen })} disabled={!!vaultLocked}>Изменить запись</button>
+      {/if}
+    </div>
+  </fieldset>
   <!-- «Имя модели», а не «Модель»: имена записей Vault в выборе выше часто содержат «модель» -->
   <label>
     Имя модели
@@ -874,23 +957,27 @@
     Предел ответа, токенов
     <input type="number" min="256" max="32000" step="1" bind:value={fMax} />
   </label>
-  <label>
-    Поле предела
-    <!-- пояснение — только описание поля (`aria-describedby`), не часть его имени (ревью r2, N2) -->
-    <span class="field-note muted" id="works-field-note" aria-hidden="true">авто — max_completion_tokens у api.openai.com, max_tokens у прочих</span>
-    <select bind:value={fField} aria-describedby="works-field-note">
-      <option value="auto">авто</option>
-      <option value="max_tokens">max_tokens</option>
-      <option value="max_completion_tokens">max_completion_tokens</option>
-    </select>
-  </label>
+  <!-- у Anthropic Messages предел — всегда max_tokens: поля нет (§9.2 п. 6) -->
+  {#if fProto === 'openai'}
+    <label>
+      Поле предела
+      <!-- пояснение — только описание поля (`aria-describedby`), не часть его имени (ревью r2, N2) -->
+      <span class="field-note muted" id="works-field-note" aria-hidden="true">авто — max_completion_tokens у api.openai.com, max_tokens у прочих</span>
+      <select bind:value={fField} aria-describedby="works-field-note">
+        <option value="auto">авто</option>
+        <option value="max_tokens">max_tokens</option>
+        <option value="max_completion_tokens">max_completion_tokens</option>
+      </select>
+    </label>
+  {/if}
   <label>
     body_extra (JSON, необязательно)
-    <textarea rows="4" bind:value={fExtra} aria-invalid={!!extraError} spellcheck="false" placeholder={'{"chat_template_kwargs": {"enable_thinking": false}}'}></textarea>
+    <textarea rows="4" bind:value={fExtra} aria-invalid={!!extraError} spellcheck="false"
+      placeholder={fProto === 'anthropic' ? '{"output_config": {"effort": "low"}}' : '{"chat_template_kwargs": {"enable_thinking": false}}'}></textarea>
   </label>
   {#if extraError}<p class="error small" role="alert">{extraError}</p>{/if}
   <div class="row recipes" role="group" aria-label="Рецепты body_extra">
-    {#each RECIPES as r (r.name)}<button type="button" class="small-btn" onclick={() => addRecipe(r.value)}>{r.title}</button>{/each}
+    {#each recipesOf(fProto) as r (r.name)}<button type="button" class="small-btn" onclick={() => addRecipe(r.value)}>{r.title}</button>{/each}
   </div>
   {#snippet extra()}
     <!-- без сохранённого подключения проверять нечего: сначала сохранить (сервер проверяет сохранённое) -->
@@ -899,6 +986,25 @@
     </button>
   {/snippet}
 </FormDialog>
+
+{#if vform}
+  <!-- окно записи Vault поверх окна подключения (решение 167): создать, изменить, исправить адрес -->
+  {#await import('../components/VaultForm.svelte') then m}
+    <m.default
+      open
+      user={target ?? me.user_id}
+      space="knowledge"
+      item={vform.item}
+      model={fProto}
+      url={vform.url}
+      onsaved={vaultSaved}
+      onclose={() => (vform = null)}
+      onexpired={() => expired(new ApiError(401, 'сессия истекла'))}
+    />
+  {:catch}
+    <p class="error" role="alert">Форма записи не загрузилась — обновите страницу.</p>
+  {/await}
+{/if}
 
 <!-- фокус по умолчанию — на «Отмена» (`cautious`, как у опасных подтверждений, APG alertdialog):
      Enter не отправляет ключ и пакеты на новый адрес без сверки «был / стал» (финальное ревью M7.3,
@@ -1099,6 +1205,10 @@
   .field-note .muted {
     display: inline;
   }
+  /* куда уйдёт запрос — своей строкой под адресом и его классом */
+  .field-note .req-url {
+    display: block;
+  }
   .error-text {
     color: var(--danger);
   }
@@ -1131,5 +1241,13 @@
   }
   td {
     vertical-align: top;
+  }
+  .vault-actions {
+    display: grid;
+    gap: 8px;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    min-width: 0;
   }
 </style>

@@ -1,4 +1,5 @@
-//! Подставной OpenAI-совместимый сервер модели (M7.3, спецификация §6.2 «Проверка»): `axum` на
+//! Подставной сервер модели — OpenAI-совместимый и Anthropic Messages (M7.3, спецификация §6.2
+//! «Проверка»; M7.6 §9.2 — ответы [`MockReply::messages`], [`MockReply::anthropic_error`]): `axum` на
 //! `127.0.0.1` со своим потоком и рантаймом (годится и для синхронных тестов клиента `ureq`, и
 //! для тестов REST сервера). Отвечает по очереди заданных ответов ([`MockModel::push`]; очередь
 //! пуста — ответ по умолчанию [`MockModel::set_default`]) и запоминает каждый запрос — метод,
@@ -114,6 +115,44 @@ impl MockReply {
         )
     }
 
+    /// Ответ Anthropic Messages (M7.6 §9.2 п. 3): блоки `content`, `stop_reason`, `usage` 11/7
+    /// без кэша.
+    pub fn messages_with(content: Value, stop_reason: &str) -> MockReply {
+        MockReply::json(
+            200,
+            json!({
+                "id": "msg_mock",
+                "type": "message",
+                "role": "assistant",
+                "model": "mock",
+                "content": content,
+                "stop_reason": stop_reason,
+                "stop_sequence": null,
+                "stop_details": null,
+                "usage": {
+                    "input_tokens": 11,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 7
+                }
+            }),
+        )
+    }
+
+    /// Обычный ответ Anthropic Messages: один блок `text`, `stop_reason = end_turn`.
+    pub fn messages(text: &str) -> MockReply {
+        MockReply::messages_with(json!([{"type": "text", "text": text}]), "end_turn")
+    }
+
+    /// Ошибка Anthropic: `{"type": "error", "error": {"type", "message"}, "request_id"}`.
+    pub fn anthropic_error(status: u16, kind: &str) -> MockReply {
+        MockReply::json(
+            status,
+            json!({"type": "error", "error": {"type": kind, "message": "mock"},
+                   "request_id": "req_mock"}),
+        )
+    }
+
     /// Перенаправление `302` на `location`.
     pub fn redirect(location: &str) -> MockReply {
         MockReply::raw(302, "").header("location", location)
@@ -218,6 +257,12 @@ impl MockModel {
     /// Базовый адрес подключения: `http://127.0.0.1:<порт>/v1`.
     pub fn base_url(&self) -> String {
         format!("http://{}/v1", self.addr)
+    }
+
+    /// Корень без пути: `http://127.0.0.1:<порт>` (адрес Anthropic Messages, как у SDK, — без
+    /// `/v1`).
+    pub fn root_url(&self) -> String {
+        format!("http://{}", self.addr)
     }
 
     /// Следующий ответ в очередь.

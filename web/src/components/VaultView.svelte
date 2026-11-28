@@ -6,9 +6,14 @@
   // «Показать» неактивна, над списком — баннер vault-locked (§7.6). Записи окружения (`host`,
   // `environment`, M4.5 §8) несут открытые поля (назначение, адрес, ограничения, заметки) и
   // могут не иметь значения: тогда «Показать» сообщает, что значения нет.
+  // M7.6 (решение 167): «Новая запись», «Изменить» и «Удалить» (подтверждение) — окно записи
+  // `VaultForm` (ленивый чанк по нажатию): значение только для записи, при правке пусто — прежнее.
   import { onDestroy, untrack } from 'svelte';
+  import FormDialog from './FormDialog.svelte';
+  import Notice from './Notice.svelte';
   import {
     ApiError,
+    deleteVault,
     errorText,
     isVaultLocked,
     listVault,
@@ -88,6 +93,45 @@
     });
   });
 
+  // ---- создание, правка и удаление (M7.6, решение 167) ----
+
+  /** Окно записи: создание (`item: null`) или правка. */
+  let form = $state<{ item: VaultItem | null } | null>(null);
+  let notice = $state('');
+  /** Запись к удалению (окно-подтверждение). */
+  let removing = $state<VaultItem | null>(null);
+  let removeError = $state('');
+
+  function openForm(item: VaultItem | null) {
+    notice = '';
+    form = { item };
+  }
+
+  async function saved(it: VaultItem) {
+    const created = !form?.item;
+    form = null;
+    notice = created ? `Запись «${it.title}» создана.` : `Запись «${it.title}» сохранена.`;
+    await load(user, space);
+  }
+
+  async function remove() {
+    const it = removing;
+    if (!it) return;
+    removeError = '';
+    try {
+      await deleteVault(user, it.id);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) {
+        onexpired();
+        return;
+      }
+      throw new Error(errorText(e));
+    }
+    removing = null;
+    notice = `Запись «${it.title}» удалена.`;
+    await load(user, space);
+  }
+
   function fail(e: unknown) {
     if (e instanceof ApiError && e.status === 401) return onexpired();
     if (isVaultLocked(e)) {
@@ -153,10 +197,14 @@
       </p>
     </div>
   {/if}
-  <p class="muted small">
-    Значения скрыты. «Показать» раскрывает значение на {REVEAL_MS / 1000} с; каждое раскрытие
-    записывается в аудит.
-  </p>
+  <div class="row bar">
+    <p class="muted small">
+      Значения скрыты. «Показать» раскрывает значение на {REVEAL_MS / 1000} с; каждое раскрытие
+      записывается в аудит.
+    </p>
+    <button type="button" class="primary" onclick={() => openForm(null)} disabled={locked !== null}>Новая запись</button>
+  </div>
+  <Notice text={notice} />
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   {#if loading}<p class="muted">Загрузка…</p>{/if}
   {#if !loading && !locked && items.length === 0 && !error}
@@ -198,11 +246,37 @@
             <button type="button" onclick={() => reveal(it)} disabled={locked !== null}
               title="Раскрытие записывается в аудит">Показать</button>
           {/if}
+          <span class="grow"></span>
+          <button type="button" onclick={() => openForm(it)} disabled={locked !== null} aria-label="Изменить {it.title}">Изменить</button>
+          <button type="button" class="danger" onclick={() => ((removeError = ''), (removing = it))} disabled={locked !== null}
+            aria-label="Удалить {it.title}">Удалить</button>
         </div>
       </li>
     {/each}
   </ul>
 </section>
+
+{#if form}
+  <!-- окно — отдельным чанком по нажатию (страница Vault — в стартовом чанке) -->
+  {#await import('./VaultForm.svelte') then m}
+    <m.default open {user} {space} item={form.item} onsaved={saved} onclose={() => (form = null)} {onexpired} />
+  {:catch}
+    <p class="error" role="alert">Форма записи не загрузилась — обновите страницу.</p>
+  {/await}
+{/if}
+
+<FormDialog
+  open={removing !== null}
+  confirm
+  danger
+  title="Удалить запись Vault"
+  subject={removing?.title}
+  description="Запись уйдёт из списка и из выдачи агенту; прежние ревизии со значением остаются в истории (их видит только администратор)."
+  submit="Удалить"
+  error={removeError}
+  onsubmit={remove}
+  onclose={() => (removing = null)}
+/>
 
 <style>
   .locked {
@@ -238,6 +312,18 @@
   }
   .value {
     margin-top: 6px;
+  }
+  .bar {
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+  }
+  .bar p {
+    margin: 0;
+    flex: 1 1 240px;
+  }
+  .grow {
+    flex: 1;
   }
   .fields {
     overflow-wrap: anywhere;

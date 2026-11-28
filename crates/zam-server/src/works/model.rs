@@ -1,6 +1,8 @@
 //! Клиент подключённой модели (M7.3, спецификация §6.2 пп. 1, 2, 5): OpenAI-совместимый Chat
 //! Completions без потока и инструментов (решение координатора п. 36) — тело запроса, вызов
-//! агентом `ureq`, разбор ответа и классы ошибок.
+//! агентом `ureq`, разбор ответа и классы ошибок. С M7.6 (§9.2) протоколов два ([`Protocol`]):
+//! `openai` — здесь, `anthropic` (родной Anthropic Messages) — тело, заголовки и разбор в
+//! [`super::anthropic`]; маршрут, агент `ureq`, пределы и журнал отправок — общие.
 //!
 //! - **Запрос** — `POST <url>/chat/completions`, `Authorization: Bearer <ключ>` (у `auth = "none"`
 //!   — без него), тело `{model, messages, <предел>, stream: false}` и `body_extra` верхним уровнем;
@@ -16,19 +18,88 @@
 //!   ([`super::egress::route`]); прокси окружения — только у маршрута вне LAN (`NO_PROXY` `ureq`
 //!   учитывает сам), у петли и LAN — без прокси.
 //!
-//! Ключ поставщика в журнал, аудит и `tracing` не попадает: заголовок помечен чувствительным, а
-//! `ureq` в отладочном журнале показывает только безопасные заголовки.
+//! Ключ поставщика в журнал, аудит и `tracing` не попадает: заголовок (`Authorization` или
+//! `x-api-key`, [`auth_header`]) помечен чувствительным, а `ureq` в отладочном журнале показывает
+//! только безопасные заголовки.
 
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
+pub use super::anthropic::RESERVED_BODY_KEYS as ANTHROPIC_RESERVED_BODY_KEYS;
 use super::egress::{BaseUrl, PinnedResolver, Route, endpoint};
 pub use super::settings::{BODY_EXTRA_MAX_BYTES, ModelAuth, ModelConn, TokenField};
 
-/// Протокол подключения в M7.3 — один (§6.2 п. 1).
+/// OpenAI-совместимый Chat Completions (§6.2 п. 1).
 pub const PROTOCOL_OPENAI: &str = "openai";
-/// Ключи тела, которые задаёт сервер: в `body_extra` — 422.
+/// Родной Anthropic Messages (M7.6 §9.2).
+pub const PROTOCOL_ANTHROPIC: &str = "anthropic";
+
+/// Протокол подключения `works.model.protocol` (M7.6 §9.2 п. 1). В настройке хранится строкой
+/// ([`ModelConn::protocol`]): строку, записанную более новой версией, сервер читает, а вызов с
+/// незнакомым протоколом не отправляет ([`call_chat_blocking`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    /// `openai` — OpenAI-совместимый Chat Completions.
+    OpenAi,
+    /// `anthropic` — родной Anthropic Messages.
+    Anthropic,
+}
+
+impl Protocol {
+    pub const ALL: [Protocol; 2] = [Protocol::OpenAi, Protocol::Anthropic];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Protocol::OpenAi => PROTOCOL_OPENAI,
+            Protocol::Anthropic => PROTOCOL_ANTHROPIC,
+        }
+    }
+
+    /// Обратное [`Protocol::as_str`]; регистр важен.
+    pub fn parse(s: &str) -> Option<Protocol> {
+        Protocol::ALL.into_iter().find(|p| p.as_str() == s)
+    }
+
+    /// Ключи тела, которые задаёт сервер: в `body_extra` — 422.
+    pub fn reserved_body_keys(self) -> &'static [&'static str] {
+        match self {
+            Protocol::OpenAi => &RESERVED_BODY_KEYS,
+            Protocol::Anthropic => &super::anthropic::RESERVED_BODY_KEYS,
+        }
+    }
+
+    /// `body_extra` — JSON-объект до [`BODY_EXTRA_MAX_BYTES`] без зарезервированных ключей
+    /// протокола (§6.2 п. 1, §9.2 п. 2); ошибка — текст для 422.
+    pub fn check_body_extra(self, extra: &Map<String, Value>) -> Result<(), String> {
+        if self == Protocol::Anthropic {
+            super::anthropic::check_sampling(extra)?;
+        }
+        let reserved = self.reserved_body_keys();
+        if let Some(k) = extra.keys().find(|k| reserved.contains(&k.as_str())) {
+            return Err(format!(
+                "ключ «{k}» в body_extra задаёт сервер (запрещены: {})",
+                reserved.join(", ")
+            ));
+        }
+        let size = serde_json::to_vec(extra).map_or(usize::MAX, |v| v.len());
+        if size > BODY_EXTRA_MAX_BYTES {
+            return Err(format!(
+                "body_extra — {size} байт, предел {BODY_EXTRA_MAX_BYTES} (4 КиБ)"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl ModelConn {
+    /// Протокол подключения; `None` — незнакомая строка (записала более новая версия).
+    pub fn proto(&self) -> Option<Protocol> {
+        Protocol::parse(&self.protocol)
+    }
+}
+
+/// Ключи тела OpenAI-совместимого запроса, которые задаёт сервер: в `body_extra` — 422.
 pub const RESERVED_BODY_KEYS: [&str; 5] = [
     "model",
     "messages",
@@ -132,8 +203,52 @@ impl CallClass {
         ALL_CLASSES.into_iter().find(|c| c.as_str() == s)
     }
 
-    /// Подсказка человеку (проверка подключения, WebUI); у классов без совета — `None`.
+    /// Подсказка человеку у OpenAI-совместимого подключения — [`CallClass::hint_for`].
     pub fn hint(self) -> Option<&'static str> {
+        self.hint_for(Protocol::OpenAi)
+    }
+
+    /// Подсказка человеку (проверка подключения, WebUI) по протоколу подключения: у
+    /// `anthropic` размышления не выключаются у новых моделей — совет про `effort` и
+    /// `max_tokens` (§9.2 п. 3); у классов без совета — `None`.
+    pub fn hint_for(self, p: Protocol) -> Option<&'static str> {
+        if p == Protocol::Anthropic {
+            match self {
+                CallClass::NotFound => {
+                    return Some(
+                        "модель или адрес не найдены: проверьте `model` и `data.url` записи Vault \
+                         (https://api.anthropic.com — с /v1 или без)",
+                    );
+                }
+                CallClass::BadRequest => {
+                    return Some(
+                        "поставщик отверг запрос: обычно это поле `body_extra` (например, \
+                         {\"thinking\": {\"type\": \"disabled\"}} у модели, где размышления не \
+                         выключить)",
+                    );
+                }
+                CallClass::Thinking => {
+                    return Some(
+                        "предел ответа съели размышления модели: увеличьте `max_tokens` или \
+                         снизьте глубину в `body_extra` ({\"output_config\": {\"effort\": \
+                         \"low\"}})",
+                    );
+                }
+                CallClass::MaxTokens => {
+                    return Some(
+                        "ответ обрезан пределом `max_tokens` или окном контекста модели: \
+                         увеличьте `max_tokens` или снизьте `effort`",
+                    );
+                }
+                CallClass::BadResponse => {
+                    return Some(
+                        "ответ не по протоколу Anthropic Messages (или перенаправление 3xx — \
+                         редиректы не выполняются)",
+                    );
+                }
+                _ => {}
+            }
+        }
         Some(match self {
             CallClass::Auth => "ключ не принят: проверьте значение записи Vault подключения",
             CallClass::NotFound => {
@@ -174,13 +289,15 @@ pub struct Usage {
 
 /// Неудача вызова: класс, код HTTP (если ответ был), `retry-after` в секундах (у `rate`) и учёт
 /// токенов, если ответ их израсходовал (обрезанный пределом, отказ) — расход идёт в журнал
-/// отправок и пределы.
+/// отправок и пределы. `refusal_category` — категория отказа Anthropic (`stop_details.category`
+/// из известного набора; пояснение `explanation` не берётся — M7.6 §9.2 п. 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallError {
     pub class: CallClass,
     pub http_status: Option<u16>,
     pub retry_after: Option<u64>,
     pub usage: Option<Usage>,
+    pub refusal_category: Option<super::anthropic::RefusalCategory>,
 }
 
 impl CallError {
@@ -191,10 +308,11 @@ impl CallError {
             http_status: None,
             retry_after: None,
             usage: None,
+            refusal_category: None,
         }
     }
 
-    fn http(class: CallClass, status: u16) -> CallError {
+    pub(super) fn http(class: CallClass, status: u16) -> CallError {
         CallError {
             http_status: Some(status),
             ..CallError::new(class)
@@ -281,38 +399,48 @@ impl ChatMessage {
     }
 }
 
-/// Протокол подключения — пока только `openai` (§6.2 п. 1); ошибка — текст для 422.
-pub fn check_protocol(p: &str) -> Result<(), String> {
-    if p == PROTOCOL_OPENAI {
-        Ok(())
-    } else {
-        Err(format!(
-            "протокол «{p}» не поддерживается: в этой версии — только \"openai\" \
-             (OpenAI-совместимый Chat Completions); родной протокол Anthropic появится в \
-             0.0.19-m7.6"
-        ))
-    }
+/// Протокол подключения — `openai` или `anthropic` (§9.2 п. 1; регистр важен); ошибка — текст
+/// для 422 со списком обоих.
+pub fn check_protocol(p: &str) -> Result<Protocol, String> {
+    Protocol::parse(p).ok_or_else(|| {
+        format!(
+            "протокол «{p}» не поддерживается: \"{PROTOCOL_OPENAI}\" (OpenAI-совместимый Chat \
+             Completions) или \"{PROTOCOL_ANTHROPIC}\" (Anthropic Messages)"
+        )
+    })
 }
 
-/// `body_extra` — JSON-объект до [`BODY_EXTRA_MAX_BYTES`] без ключей [`RESERVED_BODY_KEYS`]
-/// (§6.2 п. 1); ошибка — текст для 422.
+/// `body_extra` OpenAI-совместимого подключения (§6.2 п. 1) — [`Protocol::check_body_extra`].
 pub fn check_body_extra(extra: &Map<String, Value>) -> Result<(), String> {
-    if let Some(k) = extra
-        .keys()
-        .find(|k| RESERVED_BODY_KEYS.contains(&k.as_str()))
-    {
-        return Err(format!(
-            "ключ «{k}» в body_extra задаёт сервер (запрещены: {})",
-            RESERVED_BODY_KEYS.join(", ")
-        ));
-    }
-    let size = serde_json::to_vec(extra).map_or(usize::MAX, |v| v.len());
-    if size > BODY_EXTRA_MAX_BYTES {
-        return Err(format!(
-            "body_extra — {size} байт, предел {BODY_EXTRA_MAX_BYTES} (4 КиБ)"
-        ));
+    Protocol::OpenAi.check_body_extra(extra)
+}
+
+/// Поле предела у протокола (§9.2 п. 1): у `anthropic` — только `auto` (предел — всегда
+/// `max_tokens`); ошибка — текст для 422.
+pub fn check_token_field(p: Protocol, tf: TokenField) -> Result<(), String> {
+    if p == Protocol::Anthropic && tf != TokenField::Auto {
+        return Err(
+            "у протокола anthropic предел — всегда max_tokens (поле предела — auto)".into(),
+        );
     }
     Ok(())
+}
+
+/// Заголовок ключа поставщика по протоколу: `Authorization: Bearer <ключ>` (`openai`) или
+/// `x-api-key: <ключ>` (`anthropic`); значение помечено чувствительным. Ключ не годится для
+/// заголовка — `vault`.
+pub fn auth_header(
+    p: Protocol,
+    key: &str,
+) -> Result<(&'static str, ureq::http::HeaderValue), CallError> {
+    let (name, value) = match p {
+        Protocol::OpenAi => ("authorization", format!("Bearer {key}")),
+        Protocol::Anthropic => ("x-api-key", key.to_string()),
+    };
+    let mut v =
+        ureq::http::HeaderValue::try_from(value).map_err(|_| CallError::new(CallClass::Vault))?;
+    v.set_sensitive(true);
+    Ok((name, v))
 }
 
 /// Имя поля предела ответа: явное или по хосту при `auto` (§6.2 п. 2).
@@ -374,7 +502,11 @@ fn insufficient_quota(v: &Value) -> bool {
 }
 
 /// Класс ответа HTTP не 2xx по таблице §6.2 п. 5 (тело уже прочитано).
-fn status_class(status: u16, body: Option<&Value>, retry_after: Option<u64>) -> CallError {
+pub(super) fn status_class(
+    status: u16,
+    body: Option<&Value>,
+    retry_after: Option<u64>,
+) -> CallError {
     if (400..500).contains(&status) && body.is_some_and(insufficient_quota) {
         return CallError::http(CallClass::Quota, status);
     }
@@ -412,7 +544,7 @@ fn content_text(c: &Value) -> String {
 }
 
 /// Оценка входа счётчиком выдачи: содержимое сообщений через перевод строки.
-fn estimate_input(sent: &[ChatMessage]) -> u64 {
+pub(super) fn estimate_input(sent: &[ChatMessage]) -> u64 {
     let joined: Vec<&str> = sent.iter().map(|m| m.content.as_str()).collect();
     zam_store::count_tokens(&joined.join("\n")) as u64
 }
@@ -509,6 +641,92 @@ fn transport_class(e: &ureq::Error) -> CallClass {
     }
 }
 
+/// Полный адрес запроса к модели по протоколу: `openai` — `<база>/chat/completions`,
+/// `anthropic` — `<база>/v1/messages` (`/v1` не удваивается). Его показывает проверка
+/// подключения при неудаче (M7.6, решение 169).
+pub fn request_url(p: Protocol, base: &BaseUrl) -> String {
+    match p {
+        Protocol::OpenAi => endpoint(base, "/chat/completions"),
+        Protocol::Anthropic => super::anthropic::url(base),
+    }
+}
+
+/// Агент `ureq` одного обращения: редиректы не выполняются, тело 4xx/5xx читается, соединение —
+/// только по адресам маршрута, прокси окружения — только вне LAN (см. модуль).
+fn agent(route: &Route, timeout: Duration) -> ureq::Agent {
+    let mut cfg = ureq::Agent::config_builder()
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .timeout_global(Some(timeout))
+        .timeout_connect(Some(timeout.min(CONNECT_TIMEOUT)))
+        .user_agent(concat!("zam-server/", env!("CARGO_PKG_VERSION")));
+    if !route.external {
+        cfg = cfg.proxy(None);
+    }
+    ureq::Agent::with_parts(
+        cfg.build(),
+        ureq::unversioned::transport::DefaultConnector::default(),
+        PinnedResolver::new(route),
+    )
+}
+
+/// Сколько имён моделей показывает проверка подключения.
+pub const MODELS_SHOWN_MAX: usize = 50;
+/// Предел тела списка моделей, байт.
+const MAX_MODELS_BYTES: u64 = 1 << 20;
+
+/// Список имён моделей сервера (`GET <база>/models` у `openai`, `GET <база>/v1/models` у
+/// `anthropic`; ответ `{data: [{id}]}`) — для проверки подключения, когда модель или адрес не
+/// найдены (M7.6, решение 169): есть список — API по адресу есть, нет имени модели. Тот же
+/// маршрут, ключ и заголовки, без данных памяти и токенов; не 2xx, не JSON, пустой список —
+/// `None`. Имена — до [`MODELS_SHOWN_MAX`], без управляющих символов, до 200 символов.
+pub fn list_models_blocking(
+    req: &ModelConn,
+    route: &Route,
+    key: Option<&str>,
+    timeout: Duration,
+) -> Option<Vec<String>> {
+    let proto = req.proto()?;
+    let url = match proto {
+        Protocol::OpenAi => endpoint(&route.base, "/models"),
+        Protocol::Anthropic => super::egress::v1_endpoint(&route.base, "/models"),
+    };
+    let mut rb = agent(route, timeout)
+        .get(url)
+        .header("accept", "application/json");
+    if proto == Protocol::Anthropic {
+        rb = rb.header("anthropic-version", super::anthropic::API_VERSION);
+    }
+    if let (ModelAuth::Key, Some(k)) = (req.auth, key) {
+        let (name, v) = auth_header(proto, k).ok()?;
+        rb = rb.header(name, v);
+    }
+    let resp = rb.call().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = resp
+        .into_body()
+        .with_config()
+        .limit(MAX_MODELS_BYTES)
+        .read_to_vec()
+        .ok()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    let names: Vec<String> = v["data"]
+        .as_array()?
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .filter(|s| !s.is_empty() && s.chars().count() <= MODEL_ID_MAX)
+        .filter(|s| !s.chars().any(char::is_control))
+        .take(MODELS_SHOWN_MAX)
+        .map(str::to_string)
+        .collect();
+    (!names.is_empty()).then_some(names)
+}
+
+/// Предел длины имени модели в списке сервера (как у `works.model.model`).
+const MODEL_ID_MAX: usize = 200;
+
 /// Вызов с системным и пользовательским сообщением (§6.2 п. 2) — [`call_chat_blocking`].
 pub fn call_blocking(
     req: &ModelConn,
@@ -527,9 +745,12 @@ pub fn call_blocking(
     )
 }
 
-/// Один вызов Chat Completions с беседой `messages` (повтор JSON — с ответом и просьбой
-/// исправить, [`super::exec::json_step`]). Блокирующий: зовётся из `spawn_blocking`; срок вызова
-/// — `timeout`, соединения — не дольше [`CONNECT_TIMEOUT`]. `auth = "key"` без ключа — `vault`.
+/// Один вызов модели протоколом подключения с беседой `messages` (повтор JSON — с ответом и
+/// просьбой исправить, [`super::exec::json_step`]): `openai` — `POST <база>/chat/completions`,
+/// `anthropic` — `POST <база>/v1/messages` ([`super::anthropic`]). Блокирующий: зовётся из
+/// отдельного потока; срок вызова — `timeout`, соединения — не дольше [`CONNECT_TIMEOUT`].
+/// `auth = "key"` без ключа — `vault`; незнакомый протокол (строку записала более новая версия)
+/// — `bad_request` без отправки.
 pub fn call_chat_blocking(
     req: &ModelConn,
     route: &Route,
@@ -537,38 +758,28 @@ pub fn call_chat_blocking(
     messages: &[ChatMessage],
     timeout: Duration,
 ) -> Result<ModelReply, CallError> {
+    let Some(proto) = req.proto() else {
+        return Err(CallError::new(CallClass::BadRequest));
+    };
     let auth = match (req.auth, key) {
         (ModelAuth::None, _) => None,
-        (ModelAuth::Key, Some(k)) => {
-            let mut v = ureq::http::HeaderValue::try_from(format!("Bearer {k}"))
-                .map_err(|_| CallError::new(CallClass::Vault))?;
-            v.set_sensitive(true);
-            Some(v)
-        }
+        (ModelAuth::Key, Some(k)) => Some(auth_header(proto, k)?),
         (ModelAuth::Key, None) => return Err(CallError::new(CallClass::Vault)),
     };
-    let body = serde_json::to_vec(&request_body(req, &route.base, messages))
-        .map_err(|_| CallError::new(CallClass::BadRequest))?;
-    let mut cfg = ureq::Agent::config_builder()
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .timeout_global(Some(timeout))
-        .timeout_connect(Some(timeout.min(CONNECT_TIMEOUT)))
-        .user_agent(concat!("zam-server/", env!("CARGO_PKG_VERSION")));
-    if !route.external {
-        cfg = cfg.proxy(None);
-    }
-    let agent = ureq::Agent::with_parts(
-        cfg.build(),
-        ureq::unversioned::transport::DefaultConnector::default(),
-        PinnedResolver::new(route),
-    );
-    let mut rb = agent
-        .post(endpoint(&route.base, "/chat/completions"))
+    let body = match proto {
+        Protocol::OpenAi => request_body(req, &route.base, messages),
+        Protocol::Anthropic => super::anthropic::request_body(req, messages),
+    };
+    let body = serde_json::to_vec(&body).map_err(|_| CallError::new(CallClass::BadRequest))?;
+    let mut rb = agent(route, timeout)
+        .post(request_url(proto, &route.base))
         .header("content-type", "application/json")
         .header("accept", "application/json");
-    if let Some(v) = auth {
-        rb = rb.header("authorization", v);
+    if proto == Protocol::Anthropic {
+        rb = rb.header("anthropic-version", super::anthropic::API_VERSION);
+    }
+    if let Some((name, v)) = auth {
+        rb = rb.header(name, v);
     }
     let resp = rb
         .send(&body[..])
@@ -594,7 +805,28 @@ pub fn call_chat_blocking(
                 ..CallError::new(class)
             }
         })?;
-    parse_response(status, retry_after.as_deref(), &bytes, messages)
+    match proto {
+        Protocol::OpenAi => parse_response(status, retry_after.as_deref(), &bytes, messages),
+        Protocol::Anthropic => {
+            let r =
+                super::anthropic::parse_response(status, retry_after.as_deref(), &bytes, messages);
+            if let Err(CallError {
+                refusal_category: Some(category),
+                ..
+            }) = &r
+            {
+                // категория отказа — в журнал сервера (у журнала отправок нет поля, миграций в
+                // M7.6 нет — решение 145); пояснения `explanation` нет нигде
+                tracing::info!(
+                    host = %route.base.host,
+                    model = %req.model,
+                    category = category.as_str(),
+                    "внутренние работы: модель отказалась отвечать (stop_reason refusal)"
+                );
+            }
+            r
+        }
+    }
 }
 
 #[cfg(test)]

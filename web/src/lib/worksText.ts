@@ -230,13 +230,80 @@ export function pinnedHost(p: Pinned): string {
 /** Полный закреплённый адрес: «https://api.example.com/v1» (как «был → стал» паузы). */
 export const pinnedUrl = (p: Pinned): string => `${p.scheme}://${pinnedHost(p)}${p.path}`;
 
+// ---- протокол подключения (M7.6 §9.2) ----
+
+/** Протокол `works.model.protocol`. */
+export type Protocol = 'openai' | 'anthropic';
+export const PROTOCOLS: Protocol[] = ['openai', 'anthropic'];
+export const PROTOCOL_TITLE: Record<Protocol, string> = {
+  openai: 'OpenAI-совместимый (Chat Completions)',
+  anthropic: 'Anthropic Messages',
+};
+/** Протокол из ответа сервера (незнакомое значение — как OpenAI-совместимый). */
+export const protocolOf = (p: string | null | undefined): Protocol => (p === 'anthropic' ? 'anthropic' : 'openai');
+
+/** Адрес записи Vault — адрес API модели: `http(s)://хост…` (решение 166). Описания хостов
+ * («192.168.0.210 (SSH…)», «локальная машина») выбором подключения не показываются. */
+export function isModelUrl(addr: string): boolean {
+  const s = addr.trim();
+  if (!/^https?:\/\/[^\s/]/i.test(s) || /\s/.test(s)) return false;
+  try {
+    return !!new URL(s).hostname;
+  } catch {
+    return false;
+  }
+}
+
+/** Пункт выбора записи подключения: «<имя> — <адрес>». */
+export const vaultChoiceLabel = (title: string, addr: string): string => `${title} — ${addr.trim()}`;
+
+/** Адрес без хвостовых «/». */
+const trimSlash = (s: string) => s.trim().replace(/\/+$/, '');
+
+/** Куда уйдёт запрос к модели (как сервер, `request_url`): OpenAI-совместимый —
+ * `<адрес>/chat/completions`, Anthropic — `<адрес>/v1/messages`, у адреса с `/v1` — без удвоения. */
+export function requestUrlOf(p: Protocol, addr: string): string {
+  const b = trimSlash(addr);
+  if (p === 'openai') return `${b}/chat/completions`;
+  return /\/v1$/i.test(b) ? `${b}/messages` : `${b}/v1/messages`;
+}
+
+/** Предупреждение о пути адреса до сохранения (решение 168) и исправленный адрес для «Исправить
+ * адрес»: у OpenAI-совместимого адрес без пути — запросы уйдут мимо `/v1`; полная точка входа
+ * вместо базы (`…/chat/completions`, `…/v1/messages`) — путь удвоится. Нет замечания — `null`. */
+export function pathWarning(p: Protocol, addr: string): { text: string; fixed: string } | null {
+  if (!isModelUrl(addr)) return null;
+  const b = trimSlash(addr);
+  const path = new URL(b).pathname.replace(/\/+$/, '');
+  if (p === 'openai') {
+    if (/\/chat\/completions$/i.test(path)) {
+      const fixed = b.replace(/\/chat\/completions$/i, '');
+      return { text: `Адрес — уже точка входа: запрос уйдёт на ${b}/chat/completions; нужен адрес без /chat/completions — ${fixed}`, fixed };
+    }
+    if (!path) {
+      return { text: `Адрес без /v1 — запрос уйдёт на ${b}/chat/completions; обычно нужен ${b}/v1`, fixed: `${b}/v1` };
+    }
+    return null;
+  }
+  if (/\/messages$/i.test(path)) {
+    const fixed = b.replace(/\/messages$/i, '');
+    return { text: `Адрес — уже точка входа: запрос уйдёт на ${requestUrlOf(p, b)}; нужен адрес без /messages — ${fixed}`, fixed };
+  }
+  return null;
+}
+
 // ---- body_extra (§6.2 п. 1) ----
 
-/** Ключи тела запроса, которые задаёт сервер. */
+/** Ключи тела запроса, которые задаёт сервер (OpenAI-совместимый). */
 export const RESERVED_BODY_KEYS = ['model', 'messages', 'stream', 'max_tokens', 'max_completion_tokens'];
+/** Ключи тела Anthropic Messages, которые задаёт сервер, и параметры выборки (версия API
+ * `2026-10-21` отвергает их у всех моделей, §9.2 п. 2). */
+export const ANTHROPIC_RESERVED_BODY_KEYS = ['model', 'messages', 'system', 'stream', 'max_tokens', 'temperature', 'top_p', 'top_k'];
 export const BODY_EXTRA_MAX_BYTES = 4096;
 
-/** Рецепты `body_extra` — особенности поставщиков (таблица руководства, §6.2 п. 3). */
+const reservedOf = (p: Protocol) => (p === 'anthropic' ? ANTHROPIC_RESERVED_BODY_KEYS : RESERVED_BODY_KEYS);
+
+/** Рецепты `body_extra` — особенности поставщиков (таблица руководства, §6.2 п. 3, §9.2 п. 7). */
 export const RECIPES: { name: string; title: string; value: Record<string, unknown> }[] = [
   {
     name: 'qwen-local',
@@ -246,11 +313,18 @@ export const RECIPES: { name: string; title: string; value: Record<string, unkno
   { name: 'dashscope', title: 'Qwen (DashScope): без размышлений', value: { enable_thinking: false } },
   { name: 'json', title: 'Ответ — JSON-объект', value: { response_format: { type: 'json_object' } } },
 ];
+/** Рецепты Anthropic Messages: глубина размышлений и их выключение (у моделей, где можно). */
+export const ANTHROPIC_RECIPES: typeof RECIPES = [
+  { name: 'effort-low', title: 'Меньше размышлений (effort: low)', value: { output_config: { effort: 'low' } } },
+  { name: 'thinking-off', title: 'Без размышлений (где модель позволяет)', value: { thinking: { type: 'disabled' } } },
+];
+export const recipesOf = (p: Protocol) => (p === 'anthropic' ? ANTHROPIC_RECIPES : RECIPES);
 
 export type BodyExtra = { value: Record<string, unknown> } | { error: string };
 
-/** `body_extra` из текста поля: пусто — `{}`; JSON-объект до 4 КиБ без ключей сервера. */
-export function parseBodyExtra(text: string): BodyExtra {
+/** `body_extra` из текста поля: пусто — `{}`; JSON-объект до 4 КиБ без ключей сервера протокола
+ * `p` (у Anthropic — и без параметров выборки). */
+export function parseBodyExtra(text: string, p: Protocol = 'openai'): BodyExtra {
   const t = text.trim();
   if (!t) return { value: {} };
   let v: unknown;
@@ -260,7 +334,9 @@ export function parseBodyExtra(text: string): BodyExtra {
     return { error: `не JSON: ${(e as Error).message}` };
   }
   if (!v || typeof v !== 'object' || Array.isArray(v)) return { error: 'нужен JSON-объект: {"ключ": значение}' };
-  const bad = Object.keys(v).filter((k) => RESERVED_BODY_KEYS.includes(k));
+  const bad = Object.keys(v).filter((k) => reservedOf(p).includes(k));
+  const sampling = bad.filter((k) => ['temperature', 'top_p', 'top_k'].includes(k));
+  if (sampling.length) return { error: `ключи ${sampling.join(', ')} Anthropic не принимает (версия API 2026-10-21) — уберите их` };
   if (bad.length) return { error: `ключи ${bad.join(', ')} задаёт сервер — уберите их` };
   const size = new TextEncoder().encode(JSON.stringify(v)).length;
   if (size > BODY_EXTRA_MAX_BYTES) return { error: `${size} байт — больше 4 КиБ` };
@@ -373,7 +449,7 @@ export const OUTCOME_TEXT: Record<string, string> = {
   thinking: 'предел съели размышления',
   max_tokens: 'ответ обрезан пределом',
   refused: 'отказ модели',
-  bad_response: 'не ответ Chat Completions',
+  bad_response: 'ответ не по протоколу',
   bad_json: 'ответ не JSON',
   secret_in_payload: 'секрет в пакете',
   blocked: 'адрес запрещён',
@@ -390,6 +466,32 @@ export function outcomeText(outcome: string, http: number | null | undefined): s
   const t = OUTCOME_TEXT[outcome];
   const code = http ? `${outcome}, HTTP ${http}` : outcome;
   return t ? `${t} (${code})` : code;
+}
+
+/** Итог проверки подключения (`POST /works/model/test`; M7.6, решение 169 — `url` и `models`). */
+export interface TestReply {
+  ok: boolean;
+  ms: number | null;
+  class?: string;
+  hint?: string;
+  url?: string;
+  models?: string[];
+}
+
+/** Неудачная проверка подключения — понятной причиной и полным адресом запроса (решение 169):
+ * ключ не подошёл, по адресу нет API, нет такой модели (с именами моделей сервера), сервер не
+ * отвечает; прочее — класс и подсказка сервера. */
+export function testFailText(r: TestReply, model: string): string {
+  const cls = r.class ?? '';
+  let why: string;
+  if (cls === 'auth') why = 'ключ не подошёл — проверьте значение записи Vault';
+  else if (cls === 'not_found' && r.models?.length) {
+    const more = r.models.length >= 50 ? ', …' : '';
+    why = `по адресу отвечает API, но модели «${model}» на нём нет — есть: ${r.models.join(', ')}${more}`;
+  } else if (cls === 'not_found') why = 'по адресу нет API — проверьте адрес (у OpenAI-совместимых — с /v1)';
+  else if (cls === 'unavailable') why = 'сервер не отвечает — нет соединения или истёк срок ответа';
+  else why = `${cls ? outcomeText(cls, null) : 'не работает'}${r.hint ? `. ${r.hint}` : ''}`;
+  return `Подключение не работает: ${why}.${r.url ? ` Адрес запроса: ${r.url}` : ''}`;
 }
 
 /** Токены строки журнала: «1 200 → 85», оценка — «≈ 1 200 → 85». */

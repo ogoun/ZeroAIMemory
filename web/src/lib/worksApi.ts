@@ -52,9 +52,10 @@ export async function refRoute(user: string, ref: string): Promise<Route | null>
 // ---- настройки исполнителя (§6.1 п. 2, §6.2 п. 1) ----
 
 /** Вход подключения `works.model` (`PATCH`): запись личного Vault — `v:<id>` (адрес — её
- * `data.url`, ключ — её значение). */
+ * `data.url`, ключ — её значение); протокол — OpenAI-совместимый или Anthropic Messages (M7.6
+ * §9.2; у `anthropic` поле предела — только `auto`). */
 export interface ModelConnInput {
-  protocol: 'openai';
+  protocol: 'openai' | 'anthropic';
   vault: string;
   model: string;
   auth: 'key' | 'none';
@@ -131,13 +132,17 @@ export const worksSettings = (user?: string | null) => call<UserSettings & { wor
 export const patchWorks = (works: WorksPatch, user?: string | null) => call<SettingsSaved>('PATCH', settingsPath(user), { works });
 
 /** Проверка подключения (§6.2 п. 9): фиксированный запрос без данных памяти. На паузе
- * `vault_changed` — 409 `{code: vault_changed, was, now}` без обращения. */
+ * `vault_changed` — 409 `{code: vault_changed, was, now}` без обращения. Неудача после отправки —
+ * с полным адресом запроса `url`, у `not_found` — имена моделей сервера `models`, если он их
+ * отдаёт (M7.6, решение 169). */
 export interface ModelTest {
   ok: boolean;
   ms: number | null;
   class?: string;
   hint?: string;
   thinking?: boolean;
+  url?: string;
+  models?: string[];
 }
 export const testModel = (user?: string | null) => call<ModelTest>('POST', `works/model/test${userQ(user, '?')}`);
 

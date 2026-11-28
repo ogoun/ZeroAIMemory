@@ -7,9 +7,10 @@
 //!   аудит `{from, to}`: токен, поправивший `data.url`, не уведёт пакеты и ключ), маршрут по
 //!   политике `[works]` (запрет — пауза `blocked`; имя не разрешилось — `unavailable` без
 //!   паузы), ключ.
-//! - [`test_connection`] — `POST /works/model/test`: фиксированный запрос без данных памяти,
-//!   строка журнала `kind = test`, размышления распознаются, успешная проверка снимает паузу
-//!   (кроме `vault_changed`).
+//! - [`test_connection`] — `POST /works/model/test`: фиксированный запрос без данных памяти
+//!   протоколом подключения (M7.6 §9.2 п. 5), строка журнала `kind = test`, размышления
+//!   распознаются (подсказка — по протоколу), успешная проверка снимает паузу (кроме
+//!   `vault_changed`).
 
 use std::time::Duration;
 
@@ -20,7 +21,7 @@ use zeroize::Zeroizing;
 
 use super::egress::{self, Policy, Route, RouteError};
 use super::exec::{Meta, call, call_timeout, estimate, extract_json, fits_limits, journal, slot};
-use super::model::{CallClass, CallError, ChatMessage, ModelConn};
+use super::model::{CallClass, CallError, ChatMessage, ModelConn, Protocol};
 use super::night::NightCtx;
 use super::pause;
 use super::settings::{self, ModelAuth, UserWorks};
@@ -234,8 +235,9 @@ pub async fn prepare(
                             ctx,
                             user,
                             CallClass::Vault,
-                            "значение записи Vault не годится для заголовка Authorization: \
-                             перевод строки, управляющий символ или не-ASCII"
+                            "значение записи Vault не годится для заголовка ключа \
+                             (Authorization или x-api-key): перевод строки, управляющий символ \
+                             или не-ASCII"
                                 .into(),
                             None,
                             who,
@@ -283,7 +285,9 @@ pub(crate) async fn observed_change(
     Some((was, now))
 }
 
-/// Итог проверки подключения (§6.2 п. 9): `{ok, ms, class?, hint?, thinking?}`.
+/// Итог проверки подключения (§6.2 п. 9): `{ok, ms, class?, hint?, thinking?, url?, models?}`.
+/// С M7.6 (решение 169) неудача после отправки несёт `url` — полный адрес запроса, а `not_found`
+/// — `models`, имена моделей сервера, если он их отдаёт (API по адресу есть, нет модели).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TestOutcome {
     pub ok: bool,
@@ -292,6 +296,10 @@ pub struct TestOutcome {
     pub hint: Option<String>,
     /// В ответе было рассуждение или предел съели размышления.
     pub thinking: bool,
+    /// Полный адрес запроса (только у неудачи после отправки).
+    pub url: Option<String>,
+    /// Имена моделей сервера (только у `not_found`, если список получен).
+    pub models: Option<Vec<String>>,
 }
 
 impl TestOutcome {
@@ -306,6 +314,12 @@ impl TestOutcome {
         if self.thinking {
             v["thinking"] = json!(true);
         }
+        if let Some(u) = &self.url {
+            v["url"] = json!(u);
+        }
+        if let Some(m) = &self.models {
+            v["models"] = json!(m);
+        }
         v
     }
 
@@ -318,6 +332,8 @@ impl TestOutcome {
                 .detail
                 .or_else(|| r.error.class.hint().map(str::to_string)),
             thinking: false,
+            url: None,
+            models: None,
         }
     }
 }
@@ -333,6 +349,57 @@ pub enum TestRefusal {
     VaultChanged { was: String, now: String },
     /// У пользователя идёт обращение к модели — 409.
     Busy,
+}
+
+/// Срок запроса списка моделей проверки подключения.
+const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Имена моделей сервера подключения (см. [`super::model::list_models_blocking`]): тот же
+/// маршрут и ключ, в блокирующем пуле; сбой — `None`.
+async fn list_models(p: &Prepared) -> Option<Vec<String>> {
+    let (conn, route, key) = (p.conn.clone(), p.route.clone(), p.key_clone());
+    tokio::task::spawn_blocking(move || {
+        super::model::list_models_blocking(
+            &conn,
+            &route,
+            key.as_ref().map(|k| k.as_str()),
+            MODELS_TIMEOUT,
+        )
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Совет проверки подключения, когда в ответе были размышления (§6.2 п. 9, §9.2 п. 3): у
+/// OpenAI-совместимых — выключить их в `body_extra`, у Anthropic (у новых моделей их не
+/// выключить) — снизить глубину.
+fn thinking_on_hint(p: Protocol) -> &'static str {
+    match p {
+        Protocol::OpenAi => {
+            "у модели включены размышления: для коротких работ выключите их в body_extra \
+             (например, {\"chat_template_kwargs\": {\"enable_thinking\": false}}) — меньше \
+             токенов и времени"
+        }
+        Protocol::Anthropic => {
+            "у модели включены размышления: для коротких работ снизьте глубину в body_extra \
+             ({\"output_config\": {\"effort\": \"low\"}}) — меньше токенов и времени"
+        }
+    }
+}
+
+/// Совет проверки подключения, когда ответ — не JSON.
+fn bad_json_hint(p: Protocol) -> &'static str {
+    match p {
+        Protocol::OpenAi => {
+            "модель ответила не JSON: для работ задайте в body_extra {\"response_format\": \
+             {\"type\": \"json_object\"}}, если поставщик его понимает"
+        }
+        Protocol::Anthropic => {
+            "модель ответила не JSON: работам нужен ответ одним JSON-объектом — проверьте имя \
+             модели или повысьте глубину (output_config.effort)"
+        }
+    }
 }
 
 /// Системное и пользовательское сообщения проверки подключения: без данных памяти.
@@ -470,6 +537,9 @@ pub async fn test_connection(
         )));
     }
     let timeout = call_timeout(cfg).min(TEST_TIMEOUT_MAX);
+    // незнакомый протокол вызов не отправит (`bad_request`); подсказки — как у OpenAI
+    let proto = p.conn.proto().unwrap_or(Protocol::OpenAi);
+    let url = super::model::request_url(proto, &p.route.base);
     let called = call(ctx, &p, &convo, timeout).await;
     journal(&db, called.row(&p, &meta)).await;
     let ms = called.ms;
@@ -483,26 +553,20 @@ pub async fn test_connection(
                         ok: true,
                         ms,
                         class: None,
-                        hint: reply.reasoning.then(|| {
-                            "у модели включены размышления: для коротких работ выключите их в \
-                             body_extra (например, {\"chat_template_kwargs\": {\"enable_thinking\": \
-                             false}}) — меньше токенов и времени"
-                                .to_string()
-                        }),
+                        hint: reply.reasoning.then(|| thinking_on_hint(proto).to_string()),
                         thinking: reply.reasoning,
+                        url: None,
+                        models: None,
                     }
                 }
                 Err(_) => TestOutcome {
                     ok: false,
                     ms,
                     class: Some(CallClass::BadJson),
-                    hint: Some(
-                        "модель ответила не JSON: для работ задайте в body_extra \
-                         {\"response_format\": {\"type\": \"json_object\"}}, если поставщик его \
-                         понимает"
-                            .into(),
-                    ),
+                    hint: Some(bad_json_hint(proto).into()),
                     thinking: reply.reasoning,
+                    url: Some(url),
+                    models: None,
                 },
             }
         }
@@ -510,12 +574,28 @@ pub async fn test_connection(
             if matches!(e.class, CallClass::Auth | CallClass::NotFound) {
                 pause::set_paused(st, user, e.class, None, actor, ip).await;
             }
+            // модель или адрес не найдены: список моделей сервера отличает «нет API по адресу» от
+            // «нет такой модели» (решение 169)
+            let models = if e.class == CallClass::NotFound {
+                list_models(&p).await
+            } else {
+                None
+            };
+            let hint = match &models {
+                Some(_) => Some(format!(
+                    "по адресу отвечает API, но модели «{}» на нём нет — выберите имя из списка",
+                    p.conn.model
+                )),
+                None => e.class.hint_for(proto).map(str::to_string),
+            };
             TestOutcome {
                 ok: false,
                 ms,
                 class: Some(e.class),
-                hint: e.class.hint().map(str::to_string),
+                hint,
                 thinking: e.class == CallClass::Thinking,
+                url: Some(url),
+                models,
             }
         }
     };

@@ -10,11 +10,16 @@
 // Каждый сценарий готовит своё подключение сам (ревью r1, Minor 11).
 // M7.4 (§7.7 п. 2): `works_admin_block` — сводка `GET /admin/works` у администратора (таблица, на
 // телефоне — карточки), имя пользователя — его вид страницы (`#/works?user=<id>`): запросы — его.
+// M7.6 (§9.2 п. 6; решения 166–170): `works_vault_choices_new_record_fix_url` — в выборе только
+// записи с адресом API («<имя> — <адрес>»), запись из окна создаётся и выбирается, адрес без /v1 —
+// предупреждение, «Исправить адрес» правит запись без смены ключа (проверка проходит);
+// `works_test_errors_401_404` — понятные причины и адрес запроса; `works_protocol_anthropic` —
+// выбор протокола, «Поле предела» скрыто, проверка подключения на заглушке `/v1/messages`, телефон.
 import { expect, test, type Page, type Request } from '@playwright/test';
-import { MOCK_REPLY_MARK, type MockRequest } from './mock-model';
+import { MOCK_MODELS, MOCK_REPLY_MARK, type MockRequest } from './mock-model';
 import { pageSnapshots } from './page-snaps';
 import { SOLUTION_GUID } from './seed';
-import { agent, human, resetWorks } from './seed-internal';
+import { MOCK_KEY, agent, human, resetWorks } from './seed-internal';
 import { ADMIN_STATE } from './session';
 
 const env = (k: string) => {
@@ -112,7 +117,7 @@ test('works_settings_and_connection_test', async ({ page }) => {
   const d = dialog(page, 'Подключение модели');
   await expect(d).toBeVisible();
   await expect(d.getByLabel('Запись Vault')).toBeFocused();
-  await d.getByLabel('Запись Vault').selectOption({ label: 'E2E модель (LAN)' });
+  await d.getByLabel('Запись Vault').selectOption({ label: `E2E модель (LAN) — ${mock()}/v1` });
   await expect(d.getByTestId('works-address')).toContainText(`${mock()}/v1`);
   await expect(d.getByTestId('works-address')).toContainText('эта же машина');
   // без сохранённого подключения проверять нечего — кнопка «Сохранить и проверить» (ревью r1, Minor 1)
@@ -222,7 +227,7 @@ test('works_external_banner_testnet', async ({ page }) => {
   await open(page);
   await page.getByRole('button', { name: 'Изменить подключение', exact: true }).click();
   const d = dialog(page, 'Подключение модели');
-  await d.getByLabel('Запись Vault').selectOption({ label: 'E2E модель (вне LAN)' });
+  await d.getByLabel('Запись Vault').selectOption({ label: 'E2E модель (вне LAN) — https://203.0.113.10/v1' });
   // до сохранения: адрес и предупреждение «вне LAN» (литерал TEST-NET-3: без DNS и соединения)
   await expect(d.getByTestId('works-address')).toContainText('https://203.0.113.10/v1');
   await expect(d.getByTestId('works-address')).toContainText('Данные памяти уйдут за пределы локальной сети: 203.0.113.10');
@@ -480,5 +485,171 @@ test('works_admin_block', async ({ page }) => {
   await expect(cards).toBeVisible();
   await expect(cards.locator(`li[data-user="${member}"]`).getByRole('link', { name: login })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+/** Запись личного Vault по REST (сессия человека): адрес `url`, значение — ключ подставной модели. */
+const vaultItem = (page: Page, title: string, url: string) =>
+  human<{ id: string }>(page, 'POST', 'spaces/knowledge/vault', { title, data: { type: 'token', url }, secret: MOCK_KEY });
+
+/** Подписи пунктов выбора записи в окне подключения. */
+const choiceLabels = (page: Page) =>
+  dialog(page, 'Подключение модели')
+    .getByLabel('Запись Vault')
+    .locator('option')
+    .allTextContents();
+
+test('works_vault_choices_new_record_fix_url', async ({ page }) => {
+  const problems = watch(page);
+  await resetWorks(page);
+  const sent = patches(page);
+  await open(page);
+  await page.getByRole('button', { name: 'Подключить модель', exact: true }).click();
+  const d = dialog(page, 'Подключение модели');
+  await expect(d).toBeVisible();
+  // решение 166: в выборе — записи с адресом API, пункт «<имя> — <адрес>»; хоста с описанием нет
+  const labels = await choiceLabels(page);
+  expect(labels).toContain(`E2E модель (LAN) — ${mock()}/v1`);
+  expect(labels.some((l) => l.includes('E2E хост') || l.includes('SSH'))).toBe(false);
+  expect(labels.every((l) => / — https?:\/\//.test(l))).toBe(true);
+  await expect(d).toContainText('Запись вашего Vault, где хранятся адрес API модели и ключ доступа. Выберите сервер модели или создайте запись');
+
+  // решение 167: «Новая запись…» — окно записи поверх окна подключения; после «Создать» запись выбрана
+  const title = `E2E модель без пути ${Date.now().toString(36)}`;
+  await d.getByRole('button', { name: 'Новая запись…', exact: true }).click();
+  const v = dialog(page, 'Новая запись Vault');
+  await expect(v).toBeVisible();
+  await expect(v.getByLabel('Название')).toBeFocused();
+  await v.getByLabel('Название').fill(title);
+  await v.getByLabel('Адрес API').fill(mock());
+  await v.getByLabel('Ключ доступа').fill(MOCK_KEY);
+  await v.getByRole('button', { name: 'Создать', exact: true }).click();
+  await expect(v).toBeHidden();
+  await expect(d).toBeVisible();
+  await expect(d.getByLabel('Запись Vault').locator('option:checked')).toHaveText(`${title} — ${mock()}`);
+  await expect(d.getByRole('status')).toContainText(`Запись «${title}» сохранена и выбрана.`);
+  // запись с ключом — подключение с ключом (без ключа «без ключа» ставится само)
+  await expect(d.getByLabel(/^Ключ/)).toHaveValue('key');
+  // решение 168: адрес без /v1 — предупреждение с полным адресом запроса
+  const warn = d.getByTestId('works-path-warning');
+  await expect(warn).toContainText(`Адрес без /v1 — запрос уйдёт на ${mock()}/chat/completions; обычно нужен ${mock()}/v1`);
+  await d.getByLabel('Имя модели').fill('e2e-mock');
+  await d.getByRole('button', { name: 'Сохранить', exact: true }).click();
+  await expect(d).toBeHidden();
+  // решение 169: проверка — «по адресу нет API» и полный адрес запроса
+  await page.getByRole('button', { name: 'Проверить подключение', exact: true }).click();
+  const err = page.getByRole('alert').filter({ hasText: 'Подключение не работает' });
+  await expect(err).toContainText('по адресу нет API');
+  await expect(err).toContainText(`Адрес запроса: ${mock()}/chat/completions`);
+
+  // «Исправить адрес»: окно записи с адресом + /v1, ключ не трогается — проверка проходит
+  await page.getByRole('button', { name: 'Изменить подключение', exact: true }).click();
+  await d.getByTestId('works-path-warning').getByRole('button', { name: 'Исправить адрес', exact: true }).click();
+  const e = dialog(page, 'Изменить запись Vault');
+  await expect(e).toBeVisible();
+  await expect(e.getByLabel('Адрес API')).toHaveValue(`${mock()}/v1`);
+  await expect(e.getByLabel('Ключ доступа')).toHaveValue('');
+  await e.getByRole('button', { name: 'Сохранить', exact: true }).click();
+  await expect(e).toBeHidden();
+  await expect(d.getByTestId('works-path-warning')).toHaveCount(0);
+  await expect(d.getByTestId('works-request-url')).toContainText(`${mock()}/v1/chat/completions`);
+  const before = (await mockRequests()).length;
+  await d.getByRole('button', { name: 'Сохранить и проверить', exact: true }).click();
+  await expect(d.getByRole('status')).toContainText('Подключение работает');
+  const reqs = (await mockRequests()).slice(before);
+  expect(reqs.map((r) => [r.path, r.auth])).toEqual([['/v1/chat/completions', true]]);
+  // окно записи поверх окна подключения: Esc закрывает только его, фокус — на «Новая запись…»
+  const add = d.getByRole('button', { name: 'Новая запись…', exact: true });
+  await add.click();
+  await expect(v).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(v).toBeHidden();
+  await expect(d).toBeVisible();
+  await expect(add).toBeFocused();
+  await d.getByRole('button', { name: 'Отмена', exact: true }).click();
+  await expect(d).toBeHidden();
+  // телефон: «Назад» закрывает только верхнее окно, страница без горизонтальной прокрутки
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole('button', { name: 'Изменить подключение', exact: true }).click();
+  await expect(d).toBeVisible();
+  await add.click();
+  await expect(v).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.goBack({ waitUntil: 'commit' });
+  await expect(v).toBeHidden();
+  await expect(d).toBeVisible();
+  await page.goBack({ waitUntil: 'commit' });
+  await expect(d).toBeHidden();
+  await expect(page).toHaveURL(/#\/works$/);
+  await page.setViewportSize({ width: 1280, height: 900 });
+  // значение ключа ни в теле PATCH подключения, ни на странице
+  expect(JSON.stringify(sent)).not.toContain(MOCK_KEY);
+  expect(await page.content()).not.toContain(MOCK_KEY);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('works_test_errors_401_404', async ({ page }) => {
+  const problems = watch(page);
+  await resetWorks(page);
+  const lan = env('E2E_VAULT_LAN');
+  const conn = (model: string) =>
+    human(page, 'PATCH', 'auth/settings', { works: { model: { protocol: 'openai', vault: `v:${lan}`, model, auth: 'key', max_tokens: 4000 } } });
+  await conn('e2e-401');
+  await open(page);
+  await page.getByRole('button', { name: 'Проверить подключение', exact: true }).click();
+  const err = page.getByRole('alert').filter({ hasText: 'Подключение не работает' });
+  await expect(err).toContainText('ключ не подошёл');
+  await expect(err).toContainText(`Адрес запроса: ${mock()}/v1/chat/completions`);
+  // модели нет: список моделей сервера
+  await conn('e2e-missing');
+  await page.reload();
+  await page.getByRole('button', { name: 'Проверить подключение', exact: true }).click();
+  await expect(err).toContainText(`по адресу отвечает API, но модели «e2e-missing» на нём нет — есть: ${MOCK_MODELS.join(', ')}`);
+  await resetWorks(page);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('works_protocol_anthropic', async ({ page }) => {
+  const problems = watch(page);
+  await resetWorks(page);
+  const title = `E2E Anthropic ${Date.now().toString(36)}`;
+  const item = await vaultItem(page, title, mock());
+  const sent = patches(page);
+  await open(page);
+  await page.getByRole('button', { name: 'Подключить модель', exact: true }).click();
+  const d = dialog(page, 'Подключение модели');
+  await d.getByLabel('Протокол').selectOption({ label: 'Anthropic Messages' });
+  await d.getByLabel('Запись Vault').selectOption({ label: `${title} — ${mock()}` });
+  // у Anthropic: поля предела нет, адрес без /v1 — норма, запрос — <адрес>/v1/messages
+  await expect(d.getByLabel('Поле предела')).toHaveCount(0);
+  await expect(d.getByTestId('works-path-warning')).toHaveCount(0);
+  await expect(d.getByTestId('works-request-url')).toContainText(`${mock()}/v1/messages`);
+  await d.getByLabel('Имя модели').fill('claude-e2e');
+  await d.getByRole('button', { name: 'Меньше размышлений (effort: low)', exact: true }).click();
+  await expect(d.getByRole('textbox', { name: /^body_extra/ })).toHaveValue(/"output_config"/);
+  // параметры выборки Anthropic не принимает — ошибка до сохранения
+  await d.getByRole('textbox', { name: /^body_extra/ }).fill('{"temperature": 0.2}');
+  await expect(d.getByRole('alert')).toContainText('temperature');
+  await d.getByRole('textbox', { name: /^body_extra/ }).fill('{"output_config": {"effort": "low"}}');
+  await d.getByRole('button', { name: 'Сохранить', exact: true }).click();
+  await expect(d).toBeHidden();
+  const model = (sent.at(-1)!.works as { model: Record<string, unknown> }).model;
+  expect(model).toMatchObject({ protocol: 'anthropic', vault: `v:${item.id}`, token_field: 'auto', body_extra: { output_config: { effort: 'low' } } });
+  await expect(page.getByRole('region', { name: 'Подключённая модель' })).toContainText('Anthropic Messages');
+  // проверка подключения — протоколом подключения на заглушке
+  const before = (await mockRequests()).length;
+  await page.getByRole('button', { name: 'Проверить подключение', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: /^Подключение работает: ответ за \d+ мс\.$/ })).toBeVisible();
+  const reqs = (await mockRequests()).slice(before);
+  expect(reqs.map((r) => [r.protocol, r.kind, r.path, r.model, r.auth])).toEqual([['anthropic', 'test', '/v1/messages', 'claude-e2e', true]]);
+  // телефон: окно без горизонтальной прокрутки, «Поле предела» скрыто
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole('button', { name: 'Изменить подключение', exact: true }).click();
+  await expect(d).toBeVisible();
+  await expect(d.getByLabel('Протокол')).toHaveValue('anthropic');
+  await expect(d.getByLabel('Поле предела')).toHaveCount(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await d.getByRole('button', { name: 'Закрыть', exact: true }).first().click();
+  await resetWorks(page);
   expect(problems, problems.join('\n')).toEqual([]);
 });

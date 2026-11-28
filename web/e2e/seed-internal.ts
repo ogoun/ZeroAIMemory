@@ -340,6 +340,11 @@ export async function seedInternal(base: string, token: string, mock: string): P
   const lan = await vault('E2E модель (LAN)', `${mock}/v1`);
   const ext = await vault('E2E модель (вне LAN)', 'https://203.0.113.10/v1');
   const move = await vault('E2E модель (смена адреса)', `${mock}/v1`);
+  // запись хоста с описанием вместо адреса API — в выборе подключения её нет (M7.6, решение 166)
+  await call(base, token, 'POST', 'spaces/knowledge/vault', {
+    title: 'E2E хост (SSH)',
+    data: { type: 'host', address: '192.0.2.10 (SSH, ключ в агенте)', purpose: 'e2e: машина без API модели' },
+  });
   const p = await call<{ proposal: string }>(base, token, 'POST', 'proposals', {
     type: 'rule',
     path: 'e2e/кандидат-форм',

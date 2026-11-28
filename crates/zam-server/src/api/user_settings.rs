@@ -548,8 +548,9 @@ fn max_tokens_default() -> u32 {
     works_settings::MAX_TOKENS_DEFAULT
 }
 
-/// Подключение `works.model` из входа: форма, протокол (только `openai`), пределы полей,
-/// `body_extra` без ключей сервера, запись личного Vault пользователя `user` по имени или
+/// Подключение `works.model` из входа: форма, протокол (`openai` или `anthropic`; у `anthropic`
+/// поле предела — только `auto`, M7.6 §9.2 п. 1), пределы полей, `body_extra` без
+/// зарезервированных ключей протокола, запись личного Vault пользователя `user` по имени или
 /// `v:<id>` (хранится id) и её адрес (§6.2 пп. 1, 6): `data.url` (иначе `data.address`) без
 /// `userinfo`, `?` и `#`; `http` вне LAN, петля и свои адреса сервера без `[works]
 /// allow_loopback`, вне LAN при `model_access = "lan"`, имя без адресов — 422. Адрес
@@ -571,9 +572,10 @@ async fn resolve_model(
 ) -> Result<(Value, Option<String>), ApiError> {
     let input: ModelInput = serde_json::from_value(raw)
         .map_err(|e| ApiError::BadRequest(format!("works.model: {e}")))?;
-    let protocol = input.protocol.trim().to_string();
-    crate::works::model::check_protocol(&protocol)
+    let proto = crate::works::model::check_protocol(input.protocol.trim())
         .map_err(|e| ApiError::Unprocessable(format!("works.model.protocol: {e}")))?;
+    crate::works::model::check_token_field(proto, input.token_field)
+        .map_err(|e| ApiError::Unprocessable(format!("works.model.token_field: {e}")))?;
     let model = input.model.trim().to_string();
     if model.is_empty() || model.chars().count() > MODEL_NAME_MAX {
         return Err(ApiError::Unprocessable(format!(
@@ -596,8 +598,9 @@ async fn resolve_model(
             ));
         }
     };
-    // размер (до 4 КиБ) и ключи сервера — одна проверка клиента модели
-    crate::works::model::check_body_extra(&body_extra)
+    // размер (до 4 КиБ) и ключи сервера протокола — одна проверка клиента модели
+    proto
+        .check_body_extra(&body_extra)
         .map_err(|e| ApiError::Unprocessable(format!("works.model.body_extra: {e}")))?;
     let wanted = input.vault.trim();
     let by_id = wanted.strip_prefix("v:").and_then(|s| s.parse::<Id>().ok());
@@ -623,7 +626,7 @@ async fn resolve_model(
     )
     .await?;
     let conn = ModelConn {
-        protocol,
+        protocol: proto.as_str().to_string(),
         vault: item.id,
         model,
         auth: input.auth,
