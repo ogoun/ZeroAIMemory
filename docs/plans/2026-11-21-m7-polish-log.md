@@ -9093,7 +9093,12 @@ passed (у 0.0.17-m7.4 — 1110); полный локальный прогон �
 `migration_prompt_token_budget` с bge-m3: ru 2922–3079, en 2867–3021 токенов в худшем случае),
 `--test boot` — 16 (`health_features_documented`); `cargo clippy -p zam-server --all-targets -- -D
 warnings` и `cargo fmt -p zam-server --check` — чисто. WebUI: `npm run check` — 0 ошибок,
-`test:build` — 138, `build`, `npx size-limit` — в пределах; e2e — в отчёте задачи.
+`test:build` — 138, `build`, `npx size-limit` — в пределах. e2e (release-сервер): `agent-setup`,
+`admin`, `access`, `user-login` — 13 passed; `forms.spec` и `mobile.spec` целиком (фильтр `-g`
+через `npm run` не дошёл) — 958 passed, в том числе строка `setup-revoke` в четырёх ширинах,
+`revoke_token_confirm` и `all_pages_no_horizontal_scroll`. Первый прогон поймал совпадение текста
+новой ссылки с пунктом меню «Администрирование» (`admin.spec`, строгий режим) — ссылки
+переименованы («Мои токены», «токены пользователей»).
 
 ## Уточнить у владельца
 
