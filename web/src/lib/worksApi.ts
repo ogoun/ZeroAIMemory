@@ -7,11 +7,13 @@
 // администратор — его пользователь. M7.4 (§7.6 пп. 2–3, §7.7 пп. 1–2): сводка работ всех
 // пользователей (`GET /admin/works`), «Внутренние работы» пользователя глазами администратора
 // (`user` у функций очереди и настроек: чтение — `?user=`, запуск — `X-Zam-User`, настройки —
-// `/admin/users/{id}/settings`), набор проб — список, ручная проба и снятие.
+// `/admin/users/{id}/settings`), набор проб — список, ручная проба и снятие. M7.5 (§8.8 п. 1):
+// «Предложения» — кандидаты в Rules и уборки (`type=tidy`: список, «Применить», «Отклонить»).
 import { call, getEntry, getNode, listSpaces, spaceRef, type Space, type UserSettings } from './api';
 import type { CheckRun, CheckStatus } from './checkVerdict';
 import { JOURNAL_OF_KIND } from './journals';
 import type { Route } from './router';
+import type { TidyFields } from './tidyCard';
 import type { WorkKind, WorksMode } from './worksText';
 
 // ---- ссылка на запись или заметку (`i:<id>`, `n:<id>`) → адрес карточки ----
@@ -323,7 +325,8 @@ export interface ProposalSource {
 
 export interface Proposal {
   id: string;
-  type: 'rule';
+  /** `rule` — кандидат в Rules (M7.3); `tidy` — кандидат уборки (M7.5 §8.7, признак `tidy`). */
+  type: 'rule' | 'tidy';
   status: 'proposed' | 'accepted' | 'declined' | 'withdrawn' | 'stale' | 'skipped';
   space: string;
   path: string;
@@ -346,15 +349,36 @@ export interface Proposal {
   result_ref: string | null;
 }
 
-/** Карточка: ещё сумма Rules в дайджесте сейчас и с кандидатом, источники с заголовками. */
+/** Карточка: ещё сумма Rules в дайджесте сейчас и с кандидатом (у `rule`), источники с
+ * заголовками. */
 export interface ProposalCard extends Proposal {
-  rules_tokens: { now: number; after: number };
+  rules_tokens?: { now: number; after: number };
   sources: ProposalSource[];
 }
 
-export const listProposals = (status?: Proposal['status']) =>
-  call<{ proposals: Proposal[] }>('GET', `proposals?limit=200${status ? `&status=${status}` : ''}`);
-export const getProposal = (id: string) => call<ProposalCard>('GET', `proposals/${encodeURIComponent(id)}`);
+/** Предложение уборки (M7.5 §8.7, `type: tidy`): тип кандидата, сигналы, записи (L1 и ревизия на
+ * момент предложения), допустимые операции, выбранная операция и `stale` — запись изменилась
+ * после предложения («Применить» — 409). */
+export type TidyProposal = Proposal & TidyFields;
+export type TidyProposalCard = ProposalCard & TidyFields;
+
+/** Список предложений типа `type` (`rule` — по умолчанию у сервера); `status` — один статус, без
+ * него — все, кроме `skipped`. */
+export const listProposals = (type: Proposal['type'], status?: Proposal['status']) =>
+  call<{ proposals: (Proposal & Partial<TidyFields>)[] }>(
+    'GET',
+    `proposals?type=${type}&limit=200${status ? `&status=${status}` : ''}`,
+  );
+export const getProposal = (id: string) => call<ProposalCard & Partial<TidyFields>>('GET', `proposals/${encodeURIComponent(id)}`);
+/** «Применить» предложение уборки — только сессия WebUI (§8.7 п. 3): `text` — правка человеком
+ * текста `merge` или `append`; ревизия записи не та — 409 `code: stale`, решено раньше — 409
+ * `code: not_open`. `result` — новая запись `merge`, цель операции или созданный термин. */
+export const applyTidy = (id: string, body: { text?: string }) =>
+  call<{ proposal: Proposal & Partial<TidyFields>; result: string; warnings?: string[] }>(
+    'POST',
+    `proposals/${encodeURIComponent(id)}/accept`,
+    body,
+  );
 /** «Принять»: путь и текст можно поправить; заметку Rules создаёт тот же код, что у WebUI. */
 export const acceptProposal = (id: string, edit: { path?: string; content?: string }) =>
   call<{ proposal: Proposal; note: { id: string; path: string } }>('POST', `proposals/${encodeURIComponent(id)}/accept`, edit);

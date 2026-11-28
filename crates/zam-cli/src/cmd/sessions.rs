@@ -10,9 +10,11 @@
 //!   обоих — сессия агента (`ZAM_SESSION`, сессия хуков проекта), иначе последняя.
 //!   `--by-holdout` — суммы отдельно по контрольной группе A/B (`holdout`, M6 §12) и остальным.
 //!   `--subagents` (M7 §5.8 п. 2) — к сессии прибавляются её субагенты (`GET /sessions?parent=`,
-//!   строка «с субагентами: N»). Время — UTC `yyyy-MM-dd HH:mm:ss` ([`agent_time`]); `--json` —
-//!   сессии с `tokens` и суммы. Последняя строка текста — «без сессии за 30 сут.: …», если была
-//!   выдача без сессии ([`unattributed_line`]);
+//!   строка «с субагентами: N»). Под таблицей группы — «открыто подсказок: N/M (p %)» (M7.5 §8.8
+//!   п. 2: `hints_opened` и `hints_shown` сессий группы; подсказок не было — строки нет; сервер
+//!   без признака `sessions_opened` — «—», [`opened_line`]). Время — UTC `yyyy-MM-dd HH:mm:ss` ([`agent_time`]); `--json` —
+//!   сессии с `tokens` и суммы (у группы — `hints {shown, opened}` или `null`). Последняя строка
+//!   текста — «без сессии за 30 сут.: …», если была выдача без сессии ([`unattributed_line`]);
 //! - `zam sessions tokens --unattributed [--days N]` (M7 §5.8 п. 2) — выдача без сессии (MCP по
 //!   HTTP без привязки к сессии агента, `GET /sessions/unattributed`): «сутки · событие ·
 //!   вызовов · токенов» и итог; `--json` — строки сервера и сумма.
@@ -126,6 +128,31 @@ fn table(stats: &BTreeMap<String, Stat>) -> String {
         s.push_str(&format!("уже выдавалось: {}\n", shares.join("; ")));
     }
     s
+}
+
+/// Подсказки сессий (M7.5 §8.8 п. 2): `(открыто, показано)` — суммы `hints_opened` и
+/// `hints_shown`; `None` — у сессии полей нет (сервер без признака `sessions_opened`, 0.0.17 и
+/// раньше): доля неизвестна, а не «0».
+fn hints<'a>(sessions: impl IntoIterator<Item = &'a Value>) -> Option<(u64, u64)> {
+    let mut sum = (0, 0);
+    for s in sessions {
+        sum.0 += s["hints_opened"].as_u64()?;
+        sum.1 += s["hints_shown"].as_u64()?;
+    }
+    Some(sum)
+}
+
+/// Строка «открыто подсказок: N/M (p %)» (M7.5 §8.8 п. 2): сервер без признака — «—»; подсказок
+/// не показывали — строки нет (как у доли «уже выдавалось» без вызовов).
+fn opened_line(h: Option<(u64, u64)>) -> String {
+    match h {
+        None => "открыто подсказок: —\n".to_string(),
+        Some((_, 0)) => String::new(),
+        Some((opened, shown)) => {
+            let pct = ((opened as f64 / shown as f64) * 100.0).round() as u64;
+            format!("открыто подсказок: {opened}/{shown} ({pct} %)\n")
+        }
+    }
 }
 
 /// Строка сессии: id, агент, начало и последнее обращение (UTC), эпоха, признак `holdout`.
@@ -331,9 +358,11 @@ pub fn tokens(ctx: &Ctx, pick: &Pick, by_holdout: bool, subagents: bool) -> Resu
                         )
                     })
                     .collect();
+                let h = hints(list.iter().copied())
+                    .map(|(opened, shown)| json!({"shown": shown, "opened": opened}));
                 (
                     name.to_string(),
-                    json!({"sessions": list.len(), "tokens": t}),
+                    json!({"sessions": list.len(), "tokens": t, "hints": h}),
                 )
             })
             .collect();
@@ -374,6 +403,8 @@ pub fn tokens(ctx: &Ctx, pick: &Pick, by_holdout: bool, subagents: bool) -> Resu
             continue;
         }
         out.push_str(&table(&sum(list.iter().copied())));
+        // доля открытых подсказок группы (M7.5 §8.8 п. 2): таблица — по событиям, доля — по сессиям
+        out.push_str(&opened_line(hints(list.iter().copied())));
     }
     // выдача без сессии не входит ни в одну сессию — напоминание под выводом (M7 §5.8 п. 2)
     if let Some(line) = unattributed_line(ctx) {
@@ -425,6 +456,22 @@ mod tests {
         );
         let ids: Vec<&str> = got.iter().filter_map(|s| s["id"].as_str()).collect();
         assert_eq!(ids, ["s:a1", "s:a1:c1"]);
+    }
+
+    /// M7.5 §8.8 п. 2: доля открытых по сессиям группы; сессия без полей (сервер 0.0.17) — «—».
+    #[test]
+    fn opened_line_cases() {
+        let a = json!({"hints_shown": 4, "hints_opened": 1});
+        let b = json!({"hints_shown": 2, "hints_opened": 1});
+        let old = json!({"tokens": {}});
+        assert_eq!(hints([&a, &b]), Some((2, 6)));
+        assert_eq!(
+            opened_line(hints([&a, &b])),
+            "открыто подсказок: 2/6 (33 %)\n"
+        );
+        assert_eq!(hints([&a, &old]), None);
+        assert_eq!(opened_line(None), "открыто подсказок: —\n");
+        assert_eq!(opened_line(Some((0, 0))), "");
     }
 
     #[test]

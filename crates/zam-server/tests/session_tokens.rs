@@ -340,6 +340,141 @@ async fn sessions_list_with_tokens() {
     assert!(r.json()["items"][0].get("tokens").is_none(), "{}", r.text());
 }
 
+/// M7.5 §8.8 п. 2: `hints_shown` и `hints_opened` у `GET /sessions?tokens=true` и
+/// `GET /sessions/{id}` — целей, показанных сессии подсказкой `/recall`, и из них открытых агентом
+/// (`usage_opened`); цель, показанная снова в новой эпохе, — одна; открытие другой сессией в счёт
+/// не идёт; сессия без подсказок — 0 и 0; без `tokens=true` полей нет; признак `sessions_opened`.
+#[tokio::test]
+async fn sessions_tokens_opened_share() {
+    let a = api("tokens-opened", roomy).await;
+    let insight = async |title: &str, pattern: &str| -> String {
+        let r = a
+            .t(
+                Method::POST,
+                "/api/v1/spaces/knowledge/entries",
+                Some(
+                    json!({"kind": "insight", "title": title, "body": format!("{title}."),
+                            "data": {"kind": "gotcha"},
+                            "triggers": [{"type": "error_regex", "pattern": pattern}]}),
+                ),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        format!("i:{}", r.json()["id"].as_str().unwrap())
+    };
+    let hint = async |session: &str, error: &str, expect: &str| {
+        let r = a
+            .tok_h(
+                &a.token,
+                Method::POST,
+                "/api/v1/recall",
+                Some(json!({"event": "post_tool", "error": error})),
+                &[("x-zam-session", session)],
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+        let j = r.json();
+        let ids: Vec<&str> = j["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|i| i["id"].as_str())
+            .collect();
+        assert!(ids.contains(&expect), "{j}");
+    };
+    let read = async |session: &str, target: &str| {
+        let r = a
+            .tok_h(
+                &a.token,
+                Method::POST,
+                "/api/v1/read",
+                Some(json!({"items": [{"id": target, "tier": "L0"}]})),
+                &[("x-zam-session", session)],
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    };
+    let x = insight("Квазар падает на сборке", "quasar-build").await;
+    let y = insight("Пульсар падает на тестах", "pulsar-test").await;
+    let s = "s-open";
+    hint(s, "quasar-build failed", &x).await;
+    hint(s, "pulsar-test failed", &y).await;
+    // новая эпоха и снова та же цель — показано по-прежнему 2
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({"id": s, "new_epoch": true})),
+        )
+        .await;
+    assert!(r.status.is_success(), "{}", r.text());
+    hint(s, "quasar-build failed", &x).await;
+    read(s, &x).await;
+    // другая сессия: показ и открытие — свои
+    hint("s-other", "pulsar-test failed", &y).await;
+    read("s-other", &y).await;
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({"id": "s-none"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+
+    let r = a.t(Method::GET, "/api/v1/sessions?tokens=true", None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let items = r.json()["items"].as_array().unwrap().clone();
+    let by = |id: &str| items.iter().find(|v| v["id"] == id).unwrap().clone();
+    assert_eq!(
+        (by(s)["hints_shown"].clone(), by(s)["hints_opened"].clone()),
+        (json!(2), json!(1)),
+        "{items:?}"
+    );
+    assert_eq!(
+        (
+            by("s-other")["hints_shown"].clone(),
+            by("s-other")["hints_opened"].clone()
+        ),
+        (json!(1), json!(1))
+    );
+    assert_eq!(
+        (
+            by("s-none")["hints_shown"].clone(),
+            by("s-none")["hints_opened"].clone()
+        ),
+        (json!(0), json!(0))
+    );
+    // одна сессия — те же числа
+    let r = a
+        .t(Method::GET, &format!("/api/v1/sessions/{s}"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["hints_shown"], 2, "{}", r.text());
+    assert_eq!(r.json()["hints_opened"], 1, "{}", r.text());
+    // без `tokens=true` — прежняя форма строки
+    let r = a.t(Method::GET, "/api/v1/sessions", None).await;
+    assert!(
+        r.json()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| v.get("hints_shown").is_none() && v.get("hints_opened").is_none()),
+        "{}",
+        r.text()
+    );
+    let h = a.t(Method::GET, "/api/v1/health", None).await;
+    assert!(
+        h.json()["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "sessions_opened"),
+        "{}",
+        h.text()
+    );
+}
+
 /// M7 §5.8 п. 1 (задача 9 M7.2): `GET /sessions?parent=<id>` — сессии субагентов этой сессии и их
 /// субагентов (потомки по `parent_id`, круг правок 1), с `tokens=true` — их учёт; сама сессия (в том
 /// числе с самоссылкой `parent_id = id`) и субагенты другой сессии в ответ не входят; у другого

@@ -1988,12 +1988,15 @@ export const entryFeedback = (user: string, id: string, value: 'useful' | 'usele
 // Остальной REST страниц «Внутренние работы», «Проверка памяти» и «Кандидаты в Rules» —
 // `worksApi.ts` (ленивый чанк страниц); здесь — только то, что нужно оболочке при старте.
 
-/** Открытых кандидатов в Rules своего пользователя (`GET /proposals/counts`). */
+/** Открытые предложения своего пользователя (`GET /proposals/counts`): кандидаты в Rules и, с
+ * M7.5 (§8.8 п. 1), кандидаты уборки (у сервера 0.0.17 `tidy` нет). */
 export interface ProposalCounts {
   rules: number;
+  tidy?: number;
 }
 
-/** Число открытых кандидатов в Rules (метка дерева «кандидаты: N», «Кандидаты N» в шапке). */
+/** Числа открытых предложений (метка дерева «кандидаты: N» — `rules`; «Предложения N» в шапке —
+ * сумма, `proposalsOpen`). */
 export const proposalCounts = () => call<ProposalCounts>('GET', 'proposals/counts');
 
 // ---- понятные сообщения об ошибках (RFC 9457) ----

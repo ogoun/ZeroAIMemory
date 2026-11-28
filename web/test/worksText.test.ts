@@ -173,9 +173,11 @@ test('works_proposal_texts', () => {
 });
 
 test('works_admin_summary_texts', () => {
-  // сводка администратора (M7.4 §7.7 п. 2): режимы видов, очередь, последний прогон проверки
-  assert.equal(modesSummary({ probes: { mode: 'agent' }, rules: { mode: 'off' } }), 'пробы: агент · кандидаты в Rules: выкл');
-  assert.equal(modesSummary(undefined), 'пробы: выкл · кандидаты в Rules: выкл');
+  // сводка администратора (M7.4 §7.7 п. 2): режимы видов, очередь, последний прогон проверки; вид
+  // уборки (M7.5 §8.7) — третьим, без строки сервера — «выкл»
+  assert.equal(modesSummary({ probes: { mode: 'agent' }, rules: { mode: 'off' } }), 'пробы: агент · кандидаты в Rules: выкл · уборка: выкл');
+  assert.equal(modesSummary({ probes: { mode: 'off' }, rules: { mode: 'off' }, tidy: { mode: 'model' } }), 'пробы: выкл · кандидаты в Rules: выкл · уборка: модель');
+  assert.equal(modesSummary(undefined), 'пробы: выкл · кандидаты в Rules: выкл · уборка: выкл');
   assert.equal(queueText(2, 1), '2 в очереди · 1 идёт');
   assert.equal(queueText(0, 0), 'пусто');
   assert.equal(adminCheckText({ status: 'done', verdict: 'regression' }), 'ухудшение');

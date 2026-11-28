@@ -141,7 +141,7 @@ test.describe('телефон, сенсорный ввод', () => {
     await expect(page.getByRole('button', { name: 'Скрыть дерево' })).toHaveAttribute('aria-expanded', 'true');
     // в панели — «Разделы» строками по 44 px, затем дерево
     const sections = sidebar(page).getByRole('navigation', { name: 'Разделы' });
-    for (const name of ['Заметки', 'Индекс', 'Администрирование', 'Подключение агента', 'Кэш выжимок', 'Сессии', 'Проверка', 'Кандидаты']) {
+    for (const name of ['Заметки', 'Индекс', 'Администрирование', 'Подключение агента', 'Кэш выжимок', 'Сессии', 'Проверка', 'Предложения']) {
       await expect(sections.getByRole('link', { name, exact: true })).toBeVisible();
     }
     await minTarget(sections.getByRole('link'), 44);
@@ -764,7 +764,7 @@ test.describe('планшет, сенсорный ввод', () => {
     const lastBox = (await links.last().boundingBox())!;
     const moreBox = (await moreButton(page).boundingBox())!;
     expect(moreBox.x - (lastBox.x + lastBox.width), 'зазор до «Ещё»').toBeGreaterThanOrEqual(7.5);
-    await expect(await sectionItem(page, 'Кандидаты')).toBeInViewport({ ratio: 1 });
+    await expect(await sectionItem(page, 'Предложения')).toBeInViewport({ ratio: 1 });
     await page.keyboard.press('Escape');
     await expect(moreButton(page)).toBeFocused();
     await expect(page.getByRole('button', { name: 'Выйти' })).toBeVisible();
@@ -799,7 +799,7 @@ test.describe('планшет, сенсорный ввод', () => {
     await expect(page.getByRole('button', { name: 'Выйти' })).toBeInViewport({ ratio: 1 });
     // полоса не переполнена, последний раздел — в «Ещё», целиком в окне
     expect(await sections.evaluate((n) => n.scrollWidth <= n.clientWidth), 'полоса разделов без переполнения').toBe(true);
-    const last = await sectionItem(page, 'Кандидаты');
+    const last = await sectionItem(page, 'Предложения');
     await expect(last).toBeInViewport({ ratio: 1 });
     await page.keyboard.press('Escape');
     expect(await noHorizontalScroll(page)).toBe(true);
@@ -902,8 +902,8 @@ test('header_sections_fit', async ({ browser }) => {
   test.setTimeout(300_000);
   mkdirSync(screens, { recursive: true });
   const all = {
-    admin: ['Заметки', 'Индекс', 'Администрирование', 'Подключение агента', 'Кэш выжимок', 'Сессии', 'Проверка', 'Кандидаты'],
-    user: ['Заметки', 'Мои решения', 'Аккаунт', 'Подключение агента', 'Кэш выжимок', 'Сессии', 'Проверка', 'Кандидаты'],
+    admin: ['Заметки', 'Индекс', 'Администрирование', 'Подключение агента', 'Кэш выжимок', 'Сессии', 'Проверка', 'Предложения'],
+    user: ['Заметки', 'Мои решения', 'Аккаунт', 'Подключение агента', 'Кэш выжимок', 'Сессии', 'Проверка', 'Предложения'],
   };
   const layout: string[] = [];
   for (const as of ['admin', 'user'] as const) {
@@ -979,7 +979,7 @@ test('header_sections_fit', async ({ browser }) => {
         await expect(menu).toBeInViewport({ ratio: 1 });
         hidden = await items.evaluateAll(linkNames);
         // признаки скрытых разделов — и на кнопке, и у пунктов меню
-        if (hidden.includes('Кандидаты')) {
+        if (hidden.includes('Предложения')) {
           await expect(more.getByTestId('more-count'), at).toHaveText('12');
           await expect(menu.getByTestId('candidates-count'), at).toHaveText('12');
         }
