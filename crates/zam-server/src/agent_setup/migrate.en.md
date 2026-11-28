@@ -69,7 +69,7 @@ One piece of knowledge — one record: merge duplicates; on a contradiction the 
 ## 8. Working rules
 
 - Do not touch the owner's uncommitted work or tracked files, except connection files; delete only your own temporary files.
-- Temporary files and scripts — only in a project directory excluded from git (e.g. `.zeroaimemory/migrate/`); never system temporary directories.
+- Temporary files and scripts — only in a project directory excluded from git: `.zeroaimemory/cache/migrate/` (`zam init` excludes `cache/`); never system temporary directories.
 - Economically: inventory before reading, large files — by script and in parts, writes — in batches.
 - Secrets — never in notes, records or output: a value goes only to Vault via stdin.
 - Do not set `axiom`: instructions from memory are `theorem`; an axiom — only on the owner's direct word.
