@@ -1,0 +1,97 @@
+{
+  "base": "2026-11-28-m6-bge-m3-int8-tokens-m75-rank-r1-srv0.0.17-m7.4+m6-dev-default×3",
+  "arm": "2026-11-28-m6-bge-m3-int8-tokens-m75-rank-r1-srv0.0.17-m7.4+m6-dev-default-aa×3",
+  "base_files": [
+    "2026-11-28-m6-bge-m3-int8-tokens-m75-rank-r1-srv0.0.17-m7.4+m6-dev-default",
+    "2026-11-28-m6-bge-m3-int8-tokens-m75-rank-r2-srv0.0.17-m7.4+m6-dev-default",
+    "2026-11-28-m6-bge-m3-int8-tokens-m75-rank-r3-srv0.0.17-m7.4+m6-dev-default"
+  ],
+  "arm_files": [
+    "2026-11-28-m6-bge-m3-int8-tokens-m75-rank-r1-srv0.0.17-m7.4+m6-dev-default-aa",
+    "2026-11-28-m6-bge-m3-int8-tokens-m75-rank-r2-srv0.0.17-m7.4+m6-dev-default-aa",
+    "2026-11-28-m6-bge-m3-int8-tokens-m75-rank-r3-srv0.0.17-m7.4+m6-dev-default-aa"
+  ],
+  "split": "dev",
+  "scenarios": 26,
+  "excluded": [
+    "s-20",
+    "s-46",
+    "s-47",
+    "s-48"
+  ],
+  "base_tokens_mean": 88910.33333333334,
+  "arm_tokens_mean": 88912.00000000001,
+  "r": {
+    "mean": 1.0000187454776537,
+    "lo": 0.9998824328091134,
+    "hi": 1.000128991109439
+  },
+  "base_micro": 0.9166666666666666,
+  "arm_micro": 0.9166666666666666,
+  "d_micro": {
+    "mean": 0.0,
+    "lo": 0.0,
+    "hi": 0.0
+  },
+  "net_losses": 0,
+  "net_losses_all_reps": 0,
+  "noninferior": true,
+  "noise_base_p95": 0.006551131891579443,
+  "noise_arm_p95": 0.007431178238577878,
+  "pairs": [
+    {
+      "base": "2026-11-28-m6-bge-m3-int8-tokens-m75-rank-r1-srv0.0.17-m7.4+m6-dev-default",
+      "arm": "2026-11-28-m6-bge-m3-int8-tokens-m75-rank-r1-srv0.0.17-m7.4+m6-dev-default-aa",
+      "r": {
+        "mean": 0.9999437658861372,
+        "lo": 0.9996736043036807,
+        "hi": 1.0001488438395447
+      },
+      "d_micro": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      },
+      "net_losses": 0,
+      "noninferior": true
+    },
+    {
+      "base": "2026-11-28-m6-bge-m3-int8-tokens-m75-rank-r2-srv0.0.17-m7.4+m6-dev-default",
+      "arm": "2026-11-28-m6-bge-m3-int8-tokens-m75-rank-r2-srv0.0.17-m7.4+m6-dev-default-aa",
+      "r": {
+        "mean": 1.0001461560947091,
+        "lo": 0.9999038275780344,
+        "hi": 1.0004059887124161
+      },
+      "d_micro": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      },
+      "net_losses": 0,
+      "noninferior": true
+    },
+    {
+      "base": "2026-11-28-m6-bge-m3-int8-tokens-m75-rank-r3-srv0.0.17-m7.4+m6-dev-default",
+      "arm": "2026-11-28-m6-bge-m3-int8-tokens-m75-rank-r3-srv0.0.17-m7.4+m6-dev-default-aa",
+      "r": {
+        "mean": 0.9999662432064453,
+        "lo": 0.9997456261377926,
+        "hi": 1.0001514452436446
+      },
+      "d_micro": {
+        "mean": 0.0,
+        "lo": 0.0,
+        "hi": 0.0
+      },
+      "net_losses": 0,
+      "noninferior": true
+    }
+  ],
+  "bootstrap": {
+    "samples": 10000,
+    "seed": 104372539625497,
+    "r_interval": "двусторонний 95 % (перцентили 2,5 и 97,5), парный бутстреп сценариев по средним повторов",
+    "d_micro_interval": "односторонние 95 % (перцентили 5 и 95), веса — число нагетов, доли — средние повторов"
+  }
+}

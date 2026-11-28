@@ -5,6 +5,42 @@
 
 ## [Unreleased]
 
+### Изменения ответа
+
+- `/health`: флаг `search_m75` в конце `features` (M7.5 §8.1–§8.2; `docs/api-compat.md`).
+- `POST /search` и `memory_search`: запись, которую порядок по `contradicts` ставит сразу перед
+  менее надёжной (гипотеза против `theorem`/`axiom`), получает балл
+  `min(предыдущий, следующий + 0,0001)` — на шаг округления выше следующего элемента (до M7.5 —
+  равный ему); ничья с предыдущим возможна, порядок задаёт массив `items`. Форма ответа прежняя.
+
+### Added
+
+- **Ключ `[search] fts_stop_words`** (M7.5 §8.1; `ZAM_SEARCH__FTS_STOP_WORDS`, по умолчанию
+  `true` — как 0.0.17): `false` — служебные слова (стоп-список `zam_core::text::is_stop_word`:
+  «как», «для», «the»…) не идут в запросы `bm25` (строгий и ослабленный) и канала словаря
+  `alias`, если в запросе есть другое слово; запрос из одних служебных слов ищется целиком,
+  trigram, вектор и подсветка — без изменений. Прямые запросы FTS подсказок `/recall` (задачи и
+  идеи `prompt`, ошибки `post_tool`) ключ не меняет. Функция `zam_store::fts_terms`.
+
+### Для разработчиков
+
+- `xtask eval`: попадания с равным баллом — в порядке сервера (`run::hits_of`; `run::order_ties`,
+  ставивший равные по пути, убран — из-за него гипотеза `r-08` обходила сдвинутую перед ней
+  теорему). Ключ `search.fts_stop_words` — в `caps::KEYS` под признаком `search_m75`.
+- Сетки `eval/grid-m75-rank.toml` (ТС-1 dev к B4, CPU int8, K = 3) и
+  `eval/grid-m75-rank-hybrid.toml` (гибрид CPU int8: основной набор и наборы вида); итог —
+  `eval/results/2026-11-28-m75-rank.md`: умолчания прежние. На dev умолчание неинфериорность к
+  0.0.5-m4 не держит (Δ микро-полноты −0,021, нижняя −0,062: `s-04` — нужная заметка 9-я при
+  честном бюджете); правило выбрало `search.max_per_node = 1` (Н1 `fts_stop_words = false`
+  отсеяна по `reliable_first` наборов вида и recall@5), holdout его не подтвердил (`s-43`), а
+  режим `chunks` с ним теряет 16 п. п. chunk-recall@5.
+- Тесты: `order_by_contradicts_moved_strictly_above_next`, `order_by_contradicts_tie_with_prev`,
+  `lift_moved_scores`, `eval_keeps_server_order_on_ties`,
+  `fts_query_drops_stop_words_when_others_remain`, `fts_query_keeps_stop_word_only_query`,
+  `fts_stop_words_true_byte_equal_017`, `config_fts_stop_words`,
+  `search_note_answer_above_stopword_insights`; эталон `always_byte_equal_m57` — с новым баллом
+  сдвинутой теоремы (0,84 → 0,8401).
+
 ## [0.0.17-m7.4] - 2026-11-28
 
 Волна M7.4 «Администрирование сервера» этапа M7 «Полировка» — четвёртая из шести (спецификация
