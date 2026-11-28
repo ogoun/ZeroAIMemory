@@ -4,8 +4,10 @@ use std::path::{Path, PathBuf};
 
 pub mod api;
 pub mod attach;
+pub mod check;
 pub mod heavy;
 pub mod ml;
+pub mod mock_model;
 pub mod process;
 pub mod qdrant;
 pub mod read;
@@ -22,13 +24,16 @@ pub fn tmp(name: &str) -> PathBuf {
 }
 
 /// Конфигурация теста в каталоге `dir`. Рабочий процесс разбора документов — бинарник пакета:
-/// текущий исполняемый файл теста подкоманды `doc-worker` не знает.
+/// текущий исполняемый файл теста подкоманды `doc-worker` не знает. Ночная проверка выключена
+/// (M7.3, решение 67): умолчание `check = "nightly"` в 04:30 UTC запускало бы её в любом тестовом
+/// сервере в окне, в том числе при часах, замороженных в окне; тесты ночи включают её сами.
 pub fn cfg_in(dir: PathBuf) -> ServerConfig {
     let mut c = ServerConfig {
         data_dir: dir,
         ..ServerConfig::default()
     };
     c.docs.worker_program = Some(PathBuf::from(env!("CARGO_BIN_EXE_zam-server")));
+    c.works.check = zam_server::config::CheckMode::Off;
     c
 }
 
@@ -49,6 +54,38 @@ pub fn files_containing(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// Семь таблиц миграции 0027 базы пользователя (M7.3): только новые, прежние не меняются.
+pub const TABLES_0027: [&str; 7] = [
+    "check_results",
+    "check_runs",
+    "probes",
+    "proposals",
+    "usage_opened",
+    "work_calls",
+    "works",
+];
+
+/// Объекты 0027 базы `db` — `(тип, имя)` таблиц миграции и их индексов (тесты миграций старых
+/// баз сверяют прежние объекты схемы без них; эталон 0027 —
+/// `zam-store/tests/migrate_rebuild.rs::objects_0027`).
+pub async fn objects_0027(db: &zam_store::Db) -> Vec<(String, String)> {
+    db.read(|c| {
+        let mut st = c.prepare(
+            "SELECT type, name FROM sqlite_master WHERE tbl_name IN
+               (SELECT value FROM json_each(?1)) ORDER BY type, name",
+        )?;
+        let list = serde_json::to_string(&TABLES_0027).unwrap();
+        let rows = st
+            .query_map([list], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    })
+    .await
+    .unwrap()
 }
 
 /// Несуществующая ссылка того же вида, что `r`: префикс до `:` тот же, каждая цифра — другая

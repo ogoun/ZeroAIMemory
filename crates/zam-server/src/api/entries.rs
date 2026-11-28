@@ -10,8 +10,12 @@
 //!   решение владельца 2026-10-26): без него 428 `/problems/precondition-required`,
 //!   расхождение — 409 с текущей ревизией `rev`; ревизия проверяется раньше прав;
 //!   `POST /entries/{id}/restore` (`If-Match` необязателен, при наличии проверяется),
-//!   `GET /entries/{id}/revisions`; `GET /entries/{id}` отдаёт и `usage: {shown, useful,
-//!   useless}` (§10.5, оценка — [`super::feedback`]), список — у каждой insight (задача 13);
+//!   `GET /entries/{id}/revisions`; `GET /entries/{id}` отдаёт и `usage: {shown, opened, useful,
+//!   useless}` (§10.5, оценка — [`super::feedback`]; `opened` — M7.3 §6.6, признак `usage_opened`),
+//!   список — у каждой insight (задача 13); чтение `GET /entries/{id}` по токену явной сессией
+//!   после подсказки этой записи — открытие ([`super::opened`]); лента insight `noisy=1` —
+//!   «шумные» (M7.3 §6.6 п. 3, решение 68: показов ≥ 10 без открытий в окне
+//!   `max(now − 30 сут, opened_since)` и без «полезно» за всё время) с полем ответа `opened_since`;
 //! - `GET /spaces/{space}/entries/counts?kind=<вид>` — число живых записей вида по статусам с
 //!   фильтрами ленты (`area`, `tag`, `origin`, `priority`, `from_idea`, у задач — `top_level`,
 //!   `parent`): чипы статусов ленты идей WebUI (M6.5 §9), вкладки доски задач (M7 §5.4).
@@ -58,6 +62,7 @@
 //! исходнику по меткам этой записи и любой её ревизии (задача 6 M7.1, M7 §4.3.2,
 //! [`super::secret_restore`]); прочая метка записывается как есть с предупреждением
 //! `secret_mark_kept`.
+use axum::Extension;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, QueryRejection};
@@ -77,6 +82,7 @@ use zam_store::{
 use super::agent_view;
 use super::insights::{entry_card_json, entry_json, parse_triggers};
 use super::nodes::{audit_node, write::if_match};
+use super::opened::{self, ReadTarget};
 use super::render::Viewer;
 use super::reports::ReportInput;
 use super::scope::{
@@ -84,6 +90,7 @@ use super::scope::{
     trash_allowed, trash_feed_allowed,
 };
 use super::secret_restore;
+use super::sessions::McpOrigin;
 use super::{json_body, query};
 use crate::app::AppState;
 use crate::attrib::attribution;
@@ -537,6 +544,8 @@ pub struct ListQuery {
     top_level: Option<String>,
     /// Только `kind=task`: id задачи — её прямые подзадачи в порядке шагов (M7 §5.4 п. 3).
     parent: Option<String>,
+    /// Только `kind=insight`: `1` — «шумные» (M7.3 §6.6 п. 3, признак `usage_opened`).
+    noisy: Option<String>,
 }
 
 /// Фильтры подзадач `part_of` ленты и счётчиков задач (M7 §5.4 п. 3, задача 5 M7.2).
@@ -696,7 +705,9 @@ fn parse_time(raw: &str, what: &str) -> Result<Timestamp, ApiError> {
 /// виден, §7), у элементов — `first_image` и нет `body`. `deleted=only` — корзина вида `kind`
 /// (без вида — 400; новые удаления первыми): у отчётов — [`trash_allowed`], у прочих — право
 /// записи пространства, как у `DELETE` и `restore` ([`trash_feed_allowed`]); иначе 403 (M7 §5.9
-/// п. 3, решение 30). `top_level` и `parent` с корзиной — 422.
+/// п. 3, решение 30). `top_level` и `parent` с корзиной — 422. `noisy=1` — «шумные» insight (M7.3
+/// §6.6 п. 3, решение 68; [`noisy_filter`]): только с `kind=insight` и без корзины (иначе 422), в
+/// ответе — `opened_since`.
 pub async fn list(
     State(st): State<AppState>,
     p: Principal,
@@ -747,6 +758,15 @@ pub async fn list(
             "top_level и parent — фильтры живой ленты задач, у корзины (deleted=only) их нет",
         ));
     }
+    let noisy = parse_flag(q.noisy.as_deref(), "noisy")?;
+    if noisy && kind != Some(EntryKind::Insight) {
+        return Err(unprocessable("noisy — фильтр ленты insight (kind=insight)"));
+    }
+    if noisy && deleted_only {
+        return Err(unprocessable(
+            "noisy — фильтр живой ленты insight, у корзины (deleted=only) его нет",
+        ));
+    }
     let mut f = EntryFilter {
         space_id: sc.space.id,
         kind,
@@ -790,6 +810,14 @@ pub async fn list(
     if let Some(t) = &tree {
         sub.apply(&mut f, t);
     }
+    // «шумные» (M7.3 §6.6 п. 3): записи окна — условие ленты, счётчики записей — за всё время
+    let opened_since = if noisy {
+        let (since, ids) = noisy_filter(&sc.db).await?;
+        f.only_ids = Some(ids);
+        Some(since)
+    } else {
+        None
+    };
     let (items, next) = list_entries(&sc.db, f).await?;
     if tree.is_none() && items.iter().any(|e| e.kind == EntryKind::Task) {
         tree = Some(zam_store::task_tree(&sc.db, sc.space.id).await?);
@@ -834,7 +862,25 @@ pub async fn list(
     }
     // лента до 200 записей с телами — маска одним проходом, длинная — в пуле
     let out = agent_view::view_entry_json_owned(&p, Value::Array(out)).await?;
-    Ok(Json(json!({ "items": out, "next_cursor": next })))
+    let mut body = json!({ "items": out, "next_cursor": next });
+    if let Some(since) = opened_since {
+        body["opened_since"] = json!(since.map(zam_store::time::fmt_ts));
+    }
+    Ok(Json(body))
+}
+
+/// «Шумные» insight базы (M7.3 §6.6 п. 3, решение координатора 68 и круга правок 1 задачи 6):
+/// начало учёта открытий (`meta.usage_opened_since`; нет строки — `None`) и записи с `shown ≥ 10`
+/// и `opened = 0` по событиям окна `max(now − 30 сут, начало учёта)` и без оценки `useful` за всё
+/// время ([`zam_store::noisy_ids`]): до начала учёта открытия не считались — без этой границы
+/// каждая часто показываемая запись сразу стала бы «шумной»; оценки «полезно» считались всегда, и
+/// любая из них запись исключает.
+async fn noisy_filter(db: &zam_store::Db) -> Result<(Option<Timestamp>, Vec<Id>), ApiError> {
+    let since = zam_store::usage_opened_since(db).await?;
+    let window = zam_store::time::now()
+        - jiff::SignedDuration::from_hours(24 * zam_store::NOISY_WINDOW_DAYS);
+    let from = since.map_or(window, |s| s.max(window));
+    Ok((since, zam_store::noisy_ids(db, from).await?))
 }
 
 #[derive(Deserialize)]
@@ -935,6 +981,7 @@ pub async fn get(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
+    origin: Option<Extension<McpOrigin>>,
     Path(id): Path<String>,
     q: Result<Query<GetQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
@@ -970,6 +1017,13 @@ pub async fn get(
         kind: zam_core::TargetKind::Entry,
         id: sc.entry.id,
     };
+    // чтение агентом после подсказки — открытие (M7.3 §6.6 п. 2), до счётчиков: ответ его видит
+    let read = ReadTarget {
+        owner: sc.owner,
+        db: sc.db.clone(),
+        target,
+    };
+    opened::record_get(&st, &p, &headers, origin.as_deref(), read).await;
     v["usage"] = json!(usage_counts(&sc.db, target).await?);
     Ok(Json(v))
 }

@@ -127,6 +127,11 @@ pub async fn find_space(db: &Db, r: &SpaceRef) -> Result<Space, ApiError> {
     }
 }
 
+/// `detail` ответа 403 на запись агента в Rules без `rules.agent_write` (M7.3 §6.7 п. 2).
+pub const RULES_WRITE_DENIED: &str = "запись в Rules агенту закрыта (rules.agent_write = \
+     false): предложите правило: memory_write {path: \"rules:/<путь>\", content, candidate: \
+     {reason}} (REST — POST /proposals, CLI — zam rules candidate); решает человек";
+
 /// Чистая политика доступа к пространству (см. модуль); роль участника — в
 /// [`effective_write`].
 pub fn check_access(
@@ -146,7 +151,9 @@ pub fn check_access(
             return Err(ApiError::Forbidden);
         }
         if space.kind == SpaceKind::Rules && !rules_agent_write {
-            return Err(ApiError::Forbidden);
+            // запись в Rules агенту закрыта — подсказка спонтанного кандидата (M7.3 §6.7 п. 2,
+            // решение координатора 52)
+            return Err(ApiError::Denied(RULES_WRITE_DENIED.into()));
         }
     }
     Ok(())
@@ -913,6 +920,7 @@ mod tests {
         let k = space(SpaceKind::Knowledge);
         let nf = |res: Result<(), ApiError>| matches!(res, Err(ApiError::NotFound));
         let fb = |res: Result<(), ApiError>| matches!(res, Err(ApiError::Forbidden));
+        let hint = |res: Result<(), ApiError>| matches!(res, Err(ApiError::Denied(d)) if d == RULES_WRITE_DENIED);
         for m in [Mode::Read, Mode::Write] {
             assert!(nf(check_access(&rw, &h, m, true)));
             assert!(nf(check_access(&ro, &h, m, true)));
@@ -923,7 +931,7 @@ mod tests {
         assert!(fb(check_access(&ro, &k, Mode::Write, true)));
         assert!(check_access(&rw, &k, Mode::Write, false).is_ok());
         assert!(check_access(&rw, &r, Mode::Read, false).is_ok());
-        assert!(fb(check_access(&rw, &r, Mode::Write, false)));
+        assert!(hint(check_access(&rw, &r, Mode::Write, false)));
         assert!(check_access(&rw, &r, Mode::Write, true).is_ok());
         assert!(fb(check_access(&ro, &r, Mode::Write, true)));
     }

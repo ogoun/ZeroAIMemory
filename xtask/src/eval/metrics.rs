@@ -20,22 +20,9 @@ pub const BOOTSTRAP_M6: usize = 10_000;
 /// Зерно генератора бутстрепа.
 pub const SEED: u64 = 0x5eed_2026_1019;
 
-/// Метрики одного запроса. Поля M3 — только у запросов своего вида (`None` у остальных):
-/// `cancelled5` — `superseded`, `reliable_first` — `certainty`, `chunk_*` — `chunk`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
-pub struct QueryMetrics {
-    pub recall5: f64,
-    pub mrr10: f64,
-    pub ndcg10: f64,
-    /// В top-5 есть замещённый или отозванный insight из `forbid`.
-    pub cancelled5: Option<bool>,
-    /// Надёжный ответ (`expect`) стоит выше противоречащей гипотезы (`weaker`).
-    pub reliable_first: Option<bool>,
-    /// Среди первых 5 листов есть лист, целиком содержащий `evidence`.
-    pub chunk_recall5: Option<f64>,
-    /// nDCG@10 по листам: релевантен лист, целиком содержащий `evidence`.
-    pub chunk_ndcg10: Option<f64>,
-}
+/// Метрики запроса и их счёт — `zam_search::eval` (с M7.3: общие с ночной проверкой памяти
+/// сервера, §6.5 п. 3); поведение прежнее.
+pub use zam_search::eval::{QueryMetrics, score};
 
 /// `cancelled@5`: хоть одна цель из `forbid` среди первых 5 выдачи.
 pub fn cancelled_at_5(ranked: &[String], forbid: &[String]) -> bool {
@@ -71,36 +58,6 @@ pub fn chunk_scores(leaves: &[String], evidence: &str) -> (f64, f64) {
     match first {
         Some(i) => (if i < 5 { 1.0 } else { 0.0 }, 1.0 / (i as f64 + 2.0).log2()),
         None => (0.0, 0.0),
-    }
-}
-
-/// Метрики выдачи `ranked` (пути заметок по убыванию балла) при ожидаемых `expect`.
-pub fn score(ranked: &[String], expect: &[String]) -> QueryMetrics {
-    if expect.is_empty() {
-        return QueryMetrics::default();
-    }
-    let rel = |p: &String| expect.contains(p);
-    let found5 = ranked.iter().take(5).filter(|p| rel(p)).count();
-    let mrr10 = ranked
-        .iter()
-        .take(10)
-        .position(rel)
-        .map_or(0.0, |i| 1.0 / (i as f64 + 1.0));
-    let dcg: f64 = ranked
-        .iter()
-        .take(10)
-        .enumerate()
-        .filter(|(_, p)| rel(p))
-        .map(|(i, _)| 1.0 / (i as f64 + 2.0).log2())
-        .sum();
-    let ideal: f64 = (0..expect.len().min(10))
-        .map(|i| 1.0 / (i as f64 + 2.0).log2())
-        .sum();
-    QueryMetrics {
-        recall5: found5 as f64 / expect.len() as f64,
-        mrr10,
-        ndcg10: dcg / ideal,
-        ..QueryMetrics::default()
     }
 }
 

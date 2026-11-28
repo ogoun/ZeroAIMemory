@@ -20,14 +20,20 @@
 //! 3–5 задачи 6), HTML — метки без номеров. `ETag` у
 //! `format=md` — по-прежнему `"<rev>"`: это ревизия для `If-Match` записи, и у маски она та же.
 //! Сессии WebUI — исходник.
-use axum::Json;
+//!
+//! **Открытие подсказки** (M7.3 §6.6 п. 2, признак `usage_opened`): успешное чтение узла
+//! `GET /nodes/{id}` и `GET /nodes/by-path` по токену явной сессией после показа этого узла
+//! подсказкой той же сессии в той же эпохе пишет `usage_opened` ([`crate::api::opened`]);
+//! служебный запрос MCP (id заметки для `memory_write`) — нет.
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::response::{IntoResponse, Response};
+use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use zam_core::{TargetKind, TargetRef};
 use zam_markdown::{
     NOTE_L1_MAX_CHARS, OutlineItem, SectionLookup, note_l1, outline as doc_outline, parse,
     resolve_section,
@@ -35,9 +41,11 @@ use zam_markdown::{
 use zam_store::{NodeKind, NodePath, get_node_by_path, node_content};
 
 use crate::api::agent_view;
+use crate::api::opened::{self, ReadTarget};
 use crate::api::query;
 use crate::api::render::{RenderCtx, Viewer, cache_get, cache_key, render, render_cached};
 use crate::api::scope::{Mode, NodeScope, live, node_scope, space_scope};
+use crate::api::sessions::McpOrigin;
 use crate::app::AppState;
 use crate::auth::Principal;
 use crate::error::ApiError;
@@ -90,18 +98,23 @@ pub async fn by_id(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
+    origin: Option<Extension<McpOrigin>>,
     Path(id): Path<String>,
     q: Result<Query<ReadQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
     let q = query(q)?;
     let sc = node_scope(&st, &p, &headers, &id, Mode::Read).await?;
-    read(&st, &p, sc, q).await
+    let t = read_target(&sc);
+    let r = read(&st, &p, sc, q).await?;
+    opened::record_get(&st, &p, &headers, origin.as_deref(), t).await;
+    Ok(r)
 }
 
 pub async fn by_path(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
+    origin: Option<Extension<McpOrigin>>,
     q: Result<Query<ReadQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
     let q = query(q)?;
@@ -118,7 +131,22 @@ pub async fn by_path(
         node,
         role: sc.role,
     };
-    read(&st, &p, ns, q).await
+    let t = read_target(&ns);
+    let r = read(&st, &p, ns, q).await?;
+    opened::record_get(&st, &p, &headers, origin.as_deref(), t).await;
+    Ok(r)
+}
+
+/// Узел чтения — цель открытия подсказки (M7.3 §6.6 п. 2).
+fn read_target(sc: &NodeScope) -> ReadTarget {
+    ReadTarget {
+        owner: sc.owner,
+        db: sc.db.clone(),
+        target: TargetRef {
+            kind: TargetKind::Node,
+            id: sc.node.id,
+        },
+    }
 }
 
 /// `GET /nodes/{id}/outline` → `[OutlineItem]` текущей ревизии.

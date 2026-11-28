@@ -1,7 +1,11 @@
 <script lang="ts">
   // Администрирование → «Пользователи»: пользователи, их токены и пароль входа в WebUI
   // (§11.4: пароль задаёт администратор, при первом входе пользователь обязан его сменить).
-  // Новый пользователь или токен — сразу «Подключение агента» (§15.5) с окном токена.
+  // Новый пользователь или токен — сразу «Подключение агента» (§15.5) с окном токена. Новый
+  // пользователь и выдача токена — формы на виду (M7.3, §6.14 правило А); «Пароль пользователя» и
+  // «Закрыть вход» — окна `Prompt` на общем каркасе `FormDialog`; «Отозвать» токен необратим —
+  // окно-подтверждение `danger`, фокус на «Отмена» (правило Д).
+  import { onMount } from 'svelte';
   import Prompt, { type Ask } from '../components/Prompt.svelte';
   import {
     ApiError,
@@ -17,6 +21,7 @@
     type User,
   } from '../lib/api';
   import { openAgentSetup } from '../lib/agentSetup';
+  import { guardLeave } from '../lib/leaveEdit';
   import { localTime } from '../lib/time';
 
   let { onExpired }: { onExpired: () => void } = $props();
@@ -72,11 +77,28 @@
     });
   }
 
-  const revoke = (id: string) =>
-    guard(async () => {
-      await revokeToken(id);
-      await reload();
-    });
+  /** «Отозвать» токен — подтверждение; ошибка — в окне, окно открыто. */
+  function revoke(u: User, t: TokenInfo) {
+    notice = '';
+    ask = {
+      title: 'Отозвать токен?',
+      message: `Токен «${t.name}» (zam_${t.prefix}…) пользователя «${u.name}» перестанет работать сразу: агенты и CLI с ним потеряют доступ. Вернуть его нельзя — только выпустить новый.`,
+      confirm: 'Отозвать',
+      danger: true,
+      run: async () => {
+        try {
+          await revokeToken(t.id);
+        } catch (e) {
+          if (e instanceof ApiError && (e.status === 401 || e.status === 403)) return onExpired();
+          throw e;
+        }
+        notice = `Токен «${t.name}» пользователя «${u.name}» отозван.`;
+        await reload();
+      },
+      // кнопка «Отозвать» ушла вместе с отзывом — фокус на итог
+      refocus: () => document.querySelector('[data-testid="users-notice"]'),
+    };
+  }
 
   /** Пароль входа: задать (с обязательной сменой при входе) или закрыть вход. */
   function setPassword(u: User) {
@@ -122,6 +144,17 @@
     };
   }
 
+  // формы на виду (новый пользователь, выдача токена; §6.14 правило А, решение 88): набранное — в
+  // стеке проверок ухода; согласие уйти — поля очищаются
+  onMount(() =>
+    guardLeave(
+      () => !!(newName.trim() || tokenName.trim()),
+      () => {
+        newName = tokenName = '';
+      },
+    ),
+  );
+
   const passwordText = (u: User) =>
     u.is_admin ? 'из конфигурации' : !u.has_password ? 'вход закрыт' : u.must_change_password ? 'задан, смена при входе' : 'задан';
 
@@ -135,7 +168,7 @@
     <button class="primary">Создать</button>
   </form>
   {#if error}<p class="error" role="alert">{error}</p>{/if}
-  {#if notice}<p class="muted" role="status">{notice}</p>{/if}
+  <p class="muted notice" role="status" tabindex="-1" data-testid="users-notice">{notice}</p>
 
   <!-- таблица (и раскрытые строки) — в `.table-wrap` (§5.1 п. 6): прокрутка внутри, страница — нет -->
   <div class="table-wrap" style="margin-top: 12px;">
@@ -174,7 +207,7 @@
                           {#if t.revoked_at}
                             <span class="muted">отозван</span>
                           {:else}
-                            <button class="danger" onclick={() => revoke(t.id)}>Отозвать</button>
+                            <button type="button" class="danger" onclick={() => revoke(u, t)}>Отозвать</button>
                           {/if}
                         </td>
                       </tr>
@@ -203,6 +236,9 @@
 <Prompt bind:ask />
 
 <style>
+  .notice:empty {
+    margin: 0;
+  }
   .acts {
     gap: 4px;
   }

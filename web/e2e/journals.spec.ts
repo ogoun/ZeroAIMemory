@@ -143,7 +143,8 @@ test('Insights: замена записи и повышение до theorem с 
   const card = page.getByRole('article', { name: 'Карточка insight' });
   await expect(card.getByRole('heading', { name: 'Старый вывод о Qdrant' })).toBeVisible();
   await card.getByRole('button', { name: 'Заменить' }).click();
-  const form = card.getByRole('form', { name: 'Замена insight' });
+  // формы карточки — окна (M7.3, §6.14 правило Б)
+  const form = page.getByRole('dialog', { name: 'Заменить запись' });
   // новая запись человека — без статуса по умолчанию (аксиому человек ставит явно)
   await expect(form.getByLabel('Надёжность новой записи')).toHaveValue('');
   await form.getByLabel('Заголовок').fill('Новый вывод о Qdrant');
@@ -162,7 +163,7 @@ test('Insights: замена записи и повышение до theorem с 
   await table.getByRole('button', { name: 'Кэш эмбеддингов ускоряет переиндексацию' }).click();
   await expect(page).toHaveURL(new RegExp(`/j/insights/${env('E2E_INSIGHT_HYP')}$`));
   await card.getByRole('button', { name: 'Сменить статус надёжности' }).click();
-  const cf = card.getByRole('form', { name: 'Статус надёжности' });
+  const cf = page.getByRole('dialog', { name: 'Статус надёжности' });
   await cf.getByLabel('theorem').check();
   await cf.getByRole('button', { name: 'Сохранить' }).click();
   await expect(card.getByRole('status')).toHaveText('Статус надёжности изменён.');
@@ -202,7 +203,7 @@ test('Insights: замена записи и повышение до theorem с 
 
   // Триггеры: добавить, сохранить, удалить
   await card.getByRole('button', { name: 'Триггеры' }).click();
-  const tr = card.getByLabel('Триггеры', { exact: true });
+  const tr = page.getByRole('dialog', { name: 'Триггеры' });
   await tr.getByLabel('Тип триггера').selectOption('file_glob');
   await tr.getByLabel('Шаблон триггера').fill('**/qdrant/*.rs');
   await tr.getByLabel('Инструменты').fill('Write, Edit');
@@ -225,7 +226,7 @@ test('Insights: замена записи и повышение до theorem с 
   await table.getByRole('button', { name: 'Новый вывод о Qdrant' }).click();
   await expect(card.getByRole('heading', { name: 'Новый вывод о Qdrant' })).toBeVisible();
   await card.getByRole('button', { name: 'Отозвать' }).click();
-  const rf = card.getByRole('form', { name: 'Отзыв insight' });
+  const rf = page.getByRole('dialog', { name: 'Отозвать запись' });
   await rf.getByRole('button', { name: 'Отозвать' }).click();
   await expect(rf.getByRole('alert')).toHaveText('Укажите причину отзыва.');
   await rf.getByLabel('Причина').fill('Qdrant заменён в задаче 4');
@@ -501,7 +502,8 @@ test('tree_and_tabs_show_counts', async ({ page }) => {
 
     // новая идея из WebUI — «Идеи» +1 в дереве и в полосе без перезагрузки
     await page.getByRole('button', { name: 'Новая идея' }).click();
-    const form = page.getByRole('form', { name: 'Новая идея' });
+    // «Новая идея» — окно (M7.3, §6.14 правило Б), после «Записать» — карточка созданной
+    const form = page.getByRole('dialog', { name: 'Новая идея' });
     await form.getByLabel('Заголовок').fill('Идея E2E: число раздела');
     await form.getByLabel('Замысел').fill('Проверка числа записей раздела.');
     const created = page.waitForResponse((r) => r.request().method() === 'POST' && r.url().endsWith(`/spaces/${SOLUTION_GUID}/entries`));
@@ -574,9 +576,10 @@ test('changelog_edit_and_trash_restore', async ({ page }) => {
   const num = page.getByRole('navigation', { name: 'Журналы пространства' }).locator('[data-count="changelog"]');
   await expect(num).toHaveText('2');
 
-  // «Изменить»: заголовок и вид — одним PATCH с ревизией карточки, только изменённое
+  // «Изменить»: заголовок и вид — одним PATCH с ревизией карточки, только изменённое; M7.3 (§6.14
+  // п. 3, решение 85): лента без карточки — правка в широком окне формы, а не в элементе ленты
   await card.getByRole('button', { name: 'Изменить «Запись для правки»' }).click();
-  const form = card.getByRole('form', { name: 'Правка записи' });
+  const form = page.getByRole('dialog', { name: 'Правка записи' });
   await expect(form.getByLabel('Заголовок')).toBeFocused();
   await expect(form.getByLabel('Вид')).toHaveValue('fix');
   await form.getByLabel('Заголовок').fill('Запись после правки');
@@ -655,7 +658,8 @@ test('entry_edit_stale_rev_rereads', async ({ page }) => {
   await page.goto(`${base()}#/u/${c.user}/s/${guid}/j/changelog`);
   const card = page.getByRole('feed', { name: 'Лента changelog' }).locator(`[data-entry="${e.id}"]`);
   await card.getByRole('button', { name: 'Изменить «Запись под правкой»' }).click();
-  const form = card.getByRole('form', { name: 'Правка записи' });
+  // правка — в окне формы (M7.3, §6.14 п. 3)
+  const form = page.getByRole('dialog', { name: 'Правка записи' });
   await expect(form.getByLabel('Текст')).toHaveValue('Исходный текст.');
   // пока форма открыта, запись правит агент (другая сессия): текст и вид
   const other = await agentApi<Rec>('PATCH', `entries/${e.id}`, { body: 'Текст агента.', data: { kind: 'docs' } }, {
@@ -668,7 +672,8 @@ test('entry_edit_stale_rev_rereads', async ({ page }) => {
   expect((await stale).status()).toBe(409);
   // запись перечитана: ошибка видна, карточка — новой ревизии, нетронутые поля формы — агента,
   // набранный заголовок — человека
-  await expect(form.getByRole('alert')).toContainText(`Запись изменили в другом месте (сейчас ревизия ${other.rev})`);
+  // текст 409 — один у всех форм с ревизией (M7.3, §6.14 п. 5)
+  await expect(form.getByRole('alert')).toContainText(`Запись изменилась, пока вы правили (сейчас ревизия ${other.rev})`);
   await expect(card).toContainText(`ревизия ${other.rev}`);
   await expect(card).toContainText('Текст агента.');
   await expect(form.getByLabel('Текст')).toHaveValue('Текст агента.');
@@ -730,22 +735,26 @@ test('releases_edit_and_trash_restore', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Релиз 1.1.0' })).toBeVisible();
   const compare = page.locator('.compare');
   await compare.getByRole('button', { name: 'Изменить', exact: true }).click();
-  const form = compare.getByRole('form', { name: 'Правка релиза' });
+  // M7.3 (§6.14 п. 3, решение 85): правка релиза — в широком окне формы; выбор другого релиза и
+  // «Корзина» под модальным окном недоступны — несохранённое спрашивает окно (Esc) и переход по
+  // адресу (один вопрос стека проверок ухода); «Отмена» вопроса — релиз и набранное на месте
+  const form = page.getByRole('dialog', { name: 'Правка релиза' });
   await expect(form.getByLabel('Заголовок')).toBeFocused();
   await form.getByLabel('Заголовок').fill('Релиз 1.1.0 «Осень»');
   await form.getByLabel('Текст').fill('Второй, с правкой.');
-  // выбор другого релиза и «Корзина» при несохранённом — сначала вопрос; «Отмена» вопроса —
-  // релиз и форма с набранным на месте
   const list = page.getByRole('list', { name: 'Релизы' });
-  for (const leave of [list.getByRole('button', { name: /1\.0\.0/ }), trashToggle(page)]) {
-    page.once('dialog', (d) => {
-      expect([d.type(), d.message()]).toEqual(['confirm', LEAVE_EDIT]);
-      void d.dismiss();
-    });
-    await leave.click();
-    await expect(page.getByRole('heading', { name: 'Релиз 1.1.0' })).toBeVisible();
-    await expect(form.getByLabel('Заголовок')).toHaveValue('Релиз 1.1.0 «Осень»');
-  }
+  await page.keyboard.press('Escape');
+  await expect(form.getByTestId('fd-ask')).toContainText(LEAVE_EDIT);
+  await form.getByRole('button', { name: 'Продолжить правку' }).click();
+  page.once('dialog', (d) => {
+    expect([d.type(), d.message()]).toEqual(['confirm', LEAVE_EDIT]);
+    void d.dismiss();
+  });
+
+  await page.evaluate((h) => (location.hash = h), `#/u/${c.user}/s/${guid}/j/releases`);
+  await expect(page).toHaveURL(new RegExp(`/j/releases/${r2.id}$`));
+  await expect(page.getByRole('heading', { name: 'Релиз 1.1.0' })).toBeVisible();
+  await expect(form.getByLabel('Заголовок')).toHaveValue('Релиз 1.1.0 «Осень»');
   await expect(trashToggle(page)).toHaveAttribute('aria-pressed', 'false');
   const saved = page.waitForResponse((r) => r.request().method() === 'PATCH' && r.url().endsWith(`/entries/${r2.id}`));
   await form.getByRole('button', { name: 'Сохранить' }).click();
@@ -845,7 +854,8 @@ test('changelog_edit_follows_entry', async ({ page }) => {
   await page.goto(`${base()}${at(x.id)}`);
   await expect(opened.getByRole('heading')).toHaveText('Запись X');
   await opened.getByRole('button', { name: 'Изменить «Запись X»' }).click();
-  await expect(opened.getByRole('form', { name: 'Правка записи' })).toBeVisible();
+  // M7.3 (§6.14 п. 3): правка — в окне формы
+  await expect(page.getByRole('dialog', { name: 'Правка записи' })).toBeVisible();
 
   // без набранного: переход закрывает форму сразу, без вопроса; кнопки журнала доступны
   page.on('dialog', (d) => {
@@ -854,7 +864,7 @@ test('changelog_edit_follows_entry', async ({ page }) => {
   });
   await go(at(y.id));
   await expect(opened.getByRole('heading')).toHaveText('Запись Y');
-  await expect(page.getByRole('form', { name: 'Правка записи' })).toHaveCount(0);
+  await expect(page.getByRole('dialog', { name: 'Правка записи' })).toHaveCount(0);
   for (const b of [
     opened.getByRole('button', { name: 'Изменить «Запись Y»' }),
     page.getByRole('feed', { name: 'Лента changelog' }).getByRole('button', { name: 'Изменить «Запись X»' }),
@@ -867,7 +877,7 @@ test('changelog_edit_follows_entry', async ({ page }) => {
   // с набранным: переход спрашивает; «Отмена» — адрес и форма с текстом на месте; согласие — форма
   // закрыта, запись X открыта
   await opened.getByRole('button', { name: 'Изменить «Запись Y»' }).click();
-  const form = opened.getByRole('form', { name: 'Правка записи' });
+  const form = page.getByRole('dialog', { name: 'Правка записи' });
   await form.getByLabel('Заголовок').fill('Y с правкой');
   const place = () => page.evaluate(() => (history.state as { zamIdx?: number } | null)?.zamIdx);
   const yIdx = await place();
@@ -889,7 +899,7 @@ test('changelog_edit_follows_entry', async ({ page }) => {
   page.once('dialog', (d) => void d.accept());
   await go(at(x.id));
   await expect(opened.getByRole('heading')).toHaveText('Запись X');
-  await expect(page.getByRole('form', { name: 'Правка записи' })).toHaveCount(0);
+  await expect(page.getByRole('dialog', { name: 'Правка записи' })).toHaveCount(0);
   await expect(opened.getByRole('button', { name: 'Изменить «Запись X»' })).toBeEnabled();
   expect((await agentApi<Rec>('GET', `entries/${y.id}`)).title).toBe('Запись Y');
 
@@ -953,4 +963,76 @@ test('journal_trash_ro_member_403', async ({ page, browser }) => {
   } finally {
     await m.ctx.close();
   }
+});
+
+// ---- «Шумные» и счётчик «открыто» в Insights (M7.3, спецификация §6.6 п. 3; задача 8) ----
+//
+// Показ — подсказка к ошибке (`/recall post_tool`, триггер `error_regex`) в сессии агента, открытие —
+// чтение записи по токену той же сессией после показа (`GET /entries/{id}` с `X-Zam-Session`).
+// Фильтр — на сервере (лента `noisy=1`, решение 68): показано ≥ 10 и ни одного открытия за окно
+// `max(now − 30 сут, opened_since)`; учёт открытий в e2e начался с запуска сервера — строка
+// «данные об открытии копятся с <дата>».
+
+/** Десять показов записи подсказкой: каждый — в своей сессии агента. */
+async function shownTimes(guid: string, pattern: string, n: number, tag: string): Promise<string[]> {
+  const sessions: string[] = [];
+  for (let i = 1; i <= n; i++) {
+    const s = `e2e-noisy-${tag}-${i}-${Date.now().toString(36)}`;
+    await agentApi('POST', 'recall', { event: 'post_tool', error: `ошибка сборки: ${pattern}`, solution: guid, timeout_ms: 2000 }, { 'X-Zam-Session': s });
+    sessions.push(s);
+  }
+  return sessions;
+}
+
+test('insights_noisy_filter', async ({ page }) => {
+  test.setTimeout(120_000);
+  const problems = watch(page);
+  const guid = await newSolution('шумные');
+  const stamp = Date.now().toString(36);
+  const insight = (title: string, pattern: string) =>
+    agentApi<Rec>('POST', `spaces/${guid}/entries`, {
+      kind: 'insight',
+      title,
+      body: `${title}: подсказка к ошибке сборки.`,
+      data: { kind: 'gotcha' },
+      triggers: [{ type: 'error_regex', pattern }],
+      force: true,
+    });
+  const noisy = await insight('Шумная подсказка E2E', `noisyalpha${stamp}`);
+  const opened = await insight('Открытая подсказка E2E', `noisybeta${stamp}`);
+  await shownTimes(guid, `noisyalpha${stamp}`, 10, 'a');
+  const sessions = await shownTimes(guid, `noisybeta${stamp}`, 10, 'b');
+  // агент открыл вторую после её подсказки — в той же сессии
+  await agentApi('GET', `entries/${opened.id}`, undefined, { 'X-Zam-Session': sessions[0] });
+  type Usage = { usage: { shown: number; opened: number; useful: number; useless: number } };
+  expect((await agentApi<Usage>('GET', `entries/${noisy.id}`)).usage).toEqual({ shown: 10, opened: 0, useful: 0, useless: 0 });
+  expect((await agentApi<Usage>('GET', `entries/${opened.id}`)).usage).toEqual({ shown: 10, opened: 1, useful: 0, useless: 0 });
+
+  const c = await pageCtx(page);
+  await page.goto(`${base()}#/u/${c.user}/s/${guid}/j/insights`);
+  const table = page.getByRole('table', { name: 'Insights' });
+  await expect(table.getByRole('columnheader', { name: 'Показано / открыто / полезно / бесполезно' })).toBeVisible();
+  await expect(table.locator(`tr[data-entry="${noisy.id}"] td.usage`)).toHaveText('10 / 0 / 0 / 0');
+  await expect(table.locator(`tr[data-entry="${opened.id}"] td.usage`)).toHaveText('10 / 1 / 0 / 0');
+  // «Шумные» — с 10 показами без открытия есть, с одним открытием — нет
+  const lists: string[] = [];
+  page.on('request', (r) => {
+    const u = new URL(r.url());
+    if (u.pathname.endsWith(`/spaces/${guid}/entries`)) lists.push(u.searchParams.get('noisy') ?? '');
+  });
+  await page.getByLabel('Шумные', { exact: true }).check();
+  await expect(table.locator(`tr[data-entry="${noisy.id}"]`)).toBeVisible();
+  await expect(table.locator(`tr[data-entry="${opened.id}"]`)).toHaveCount(0);
+  expect(lists).toContain('1');
+  // первые 30 суток учёта открытий — предупреждение с датой начала
+  await expect(page.getByTestId('noisy-note')).toContainText('Данные об открытии копятся с');
+  // карточка — «показано · открыто · полезно · бесполезно»
+  await table.locator(`tr[data-entry="${noisy.id}"] button`).first().click();
+  await expect(page.getByRole('article', { name: 'Карточка insight' }).getByTestId('usage')).toHaveText(
+    'показано 10 · открыто 0 · полезно 0 · бесполезно 0',
+  );
+  // фильтр снят — обе снова в ленте
+  await page.getByLabel('Шумные', { exact: true }).uncheck();
+  await expect(table.locator(`tr[data-entry="${opened.id}"]`)).toBeVisible();
+  expect(problems, problems.join('\n')).toEqual([]);
 });

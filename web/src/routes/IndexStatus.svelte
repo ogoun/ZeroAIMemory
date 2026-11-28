@@ -9,8 +9,11 @@
   // плашка `rules_heavy` по базам, где Rules больше 10 или их L1 в сумме больше 1500 токенов
   // (M6 §8: дайджест выдаёт Rules сверх бюджета); блок «Копии» (M7.2, §5.6 п. 3): последняя
   // копия, автокопии и `no_recent_backup` — по полю `backup` того же статуса, без второго опроса.
-  import { Dialog } from 'bits-ui';
+  // Подтверждение переиндексации — окно на общем каркасе `FormDialog` (M7.3, §6.14 п. 1): порядок
+  // кнопок, телефон, фокус (полная — `danger`, фокус на «Отмена»); отказ сервера — в окне, окно
+  // открыто.
   import { onMount } from 'svelte';
+  import FormDialog from '../components/FormDialog.svelte';
   import RechunkBanner from '../components/RechunkBanner.svelte';
   import { ApiError, indexStatus, reindex, rulesHeavyText, type IndexStatus, type User } from '../lib/api';
   import { bannerText, dateTime, sinceText } from '../lib/backups';
@@ -28,7 +31,6 @@
   let confirm = $state<{ full: boolean } | null>(null);
   let sending = $state(false);
   let reindexMsg = $state('');
-  let reindexErr = $state('');
   /** Поколение запроса статуса: ответ устаревшего запроса (таймер до POST) не затирает свежий. */
   let seq = 0;
 
@@ -100,12 +102,12 @@
     };
   });
 
+  /** «Запустить»: поставлено — окно закрыто, итог строкой; отказ сервера — в окне (исключение). */
   async function run() {
     if (!confirm) return;
     const full = confirm.full;
     sending = true;
     reindexMsg = '';
-    reindexErr = '';
     try {
       const r = await reindex(full);
       reindexMsg =
@@ -115,8 +117,7 @@
       await load();
     } catch (e) {
       if (expired(e)) return;
-      reindexErr = e instanceof Error ? e.message : 'Ошибка';
-      confirm = null;
+      throw e instanceof Error ? e : new Error('Ошибка');
     } finally {
       sending = false;
     }
@@ -287,8 +288,7 @@
         Полная переиндексация
       </button>
     </div>
-    {#if reindexMsg}<p class="ok" role="status">{reindexMsg}</p>{/if}
-    {#if reindexErr}<p class="error" role="alert">{reindexErr}</p>{/if}
+    {#if reindexMsg}<p class="ok" role="status" tabindex="-1" data-testid="reindex-status">{reindexMsg}</p>{/if}
     {#if st.reindex.last}
       {@const l = st.reindex.last}
       <p class="small last">
@@ -333,33 +333,29 @@
   {/if}
 </section>
 
-<Dialog.Root
+<!-- подтверждение — окно на общем каркасе (§6.14 п. 1): на телефоне — во всю ширину, не во весь экран -->
+<FormDialog
   open={confirm !== null}
-  onOpenChange={(o) => {
-    if (!o && !sending) confirm = null;
-  }}
+  confirm
+  danger={!!confirm?.full}
+  title={confirm?.full ? 'Запустить полную переиндексацию?' : 'Переиндексировать из embeddings?'}
+  submit="Запустить"
+  busy={sending}
+  refocus={() => document.querySelector('[data-testid="reindex-status"]')}
+  onsubmit={run}
+  onclose={() => (confirm = null)}
 >
-  <Dialog.Portal>
-    <Dialog.Overlay class="overlay" />
-    <Dialog.Content class="panel dialog">
-      <Dialog.Title>{confirm?.full ? 'Полная переиндексация' : 'Переиндексация из embeddings'}</Dialog.Title>
-      <Dialog.Description class="warn">
-        {#if confirm?.full}
-          Все заметки всех пользователей будут перечанкованы и поставлены в очередь; для текстов
-          без кэша работает модель — это может занять долгое время. Векторный поиск на это время
-          может возвращать неполные результаты.
-        {:else}
-          Точки Qdrant всех пользователей будут удалены и записаны заново из кэша эмбеддингов (без
-          модели). На время пересборки векторный поиск может возвращать неполные результаты.
-        {/if}
-      </Dialog.Description>
-      <div class="row" style="margin-top: 12px;">
-        <button type="button" class={confirm?.full ? 'danger-fill' : 'primary'} disabled={sending} onclick={run}>Запустить</button>
-        <Dialog.Close disabled={sending}>Отмена</Dialog.Close>
-      </div>
-    </Dialog.Content>
-  </Dialog.Portal>
-</Dialog.Root>
+  <p class="warn">
+    {#if confirm?.full}
+      Все заметки всех пользователей будут перечанкованы и поставлены в очередь; для текстов без кэша
+      работает модель — это может занять долгое время. Векторный поиск на это время может возвращать
+      неполные результаты.
+    {:else}
+      Точки Qdrant всех пользователей будут удалены и записаны заново из кэша эмбеддингов (без модели). На
+      время пересборки векторный поиск может возвращать неполные результаты.
+    {/if}
+  </p>
+</FormDialog>
 
 <style>
   .head {

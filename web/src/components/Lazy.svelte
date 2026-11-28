@@ -20,7 +20,7 @@
   let { load, props, what, oncancel }: Props = $props();
 
   /** Экспорты загруженного компонента, которые читают обёртки (`EditPanel`). */
-  type Exports = { dirty?: () => boolean; leave?: () => boolean; release?: () => void };
+  type Exports = { dirty?: () => boolean; leave?: () => boolean; release?: () => void; submit?: () => Promise<void> };
   let inner = $state<Exports | undefined>();
 
   /** Загруженный компонент; пока чанк не пришёл — `undefined`. */

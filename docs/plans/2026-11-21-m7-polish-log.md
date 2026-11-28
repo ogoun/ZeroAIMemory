@@ -5086,6 +5086,2542 @@ Markdown-выдаче агенту (31). Решения по ходу задач
 | Финальное ревью ветки и волна правок | `9db9aa57..b7348711`: With fixes — Critical нет, Important I1 (несохранённое в Insights, Идеях и Словаре терялось по «←» и переходу), Minor M1–M9; волна правок `743dda54`, `bc287635`, `3008a168`, `3905b63b` (I1, M1–M5 и из триажа — признак правки всех журналов, вкладки DocView, прозрачность, окно конфликта редактора); M6–M9 — в M7.4 (задачи памяти, «Известные ограничения»); повторное ревью — закрыто всё, новых Critical и Important нет, N1 (документы) — `6bb0b755`; итог — `90830595` |
 | Тег `v0.0.15-m7.2`, Release, развёртывание на рабочий сервер памяти (с копией данных) и тестовый стенд, клиент владельца | merge `2e372bde`, тег `v0.0.15-m7.2`. Пробный `release-dry-run` не запускался: workflow, сценарии упаковки и внешние зависимости с `v0.0.14-m7.1` не менялись, `package-smoke` CI `90830595` — success (решение координатора). Первая установка тега ушла на прежний `main` `9db9aa57` (сбой слияния, команды после heredoc выполнились отдельно — `i:01M848KX3WEDVTR5YXSGB7Y3BH`): Release 45181349424 отменён до черновика (`verify-version` упал сам), неверный тег удалил владелец, тег поставлен на `2e372bde`. Release 45285886548 — success, черновик (публикует владелец); CI 45181572085, Edge 45181572198, CUDA 45181571936 на `main` — success. Развёртывание 2026-11-23 23:50 UTC скриптом обновления на месте: тестовый стенд — данные 456 МБ, копия `.bak-0.0.14`, старт 5 с; рабочий сервер памяти — 747 МБ, копия `.bak-0.0.14`, старт 4 с; `/health` — `0.0.15-m7.2`, `ok`, признаки `space_counts`, `task_subtasks`, `backup_api`, `sessions_parent`, `entries_trash` (и `agent_text_masked`); миграций нет, ошибок в журнале службы нет; комплект моделей не менялся (SHA256 `bge-m3-int8` совпадает с 0.0.14-m7.1). Клиент владельца `zam` — 0.0.15-m7.2, `zam status` — сервер и блок v8 актуальны; `zam task show` волны M7.3 — подзадачи «4/10» |
 
+## Волна M7.3 «Внутренние работы»
+
+Проект — спецификация этапа §6 (решения координатора 32–95 — §12), план —
+`docs/plans/2026-11-23-m7.3-internal.md`. Ветка `m7.3-internal` от `main` после выпуска
+`v0.0.15-m7.2`.
+
+### M7.3 · Задача 1 — Схема 0027, `[works]`, настройки `works.*`, время с поясом, `NightRunner`
+
+Спецификация §6 «Общее для волны», §6.1; worktree `.tmp/m73/wt-t1`, ветка `m7.3-t1` от
+`072e3257`.
+
+**Схема.** `0027_internal_works.sql` — `rebuild: false`, только новые таблицы `probes`,
+`check_runs`, `check_results`, `works`, `work_calls`, `proposals`, `usage_opened` и строка
+`meta.usage_opened_since` (`strftime(…) || '.000000Z'`, формат `fmt_ts`). Индексы — `works_open`
+(частичный, `queued`/`running`), `works_night`, `work_calls_ts`, `probes_active` (частичный,
+`active`), `check_runs_night (trigger_kind, night)`, `proposals_open`, `proposals_dedup`,
+`usage_opened_target`; ключи — `check_results (run_id, probe_id, space_id)` (`WITHOUT ROWID`,
+`space_id DEFAULT ''`), `usage_opened (session_id, target_kind, target_id)` (`WITHOUT ROWID`).
+Внешний ключ — только `check_results.run_id → check_runs(id) ON DELETE CASCADE` (срок прогонов
+365 суток уносит их результаты); на `entries`, `sessions` и `spaces` — нет. CHECK — у
+перечислений спецификации (`probes.kind/split/author_kind/status`, `check_runs.trigger_kind/
+status`, `works.mode/origin/state`, `proposals.status/author_kind`); у `works.kind` и
+`proposals.type` — нет. `zam_store::works::{WorkKind, ProposalType}` (`echo` — под `test-hooks`),
+`zam_store::usage::{OpenedEvent, record_opened, opened_counts_many, usage_opened_since}`.
+
+**Конфигурация.** `[works]` (`WorksSection`, `WorksMode`, `ModelAccess`, `CheckMode`) — умолчания и
+диапазоны таблицы §6.1, ошибка — с именем ключа (`works.tz` — с примерами `Europe/Moscow`, `UTC`,
+`+03:00`); `[backup] tz = "UTC"`. `jiff` — фича `tzdb-bundle-always`; `git diff main -- Cargo.lock`
+— одна строка `"jiff-tzdb"` в зависимостях `jiff`, новых `[[package]]` нет.
+
+**Время.** `zam_server::schedule::{parse_tz, slot, night_window}`; слот автокопий —
+`backup::schedule::slot` через `schedule::slot` с `[backup] tz` (прежние `schedule_tick_cases` —
+без смены ожиданий, зелёные). `works::schedule::tick` — чистая функция на `night_window`.
+
+**Настройки `works.*`.** `works::settings` — ключи, `UserWorks`, `ModelConn` (`vault` в JSON —
+`v:<id>`, хранится id; `pinned: Option<PinnedAddr>` — для задачи 2), `BaseUrl`/`PinnedAddr`,
+`Limits`, `Pause`, `effective_mode` (причины `off`: `disabled`, `model_access_off`, `no_model`,
+`paused`), `load`, `set_pause` (единственный писатель `works.pause`, после записи —
+`user_flags.invalidate`). `PATCH /auth/settings {works: {mode, kinds, model, limits, check}}`:
+выбор `mode`, равный `default_mode`, и `check = on` не хранятся; `works.model` — запись личного
+Vault по имени или `v:<id>` (нет — 422), `model` 1..=200 символов, `max_tokens` 256..=32000,
+`body_extra` — объект до 4 КиБ; аудит `works.model` — без `body_extra`; `PATCH`, сменивший
+действующий режим вида, зовёт `works::queue::on_mode_change`. Ответ — поле `works` (`mode`,
+`kinds`, `model`, `limits`, `check`, `pause`, `effective: {<вид>: {mode, reason}}`).
+
+**`NightRunner`** (`works::night`): тик `WORKS_TICK` = 60 с (первый — через период после старта),
+ночь — `check::night` (при `[works] check = "nightly"`), затем `queue::night`; обе в задаче 1 —
+заглушки, как и `queue::on_start`, `check::on_start` (зовутся один раз после сборки `AppState`
+при любом `enabled`; с круга правок 1 — в фоне раннера) и `queue::on_mode_change`. `AppState::shutdown` —
+`self.night.stop().await` первой строкой; `stop` — признак остановки, ожидание задачи
+`STOP_WAIT` = 5 с, затем `abort`, клон отпускается. `NightCtx` — клон `AppState` и признак
+остановки (`stopping`, `stopped` — для `select!` долгих вызовов задач 2, 3, 5). Тестовые точки
+(`test-hooks`): `works::night::test_hooks::{set_tick, set_jobs, reset, stop_log}`,
+`works::queue::test_hooks::mode_changes`; фича `test-hooks` сервера включает `zam-store/test-hooks`.
+`common::cfg_in` — `works.check = off` (решение 67).
+
+- [решение исполнителя, задача 1] **Клон состояния ночи держит раннер, задача — `Weak`.** Буква
+  решения 56 и плана («клон держит только задача, не поле») оставляет цикл «задача → клон →
+  `AppState.night` → раннер → `JoinHandle`»: `JoinHandle` при уничтожении задачу не снимает, и
+  после ухода последнего внешнего клона без `shutdown` (тесты `boot::first_run_creates_admin_and_
+  token_once`, `revoked_admin_tokens_do_not_issue_new_initial_token` — `drop(app); drop(st);` и
+  новая сборка на том же каталоге) лок каталога данных и базы держались бы до конца рантайма —
+  повторный старт падал бы `DataDirLocked`. Поэтому: раннер хранит `Arc<NightCtx>` в своём поле, у
+  этого клона `night` — отвязанный раннер без задачи с тем же признаком остановки (цикла нет),
+  задача держит `Weak` и берёт сильную ссылку только на время ночи. Уход последнего внешнего клона
+  уничтожает раннер и клон сразу (между ночами); `stop` снимает задачу и отпускает клон. Суть
+  решения 56 сохранена: `NightCtx` — клон `AppState`, создание до сборки, запуск после, остановка
+  первой, в `spawn_blocking` нет ни `Db`, ни `AppState`. Проверка — `boot.rs` (15 passed) и
+  мутация (ниже).
+- [решение исполнителя, задача 1] `night_runner_stops_before_dbs` — переименование файла базы
+  после `shutdown` и ухода клонов теста, пока блокирующий поток работы ещё висит (ожидание — до
+  3 с: фоновые задачи открытия базы отпускают `Db` чуть позже, как в
+  `search_rerank_boosts.rs:438`); порядок «ночь → обслуживание» — журнал `stop_log` раннера.
+- [решение исполнителя, задача 1] `works.model.protocol` хранится строкой: проверка значения
+  (`openai`, иное — 422 «протокол появится в 0.0.19-m7.6») — задача 2 (`protocol_not_openai_422`),
+  как и запрещённые ключи `body_extra`, адрес записи, класс сети и `pinned`. Задача 1 проверяет
+  форму, пределы полей и запись Vault.
+- [решение исполнителя, задача 1] Поле ответа и правки видов — `works.kinds` (имя поля
+  `UserWorks.kinds`), ключ строки — `works.kind.<вид>`; `null` в `kinds` снимает переопределение.
+- [решение исполнителя, задача 1] `Pause {class, since, from?, to?}`: `from`/`to` — хосты «был →
+  стал» паузы `vault_changed` (§6.2 п. 1), заполняет задача 2.
+- [решение исполнителя, задача 1] `probes.space_id` у `negative` — `''` (общие вопросы, §6.4 п. 4);
+  `check_runs.night` у ручного прогона — `NULL` (решение координатора по ревью r1, Minor 5: ночной
+  прогон ночи ищется по `(trigger_kind, night)`).
+- [решение исполнителя, задача 1] Тест `migrate_rebuild::reopen_v25_repairs_late_0025_schema` тоже
+  был привязан к последней схеме (счётчики таблиц): ожидание — прежние таблицы с теми же строками,
+  семь пустых таблиц 0027 и `meta` + 1.
+
+**TDD.** RED: `zam-store --test user_db` — не собирается (`OpenedEvent`, `record_opened`,
+`opened_counts_many`, `usage_opened_since` нет); после регистрации 0027 — `migrate_rebuild` 5
+FAILED (версия 26 и объекты); `zam-server --test works_settings --test works_night` — не
+собирается (нет `works`, `CheckMode`, `ModelAccess`, `WorksMode`, `ServerConfig.works`,
+`AppState.night`). GREEN — ниже.
+
+**Прогоны** (`CARGO_TARGET_DIR=.tmp/m73/wt-t1/target/m73-t1`, `ZAM_REQUIRE_ML=1`):
+- `zam-store --test user_db --test migrate_rebuild` — 11 + 11 passed;
+- `zam-server --lib` (`config::`, `schedule`, `works::`, `user_settings`) — 64 passed (новые:
+  `works_config_defaults_and_bounds`, `slot_tz_moscow_0430_is_0130_utc`, `slot_dst_gap_and_fold`,
+  `slot_fixed_offset`, `backup_tz_default_utc_unchanged`, `works_tick_window_no_catch_up`,
+  `works_tick_restart_in_window_continues`, `works_tick_window_crosses_midnight`,
+  `works_mode_resolution_cases`, `rows_roundtrip_and_garbage`; `example_config_parses_to_defaults`
+  — с `[works]` и `[backup] tz`);
+- `zam-server --test works_settings` — 6 passed, `--test works_night` — 3 passed;
+- `--test backup` — 53 passed (первый прогон: 3 FAILED — в worktree не было `target/deps`
+  (ORT, Qdrant, pdfium); после копии из основного каталога — зелёные), `--test m65_acceptance` — 7
+  passed, `--test boot` — 15 passed, `--test user_login` — 19 passed, `--test ideas_review` — 9
+  passed.
+
+**Мутации** (временные правки, откачены): без отвязанного раннера у клона ночи (цикл `Arc`) —
+`boot::first_run_creates_admin_and_token_once` и `revoked_admin_tokens_do_not_issue_new_initial_
+token` FAILED (`DataDirLocked` при повторной сборке на том же каталоге); остановка ночи после
+обслуживания — `works_night::night_runner_stops_before_dbs` FAILED (порядок журнала). Первая
+мутация показала и дефект самого теста: при падении проверки висящий блокирующий поток держал
+рантайм теста бесконечно — поток теперь отпускает guard `Unblock` и при панике.
+
+**Замер миграции.** Рабочая база владельца — на сервере памяти в LAN, из worktree недоступна; замер
+— на копии самой большой локальной базы пользователя (406 МБ, приёмка M4, схема 14) на H: (HDD):
+14 → 26 — 12,9 с; 0026 → 0027 — **5,09 с**, из них SQL 0027 — **41 мс** (семь пустых таблиц,
+индексы, строка `meta`), остальное — копия `bak-v26` (`VACUUM INTO`, пропорционально размеру
+базы). Временный тест замера в git не входит.
+
+**Круг правок 1** (ревью r1: спецификация ✅, качество Approved; ⚠️1–4, Minor 1–6 — решения
+координатора):
+- ⚠️1 — текст приведён к коду: спецификация §6.1 п. 5 и решение 56, план (задача 1); в задачи 2, 3
+  и 5 плана вписаны правила `NightCtx`: признак остановки — только `ctx.stopping()`/`stopped()`;
+  у `ctx.st().night` (отвязанный раннер) не звать `start`/`stop` (у него они теперь ничего не
+  делают, с WARN); клон `NightCtx`/`AppState` не уносить в `tokio::spawn`, переживающий будущее
+  шага.
+- ⚠️2 — `NightRunner::spawn_tracked(fut) -> Result<(), Stopping>`: учтённые запуски в `JoinSet`
+  общего состояния раннера и его отвязанного двойника; `stop` ждёт задачу и учтённые запуски одним
+  сроком `STOP_WAIT`, затем снимает; после остановки — `Err(Stopping)`. В план задач 3 и 5:
+  `POST /works/run` и `POST /check/run` — только через него.
+- ⚠️3 — шаги старта (`queue::on_start`, `check::on_start`) — в фоне задачи раннера (при любом
+  `enabled`; без `enabled` задача делает только их), `finish` и роутер их не ждут; учтённые
+  запуски начинаются после них (`watch` состояния старта). Тестовая точка `set_on_start`.
+- ⚠️4 — в план задачи 3: строка `works` в `docs/api-compat.md` описывает и форму поля настроек
+  задачи 1.
+- Minor 1 — ошибка `on_mode_change` после записи — WARN, `PATCH` не падает; в план задачи 3 —
+  сверка `effective_mode` перед захватом работы и перед каждым обращением к модели.
+- Minor 2 — `works_model_field_bounds_422`: `model` пусто, из пробелов, 201 символ; `max_tokens`
+  255 и 32001; `body_extra` строка, массив, 4097 байт — 422 с именем поля; границы 200, 256,
+  32000, 4096 байт и `null` — 200; лишнее поле входа `works.model` и `works.limits` — 400.
+- Minor 3 — `deny_unknown_fields` снят с хранимых `ModelConn`, `BaseUrl`, `Limits`; вход `PATCH`
+  строг (`ModelInput`, новый `LimitsInput`); модульный `stored_rows_tolerate_unknown_fields`.
+- Minor 4 — `crates/zam-cli/tests/common::server_defaults()` (`works.check = off`) во всех 28
+  сборках сервера тестов `zam-cli` (`..common::server_defaults()`); модульный тест
+  `zam-server` `lib.rs` — `check = off`; `ServerProc` (процессы `zam-server serve` тестов) —
+  `ZAM_WORKS__CHECK=off` только у бинарника пакета (сервер тега до 0.0.16 ключа не знает).
+  Процесс приёмки `zam-cli::m6_acceptance` (бинарник тега) и xtask — без изменений (план задачи 5).
+- Minor 5 — у ручного прогона `check_runs.night = NULL`: комментарий 0027, спецификация §6.5
+  п. 7, план задачи 5, журнал.
+- Minor 6 — `works_night::drop_without_shutdown_releases_data_dir`: раннер провёл ночь, все клоны
+  ушли без `shutdown`, повторная сборка на том же каталоге — без `DataDirLocked`.
+- Новые тесты `works_night`: `manual_runs_tracked_by_stop` (запуск, смотрящий на остановку, —
+  дождался; висящий — снят; `shutdown` ≤ 6 с; после — `Stopping`; каталог свободен),
+  `startup_steps_run_in_background` (шаги старта висят — вход администратора проходит; учтённый
+  запуск — после них). Мутации (откачены): `stop` без ожидания учтённых —
+  `manual_runs_tracked_by_stop` FAILED; учтённый запуск без ожидания старта —
+  `startup_steps_run_in_background` FAILED; без отвязанного двойника —
+  `drop_without_shutdown_releases_data_dir` FAILED (`DataDirLocked`).
+- Прогоны (`ZAM_REQUIRE_ML=1`): `fmt --check` и `clippy -p zam-store -p zam-server -p zam-cli
+  --all-targets -D warnings` — чисто; `zam-store --test user_db --test migrate_rebuild` — 11 + 11;
+  `zam-server --lib` (фильтр) — 65; `--test works_settings` 7, `works_night` 6, `boot` 15,
+  `backup` 53, `m65_acceptance` 7, `mcp` 79 (процессы `ServerProc` с `ZAM_WORKS__CHECK=off`);
+  `zam-cli --test agent_dates --test idea --test cache` — 1 + 20 + 2; 0 failed.
+
+**Круг правок 2** (повторное ревью r2: Approved, пункты r1 закрыты; новые Minor N1–N3):
+- N1 — шаги старта и каждая ночь идут **задачами учёта раннера** (`step`: `JoinSet` раннера +
+  `oneshot` о конце): паника шага — `StepEnd::Failed`, у старта — состояние `Startup::Failed` и
+  ERROR в журнал; учтённые запуски ждут «не `Running`» и идут, ночной цикл продолжает; `stop` ждёт
+  и снимает шаги вместе с запусками. Тест `startup_panic_keeps_runner_working`.
+- N2 — `spawn_tracked(|ctx: NightCtx| fut)`: контекст строит раннер из своего клона состояния
+  ночи (у клона `night` — двойник), внешний клон в запуск не попадает. Учёт шагов перенесён из
+  общего с двойником состояния в сам раннер (`Arc<Tracked>`): иначе шаг с клоном (через `night` →
+  двойник → общее состояние → учёт) замкнул бы учёт на себя. У двойника `spawn_tracked` —
+  `Err(Stopping)`; при уничтожении раннера учёт снимается сразу. Описание модуля, план (задачи 1,
+  3, 5 — новая сигнатура), спецификация §6.1 п. 5 — поправлены.
+- N3 — `startup_steps_run_in_background`: `api(...)` под `tokio::time::timeout(30 с)` — регрессия
+  падает, а не висит.
+- Прогоны (`ZAM_REQUIRE_ML=1`): `fmt --check` и `clippy -p zam-store -p zam-server -p zam-cli
+  --all-targets -D warnings` — чисто; `zam-server --test works_night` 7, `works_settings` 7,
+  `boot` 15 — 0 failed. Мутация (откачена): шаг старта без задачи учёта —
+  `startup_panic_keeps_runner_working` FAILED («не дождались: учтённый запуск после упавшего шага
+  старта»).
+
+**Правка m57 и тестов схемы** (CI ветки волны после слияния задач 1–5): `m57_acceptance::
+acceptance_migration_from_m56_db` FAILED — сравнение прежних объектов схемы базы 0023 не знало
+объектов 0027 (в задаче 1 поправлены `migrate_rebuild` и `m65_acceptance`, этот тест пропущен:
+поиск шёл по версии 26, а не по всем сравнениям `sqlite_master`). Общий помощник
+`tests/common::{TABLES_0027, objects_0027}` (по `tbl_name`: индекс `work_calls_run` задачи 2
+учтён сам), `m57_acceptance` и `m65_acceptance` — на нём. Прочие тесты, сверяющие версию и состав
+схемы базы пользователя (`git grep` `sqlite_master`, `USER_MIGRATIONS`, `user_version`), прогнаны
+с `ZAM_REQUIRE_ML=1` — зелёные без правок: `zam-server` `m57_acceptance` 13, `m65_acceptance` 7,
+`m56_acceptance` 8, `m6_acceptance` 1 (+2 ignored), `agent_dates` 4, `vault` 31, `backup` 53;
+`zam-store` целиком (`--lib` 127 и все наборы); `zam-cli` `m45_acceptance` 7.
+
+### M7.3 · Задача 2 — Клиент модели: протокол, данные наружу, пределы, журнал отправок
+
+Спецификация §6.2; worktree `.tmp/m73/wt-t2`, ветка `m7.3-t2`. Этап 1 (`f47f5490`, от
+`072e3257`) — чистый клиент без настроек; этап 2 — проводка после слияния задачи 1 (`db884070`).
+
+**Адреса** (`works::egress`): `parse_base_url` (только `http`/`https`; без `userinfo`, `?`, `#`,
+пробелов; хост — IPv4, `[IPv6]` без зоны или ASCII-имя, путь без завершающего `/`),
+`classify_ip` (петля → сам узел по UDP `connect` → link-local → LAN → вне LAN; `::ffff:` — как
+IPv4), `resolve` (литерал — без резолвера, `localhost`/`*.localhost` — `127.0.0.1` и `::1` без
+резолвера, иначе подмена `test-hooks` или системный резолвер со сроком 10 с), `check`/`allowed`
+(причины `BlockReason`: `model_access_off`, `loopback_requires_admin`, `model_access_lan`,
+`http_external`), `route` (имя — один раз, проверка **каждого** адреса). Соединение `ureq` — только
+по проверенным адресам: `Agent::with_parts(cfg, DefaultConnector, PinnedResolver)`
+(`ureq::unversioned::resolver::Resolver` в 3.4.2 есть — решение 78 выполнено без запасного пути;
+прочие имена — прокси окружения — резолвер по умолчанию).
+
+**Протокол** (`works::model`): тело `{model, messages, <предел>, stream: false}` + `body_extra`
+верхним уровнем (поля сервера сильнее), `max_completion_tokens` у `api.openai.com` при `auto`;
+агент `ureq` — `max_redirects(0)`, `http_status_as_error(false)`, прокси только вне LAN, ответ —
+до 4 МиБ; 17 классов `CallClass`, `CallError {class, http_status, retry_after, usage}`,
+`ModelReply {text, input_tokens, output_tokens, estimated, reasoning}`.
+
+**Исполнение** (`works::exec`): второй скан собранного тела (элементы с находкой выброшены,
+скан — до чистого тела), JSON (`extract_json`, `json_step` — один повтор беседы),
+`run_payload(ctx, user, RunKey, Payload, WorkKind, work)` — режим вида, окно ночи, стоп по
+журналу, `prepare` (запись Vault, сверка с `pinned`, маршрут, ключ), пределы, слоты
+(`AppState.model_calls`: `max_parallel` на сервер, у пользователя — один), повторы, журнал,
+пауза, аудит; `test_connection` (`POST /works/model/test`). `zam_store::work_calls`
+(`record_call`, `tokens_since`, `list_calls`, `calls_between`, `gc`), срок 180 суток —
+`maintenance::gc_work_calls` тем же проходом обслуживания. `PATCH works.model`: протокол,
+ключи сервера в `body_extra`, адрес записи (разбор и маршрут по политике `[works]`; при
+`model_access = "off"` — как при `any`), `pinned`, `warnings`, аудит `works.model.external`,
+снятие паузы.
+
+- [решение исполнителя, задача 2] **`call_blocking` берёт проверенный `&Route`**, а не `&BaseUrl`:
+  в сигнатуре плана нет политики, а «имя разрешается один раз за вызов, соединение — по
+  проверенным адресам» требует передать в вызов итог проверки (`egress::route(base, Policy)`).
+- [решение исполнителя, задача 2] `CallError.usage` сверх полей плана: обрезанный (`thinking`,
+  `max_tokens`) и отклонённый ответ токены израсходовал — пределы считаются по журналу.
+  `ModelReply.reasoning` — для `thinking?` проверки подключения. `call_chat_blocking(messages)` —
+  повтор JSON «той же беседой»; `call_blocking` — обёртка.
+- [решение исполнителя, задача 2] **Строки запуска (`RunKey`) — по времени**, отдельного столбца
+  в `work_calls` нет (схема полна с задачи 1): ночь — `[slot(d), slot(d) + window_min)` (ночные
+  обращения идут только в окне; `run_payload` ночи вне окна — `aborted` без запроса), ручной
+  запуск — от момента его id (UUIDv7; задача 3 создаёт id в начале запуска; округление вверх до
+  миллисекунды). Проверки подключения (`kind = test`) в стоп не входят, в расход — входят.
+- [решение исполнителя, задача 2] **Стоп по журналу** (решение 77): строка `quota` или `limit` —
+  стоп; **последняя** строка запуска — `rate` (повтор не помог или `retry-after` > 60 с) — стоп;
+  три `unavailable` — стоп. Строка `limit` пишется без отправки (`ms = NULL`): иначе следующий,
+  меньший пакет той же ночи прошёл бы. Имя не разрешилось — строка `unavailable` без отправки.
+- [решение исполнителя, задача 2] `run_payload`: режим вида не `model` (в том числе `enabled =
+  false`, пауза) — `blocked` **без** паузы; сбой хранилища — `aborted` (класс только для
+  вызывающего, в журнал не пишется). Вид — `WorkKind`, а не `&str` плана.
+- [решение исполнителя, задача 2] Пауза ставится там, где запрос не уходит (`blocked`, `vault`,
+  `vault_changed`) и после ответа `auth`/`not_found` — и у проверки подключения (таблица п. 5).
+  Аудит паузы — `works.model.paused {class}`, снятия — `works.model.pause_cleared {class, by:
+  save|test}`. Снятие паузы не зовёт `on_mode_change`: пауза — не смена режима вида.
+- [решение исполнителя, задача 2] **Подтверждение адреса** после `vault_changed` — повторное
+  сохранение подключения (`PATCH works.model`, и без изменений): закрепляется адрес, который
+  человек видит в записи Vault; отдельной кнопки-эндпоинта в задаче 2 нет (WebUI — задача 8).
+- [решение исполнителя, задача 2] `POST /works/model/test`: `[works] enabled = false` и
+  `model_access = "off"` — 409 `code: works_disabled` (`/problems/conflict`; тип
+  `/problems/works-disabled` задачи 3 — для `POST /works/run`), идёт обращение пользователя —
+  409 `model_busy`, нет подключения — 422; срок — не дольше 120 с; ответ не JSON — `ok: false`,
+  `bad_json` с советом `response_format`. Администратор — `?user=<id>` у обоих маршрутов.
+- [решение исполнителя, задача 2] Классы вне строк таблицы п. 5: 408 — `unavailable`, прочие
+  1xx/4xx — `bad_response`; `insufficient_quota` в теле любого 4xx — `quota`; непонятный
+  `retry-after` — как без него; HTTP-дата `retry-after` — секунды до неё; TLS, DNS, прокси —
+  `unavailable`; поле `refusal` — `refused`; `tool_calls` — `bad_response`; пустой `content` при
+  рассуждении — `thinking` при любом `finish_reason`; рассуждение — и `reasoning` (OpenRouter);
+  `<think>…</think>` в начале ответа перед разбором JSON снимается.
+- [решение исполнителя, задача 2] `localhost` — без резолвера (`hosts` не уводит «петлю»); `::` —
+  петля; IPv4-в-IPv6 соединяется как IPv4; «худший» класс — петля > сам узел > link-local > вне
+  LAN > LAN, но политика — по каждому адресу.
+- [решение исполнителя, задача 2] Тестовые записи Vault задачи 1 (`works_settings.rs`) —
+  `https://192.0.2.10:8443/v1`: `http` вне LAN `PATCH` теперь отвергает.
+
+**Поставщики** (таблица «Подключённая модель» `deploy/README-install.md`, сверка 2026-11-23):
+OpenAI — https://developers.openai.com/api/reference/resources/chat (`max_tokens` устарел,
+`max_completion_tokens`, `reasoning_effort` с `none`, `json_object`); Anthropic —
+https://platform.claude.com/docs/en/api/openai-sdk (вход `https://api.anthropic.com/v1/`,
+`response_format` — только `json_schema` со `strict`, `json_object` — 400, у Claude 5 размышления
+включены и в ответе не видны, `thinking {type: enabled, budget_tokens}` у прочих,
+`reasoning_effort` игнорируется, «не для промышленной нагрузки»); DeepSeek —
+https://api-docs.deepseek.com/, …/guides/thinking_mode, …/guides/json_mode (база
+`https://api.deepseek.com`, `thinking {type: disabled}`, `reasoning_content`, `json_object` и слово
+«json»); Kimi — https://platform.kimi.ai/docs/api/chat (`https://api.moonshot.ai/v1`, `max_tokens`
+устарел, K2.6 — `thinking {type: disabled}`, K3 — только `reasoning_effort`); Qwen DashScope —
+https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope и
+https://www.alibabacloud.com/help/en/model-studio/deep-thinking (адреса регионов и рабочих областей,
+`enable_thinking`); OpenRouter — https://openrouter.ai/docs/use-cases/reasoning-tokens
+(`https://openrouter.ai/api/v1`, `reasoning.effort: none`, `reasoning.exclude`, поле `reasoning`);
+Ollama — https://docs.ollama.com/api/openai-compatibility (`http://localhost:11434/v1`, ключ не
+проверяется, `reasoning_effort: none`); llama.cpp — README `tools/server` (`--port`, на дату
+сверки по умолчанию 9931, `--host` 127.0.0.1, `--api-key`, `--reasoning-format deepseek`,
+`--reasoning-budget 0`) и issue/PR о `chat_template_kwargs` в теле запроса (официальной страницы
+нет); vLLM — https://docs.vllm.ai/en/latest/serving/online_serving/openai_compatible_server/
+(`:8000/v1`, `--api-key`, `chat_template_kwargs`, `json_object`); LM Studio —
+https://lmstudio.ai/docs/app/api/endpoints/openai и …/developer/core/authentication (`:1234/v1`,
+ключ по умолчанию не нужен).
+
+**TDD.** Этап 1: интеграционные тесты и подставная модель — до реализации `model`/`exec`; RED на
+заглушках `todo!()` всех публичных функций — `works_model` 0/18, `--lib works::` 0/14. Этап 2:
+реализация раньше тестов, поэтому RED — мутациями (откачены): стоп по журналу выключен, сверка с
+`pinned` выключена, пределы всегда «помещаются», `key_use` на каждый вызов, второй скан выключен,
+проверка адреса в `PATCH` без политики и предупреждения, снятие паузы сохранением и проверкой
+убрано, срок журнала не удаляет — `works_model` 17 passed / **14 FAILED** (`pause_cleared_by_patch_
+or_test`, `http_external_refused`, `model_test_409_on_vault_changed`, `loopback_requires_admin`,
+`work_calls_retention_180_days`, `lan_check_cases`, `off_mode_zero_requests`,
+`error_classes_reactions`, `vault_url_change_by_token_pauses`, `secret_in_payload_element_dropped`,
+`limits_daily_monthly_stop`, `key_use_audit_once_per_night`, `model_access_lan_blocks_external`,
+`own_address_is_self`).
+
+**Прогоны** (`CARGO_TARGET_DIR=.tmp/m73/wt-t2/target/m73-t2`): `zam-server --test works_model` —
+31 passed (часы не замораживаются: ночь теста — окно с началом за 10 минут до «сейчас»; сроки и
+ожидания повторов — `works::exec::test_hooks` в мс), `--test works_settings` — 7 passed; числа
+итогового прогона, clippy и `fmt` — в отчёте задачи. Тест хоста `api.openai.com` — без сети
+(подмена резолвера действует и на соединение). `git diff main -- Cargo.lock` — строка `"ureq"` в
+зависимостях `zam-server`, новых `[[package]]` нет.
+
+**Круг правок 1** (ревью r1: 0 Critical / 4 Important / 10 Minor; решения координатора):
+- Important 1 — **подтверждение адреса только явное**: `PATCH works.model {confirm_host}` (хост
+  «стал», который видел человек; не хранится). Та же запись Vault, а адрес не совпал с
+  `pinned` или пауза `vault_changed`: без подтверждения или с устаревшим хостом — 409
+  `{code: vault_changed, was, now}`, ничего не записано, пауза ставится (если её не было) и
+  остаётся; совпал — закреплено, пауза снята. Новая запись Vault — новое подключение, без
+  подтверждения. 409 проверки подключения — тоже `{code, was, now}`.
+- Important 2 — режим вида и пауза сверяются перед **каждым** обращением и повтором
+  (`Run::send`: `settings::load` + `effective_mode`; не `model` — `blocked` без запроса).
+- Important 3 — вызов модели — в **отвязанном** `std::thread` (не `spawn_blocking`): остановка
+  его не ждёт ни в `NightRunner::stop`, ни при уничтожении рантайма; строка `aborted` — `ms =
+  NULL` (`CallRow::sent` — `ms` или `aborted`); `main.rs` — `rt.shutdown_timeout(5 с)`, как у
+  службы Windows.
+- Important 4 — аудит не глотается: `works::pause::audit` — WARN с действием и пользователем;
+  `key_use` не записался — обращения с ключом нет (`aborted`).
+- Minor 1 — ключ проверяется в `prepare` (края обрезаются; перевод строки, управляющий символ,
+  не-ASCII — пауза `vault` до отправки). Minor 2 — слот сервера берётся до аудита `key_use`,
+  без слота (остановка) — без строки «отправлено». Minor 3 — оговорка «кроме прокси» в
+  README и ТЗ §7.15, цена — в спецификации §12 п. 78. Minor 4 — тесты пауз `vault` (удалена,
+  перенесена в решение, без значения) и `blocked` (имя стало петлёй), `model_access = "off"`,
+  чужой `?user=` сессии пользователя, начало месяца. Minor 5 — размер `body_extra` — одна
+  проверка (`check_body_extra`). Minor 6 — аудит паузы, снятия и `key_use` — от имени того, кто
+  действовал (человек с IP или `system`). Minor 7 — столбец **`work_calls.run`**
+  (`night:<дата>` | `manual:<id>`) и индекс `work_calls_run` прямо в 0027 (миграция не выпущена;
+  тесты миграций задачи 1 — зелёные): стоп и `key_used` — по строкам своего запуска
+  (`calls_of_run`), пересечения ночи и ручного запуска нет. Minor 8 — `prepare` и
+  `test_connection` — `works/conn.rs`, пауза и аудит — `works/pause.rs`. Minor 9 — строка «имя не
+  разрешилось» — `external` по `egress::assumed_external` (литерал — по классу, имя — вне LAN).
+  Minor 10 — IPv4-совместимый `::a.b.c.d`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16` — по
+  вложенному IPv4.
+- ⚠️ План: Interfaces задачи 2 (как сделано) и задачи 3 («Контракт задачи 2»: `kind: WorkKind`,
+  один `RunKey::Manual(Id::new())` на ручной запуск, `json: Null`, `Blocked` без паузы, стоп),
+  Global Constraints — `work_calls.run` в 0027.
+- [решение исполнителя, задача 2, круг 1] `confirm_host` сравнивается с `host_label` текущего
+  адреса (хост и порт, порт схемы по умолчанию опущен) без учёта регистра; адрес изменён без
+  паузы (обращений ещё не было) — `PATCH` той же записи тоже требует подтверждения и ставит
+  паузу.
+- [решение исполнителя, задача 2, круг 1] Остановка во время вызова — строка `aborted` с `ms =
+  NULL` (по решению координатора), отправленной её считает `CallRow::sent` (ключ ушёл —
+  `key_use` в этом запуске уже был).
+- TDD круга: RED — `works_model` 32 passed / 8 FAILED (`run_key_isolation`,
+  `model_test_409_on_vault_changed`, `mode_rechecked_before_retry`, `pause_cleared_by_patch_or_test`,
+  `vault_confirm_requires_seen_host`, `vault_key_bad_header_pauses`,
+  `vault_url_change_by_token_pauses`, `shutdown_releases_hanging_call` — «рантайм: 9.06 s»),
+  `--lib works::` — `classify_embedded_ipv4` FAILED; GREEN — `works_model` 40 passed, `--lib
+  works::` 23 passed. Тесты покрытия Minor 4 (`vault_record_problems_pause`,
+  `address_now_blocked_pauses`, `model_access_off_zero_requests`,
+  `works_calls_user_session_foreign_403`, `month_start_is_first_of_month`) прошли и до правок —
+  они закрывают непокрытые пути, а не новое поведение.
+
+**Круг правок 2** (ревью r2: 1 Important / 4 Minor):
+- Important 1 — вложенный IPv4 (`::a.b.c.d`, `64:ff9b::/96`, `2002::/16`) только **ужесточает**
+  класс: петля, сам узел, link-local внутри — как IPv4; прочее (и частный IPv4) — класс самого
+  IPv6 (вне LAN): соединение идёт по адресу IPv6, а он маршрутизируется наружу (RFC 6052 §3.1
+  запрещает `64:ff9b::/96` для частных IPv4). `http://[::10.203.113.7]/v1` — 422. `::ffff:0:0/96`
+  — по-прежнему как IPv4 (соединение — по IPv4).
+- Minor 1 — пауза `vault_changed` держит актуальное «стал»: при новой смене адреса проверка
+  подключения и `PATCH` (неподтверждённый) переписывают паузу и пишут аудит `vault_changed`; 409
+  обоих — то же «был → стал».
+- Minor 2 — спецификация §6.2 п. 8 (столбец `run`, исходы `aborted`/`internal`), §12 п. 77 (индекс
+  `work_calls_run`).
+- Minor 3 — поток вызова не запустился или кончился без ответа — строка `internal` с `ms =
+  NULL` (`zam_store::work_calls::OUTCOME_INTERNAL`), `CallRow::sent()` её не считает; `aborted` —
+  только остановка после отправки.
+- Minor 4 — подтверждение — **`confirm_url`** (поле `confirm_host` переименовано: сверяется вся
+  нормализованная база — схема, хост, порт, путь — `parse_base_url` и равенство `BaseUrl`);
+  «был → стал» в паузе и 409 — полные адреса (`egress::address_label`), в аудите
+  `works.model.vault_changed` — хосты (§6.2 п. 1).
+- ⚠️ задача 8 — в план (Step 1, `works_pause_dot_and_confirm_address`): форма шлёт `v:<id>`,
+  показывает адрес записи, «Подтвердить адрес» — `confirm_url` из `pause.to`.
+- [решение исполнителя, задача 2, круг 2] Поле подтверждения переименовано в `confirm_url`: оно
+  несёт адрес, а не хост; выпуска с `confirm_host` не было.
+- TDD круга: RED — `zam-store --lib work_calls` не собирается (`OUTCOME_INTERNAL`), `works_model` 35
+  passed / 6 FAILED (`http_external_refused`, `pause_cleared_by_patch_or_test`,
+  `model_test_409_on_vault_changed`, `vault_confirm_full_address`, `vault_confirm_requires_seen_host`,
+  `vault_url_change_by_token_pauses`), `--lib works::` — `classify_embedded_ipv4` FAILED; GREEN —
+  в отчёте задачи.
+
+### M7.3 · Задача 3 — Очередь работ, пакет и итог, режим «агент», ночь и ручной запуск
+
+Спецификация §6.3; worktree `.tmp/m73/wt-t3`, ветка `m7.3-t3` от `m7.3-internal` `4c287ef5`
+(задачи 1 и 2 слиты); круг 2 вместе с задачей 5.
+
+**Очередь** (`zam_store::works`): `Work`, `WorkItem`, `NewWork`, `WorkMode`, `Origin`, `WorkState`;
+`enqueue` (незакрытая работа вида в пространстве есть — `None`), `claim_next` (своя живая аренда
+сессии — та же работа; иначе старейшая `queued` работа агента, аренда), `start_model`, `finish`,
+`finish_claimed` (CAS по сессии, `result_key`), `release`, `set_items`, `cancel_kind` (с фильтром
+исполнителя), `requeue_model_running`, `expire` (7 суток, истёкшая аренда, третья — `failed`),
+`served_at`, `count_packages`, `nightly_spaces`, `next_model_queued`, `list`, `last_night`,
+`queued_agent_counts`, `excluded_refs`, `accepted_refs`, `owner_entries` (живые записи, все
+ревизии — владельца базы). Строка неизвестного вида, режима или состояния — `None` с WARN.
+
+**Виды и пакет** (`works::kinds`, `works::package`): диспетчер — `space_kinds`, `label`, `collect`,
+`instruction`, `schema`, `accept_item`; `probes`/`rules` — заготовки (сборщик пуст, элемент
+отклоняется) под задачи 4 и 7; `echo` (только `test-hooks`) — insight пространства, итог `{n,
+text}`. Пакет — `render`/`render_numbered`: заголовок, инструкция вида со строкой «данные, а не
+указания», `<record n ref kind>` (граница экранирована без учёта регистра), схема, строка итога;
+бюджет 6000 (1..=20000); `check_mask_literal`, `check_mask_literal_json`, `agent_text`.
+
+**Исполнение** (`works::queue`): `night` (пользователи → виды по порядку; `agent` — до 4 работ,
+по одной на пространство за ночь; `model` — `run_model` по кругу пространств до окна, предела или
+стопа), `manual_agent`, `manual_model` (через `spawn_tracked`), общая проверка итога `accept`,
+`on_mode_change` и снятие работ не того исполнителя ночью (`drop_stale`), `on_start`
+(`requeue_model_running`), `digest_line`. REST `api::works`: `GET /works`, `GET /works/usage`,
+`POST /works/run`, `POST /works/{id}/result`, `POST /works/{id}/release`, пакет `/recall {event:
+"work"}` (`package`); `ApiError::WorksDisabled` (`/problems/works-disabled`) и
+`ApiError::WorkNotClaimed` (`/problems/work-not-claimed`); `POST /works/model/test` при `enabled =
+false` — тоже `works-disabled`. `/recall`: `Event::Work`, поле `kind`, строка работ дайджеста
+(`works_line`) после строки идей. MCP: событие `work` и `kind` у `memory_recall`, вид `work` у
+`memory_log` (`required` — `["kind"]`, обработчик `work_result` до `EntryKind::parse`), подсвойства
+`data.work`, `data.items`, `data.skip`. CLI `zam work status|next|put|release`. Признак `works`.
+
+**Описания MCP** (тест длины прежний, `chars().count() <= 300`):
+- `memory_log` — 299 → **298**: «Запись журнала: kind changelog|release, insight (data.kind,
+  triggers, scope, certainty), term, task, idea, question (поля data — в схеме); refs.files —
+  файлы. report — отчёт, неизменяем: images [{name, data base64}], большой — zam report. work —
+  итог работы (без title). Дубль insight — 409: force.» (подробности `term`, `question` — в
+  описании `data`; `title` — «обязателен у всех видов, кроме work»);
+- `memory_recall` — 292 → **296**: «Подсказки памяти к событию: session_start — дайджест, prompt
+  — к запросу, post_tool — к ошибке (error, tool); повторы в сессии отсекаются. Пакеты: recovery —
+  после сжатия, brief — под задачу task, idea_review — идеи на разбор (limit), work — внутренняя
+  работа (kind; итог — memory_log kind=work).»;
+- поле `memory_recall.kind` — 84; `memory_log.title` — 35, `data.work` — 54, `data.items` — 92,
+  `data.skip` — 47.
+
+- [решение исполнителя, задача 3] **`works.items` — кандидат целиком** (`n`, ссылка и ревизия,
+  вид, заголовок-исходник, текст вида агента, сигналы), а не только «ссылки и ревизии» §6.3 п. 1:
+  пакет при захвате строится из тех же текстов, что отобрал сборщик, без перечитывания записей
+  своим загрузчиком у каждого вида; текст маскируется сборщиком до обрезки (маска куска ≠ кусок
+  маски), заголовок — исходник (человеку в `GET /works`; маска — в пакете и у токена).
+- [решение исполнителя, задача 3] `cancel_kind(db, kind, reason, mode)` — с фильтром исполнителя
+  (`None` — любые): снятие при смене режима и ночью снимает только работы **не того** исполнителя,
+  а на паузе исполнителя (действующий `off`, причина `paused`) работы модели ждут — иначе снятие
+  паузы сохранением подключения (смена `off → model`) сняло бы отложенные работы. `finish`
+  возвращает `bool`; сверх перечня плана — `get`, `start_model`, `finish_claimed`, `set_items`,
+  `nightly_spaces`, `next_model_queued`, `list`, `last_night`, `queued_agent_counts`,
+  `accepted_refs`, `owner_entries`.
+- [решение исполнителя, задача 3] **Режим агента ночью — одна работа пространства за ночь**
+  (`nightly_spaces`): иначе отказ `skip` той же ночью сразу ставил бы работу снова (§6.3 п. 4 —
+  «снова следующей ночью»); режим модели обходит пространства по кругу до предела 4 пакетов.
+- [решение исполнителя, задача 3] **Первый элемент пакета входит всегда**, даже сверх бюджета:
+  работа без элементов невыполнима; хвост сверх бюджета снимается с работы (`set_items`) и уходит
+  в следующую.
+- [решение исполнителя, задача 3] Повторный пакет той же сессии — та же работа (аренда не
+  продлевается): агент, потерявший пакет, получает его снова.
+- [решение исполнителя, задача 3] **Исход обращения модели**: `blocked` без паузы — `cancelled`
+  (`mode_changed`); пауза, стоп до следующей ночи (`quota`, `limit`, `rate`, `unavailable`),
+  остановка и сбой хранилища (`aborted`) — снова `queued`, запуск вида закончен; находка в
+  постоянном тексте (`secret_in_payload` из `run_payload`) — `failed`, запуск закончен; прочие —
+  `failed`, запуск идёт дальше; JSON не по схеме итога — `failed` (`bad_json`). Работы модели,
+  возвращённые в очередь, выполняет следующий запуск (ночь или ручной) — первыми.
+- [решение исполнителя, задача 3] Пакет и итог — только **явная** сессия (как учёт и отметки
+  M6 §7.1): неявная сессия MCP (R13) работы не захватывает — итог принимает та же сессия, а
+  неявная могла смениться между вызовами.
+- [решение исполнителя, задача 3] Введены `/problems/works-disabled` (`ApiError::WorksDisabled`) и
+  `/problems/work-not-claimed` (`ApiError::WorkNotClaimed`); `POST /works/model/test` при
+  `enabled = false` переведён на `works-disabled` (тест задачи 2 обновлён), при `model_access =
+  "off"` — прежний 409 `code: works_disabled`. `POST /check/run` из `works_disabled_manual_409` —
+  задача 5 (маршрута здесь нет; `ApiError::WorksDisabled` — ей).
+- [решение исполнителя, задача 3] «Первый `session_start` сессии» для строки работ — у сессии нет
+  учёта `session_start` и `recovery` (`session_tokens`); без сессии строка есть. Язык пакета и
+  строки — ru (тексты сервера агенту — русские), константы `_EN` — для протокола и будущего
+  выбора языка.
+- [решение исполнителя, задача 3] Вид `echo` берёт только insight пространства (кроме принятых в
+  той же ревизии и отсеянных `excluded_refs`): тесты предсказуемы, идеи и задачи в пакет не идут.
+- [решение исполнителя, задача 3] `GET /works/usage` доступен и токену (`zam work status`) — без
+  паузы; ручной запуск в аудит не пишется (обращения модели — в журнале отправок и `key_use`).
+- [решение исполнителя, задача 3] `[works] enabled = false` — пакет пуст и работ не снимает
+  (включат — работы продолжатся).
+- [решение исполнителя, задача 3] `works` — в конец `FEATURES` (указание координатора круга 2;
+  план — «перед последним»).
+
+**TDD.** RED — на базе `4c287ef5` (отдельный worktree `.tmp/red` с новыми тестами, общий
+`CARGO_TARGET_DIR`): `--test works` не собирается — 16 ошибок, нет `zam_store::works::{Work,
+NewWork, Origin, WorkItem, WorkMode, WorkState, enqueue, get, list, release, start_model,
+MODE_CHANGED, EXPIRED, LEASE_EXPIRED, SKIPPED}` и `zam_server::works::package`; `--test mcp` —
+`mcp_recall_work_event` (нет события `work` в схеме), `mcp_log_kind_work` (`required` —
+`["kind", "title"]`), `mcp_descriptions_under_300` (нет «work» в описании `memory_log`) FAILED;
+`--test agent_setup` `guide_sections_in_sync` — «раздел работ ru None, en None»; `--test boot`
+`health_features_documented` — нет `works`; `--test works_model` `off_mode_zero_requests` —
+`/problems/conflict` вместо `/problems/works-disabled`; `zam-cli --test work` — оба FAILED
+(`unrecognized subcommand 'work'`). GREEN — `--test works` 25 passed (29 с); `--test mcp` 81,
+`--test agent_setup` 21, `--test boot` 15, `--test recall` 55 (1 ignored), `--test works_model`
+41, `--test works_settings` 7, `--test works_night` 7 — все passed; `zam-server --lib` 356 passed
+(2 ignored), `zam-store --lib` 125 passed (1 ignored), `zam-cli --bin zam` 235 passed (1 ignored),
+`zam-cli --test work` 2 passed; `cargo fmt --all --check` — чисто; clippy `zam-server`, `zam-cli`,
+`zam-store` `--all-targets -D warnings` — чисто (после замены сложного типа в тесте на
+`type Numbered`).
+
+**Круг правок 1** (ревью r1: 0 Critical / 2 Important / 12 Minor; решения координатора: `works` —
+в конце `FEATURES`, `POST /check/run` и `night_checks_all_users_before_works` — задача 4):
+- Important 1 — `memory_log` в `SESSION_ARG_TOOLS` (аргумент `session_id` в схеме — общее
+  описание; длина описания инструмента прежняя, 298), `work_result` переносит его и в тело
+  `/works/{id}/result`: клиент без заголовка захватывает и сдаёт работу одной сессией.
+- Important 2 — приём итога: замок работы (`tokio::sync::Mutex` на работу; ждущий — до 30 с,
+  затем 409 `/problems/conflict` `code: result_in_progress`), под замком работа перечитывается
+  и сверяются ключ и захват; `kinds::accept_item` больше не пишет, а возвращает записи
+  (`zam_store::works::ItemWrite`), их пишет `finish_claimed` в одной транзакции с закрытием
+  (`Closed::{Closed, Replay, NotClaimed}`); у модели результат закрытия не игнорируется (WARN).
+  Повтор с тем же ключом и телом — прежний ответ без повторной записи и без `accept_item`,
+  пока первый идёт — после него; тот же ключ с другим телом — 422 (Minor 4: `request_hash`
+  тела в `result`).
+- Minor 1 — возврат работы модели — 409 `code: model_work` (и возврат — под тем же замком);
+  2 — `on_start`: база пользователя не открылась — WARN, дальше; 3 — тело итога
+  `deny_unknown_fields`, без `items` и `skip` — 400; 5 — строка работ дайджеста — ещё и отметка
+  показа `session_seen` (часть `works_line`, цель — первая работа строки): раз за сессию и у
+  агента только с MCP; 6 — `?user=` у `GET /works` и `/works/usage` (чужой — только
+  администратору); 7 — снимок кандидатов сверяется перед выдачей (`live_refs`: удалённая или
+  исправленная запись не идёт, пустая работа — `cancelled stale`); 8 — на паузе `drop_stale`
+  снимает работы агента; 9 — одна подготовка пакета `queue::prepare` для агента и модели;
+  10 — `excluded_refs`/`accepted_refs` — итоги `done` за 365 суток (`REFS_HORIZON_DAYS`),
+  документ поправлен; 11 — маска итога — `‹secret›` или `‹secret-[^›\s]*›`; 12 — тесты.
+- Тестовый вид `echo` теперь пишет строку `proposals` типа `echo` на принятый элемент (проверка
+  «нет дублей» и «снятая работа ничего не пишет»), текст `zam-test-cancel-during-accept` снимает
+  работу посреди проверки итога.
+- Тесты круга: `works` — `work_result_idempotent` (повтор без второй записи, другое тело — 422),
+  `work_result_parallel_same_key_once`, `work_result_cancelled_writes_nothing`,
+  `work_result_requires_items_or_skip`, `work_release_rest`, `work_package_skips_stale_items`,
+  `paused_night_drops_agent_works`, `?user=` в `work_member_no_works`, подключённая модель в
+  `works_disabled_manual_409`; `mcp` — `mcp_log_kind_work_session_arg`,
+  `mcp_digest_works_line_once`; модульный — `mask_literal_cases` (узкая метка).
+- [решение исполнителя, задача 3, круг 1] Замок работы — в процессе сервера (сервер один на
+  каталог данных), а не флаг в базе: замок держится только на время проверки итога, после
+  падения процесса держать нечего.
+- [решение исполнителя, задача 3, круг 1] Тот же ключ с другим телом — 422
+  `/problems/idempotency-mismatch` (как у записей журнала), а не 409.
+- [решение исполнителя, задача 3, круг 1; в круге 2 заменено штатной остановкой]
+  `boot::first_run_creates_admin_and_token_once` — повторная сборка на том же каталоге ждала
+  ограниченно (до 5 с): шаги старта раннера теперь
+  открывают базы пользователей (`queue::on_start`) с клоном состояния и отпускают его на
+  ближайшем ожидании (`works/night.rs`), а `build` берёт замок каталога синхронно; в прогоне круга
+  тест однажды упал с `DataDirLocked`. То же ждёт `check::on_start` задачи 5.
+
+
+**Круг правок 2** (ревью r2: Approved, 4 Minor):
+- N1 — `excluded_refs`: отклонённые `secret_in_payload` — из итогов `done` **и** `cancelled`
+  (модель ответила `skip` на всю работу, а второй скан элемент уже выбросил), явные `skip`
+  проб — только `done`; `item_results` берёт список состояний. Тест
+  `secret_dropped_stays_excluded_after_skip` (RED на прежнем фильтре: `excluded_refs` пуст).
+- N2 — `boot::first_run_creates_admin_and_token_once`: вместо ожидания до 5 с — `st.shutdown()`
+  перед пересборкой, как у прочих пересборок на том же каталоге (`stop` дожидается шагов старта).
+- N3 — документ `WORKS_LINE_PART`: ревизия не используется (1), важен факт показа.
+- N4 — `GET /works` не отдаёт `result.request_hash` (и `response`); в план задачи 7 вписано:
+  выборки и счёт `proposals` — с условием `type` в SQL (тестовый `echo` пишет строки типа
+  `echo`), записи вида `rules` — вариантом `ItemWrite`.
+
+### M7.3 · Задача 5 — Ночная проверка: прогон, отпечаток и контекст, вердикт, `/check`, `zam check`
+
+Спецификация §6.4 пп. 1, 3–5, §6.5; worktree `.tmp/m73/wt-t5`, ветка `m7.3-t5` от `4c287ef5`
+(задачи 1 и 2 слиты).
+
+**Хранилище**: `zam_store::probes` (`insert_probe` — `Inserted | Duplicate | Full`, предел 500
+активных проб с целью; `active_probes`, `list_probes`, `probe_counts`, `retire_probe`,
+`retire_gone`, `new_probes_since` по `works.origin`, `kind_since`, `sync_negatives`,
+`cache_candidates`), `zam_store::check` (`start_run`, `finish_run` — итог и результаты одной
+транзакцией, `mark_interrupted`, `has_nightly` по `(trigger_kind, night)` кроме `failed`, `runs`,
+`nightly_done`, `get_run`, `results`, `results_of`, `accept_run` — проверка «последний ночной
+прогон эпизода» в транзакции писателя, `gc`). `cache_lookup_with(db, q, touch)` — чтение выжимок без
+`hits`/`last_used_at`.
+
+**Поиск**: `zam_search::eval` — `probe_split`, `split_by_rank` (перенос из xtask, сторож
+`split_by_rank_unchanged`: holdout ТС-1 — 18 сценариев, ТС-2 — 8 сессий, прежние), `overlap`,
+`QueryMetrics`/`score` (перенос из `xtask/src/eval/metrics.rs`), `check_metrics`/`part_metrics`,
+`median`, `percentile` (ближайший ранг).
+
+**Сервер**: `crate::check` (`night`, `run_night`, `run_now`, `start_manual`, `on_start`,
+`ensure_marked`, `digest_line`, `Accounting`, тестовые точки), `check::run` (прогон), `check::verdict`
+(`decide`, JSON вердикта, строки дайджеста), `check::negatives` (набор `eval/check-negative.toml`,
+`NEGATIVES_HASH` закреплён тестом), `api::check` (`/check/*`), варианты `ApiError::CheckRunning
+{run}` и `CheckAcceptNotLatest`, выключатель — `ApiError::WorksDisabled` задачи 3 (слияние с задачей 3:
+прежний `ApiError::Typed` сведён к принятому «вариант на тип»). `search_with(…, Accounting)`,
+`recall_with(…, Accounting)` (обработчик `recall` — обёртка с `Normal`), строка регрессии в дайджесте
+— `Lines.check_line` после строки работ задачи 3 (идеи → работы → регрессия),
+`maintenance::gc_check_runs` (365 суток). `zam check status | report [--json] | run [--no-wait]`.
+xtask: `("works.check", F("memory_check"))` в `KEYS`; `Session::start` — `ZAM_WORKS__CHECK=off` в
+окружение сервера, который знает ключ (проба `run::night_check_known` — раз на процесс и каталог
+бинарника, `bench` — до замеров), у всех видов замера, `sets` прогона прежние (круг правок 1).
+
+- [решение исполнителя, задача 5] **Пометка прерванных прогонов — при первом обращении к базе
+  после старта** (`check::ensure_marked`: статус, списки, ночной и ручной прогон), а `on_start` —
+  без открытия баз. Почему: шаг старта держит клон состояния, и открытие всех баз пользователей в
+  нём держало лок каталога данных после ухода последнего внешнего клона без `shutdown` — падали
+  `boot::first_run_creates_admin_and_token_once` и `revoked_admin_tokens_do_not_issue_new_initial_token`
+  (пересборка сервера на том же каталоге сразу). Наблюдаемо то же: читатель видит `failed
+  (interrupted)`, ночь им не занята. ⚠️ Тот же риск у `queue::on_start` задачи 3
+  (`requeue_model_running` по всем базам).
+- [решение исполнителя, задача 5] Тип части `Split` — в `zam_core::split` (реэкспорт в
+  `zam_search::eval` и `zam_store::probes`): `NewProbe.split` без перевода между двумя одинаковыми
+  перечислениями и без ребра `zam-store → zam-search`.
+- [решение исполнителя, задача 5] База без проб с целью ночью не проверяется (посторонние вопросы
+  без своих записей ничего не меряют); ручной прогон идёт и без них.
+- [решение исполнителя, задача 5] Все критерии регрессии — по части `test` (шапка §6.5 п. 5), в том
+  числе потеря устойчивых; `few` — меньше 20 **общих** проб `test`; посторонние вопросы —
+  по всем частям, общие для прогона и базы; у постороннего вопроса поиск не идёт (метрика — только
+  подсказки), `prompt_rank` в `check_results` — число показанных подсказок.
+- [решение исполнителя, задача 5] Цель пробы из кэша — до 5 источников: проба снимается, когда не
+  осталось ни одной живой цели; «найдена» — если найдена любая цель.
+- [решение исполнителя, задача 5] Ручной прогон эпизода не начинает (в базу он не входит), но
+  показывает идущий; строку дайджеста держит последний **ночной** прогон.
+- [решение исполнителя, задача 5] Отпечаток без загруженной модели (и устройства) берёт их **и
+  реранкер** (круг правок 1, Important 1) из прошлого прогона: деградация не выглядит сменой
+  модели или реранкера (`changed`; на CUDA-сервере реранкер «без устройства» — CPU), иначе переход
+  «с векторами → без» никогда не дал бы регрессию.
+- [решение исполнителя, задача 5] Разница в п. п. для порогов округляется до десятой (0,92 − 1,0 =
+  −7,999… — это −8): граница −8 п. п. срабатывает ровно.
+- [решение исполнителя, задача 5] Первый `session_start` сессии — источник хука не `compact`,
+  `resume`, `clear` (сессия та же); у явного вызова без `source` — тоже первый.
+- [решение исполнителя, задача 5] Флаг `backup_overlap` — у прогона, во время которого копия шла
+  хоть раз между пробами (ночной прогон её дожидается до начала, у ручного она может идти и с
+  начала).
+- [решение исполнителя, задача 5] `FEATURES` — строка `memory_check` в конце массива (указание
+  координатора к кругу 2; правило «перед последним» Global Constraints — под ним).
+- [решение исполнителя, задача 5] `web/e2e/global-setup.ts` (`ZAM_WORKS__CHECK=off`) не тронут —
+  файл задачи 8 (решение 67); `smoke` и `code_bench` (свой запуск сервера, не сессия замера)
+  ключ не шлют.
+
+**Замер** (машина разработки, Windows, CPU, HDD; MiniLM int8, внешний Qdrant теста;
+`check_timing_100_probes`, `--ignored`, отладочная сборка): ручной прогон 100 проб и 30
+посторонних вопросов (без решения) — **11,0 с**, ≈ 85 мс на запрос с паузой 25 мс; основной поиск
+p50 23 мс, p95 36 мс; подсказки к запросу p50 30 мс, p95 46 мс; `hit_search` 1,0. Предел
+`check_max_min = 30` при таком темпе — около 21 000 запросов. Замер на рабочем сервере (CPU, HDD,
+релизная сборка) — задача 9.
+
+TDD: RED — `negatives_hash_pinned` (пустой отпечаток), `check_thresholds` (−7,999 п. п.), сторож
+`split_by_rank_unchanged` (пустые списки holdout), `boot::health_features_documented`
+(`memory_check` без строки `api-compat`), `boot::first_run_creates_admin_and_token_once` и
+`revoked_admin_tokens_do_not_issue_new_initial_token` (лок каталога при пометке в `on_start`),
+`check_run` — 7 FAILED (ревизия узла, токен после перезапуска), `ml::check_regression_on_index_damage`
+(общие слова вопроса и заметки — цель находил FTS); GREEN — в отчёте задачи.
+
+**Круг правок 1** (ревью r1: 2 Important, 8 Minor; решения координатора по ⚠️ — ленивая пометка
+прерванных, толкование «по `test`» и `Split` в `zam_core` приняты, спецификация §6.1 п. 5, §6.5
+пп. 1, 5 и план — под факт кода):
+- отпечаток без эмбеддера — реранкер тоже из прошлого прогона (`check::run::fingerprint_of`,
+  тест `check_degraded_on_cuda_keeps_fingerprint`: прошлые прогоны на `cuda:0` → вердикт
+  `regression` с флагом `degraded` и строкой дайджеста); тест `changed` без модели — по режиму
+  Qdrant, смена реранкера — модульный тест;
+- xtask: `works.check = off` — в окружение сервера в `Session::start` (без перезапуска после
+  `start_preloaded`: `loaded_at`, `area_probes`, индексация `--preload` прежние), у всех видов
+  замера; `sets` и отчёты прежние;
+- [решение исполнителя, круг правок 1; принято координатором — спецификация §12 п. 79] строка
+  дайджеста эпизода после обновления — с версией и без флага («Ночная проверка памяти: ухудшение
+  поиска после обновления до <версия> — zam check report»): с версией и флагом выходило до 42 токенов bge-m3; флаги — в отчёте; тексты флагов
+  короче («посторонние: +N п. п.», «p95: N мс, медиана M мс»); сторож — точный счётчик bge-m3 на
+  крайних числах, ru/en;
+- пробы из кэша — обход всех действующих выжимок с пропуском опробованных (не 160 новейших);
+  `GET /check/runs/{id}` — пробы по id результатов; `zam check run` — не дольше 2 мин ждёт
+  появления прогона (404), затем код 1 с подсказкой; `zam check status` — счётчики словами;
+  `run_night` — под `test-hooks`; один помощник ожидания в `nightly_for`; общие помощники тестов
+  — `tests/common/check.rs`.
+
+**Ревью r2** (Approved; три Minor до слияния): каталог пробы xtask — `caps-probe-<pid>`,
+удаляется после пробы; `context`, `fp_hash`, `FpInputs`, `fingerprint_of` — `pub(crate)`, тестам —
+`check::test_hooks::{context, fp_hash}`; протокол `zam guide` (ru/en) называет вариант строки
+«после обновления до <версия>»; спецификация §6.1 п. 5 — перенос строк.
+
+### M7.3 · Задача 4 — Вид работы `probes`
+
+Спецификация §6.4 п. 2; worktree `.tmp/m73/wt-t4`, ветка `m7.3-t4` от `m7.3-internal` `7ffd7c61`
+(задачи 1, 2, 3, 5 слиты); круг 3 вместе с задачей 7.
+
+**Хранилище** (`zam_store::probes`): `ProbeSource` и `probe_sources` (insight без замещённых и
+отозванных, термины, заметки пространства; все ревизии — владельца базы, `NULL` — владельца; без
+исключённых из индекса и без записей с активной пробой), `SourceText` и `source_text` (заголовок —
+`title`, у заметки — путь; текст — тело, у термина — определение и тело, у заметки — без
+frontmatter), `question_taken`, `active_targeted`; `insert_tx` и `new_since_tx` — для транзакции
+закрытия работы. `zam_store::works::ItemWrite::Probe {probe, since, cap}` и ветка `apply_write`:
+предел новых проб постановки работы и повтор вопроса сверяются ещё раз в транзакции.
+
+**Сервер** (`works::probes`): `PROBES_PER_NIGHT = 40`, `PROBES_PER_DAY_MANUAL = 40`, `PROBE_WORDS =
+8..=25`, `PROBE_MAX_CHARS = 300`, `OVERLAP_MAX = 0.5`, `LONG_RECORD_CHARS = 2000`, `SCHEMA`,
+`INSTRUCTION_RU`/`_EN`; `current_night`, `order` (по кругу слоёв, внутри слоя `blake3("probes" ‖
+ночь ‖ id)`), `collect`/`collect_on`, `check_question`, `quota`, `room`, `accept`. Диспетчер
+`works::kinds`: ветка `Probes` во всех `match`, `space_kinds(Probes)` — решения, Knowledge и Rules,
+`accept_item(…, prior)`, `repeats`, `room`. Общая проверка итога `queue::accept`: элемент — `n`
+или `target`; постановка агента и модели — не больше остатка `kinds::room`.
+
+- [решение исполнителя, задача 4] **Элемент итога — номер `n` или ссылка `target`** (общая
+  проверка): схема вида из плана — по `target`, номер по-прежнему принимается (модель отвечает по
+  номерам `<record>`); оба есть и не совпали — отказ. Повтор номера — только у вида с несколькими
+  элементами на запись (`kinds::repeats`: у `probes` — вторая проба длинной записи).
+- [решение исполнителя, задача 4] `accept_item` получил `prior: &[ItemWrite]` — записи принятых
+  раньше элементов того же итога (повтор вопроса внутри итога, проб на запись, пределы). Ветке
+  `Rules` задачи 7 при слиянии — тот же параметр.
+- [решение исполнителя, задача 4] **Ночь порядка сборщика** — дата последнего слота `[works]
+  at`/`tz` не позже «сейчас» (`current_night`), а не дата ночи плана: сигнатура `kinds::collect`
+  без даты — контракт задачи 3 и параллельной задачи 7; ночью они совпадают, днём (ручной
+  запуск) — прошедшая ночь. Ночной предел проб считается с той же точки: итог работы агента,
+  пришедший после следующего слота, — в предел текущей ночи.
+- [решение исполнителя, задача 4] Слои — `insight:<data.kind>` (без вида — `insight`), `note`,
+  `term`, порядок слоёв — по имени; работа — одно пространство, поэтому в Rules слой один
+  (заметки). Заголовок заметки для `overlap` — путь (как карточка прогона проверки).
+- [решение исполнителя, задача 4] Сигнал `вопросов: 2` — только у записи длиннее 2000 символов
+  (длина — текста записи до маски и обрезки); исключённые из индекса (их поиск не находит) и
+  пустые записи не берутся.
+- [решение исполнителя, задача 4] **Постановка — не больше остатка предела** (`kinds::room`, у
+  `probes` — меньшее из остатков новых проб постановки и активных): пакеты сверх предела не
+  ставятся, на исчерпанном пределе запуск вида кончен — модель не тратит токены на отказы
+  (`probes_limits_per_user`: 2 обращения, 25 + 15). Итог при этом проверяет предел сам (работы
+  агента одной ночи ставятся до итогов).
+- [решение исполнителя, задача 4] Проба, не прошедшая повторной сверки в транзакции закрытия
+  (гонка итогов разных работ), не пишется (WARN), в ответе элемент остаётся принятым; сбой
+  хранилища при проверке элемента — отказ «временный сбой хранилища — повторите итог позже».
+- [решение исполнителя, задача 4] Помощники тестов `works.rs`, `mcp.rs` (`queued_work`) и
+  `zam-cli/tests/work.rs` ставят `probes` и `rules` в `off`: тесты — на виде `echo`, настоящий
+  сборщик `probes` ставил бы свои работы (оба вида — чтобы совпасть с правкой задачи 7).
+- [решение исполнителя, задача 4] Ручной запуск при исчерпанном пределе проб — прежний ответ
+  `POST /works/run` (агент — 200 с пустой `queued`, модель — 202 без работ): `manual_limit` — по
+  пакетам.
+- По указанию координатора — `night_checks_all_users_before_works` (два пользователя в режиме
+  `model`, ночь тиком раннера после перезапуска: `finished_at` обоих ночных прогонов раньше
+  `created_at` первой работы) и `works_disabled_manual_409` с `POST /check/run` (человек и токен).
+
+TDD: RED — `works_probes` 10 FAILED по ожидаемой причине (пакет «Внутренних работ нет.», итог
+«вид ещё не принимает итог», сборщик Rules пуст, ночь без работ); GREEN — 10 passed. Покрывающие
+наборы (`ZAM_REQUIRE_ML=1`, модели `.tmp/ci-models`, ORT и Qdrant — копия в `target/deps`
+worktree): `zam-server --lib` 377 (+3 модульных `works::probes`), `works` 32, `works_probes` 10,
+`check_run` 27 (с ML), `check_probes` 7, `works_model` 41, `works_night` 7, `works_settings` 7,
+`mcp` 83, `agent_setup` 21; `zam-store --lib` 127; `zam-cli --test work` 2; clippy `zam-store`,
+`zam-server`, `zam-cli` `--all-targets -D warnings` и `cargo fmt --all --check` — чисто.
+
+**Круг правок 1** (ревью r1: 1 Important, 8 Minor, 3 ⚠️; решение координатора по I1):
+- I1 — **отправленное этой ночью — той же ночью снова не предлагается**:
+  `zam_store::works::offered_refs(db, kind, origin, night, since)` — пары `(ref, rev)` из `items`
+  работ вида этой ночи (`origin = nightly`, `night`), у ручного запуска — `manual` с начала суток
+  UTC; любое состояние работы; из базы (перезапуск отсев не снимает). `kinds::collect` получил
+  параметр `exclude` (отсев до `limit`; ветке `Rules` задачи 7 — тот же параметр), вызовы —
+  `run_model` и `agent_batch`; тестовый вид `echo` отсев соблюдает — в `works.rs` у
+  `manual_limits_separate_from_night` четыре записи (по одной на пакет), у
+  `secret_dropped_stays_excluded_after_skip` подставная работа — прошлой ночи. Тест
+  `probes_offered_not_reoffered_same_night`: модель молчит — вторая постановка той же ночи без
+  обращений; отказ «пересказ заголовка» — то же; другой ночью — все снова кандидаты.
+- M1 — сборщик `probes` не держит принятые элементы (`accepted_refs`): запись с активной пробой и
+  так не источник, а запись, чья проба не записалась при сверке в транзакции, возвращается.
+- M2 — порядок слоёв в круге — `blake3("probes" ‖ ночь ‖ "layer:" ‖ слой)` (тест
+  `probes_layer_round_start_varies`: предел 3 при 4 слоях — за 12 ночей каждый слой в выборке).
+- M3 — `agent_batch` вычитает кандидатов, поставленных в этом проходе (25 + 15 вместо 25 + 25).
+- M4 — причина сбоя хранилища при проверке: «запись вернётся в одну из следующих работ»
+  (`REASON_STORE`).
+- M5 — заголовок заметки — «первый H1 (путь)» (тест `probes_note_title_includes_heading`).
+- M6 — отказ по `target` не из пакета — с присланной ссылкой; описание `items` у MCP
+  `memory_log` — `[{n | target, …}]`.
+- M7 — границы проверки: 25 слов и 300 символов приняты, `‹secret-1›`, путь Windows, `www.`.
+- M8 — буква ссылки — `EntryKind::ref_letter`.
+- ⚠️ кириллица — `probes_overlap_cyrillic_boundary` (ровно 0,5 — 4 из 8 со словоформами,
+  регистром и `ё`/`е` — принят, 5 из 9 — отказ). ⚠️ гонка записи — у `probes` уникального ключа
+  нет (схема 0027 полна), повтор и пределы сверяет код внутри транзакции единственного писателя
+  базы (`Db::write`, `IMMEDIATE`); тесты `probes_write_rechecks_in_transaction` (тот же вопрос,
+  записанный другим путём до закрытия, — не дублируется; предел исчерпан к закрытию — не
+  пишется) и `probes_parallel_results_once` (параллельный повтор с тем же `Idempotency-Key` — одна
+  запись; параллельные итоги двух работ у предела — ровно 40).
+- TDD круга: новые и изменённые тесты на временно испорченном коде (без отсева, без вычета,
+  слои по имени, `accepted_refs`, заголовок — путь, отказ без ссылки) — 6 FAILED, каждый по своей
+  порче; на исправленном — зелёные.
+
+**Круг правок 2** (ревью r2 — Approved; Minor N1–N5 до слияния; решение координатора по I1 —
+в спецификацию):
+- Спецификация: §6.4 п. 2 — правило «отправленное этой ночью при любом исходе той же ночью не
+  предлагается (ручной запуск — с начала суток UTC), следующей ночью — снова кандидат»; §12 —
+  решение 80 с ценой (оборванный ответ модели ждёт сутки).
+- N2 — «отправлено этой ночью» включает работы с обращением к модели этого запуска
+  (`work_calls.run = night:<дата>`): работа прошлой ночи, возвращённая в очередь и выполненная
+  сейчас, той же ночью второго пакета не даёт (`offered_refs(…, run)`; тест
+  `probes_requeued_last_night_counts_as_offered`: было 2 обращения — стало 1). Следствие для
+  `works.rs::secret_dropped_stays_excluded_after_skip`: подставная работа выполняется этой ночью
+  и её записи «отправлены этой ночью» — следующая постановка проверяется сборщиком без отсева ночи
+  (чистая запись — кандидат, запись с ключом — нет), повтор ночи — без обращений.
+- N4 — H1 заметки — разбором `zam_markdown::parse` (заголовки и `body_start` вместо ручного
+  разбора frontmatter и строк): строка кода с отступом — не заголовок, setext — заголовок (тест
+  `probes_note_title_includes_heading`, RED: заголовком бралась строка кода).
+- N1 — ТЗ §18.3: `overlap` у заметки — к первому H1 и пути. N3 — комментарий теста гонки (37 + 2 =
+  39). N5 — `manual_limits_separate_from_night`: цели четырёх ночных и четырёх ручных работ
+  различны (ручная ветка отсева).
+
+### M7.3 · Задача 7 — Кандидаты в Rules
+
+Спецификация §6.7 пп. 1–5 (WebUI — задача 8); worktree `.tmp/m73/wt-t7`, ветка `m7.3-t7` от
+`7ffd7c61` (задачи 1, 2, 3, 5 слиты), параллельно с задачей 4.
+
+**Хранилище**: `zam_store::proposals` — `Proposal`, `NewProposal`, `insert` (`Inserted | Existing
+| Full`: сначала повтор по `dedup_key` в любом статусе, затем предел `PROPOSALS_OPEN_MAX = 50`
+открытых), `get` (неизвестный тип — WARN, `None`), `list(ListFilter)` и `counts` — с `type = ?` в
+SQL (строки `echo` задачи 3 и будущей уборки не задевают), `decide(Decision {to, by, note,
+result_ref})` → `Done | NotOpen`, `existing_keys`; ключи `key_source` (предложение из работы — по
+ссылке источника), `key_source_rev` (`skipped`), `key_text` (спонтанный: путь и текст).
+`ItemWrite::Rule` и `ItemWrite::RuleSkip` — ветки `apply_write` (одна транзакция с закрытием
+работы). `zam_markdown::has_code_block` — обход AST comrak (`NodeValue::CodeBlock`).
+
+**Сервер**: `works::rules` — проверка `check_candidate` (одна для спонтанного кандидата и
+элемента работы агента и модели: путь `rule_path` по `zam_core::space::split_space`, текст
+`check_text` — 200 токенов счётчика выдачи, маска, URL, блок кода; довод 20..=2000; свободный путь;
+почти-дубль — нормализованный заголовок и, при векторном канале, `nearest_dense` по Rules
+владельца с `insights.dedup_threshold`), сборщик `collect`, инструкция ru/en и схема, `accept`,
+`skip`, контекст пакета `context`, оценка `rules_tokens`, `origin_message`, `has_shell`;
+`api::proposals` (`/proposals*`), `ApiError::ProposalsFull` (409 `/problems/proposals-full`),
+`scope::RULES_WRITE_DENIED` (403 записи в Rules с подсказкой `candidate`), MCP `memory_write` —
+поле `candidate` → `POST /proposals` (описание переписано плотнее: 252 → 272 символа из 300),
+`FEATURES` — `proposals` в конце (указание координатора), `nodes::write::create_note_in` —
+создание заметки WebUI вынесено для принятия кандидата. CLI `zam rules candidate | candidates`.
+
+- [решение исполнителя, задача 7] **Контекст пакета — запись `<record n="0" ref="rules"
+  kind="rules">`** с действующими заметками Rules (путь и L0, до 50): построитель пакета один
+  (`queue::prepare` берёт `kinds::context`), запись идёт в пользовательское сообщение модели как
+  элемент — второй скан её проверяет и при находке выбрасывает (в инструкции — работа целиком
+  отказала бы); `n = 0` всегда входит в бюджет и не занимает правило «первый элемент — всегда»;
+  итога для неё нет (элемента `n = 0` в работе нет); только контекст без элементов — запроса к
+  модели нет (`exec::run_payload`).
+- [решение исполнителя, задача 7] **Отказ `{n, skip}` у вида `rules` — строка `skipped`**:
+  `kinds::skip_writes` из общей проверки итога (`queue::accept`), запись — той же транзакцией;
+  у прочих видов отказ — только в `result.skip`.
+- [решение исполнителя, задача 7] `title` элемента работы — заголовком `# …` в тексте, если своего
+  заголовка нет (payload — `{path, content}`, §6.7 п. 1); заголовок для почти-дубля — первый
+  заголовок текста, иначе имя заметки (последний сегмент пути).
+- [решение исполнителя, задача 7] Любая строка с тем же `dedup_key` — повтор, в каком бы статусе
+  она ни была: отклонённый спонтанный текст тем же путём — прежнее `o:` со статусом `declined`;
+  отозванный (`withdrawn`) источник работы — как отклонённый, больше не предлагается.
+- [решение исполнителя, задача 7] Предел 50 — и у сборщика: кандидатов не больше свободных мест;
+  в гонке со спонтанными кандидатами запись сверх предела в транзакции закрытия не делается (WARN),
+  итог работы при этом показывает элемент принятым.
+- [решение исполнителя, задача 7] Принятие человеком проверяет только путь (допустимый и
+  свободный) и маску секрета: адрес и пример кода человек вправе дописать (решение 58); пустой
+  текст — 422. Принятия — по одному (замок процесса): заметка и решение — два шага.
+- [решение исполнителя, задача 7] `author=me` — предложения агентов пользователя запроса (то же,
+  что `agent`): база личная, автор-агент — любой токен пользователя (так же отзыв `withdraw`);
+  спонтанный кандидат без сессии — автор не указан.
+- [решение исполнителя, задача 7] Источники — Knowledge, затем решения базы по id, записи старые
+  первыми; `opened` и `useful` — только у `gotcha | pattern` (у аксиом-решений — сигнал
+  `certainty: axiom`); `decision` с `certainty = axiom` — без порога сигналов.
+- [решение исполнителя, задача 7] Карточка получает `shell` (пометка команд shell) и `sources`
+  (ссылки с заголовками) — одно определение на сервере для WebUI задачи 8; `rules_tokens` —
+  оценка строк правил дайджеста (путь, ссылка, L1 по `rule_l1`) по всем заметкам Rules.
+- [решение исполнителя, задача 7] `boot::revoked_admin_tokens_do_not_issue_new_initial_token` —
+  штатная остановка (`st.shutdown()`) перед пересборкой на том же каталоге, как правка N2 задачи 3
+  у `first_run_creates_admin_and_token_once`: шаг старта раннера держит клон состояния (лок
+  каталога) — без остановки тест падал в 2 прогонах из 3 (гонка с задачи 3), после — 4 из 4 ok.
+
+**Линия отсечения** (решение 54): ночной вид отделим — ветки `Rules` в `kinds.rs` (сборщик,
+проверка элемента, `skip_writes`, `context`), `works::rules::{collect, context, accept, skip}`,
+`ItemWrite::{Rule, RuleSkip}`, запись `n="0"` в `queue::prepare`/`package`/`exec`; спонтанный
+кандидат, хранилище, REST, CLI и решение человека от них не зависят (общая — только
+`check_candidate`).
+
+TDD: RED — `has_code_block_cases` (заглушка `false`), `proposals_rules` — 19 FAILED на сборке до
+сервера (404 маршрутов, 403 без подсказки, нет работ `rules`, нет раздела протокола); GREEN —
+`proposals_rules` 19/19, `zam-server --lib` 380, `mcp` 84, `boot` 15, `works` 32, `works_model`
+41, `works_night` 7, `agent_setup` 21, `nodes` 20, `zam-markdown` и `zam-store --lib`, `zam-cli`
+(`--bin zam` 237, `--test rules` 2); clippy `-D warnings` и `fmt --check` — чисто.
+
+**Круг правок 1** (ревью r1: 3 Important, 8 Minor; Minor 7 и ⚠️ 1 — не делать: `proposals` в
+хвосте `FEATURES` — по указанию координатора, как `works` и `memory_check`). Решения исполнителя
+выше о заголовке почти-дубля, повторе отозванного и пределе при закрытии — заменены:
+- сборщик: ловушки и приёмы (`gotcha | pattern`) — **только из Knowledge**, аксиомы-решения — из
+  Knowledge и решений (§6.7 п. 3; `works::rules::source_kind`); тест `rules_work_sources_and_skip`
+  — ловушка решения с сигналами не берётся, аксиома решения берётся;
+- `sources` карточки: токену заметки пространств, которых он не читает (Human), и скрытые записи
+  (`hidden_entry`: отчёт) — как несуществующие (`{ref, rev, live: false}`), тест
+  `proposals_sources_hidden_for_token`;
+- почти-дубль по векторам — тест с моделью `rules_near_duplicate_by_vector` (MiniLM int8, свой
+  Qdrant теста): тот же смысл под другим заголовком и путём — 409 `reason: vector`, балл ≥ 0,90;
+  правило на ту же тему (CRLF у `.bat`) — 201; порог insight для правил подошёл, своего не нужно;
+- Minor 1: замок решений `DECIDING` — у принятия, отклонения и отзыва;
+- Minor 2: заголовок почти-дубля — только явный (`# …`), имя заметки не сравнивается; текст —
+  «похоже на заметку Rules (…): проверьте, нет ли там этого правила, или предложите другое»;
+- Minor 3: сбой хранилища при проверке — `RuleError::Store` → 500 у REST, у элемента работы —
+  «повторите позже»;
+- Minor 4: контекст `n="0"` — до 50 заметок, путь целиком, L0 до 160 символов (маска до обрезки),
+  без обрезки записи до 1500 символов; тест `rules_context_lists_50_notes`;
+- Minor 5: `withdrawn` повтором не считается (`insert_tx`, `existing_keys`): отзыв — не отказ
+  человека; сборщик `rules` не берёт `accepted_refs` (отсев принятых — строками `proposals`);
+  тесты `withdraw_by_author` (тот же текст — новое `o:`), `withdrawn_source_back_as_candidate`;
+- Minor 6: элемент без места или с предложением у источника — отказ с причиной при проверке;
+  гонка с закрытием — `apply_write` отдаёт предупреждение, `Closed::Closed { warnings }`,
+  `warnings` в итоге работы и его копии для повтора (REST, MCP, `zam work put`); тест
+  `rules_item_full_or_existing_reported`;
+- Minor 8: `has_code_block` — и HTML-блок с `<pre>`/`<code>` (HTML внутри абзаца — нет).
+
+TDD круга: RED — `has_code_block_cases` (`<pre>`), `proposals_rules` — 7 FAILED по ожидаемым
+причинам (ловушка решения в пакете, `sources` с заголовком Human, контекст обрезан, элемент
+«принят» при 50 открытых, «почти-дубль» `git/style`/`rust/style` и прежний текст, отозванное —
+прежнее `o:`, источник не возвращается); `rules_near_duplicate_by_vector` — зелёный и на прежнем
+коде (покрытие существующей ветки). GREEN — отчёт задачи, «Круг правок 1».
+
+**Круг правок 2** (ревью r2: Approved, три Minor):
+- контекст `n="0"` — в пределе `min(budget_tokens / 4, 1500)` токенов всей записи
+  (`CONTEXT_BUDGET_SHARE`, `CONTEXT_MAX_TOKENS`): пути — пока помещаются, хвост — «ещё заметок
+  Rules: N», затем L0 — пока помещаются; бюджет передаётся `kinds::context` из `queue::prepare`.
+  RED: `rules_context_fits_small_budget` — 1378 токенов контекста при `budget_tokens = 800`;
+- [решение исполнителя, задача 7, круг 2] почти-дубль по векторам ловит почти-копию, а не
+  пересказ: на MiniLM int8 (модель тестов) у копии под другим заголовком dense-косинус 0,933, у
+  пересказа другими словами — 0,734 при пороге insight 0,90; порог правил не снижен (соседняя
+  тема — ниже пересказа, снижение до пересказа дало бы ложные отказы законным правилам), пересказ
+  оценивает человек при принятии; тест `rules_near_duplicate_by_vector` закрепляет фактическое
+  поведение (пересказ — 201, балл ниже порога);
+- ветка «у источника уже есть предложение» — тест `rules_item_existing_source_reported`: отказ
+  при проверке с причиной и `warnings` с `o:<id>` при закрытии работы (покрытие кода круга 1).
+
+### M7.3 · Задача 6 — «Открыл ли агент подсказку» и «Шумные»: сервер и CLI
+
+Спецификация §6.6 пп. 1–4 (WebUI — задача 8, решение 91); worktree `.tmp/m73/wt-t6`, ветка
+`m7.3-t6` от `c6188ae6` (задачи 1–5 и 7 слиты), параллельно с задачей 10a.
+
+**Хранилище**: `UsageCounts.opened` — `usage_counts` и `usage_counts_many` считают открытия тем же
+чтением (`usage_opened_target`; общий `opened_many_in` с `opened_counts_many`);
+`UsageSource::parse`; `open_source(db, session, target)` — `source` последнего `recall_shown` этой
+сессии (`usage_target`) и «уже открыто» одним чтением (повтор не берёт запись базы);
+`noisy_ids(db, since)` — `shown ≥ NOISY_MIN_SHOWN (10)`, ни одного `useful` и открытия с `since`
+(`GROUP BY … HAVING` по `usage_target`, `NOT EXISTS` по `usage_opened_target`), `NOISY_WINDOW_DAYS
+= 30`; `sessions::hint_shown(db, session, epoch, targets)` — показ подсказкой (`RECALL_PART`)
+**в эпоху** (через `seen_revs`; `seen_entry_ids` эпох не различает). Схема — 0027 задачи 1.
+
+**Сервер**: `api::opened` — `record(p, s, targets)` (токен и явная сессия с текущей эпохой →
+`hint_shown` в базе сессии → `open_source` и `record_opened` в базе цели) и `record_get` для
+`GET /entries/{id}`, `GET /nodes/{id}`, `GET /nodes/by-path` (`seen_session` по `X-Zam-Session`).
+`/read` — после отметки выданного, по элементам `Text`, `Budget`, `Unchanged`; поле `Fetched`
+`stale_key` → `target_key` (не забирается `fill_stale_refs`: нужно и открытию). Лента `noisy`
+(`parse_flag`) — `only_ids` из `noisy_ids` с `max(now − 30 сут, usage_opened_since)` и поле
+`opened_since`; `FEATURES` — `usage_opened` в конце (указание координатора, как `works`,
+`memory_check`, `proposals`). CLI `zam insight show` — `usage_line`.
+
+- [решение исполнителя, задача 6] **`/read` — открытие и у `unchanged` (`if_rev`) и у элемента,
+  не влезшего в бюджет**: агент запросил цель после подсказки — это и есть отклик на неё; ошибка
+  элемента (нет, доступ, неверная секция) — не открытие. У `GET` — только успешный ответ.
+- [решение исполнителя, задача 6] **`source` — событие последнего показа этой сессии из `usage`**
+  базы цели: у `session_seen` события нет, а `usage` пишется тем же `record` `/recall` (подмножество
+  целей `session_seen` — в `usage`). Показа в `usage` нет (сбой учёта показа) — открытие не
+  пишется: «открыто» без «показано» исказило бы счётчики.
+- [решение исполнителя, задача 6] **Служебные `GET` MCP — не открытие**: `memory_write` ищет id
+  заметки `GET /nodes/by-path` (расширение `McpOrigin`); чтение агентом через MCP —
+  `memory_read` → `POST /read`, оно считается (с явной сессией `zam mcp` или аргументом
+  `session_id`). `GET` CLI в сессии агента (`zam insight show`, `zam read` с `ZAM_SESSION` или
+  сессией хуков) — открытие.
+- [решение исполнителя, задача 6] **Некорректный `X-Zam-Session` у `GET /entries/{id}` и
+  `GET /nodes/*` — не 400**: раньше эти маршруты заголовок не читали, ответ не меняется (DEBUG);
+  у `/read` — 400, как и было.
+- [решение исполнителя, задача 6] **Открытие в `GET /entries/{id}` пишется до счётчиков**: ответ
+  того же чтения уже показывает `opened` с этой сессией.
+- [решение исполнителя, задача 6] **`noisy` — 422 без `kind=insight` и с `deleted=only`**, значение
+  — флагом (`1 | 0 | true | false`, иначе 400), как `from_idea` и `top_level`; сервер без признака
+  параметр молча пропускает (у `ListQuery` нет `deny_unknown_fields`) — клиент шлёт его только с
+  признаком (строка `docs/api-compat.md`).
+- [решение координатора, круг правок 1 задачи 6; заменяет решение исполнителя 6] **Окно «шумных»
+  — у показов и открытий, оценка `useful` — за всё время**: любая «полезно», в том числе до
+  выпуска и старше 30 суток, запись исключает (у «шумной» записи в карточке всегда `useful = 0`);
+  §6.6 п. 3 и цена решения 68 уточнены в спецификации.
+- [решение исполнителя, задача 6] **Строка руководства** (§6.6 п. 4) — `deploy/README-install.md`,
+  «Работа с заметками из CLI», абзац «Польза подсказок»; протокол `zam guide` не меняется: агенту
+  новое поведение не нужно (открытие — побочный учёт чтения).
+
+**Бюджеты и совместимость**: хуки, `/recall`, блок v8, MCP (11 инструментов, описания) не
+тронуты; новые поля — `usage.opened` и `opened_since` (только с `noisy=1`); старый `zam` с новым
+сервером — `usage` с лишним полем (печать прежняя, `--json` — как есть); новый `zam` со старым
+сервером — прежняя строка (тест `insight_show_opened`). Ночная проверка не читает `/read`,
+`/entries`, `/nodes` — `check_run_leaves_no_traces` (сверяет и `usage_opened`) зелёный.
+
+TDD: RED — `usage_opened` 5 FAILED из 7 (`opened_after_hint_read`, `opened_once_per_session`,
+`not_opened_other_epoch` — строк нет; `usage_opened_in_entry_json` — `usage` без `opened`;
+`noisy_window_from_migration` — `noisy` пропущен, лента целиком), `not_opened_webui` и
+`not_opened_without_hint` на прежнем коде зелёные (защищают от лишней записи);
+`boot::health_features_documented` — таблица против `FEATURES`; CLI `insight_show_opened` и
+`insight_feedback_counts` (ожидание с `opened`) — прежняя строка «показы · полезно · бесполезно».
+GREEN (`ZAM_REQUIRE_ML=1`, до круга правок) — `usage_opened` 7/7, `boot` 15,
+`zam-server --lib` 385, `recall` 55,
+`read_batch` 13, `read_focus` 20, `read_since_rev` 7, `read_attachments` 9, `journals` 20, `nodes`
+20, `insights` 19, `sessions` 17 (ожидание `usage` с `opened`), `session_tokens` 6, `check_run` 27
+(в том числе `check_run_leaves_no_traces`), `mcp` 84, `proposals_rules` 26, `tasks` 24,
+`reports_invisible` 17, `secrets` 44; `zam-store` `--lib` 129, `sessions` 19, `user_db` 11 (в том
+числе `usage_target_index_kept`); `zam-cli` `--bin zam` 237, `--test insights` 16; clippy
+`zam-store`, `zam-server`, `zam-cli` `--all-targets -D warnings` и `fmt --all --check` — чисто.
+
+**Круг правок 1** (ревью r1: ✅ с ⚠️ 2, Needs fixes — 1 Important, 4 Minor):
+- Important 1 (решение координатора): `noisy_ids` — `useful` за всё время (`NOT EXISTS` по
+  `usage_target`), показы и открытия — по окну. Тест `noisy_window_from_migration`: запись с
+  оценкой до начала учёта и 12 показами в окне и запись с оценкой старше 30 суток — не «шумные»;
+  открытие старше окна запись не защищает (`opened: 1` в карточке «шумной»). ТЗ §10.5 (строки
+  «шумные» согласованы), `docs/api-compat.md`, CHANGELOG, спецификация §6.6 п. 3 и цена решения
+  68 — в этом worktree.
+- Minor 1: окно `usage` — по `rowid` без миграции: `NOISY_LO_SQL` (`id` последней строки старше
+  начала окна — обход с конца) и `id > lo` в `NOISY_SQL` с `+target_kind` (иначе планировщик уходит
+  в `usage_target` и обходит все показы записей); точная проверка `ts` осталась. Модульный тест
+  `usage::tests::noisy_window_by_rowid` — `EXPLAIN QUERY PLAN`: `SEARCH u USING INTEGER PRIMARY KEY
+  (rowid>?)`, граница — `SCAN usage` без B-дерева, `useful` и открытия — по своим индексам. Строки
+  теста ленты пишутся по порядку времени, как у сервера.
+- Minor 2: служебные чтения `zam` в сессии агента (ревизия для `zam write`, `zam insight triggers
+  | revisit | certify | append | supersede`) — открытие, записано явно (`docs/api-compat.md`, ТЗ
+  §10.5, модуль `api::opened`).
+- Minor 3: тесты решений исполнителя 1, 3, 4, 5 — `opened_read_any_form` (секция, фокус,
+  `unchanged`, `(budget)` — открытие; ошибка элемента — нет), `opened_via_mcp_read_not_service_get`
+  (`memory_write` с `base_rev` — не открытие, `memory_read` с явной сессией — открытие),
+  `get_bad_session_header_ignored` (200, ответ прежний), `noisy=1&deleted=only` — 422 в
+  `noisy_window_from_migration`.
+- Minor 4: пакет разбора идей (`idea_review`, `source = agent`) — тоже подсказка; `agent` дописан в
+  список источников (`docs/api-compat.md`, ТЗ §10.5), поведение прежнее
+  **[решение исполнителя, задача 6, круг 1: первый вариант ревью]**.
+- ⚠️ 2: тест `usage_target_index_kept` остаётся в `zam-store/tests/user_db.rs` (задача 1); в
+  спецификации §6.6 «Проверка» место указано.
+
+TDD круга: RED — `noisy_window_from_migration` (в «шумных» — обе записи с оценкой вне окна); новые
+тесты Minor 3 на прежнем коде зелёные — они закрепляют решения исполнителя, а не меняют поведение;
+`noisy_window_by_rowid` написан вместе с запросом. GREEN (`ZAM_REQUIRE_ML=1`) — `usage_opened`
+10/10, `zam-server --lib` 385, `boot` 15, `check_run` 27 (с `check_run_leaves_no_traces`),
+`insights` 19, `sessions` 17, `read_attachments` 9, `read_batch` 13, `read_budget_memory` 1,
+`read_focus` 20, `read_focus_ml` 2, `read_since_rev` 7, `journals` 20, `entries_index` 5,
+`entries_revision` 4, `nodes` 20, `mcp` 84; `zam-store --lib` 130 (с `noisy_window_by_rowid`);
+`zam-cli --test insights` 16; clippy трёх крейтов `-D warnings` и `fmt --all --check` — чисто.
+
+### M7.3 · Задача 10a — Карточки и формы ввода WebUI: ядро
+
+Спецификация §6.14 пп. 1–8 (ядро: стек проверок ухода, окно формы `FormDialog`, `Prompt` на нём,
+`JournalSplit`, Задачи, Insights с «Новым insight», Идеи); задача владельца
+`k:01M85AS1C0EZVV95FQZ2ZEQCET`, с ней — `k:01M83ZDF5WED9AH9WVFF1S234C` (стек проверок ухода) и
+`k:01M83WA2A6EH0AP6FR7NPG9CJH` (набранное при 409). Worktree `.tmp/m73/wt-t10a`, ветка
+`m7.3-t10a` от `c6188ae6` (задачи 1–5 и 7 слиты), параллельно с задачей 6. Только WebUI, Rust не
+менялся.
+
+**Сделано.**
+- `web/src/lib/guards.ts` — стек проверок ухода без DOM (`createGuards`, `Guard`, `LEAVE_EDIT`);
+  `router.ts`: `setGuard` заменён на `pushGuard` (переход спрашивает один раз текстом верхней
+  грязной, согласие отпускает все, один `beforeunload` на стек) и **слои истории** `pushLayer`
+  (окно во весь экран на телефоне кладёт запись с тем же адресом и меткой `zamLayer`; `popstate`
+  с неё вызывает `close` окна, а не переход; `drop` — `history.back()`, который роутер поглощает;
+  переход, пока слой на вершине, заменяет запись слоя адресом). `leaveEdit.guardLeave` и
+  редактор заметки (`Editor.svelte:136`, свой вопрос) — на стеке.
+- `web/src/lib/formDraft.ts` — общий `isDirty<T>`, `rebase<T>` (поля — и структуры: списки
+  триггеров, ADR — сравнение по содержимому), текст 409 `rebaseText`; `entryEdit.ts` —
+  реэкспорт (прежние тесты `entryEdit.test.ts` — без смены ожиданий).
+- `FormDialog.svelte` — окно формы (§6.14 п. 1): шапка «✕ · заголовок (и запись) · основное
+  действие на телефоне», тело с прокруткой, кнопки «действие · Отмена» справа; фокус —
+  `[data-autofocus]`, у подтверждения `danger` — «Отмена»; вопрос о несохранённом внутри окна
+  (текст — `aria-describedby` «Продолжить правку», живой области нет); ошибка — `role="alert"` в
+  окне; в стеке проверок ухода, пока открыто; телефон — во весь экран (`app.css`: `.dialog.fd-form`)
+  со слоем истории. `Prompt.svelte` — обёртка, `Ask` прежний.
+- `JournalSplit` — открытие записи в `split` переводит фокус на заголовок и прокручивает к нему;
+  своя прокрутка карточки (`split`, `overlay`) при открытии и смене записи — к началу.
+- Задачи — порядок карточки (шапка → «Смена статуса», «Изменить» / «Удалить», шаг → текст,
+  «Из идей», подзадачи, файлы); «→ в работе» / «→ открыт» — сразу; «→ выполнен» / «→ снят» —
+  подтверждение; «Переоткрыть» и «→ заблокирован» — окна; «Новая задача» — окно, после «Добавить» —
+  карточка созданной; «Изменить» — правка в карточке на месте (вид сменяется формой); шаг — на
+  месте, под `pushGuard`.
+- Insights — ряд действий под шапкой; «Заменить», «Поля ADR», «Отозвать», «Статус надёжности»,
+  «Триггеры» — окна; 409 — `rebase`, окно открыто; **«Новый insight»** (`InsightNew.svelte`,
+  ленивый чанк): кандидаты-дубли 409 `possible-duplicate` — ссылками, «Записать всё равно»
+  (`force`); `api.ts` — `createInsight`, `duplicateCandidates`.
+- Идеи — ряд решений под шапкой; «Новая идея» и решения с полями — окна (`IdeaForm` в
+  `FormDialog`); правка — в карточке; 409 правки и решений — `IdeaForm.rebase`, форма открыта.
+- `EditPanel` / `EntryEdit` — вариант «в окне» (`dialog` / `bare`: кнопки — у окна, `leave()` не
+  спрашивает, своей проверки ухода нет) для лент задачи 10b.
+
+- [решение исполнителя, задача 10a] **Проверка ухода знает адрес перехода**: `Guard.dirty(next?)`
+  и `allow(next?)` (`createGuards<R>`) — совместимое расширение интерфейса плана: редактор
+  заметки свободен внутри своей заметки (как прежний `setGuard((next) => …)`). `LEAVE_EDIT` — в
+  `guards.ts` (модуль без runtime-импортов для `node --test`), `leaveEdit.ts` его реэкспортирует.
+- [решение исполнителя, задача 10a] **Любой переход, пока слой окна на вершине истории, заменяет
+  запись слоя** (не только `replaceWith`): после «Добавить», запись из Ctrl+K, ссылка кандидата-
+  дубля (ссылки `#/…` внутри окна идут через роутер); переход, пока снятие слоя (`back()`) ещё в
+  пути, и новый слой — после него. Так журналу всё равно, закрыть окно до перехода или после;
+  переход на тот же адрес снимает слой и даёт событие маршрута (без пустого шага «Назад»).
+- [решение исполнителя, задача 10a] Окно не спрашивает о набранном, пока идёт его отправка:
+  переход во время `onsubmit` — её итог (`Prompt` дерева открывает созданную заметку, журнал —
+  карточку созданной записи), а не уход с набранным.
+- [решение исполнителя, задача 10a] `popstate` с другим адресом (новая запись по ссылке или
+  `location.hash =` — у неё тоже `popstate`) слой не закрывает: решает `hashchange` с проверкой
+  ухода, отменённый переход возвращает на запись слоя; закрывает окно только «Назад» на тот же
+  адрес.
+- [решение исполнителя, задача 10a] `FormDialog` получает `subject` — запись, которую правит окно, в
+  шапке (цена решения 81: «что я правлю» на телефоне, где окно закрывает карточку). «✕» — у окон с
+  полями на всех ширинах; у окон-подтверждений — нет (есть «Отмена»).
+- [решение исполнителя, задача 10a] `refocus` окна применяется, только если окно закрыл владелец
+  во время отправки (удавшееся действие) — как `Ask.refocus` у `Prompt`; Esc, «Отмена», «✕» —
+  фокус на кнопку, открывшую окно. Журналы ведут фокус после действия на итог карточки
+  (`Notice`): нажатая кнопка статуса уходит вместе со статусом. В «Идеях» итог карточки — живая
+  область всегда (как `Notice` у Задач и Insights).
+- [решение исполнителя, задача 10a] Вопрос о несохранённом в окне — между шапкой и телом, без роли
+  (текст — описание «Продолжить правку»); порядок кнопок — «Продолжить правку», «Закрыть без
+  сохранения», как у панели `JournalSplit`.
+- [решение исполнителя, задача 10a] «→ снят» — подтверждение `danger` (фокус на «Отмена»),
+  «→ выполнен» — нет (фокус на «Отметить выполненной»); «Что мешает» — необязательно (как
+  прежняя форма); причина переоткрытия — `required`, причина отзыва insight — без `required`
+  (сообщение журнала «Укажите причину отзыва.», как было).
+- [решение исполнителя, задача 10a] Шапка карточки задачи — заголовок, статус, мета и короткие
+  строки состояния («Часть», захват, блокер, «Выполнено»); правка на месте сохраняет шапку
+  (заголовок и ревизию видно), вид ниже сменяется формой — у задачи и идеи.
+- [решение исполнителя, задача 10a; исправлено в круге правок 1] **`FormDialog` — общий чанк
+  сборщика**: его импортируют и основной чанк (`Prompt`, журналы), и ленивые (`IdeaForm`,
+  `InsightNew`, `EditPanel`), и rolldown вынес вместе с ним из `entry` общие модули `router`,
+  `journals`, `focus`, `time`, `viewport.svelte`, `layout`. Первая запись здесь («`entry` 86,03 →
+  84,56, в бюджете») была неверной: `entry` «похудел» не из-за окон, а потому что код ушёл в общие
+  чанки, которые грузятся при старте так же, — стартовая загрузка выросла на 7,3 КБ (см. круг
+  правок 1: строка size-limit `start` и журнал Insights своим чанком).
+- [решение исполнителя, задача 10a] Сбой загрузки чанка формы идеи у окон — окно той формы с той
+  же ошибкой (`role="alert"`) и «Обновить страницу»; у правки в карточке — прежний `LazyFail`.
+- [решение исполнителя, задача 10a] «Сохранить шаг» при 409 — набранный шаг остаётся (правило
+  `rebase`: тронутое — человека), карточка перечитана.
+- [решение исполнителя, задача 10a] `Prompt` с полем на телефоне — окно формы во весь экран (слой
+  истории, «Назад»); без поля — подтверждение прежнего вида.
+- [решение исполнителя, задача 10a] «Руководство WebUI» — ТЗ §15 (§15.1, §15.4): отдельного
+  руководства WebUI в репозитории нет.
+- [решение исполнителя, задача 10a] `EditPanel` с `dialog` (правка в окне для лент без карточки)
+  сделан в 10a по плану, потребитель и e2e — строки `FORM_CASES` задачи 10b; в 10a проверен
+  `svelte-check`.
+
+**TDD.** RED: `guards.test.ts`, `formDraft.test.ts` — `ERR_MODULE_NOT_FOUND` (модулей нет); e2e
+`forms.spec.ts` на сборке ветки волны до правок WebUI (0.0.15, свой `zam-server`) — 13 из 14
+выбранных падают по ожидаемой причине (14-й, `card_in_view_on_open task phone`, — раскладка
+`stack`, где фокус и прокрутка были и до правок): окна формы нет (`getByRole('dialog', {name})` не найден —
+«Задача заблокирована», «Переоткрыть задачу», «Заменить запись»), фокус не на поле (панель «Новая
+задача»), ряд статусов карточки задачи с 50 подзадачами — на 4323 px при высоте 844
+(`card_actions_in_view_on_open`), в `split` фокус не на заголовке карточки
+(`card_in_view_on_open` insight и term, desktop), «→ в работе»
+открывает форму, «Новый insight» нет. GREEN: `npm run test:build` — 98/98 (новых 8: стек
+проверок ухода 4, черновик формы 4; прежние `entryEdit.test.ts` — без смены ожиданий);
+`forms.spec.ts` — 301/301 (19 строк `FORM_CASES` × 3 ширины и `tabletLand` для открытия; по местам — `card_in_view_on_open` 5 журналов × 4 ширины, `card_actions_in_view_on_open` × 4, `task_status_no_fields_immediate`, `leave_guard_stack_board_forms` (компьютер и телефон), `insights_409_keeps_typed`, `ideas_409_keeps_typed`, `insight_create_duplicate_force`) тестов; полный набор e2e — 502/502 за 9,1 мин (release-сервер worktree с `pdfium.dll`, Edge).
+
+По ходу GREEN найдено и исправлено (каждое — тестом `forms.spec.ts` или прежним e2e):
+- аргумент фрагмента Svelte 5 — функция, читается заново: `open={mode === m}` в фрагменте
+  `form(m)` был всегда `true`, окно идеи после «Записать» спрашивало о набранном и отменяло
+  переход к созданной (`forms_create_opens_created_card idea-create`) — `open={dialogMode}`;
+- `location.hash =` порождает и `popstate`: слой окна закрывался раньше проверки ухода
+  (`insights_unsaved_back_asks_phone`) — `popstate` с другим адресом слой не трогает;
+- переход во время отправки окна (`Prompt` дерева открывает созданную заметку) спрашивал о
+  набранном и отменялся (`notes.spec`, `editor.spec`) — проверка окна молчит, пока идёт отправка;
+- `refocus` перебивал фокус на заголовке открытой карточки (замена insight на телефоне) — фокус,
+  ушедший сам, не трогается;
+- липкая карточка рядом со списком: `scrollIntoView` оставлял заголовок под шапкой
+  (`card_in_view_on_open` desktop) — прокрутка на разницу, два прохода.
+
+**Проверки:** `npm run check` — 0 ошибок и предупреждений; `npm run test:build` — 98/98; `npm run
+build`; `npx size-limit` — без превышений (таблица ниже); e2e — `forms.spec.ts` и полный набор на
+release-сервере worktree (числа — в TDD). Rust не менялся: clippy и fmt не нужны. **Линия
+отсечения** не понадобилась: «Новый insight» готов в 10a (`insight_create_duplicate_force` —
+зелёный).
+
+**Размеры** (`npx size-limit`, gzip, до → после; превышений нет):
+
+| Чанк | До | После | Предел | Причина |
+|---|---|---|---|---|
+| `start` (новая строка, круг правок 1) | 101,28 | 90,62 (круг 1 — 101,55) | 103 (новый) | старт без `api`: в 0.0.15 — `entry`, `dialog-content`, `index-client`, `preload-helper`; теперь ещё общие чанки `FormDialog`, `router`, `journals`, `focus`, `time`, `viewport.svelte`, `layout`, `tabs`, `CertaintyBadge`, `TrashPanel`; до круга правок 1 было 108,56 (+7,3) |
+| `entry` | 86,03 | 64,38 (круг 1 — 75,31) | 103 (прежний) | общие модули — в своих чанках (строка `start`), журналы Insights, Словарь, Вопросы, Changelog и Releases — свои чанки |
+| `api` (новая строка) | 26,88 | 26,96 | 29,7 (новый) | REST-клиент, отдельный чанк при старте и в 0.0.15 (строки не было) |
+| `start+api` (новая строка, круг правок 2) | 128,16 | 117,58 | 129,5 (новый) | весь статический старт одним числом |
+| `InsightsView` (новый, журнал) | — | 11,49 | 12,6 (новый) | журнал Insights — ленивым чанком, как «Идеи» (круг правок 1) |
+| `GlossaryView` (новый, журнал) | — | 5,17 | 5,7 (новый) | ленивым чанком (круг правок 2, N2) |
+| `QuestionsView` (новый, журнал) | — | 4,84 | 5,3 (новый) | ленивым чанком (круг правок 2, N2) |
+| `ChangelogView` (новый, журнал) | — | 3,35 | 3,7 (новый) | ленивым чанком (круг правок 2, N2) |
+| `ReleasesView` (новый, журнал) | — | 3,68 | 4,05 (новый) | ленивым чанком (круг правок 2, N2) |
+| `FormDialog` (новый, общий, при старте) | — | 3,00 | 3,25 (новый) | окно формы — общий модуль `entry` и ленивых чанков |
+| `InsightNew` (новый, по нажатию) | — | 2,22 | 2,45 (новый) | окно «Новый insight» |
+| `IdeasView` | 11,54 | 12,17 | 12 → 13,2 | окна решений, правка на месте, 409 — `rebase`, загрузка и сбой чанка в окне; запас был 0,46 КБ |
+| `IdeaForm` | 2,26 | 3,11 | 2,5 → 3,4 | форма в окне (`FormDialog`) и в карточке, `rebase`, пометки расхождений |
+| `ReportsView` | 8,89 | 9,11 | 9 → 9,5 | кода журнала задача не меняла: импорт из общих чанков (`entry`, `api`, `journals`) с новыми именами привязок после выделения общих модулей |
+| `EntryEdit` | 3,17 | 3,48 | 3,4 → 3,8 | вариант «в окне», пометки расхождений 409, общий текст 409 |
+| `dialog-content` | 13,32 | 13,31 | 14,7 (прежний) | — |
+
+**Правки прежних e2e** (поведение изменено намеренно по §6.14; другие ожидания не трогались):
+- `tasks.spec.ts`:
+  - `tasks_board_loads_per_status`, `tasks_overlay_desktop` (часть «→ в работе») — без
+    «Применить»: статус без полей — сразу (решение 84);
+  - `tasks_status_change_reloads_both_columns` (телефон), `tasks_subtask_status_updates_progress`
+    (дважды) — «→ выполнен» подтверждается окном «Отметить задачу выполненной?» вместо
+    «Применить»;
+  - `task_edit_stale_keeps_next_step` — правка заменяет вид карточки (§6.14 п. 3): снята проверка
+    «смена статуса при набранном в форме спрашивает» (ряда статусов во время правки нет), добавлено
+    «ряда статусов и поля шага нет»; шаг агента после 409 проверяется после «Отмена»;
+  - `task_edit_cancelled_leave_keeps_history` (оба варианта) — (а) правится шаг плана, ссылка
+    карточки — «Часть» в шапке, а не раздел «Подзадачи» (его под формой нет), шаг открыт с доски
+    переходом по адресу;
+  - `task_edit_cancelled_at_history_limit` (оба варианта) — (б) переход по адресу подзадачи вместо
+    ссылки «Подзадачи» (та же новая запись на пределе истории).
+- `working-memory.spec.ts` — `task_board_and_status_by_human`: «→ заблокирован» и «Переоткрыть»
+  — окна «Задача заблокирована» и «Переоткрыть задачу»; `decision_adr_fields`: «Поля ADR» — окно.
+- `user-login.spec.ts` (вход пользователя, insight своей Knowledge) — «Заменить запись» и «Статус
+  надёжности» — окна (спецификации нет в перечне плана: форма Insights переехала в окно и здесь).
+- `journals.spec.ts` — формы карточки Insights — окна («Заменить запись», «Статус надёжности»,
+  «Триггеры», «Отозвать запись»); «Новая идея» в сценарии чисел разделов — окно.
+- `ideas.spec.ts` — «Новая идея», «Начать» идеи Knowledge, «Отложить», «Отказаться», «Вернуть на
+  разбор» — окна; сценарий «повторное нажатие кнопки карточки при набранном» заменён на вопрос в
+  окне по Esc (кнопка карточки под окном недоступна); сбой чанка формы у окон — в окне той формы;
+  `ideas_stale_rev_conflict_rereads` — после 409 форма открыта, набранное цело, нетронутый замысел —
+  из свежей идеи (п. 5), повтор сохраняет без повторного «Изменить».
+- `mobile.spec.ts` (`insights_unsaved_back_asks_phone`) — отзыв — окно во весь экран: системная
+  «Назад» с набранным спрашивает в окне, уход по адресу — один вопрос роутера, без набранного
+  «Назад» закрывает окно, «← Insights» — к таблице.
+
+**Снимки «до/после»** (§6.14 п. 9; `.tmp/e2e/screens/forms/{before,after}/<форма>-<ширина>.png`,
+вне git; ширины `phone` 390 × 844 и `tabletLand` 1180 × 820 — с касанием, `tablet` 820 × 1180,
+`desktop` 1440 × 900): `forms.spec.ts` в режиме `E2E_FORMS_SNAP`. «До» — сервер, собранный из ветки
+волны до правок WebUI (по сути 0.0.15), 39 мест × 4 ширины = 156 снимков; «после» — 156 снимков в
+конце задачи. Список с положением формы — `list-final.tsv` («до») и `list.tsv` («после») рядом со
+снимками. Перед нажатием Playwright прокручивает к кнопке, поэтому «в карточке» значит: форма
+раскрылась под кнопкой, к которой пришлось прокрутить; «видно частично» — низ формы ниже края
+окна (число — его координата при высоте окна). Строки `term-*`, `question-*`, `changelog-*`,
+`release-*`, `note-*`, вложения, отчёты, пользователи, копии, импорт, индекс — места задачи 10b
+(в 10a — только каркас `Prompt`): снимки «до» сняты здесь для неё.
+
+| Форма | Перечень §6.14 | До (0.0.15) | После (10a) |
+|---|---|---|---|
+| `task-create` | Новая задача | тел.: в карточке; план.: в карточке; план. гориз. и комп.: в панели карточки поверх доски, ниже рядов кнопок¹ | окно |
+| `task-blocked` | Смена статуса: заблокирован | тел.: в карточке; план.: в карточке; план. гориз. и комп.: в панели карточки поверх доски, ниже рядов кнопок¹ | окно |
+| `task-reopen` | Смена статуса: переоткрыть | тел.: в карточке; план.: в карточке; план. гориз. и комп.: в панели карточки поверх доски, ниже рядов кнопок¹ | окно |
+| `task-done` | Смена статуса: выполнен | тел.: в карточке; план.: в карточке; план. гориз. и комп.: в панели карточки поверх доски, ниже рядов кнопок¹ | окно |
+| `task-dropped` | Смена статуса: снят | тел.: в карточке; план.: в карточке; план. гориз. и комп.: в панели карточки поверх доски, ниже рядов кнопок¹ | окно |
+| `task-delete` | Удалить задачу | окно | окно |
+| `insight-new` | Новый insight | не открылась | окно |
+| `insight-supersede` | Заменить insight | тел.: в карточке, видно частично (низ 1995); план.: в карточке, видно частично (низ 1684); план. гориз.: в карточке, видно частично (низ 2007); комп.: в карточке, видно частично (низ 1714) | окно |
+| `insight-adr` | Поля ADR | тел.: в карточке, видно частично (низ 1662); план.: в карточке, видно частично (низ 1408); план. гориз.: в карточке, видно частично (низ 1656); комп.: в карточке, видно частично (низ 1438) | окно |
+| `insight-retract` | Отозвать insight | тел.: в карточке, видно частично (низ 1038); план.: в карточке; план. гориз.: в карточке, видно частично (низ 1050); комп.: в карточке | окно |
+| `insight-certainty` | Статус надёжности | тел.: в карточке, видно частично (низ 1121); план.: в карточке; план. гориз.: в карточке, видно частично (низ 1133); комп.: в карточке, видно частично (низ 918) | окно |
+| `insight-triggers` | Триггеры | тел.: в карточке, видно частично (низ 1150); план.: в карточке; план. гориз.: в карточке, видно частично (низ 1110); комп.: в карточке | окно |
+| `insight-delete` | Удалить insight | окно | окно |
+| `idea-create` | Новая идея | в карточке | окно |
+| `idea-start` | Начать идею Knowledge | в карточке | окно |
+| `idea-defer` | Отложить идею | в карточке | окно |
+| `idea-decline` | Отказаться от идеи | в карточке | окно |
+| `idea-reopen` | Вернуть идею на разбор | тел.: в карточке, видно частично (низ 1009); план.: в карточке; план. гориз.: в карточке, видно частично (низ 1003); комп.: в карточке | окно |
+| `idea-delete` | Удалить идею | окно | окно |
+| `term-new` | Новый термин | тел.: в карточке, видно частично (низ 1023); план.: в карточке; план. гориз.: в карточке, видно частично (низ 1035); комп.: в карточке, видно частично (низ 943) | тел.: в карточке, видно частично (низ 1023); план.: в карточке; план. гориз.: в карточке, видно частично (низ 1035); комп.: в карточке, видно частично (низ 943) |
+| `term-edit` | Правка термина | тел.: в карточке, видно частично (низ 1204); план.: в карточке; план. гориз.: в карточке, видно частично (низ 1216); комп.: в карточке, видно частично (низ 1116) | тел.: в карточке, видно частично (низ 1204); план.: в карточке; план. гориз.: в карточке, видно частично (низ 1216); комп.: в карточке, видно частично (низ 1116) |
+| `term-retract` | Отозвать термин | в карточке | в карточке |
+| `question-edit` | Правка вопроса | тел.: в карточке, видно частично (низ 862); план.: в карточке; план. гориз.: в карточке; комп.: в карточке | тел.: в карточке, видно частично (низ 862); план.: в карточке; план. гориз.: в карточке; комп.: в карточке |
+| `question-obsolete` | Вопрос неактуален | окно | окно |
+| `question-defer` | Отложить до (вопрос-предложение) | в карточке | в карточке |
+| `changelog-edit` | Правка записи Changelog | тел.: в карточке, видно частично (низ 1049); план.: в карточке; план. гориз.: в карточке, видно частично (низ 926); комп.: в карточке | тел.: в карточке, видно частично (низ 1049); план.: в карточке; план. гориз.: в карточке, видно частично (низ 926); комп.: в карточке |
+| `changelog-delete` | Удалить запись журнала | окно | окно |
+| `release-edit` | Правка релиза | тел.: в карточке, видно частично (низ 981); план.: в карточке; план. гориз.: в карточке, видно частично (низ 898); комп.: в карточке | тел.: в карточке, видно частично (низ 981); план.: в карточке; план. гориз.: в карточке, видно частично (низ 898); комп.: в карточке |
+| `note-new` | Новая заметка | окно | окно |
+| `folder-new` | Новая папка | окно | окно |
+| `import` | Импорт архива | окно | окно |
+| `note-delete` | Удалить заметку | тел.: окно; план.: окно; план. гориз.: не открылась; комп.: окно | тел.: окно; план.: окно; план. гориз.: не открылась; комп.: окно |
+| `note-move` | Переименовать или переместить | тел.: окно; план.: окно; план. гориз.: не открылась; комп.: окно | тел.: окно; план.: окно; план. гориз.: не открылась; комп.: окно |
+| `attachment-detach` | Открепить вложение | окно | окно |
+| `history-revert` | Восстановить ревизию | окно | окно |
+| `report-delete` | Удалить отчёт | окно | окно |
+| `user-password` | Пароль пользователя | окно | окно |
+| `backup-run` | Снять копию сейчас | окно | окно |
+| `reindex` | Переиндексация | окно | окно |
+
+¹ Панель карточки доски — `role="dialog"`, съёмка «до» сочла её окном; форма статуса и новой
+задачи — внизу панели, под рядами кнопок.
+
+Сравнение глазами. В первой сдаче (r0) запись здесь называла все окна ядра на телефоне годными —
+это было неверно: на снимках «после» r0 короткие формы во весь экран раскладывали поля по всей
+высоте экрана с пустыми полосами по ~200 px («Новая задача», «Переоткрыть», «Новая идея», «Статус
+надёжности», окна `Prompt` с полем), что ревью r1 нашло (I1). Снимки «после» пересняты в круге
+правок 1 (156: 39 мест × 4 ширины, `after/`); на компьютере и планшете — окна по центру с
+затемнением, шапка «Заголовок · запись · ✕», кнопки «действие · Отмена» справа, фокус — в первом
+поле. **Телефон, по каждому снимку ядра:**
+- `task-create-phone` — шапка «✕ · Новая задача · Добавить»; «Заголовок» (в фокусе), «Описание»,
+  «Следующий шаг» — подряд под шапкой; ниже — пустой белый экран.
+- `task-blocked-phone` — «✕ · Задача заблокирована / Задача форм: открытая · Заблокировать»
+  (заголовок переносится на две строки); пояснение; «Что мешает (необязательно)» в фокусе.
+- `task-reopen-phone` — «✕ · Переоткрыть задачу / запись · Переоткрыть»; пояснение; «Причина
+  переоткрытия» в фокусе.
+- `task-done-phone`, `task-dropped-phone`, `task-delete-phone` — окно-подтверждение во всю ширину
+  посреди экрана над затемнённой карточкой; «Отметить выполненной» — синяя, «Снять задачу» и
+  «Удалить» — красные, рядом «Отмена».
+- `task-edit`, `task-step`, `idea-edit` — формы на месте, снимков нет (не окна; e2e
+  `forms_inline_open_in_view` — поле на виду).
+- `insight-new-phone` — «✕ · Новый insight · Записать»; пояснение; «Вид», «Заголовок» (фокус),
+  «Текст», «Область (необязательно)», «Надёжность» — подряд.
+- `insight-supersede-phone` — длинная форма: «Заголовок» (фокус), «Текст», «Вид», «Надёжность», поля
+  ADR в рамке; тело прокручивается, шапка с «Заменить» закреплена.
+- `insight-adr-phone` — поля ADR подряд, тело прокручивается.
+- `insight-retract-phone` — «Отозвать» красная в шапке; пояснение; «Причина» в фокусе.
+- `insight-certainty-phone` — пояснение; переключатели «axiom · theorem · hypothesis» и «без
+  статуса» в две строки, выбран (и в фокусе) `hypothesis`; «Причина (необязательно)».
+- `insight-triggers-phone` — «Триггеров нет.»; «тип · шаблон» (фокус) и «инструменты · Добавить»;
+  «Сохранить триггеры» в шапке (запись под заголовком переносится на две строки).
+- `insight-delete-phone`, `idea-delete-phone` — подтверждения, как у задачи.
+- `idea-create-phone` — «Заголовок» (фокус), «Замысел», ряд «Приоритет | Не раньше · UTC»,
+  «Теги».
+- `idea-start-phone` — «Пространство задачи» (фокус), ниже — пусто.
+- `idea-defer-phone` — «Отложить до» (дата и «UTC» в одной строке, в фокусе).
+- `idea-decline-phone` — «Отказаться» красная в шапке; «Причина (необязательно)» в фокусе.
+- `idea-reopen-phone` — «Причина» в фокусе.
+- Окна `Prompt` с полем (каркас задачи 10a, места задачи 10b): `note-new-phone` — пояснение и «Имя»
+  сразу под шапкой «✕ · Новая заметка · Создать»; `folder-new`, `note-move`, `user-password` — так
+  же (у пароля пояснение в четыре строки).
+
+Заметки: `note-delete`, `note-move` в `tabletLand` не открылись в обеих сборках (кнопка «⋯» заметки в
+неподвижном дереве на касании — опенер снимка, не продукт; на остальных ширинах — окно);
+`question-start` («начать» вопроса-предложения в 0.0.15 сразу отвечает, если задача не в общем
+решении — снимок изменил бы данные) и `user-close` (у пользователей без пароля кнопки нет) —
+без снимка; системное окно причины надёжности редактора (`window.prompt`) Playwright не снимает.
+
+**Круг правок 1** (ревью r1: 0 Critical, 2 Important, 10 Minor, 5 ⚠️ — исправлено всё):
+- **I1 — поля окна на телефоне разъезжались по экрану.** Тело окна растянуто на всю высоту, а у
+  сетки `.fd-body` по умолчанию `align-content: normal` (как `stretch`) — свободное место делилось
+  между строками. Теперь `align-content: start`: поля идут сверху вниз плотно, как в окне на
+  компьютере, свободное место — внизу; абзацы тела — без своих полей (отступ один — `gap`), пустой
+  список триггеров не рисуется. Проверка — `fieldsDense` в `forms_phone_header_actions` (от низа поля
+  до верха следующей подписи ≤ 24 px; растянутая сетка давала сотни) и новый
+  `forms_phone_prompt_dense` (окно `Prompt` «Новая заметка»: поле в верхней трети экрана).
+- **I2 — стартовая загрузка** [решение координатора]: строка size-limit `start` ≤ 103 КБ gzip —
+  `entry` и чанки, которые `index.html` грузит статически (`modulepreload`), кроме REST-клиента
+  `api` (у него теперь своя строка, 29,7 КБ; в 0.0.15 он тоже был отдельным чанком без строки).
+  Без правки стартовая загрузка выросла на 7,3 КБ (101,28 → 108,56: общие модули, вынесенные из
+  `entry` вместе с `FormDialog`, и код окон Задач и Insights) и не прошла бы предел. Журнал
+  Insights грузится своим чанком при первом открытии (`Shell.svelte`, как «Идеи», «Отчёты», «Код»):
+  `start` 101,55 КБ (0.0.15 — 101,28), `entry` 75,31. Вся статическая загрузка с `api` — 128,16 →
+  128,52 КБ. §6.14 п. 8 спецификации поправлен; решение исполнителя о `FormDialog` выше — с
+  верными числами. [решение исполнителя, круг правок 1] `Shell.svelte` — общий файл с задачей 8
+  (круг 5): правка — одна ветка журнала Insights (`{#await import()}`); список путей `start` надо
+  сверять с `modulepreload` в `dist/index.html`, когда сборщик выделяет новый общий чанк.
+- **M1.** (а) `forms_phone_header_actions` у окон-подтверждений: не во весь экран (во всю ширину,
+  не от верха, ниже 70 % высоты), «Отмена» на месте, «✕» нет. (б) «Назад» на телефоне и «Добавить»
+  → «Назад» — и без Navigation API (`hideNavApi`, номера записей `zamIdx`): `forms_phone_back_closes
+  … no_nav_api` (Новая задача, Переоткрыть, Новый insight, Новая идея, Отложить),
+  `forms_phone_create_then_back … no_nav_api`. (в) В `FORM_CASES` — строки формы на месте:
+  `task-edit`, `idea-edit` (правка в карточке) и `task-step` (поле шага) с `inline`; для них —
+  `forms_inline_open_in_view` (поле видно, фокус на первом поле правки), `forms_server_error_keeps_input`
+  (ошибка у формы, набранное цело), `forms_inline_leave_asks` (уход по адресу — один вопрос).
+- **M2.** Поля-расхождения 409 помечены во всех формах с ревизией — Insights, `IdeaForm`, окно
+  статуса задачи, `EntryEdit`: рамка поля и пометка «изменено и здесь, и в другом месте» в подписи
+  (её читает программа чтения с экрана; `aria-invalid` снят — поле не ошибочное). Текст 409 — один,
+  `rebaseText` («Запись изменилась, пока вы правили (сейчас ревизия N): проверьте и сохраните
+  снова…») и у `EntryEdit`; ожидание `journals.spec.ts` (правка записи Changelog при 409) — на новый
+  текст.
+- **M3.** «Новый insight»: загрузка и сбой чанка — в окне с тем же заголовком («Загрузка…» или ошибка
+  и «Обновить страницу»), а не внизу страницы; у окон «Идей» — то же на время первой загрузки; чанки
+  окон грузятся заранее, когда журнал открыт.
+- **M4.** «Новый insight» закрывается при переходе к другой записи (как «Новая задача»).
+- **M5.** После «Добавить» фокус не возвращается на кнопку под окном, если отправка сменила адрес:
+  его переводит карточка созданной записи на заголовок.
+- **M6.** Основная кнопка окна (и в шапке телефона) выключена, пока на экране вопрос о несохранённом.
+- **M7.** «✕» — слева на телефоне («✕ · Заголовок · Добавить»), справа в шапке окна по центру на
+  планшете и компьютере; в разметке — две кнопки, видна одна (вторая — `display: none`, вне порядка
+  Tab, без имени для чтения с экрана).
+- **M8.** «Новый insight» — порядок §6.14 п. 7: «Вид», «Заголовок», «Текст», затем «Область» и
+  «Надёжность» в ряд; в окне «Отложить» видимая подпись — «Отложить до» (как имя поля); у поля шага
+  задачи — видимая подпись «Следующий шаг»; в окне «Статус надёжности» фокус — на выбранном
+  статусе (главный выбор), а не на необязательной причине.
+- **M9.** `LayerHandle.replaceWith` убран: закрытие с переходом — неявная замена записи слоя в `go`
+  (единственный путь, описан у `LayerHandle` и в комментарии роутера) [решение исполнителя, круг
+  правок 1: интерфейс плана упрощён].
+- **M10.** Строка замены insight — своя запись `E2E_FORMS_INSIGHT_SUP`, удавшаяся замена в
+  `forms_create_opens_created_card` идёт на свежей записи и возвращает общую (`finally`) — падение
+  не роняет прочие строки; «второго вопроса нет» — после двух кадров отрисовки (`settled`), а не
+  `waitForTimeout`. `task_edit_cancelled_at_history_limit` (б) — переход по адресу вместо ссылки,
+  как принято ревью.
+
+Прогоны круга 1: `npm run test:build` — 99/99 (новый `rebase_text_one_for_all_forms`); `npm run
+check` — 0/0; `npm run build`; `npx size-limit` — без превышений (`start` 101,55 / 103, `entry`
+75,31, `api` 26,96 / 29,7, `InsightsView` 11,49 / 12,6, `IdeasView` 12,16 / 13,2, `IdeaForm` 3,11 /
+3,4 (было 3), `EntryEdit` 3,48 / 3,8 (было 3,4) — оба выросли на пометки расхождений, `FormDialog`
+3,00 / 3,25); e2e на release-сервере worktree: `forms.spec.ts` — 344/344 (было 301: строки на месте,
+подтверждения на телефоне, `no_nav_api`, `forms_phone_prompt_dense`), полный набор — 545/545 за 8,7
+мин. Найдено по ходу: у записи агента статус надёжности по умолчанию — `hypothesis` (фокус окна —
+на нём); замена insight в `forms_create_opens_created_card` портила общую запись строки для
+следующих ширин — исправлено свежей записью и `finally`.
+
+**Круг правок 2** (ревью r2: Approved, всё из r1 закрыто; пять новых Minor — исправлены до слияния):
+- **N1 — сверка строк старта.** `web/build/start-budget.ts` (без runtime-импортов): чанки старта из
+  `dist/index.html` (`<script type="module" src>` и `<link rel="modulepreload">`) — каждый ровно в
+  одной из строк `start` и `api`, каждый шаблон этих строк находит файл и только чанк старта, шаблоны
+  `start+api` — ровно их объединение. Проверяет плагин сборки `zam-start-budget`
+  (`build/start-budget-plugin.mjs`, `vite.config.ts`): расхождение — ошибка `npm run build` (в CI
+  сборка идёт до `npx size-limit`), проверено подменой шаблона; модульный тест
+  `build/start-budget.test.ts` в `test:build` (3 теста, третий сверяет настоящий `dist`, если он
+  есть). Строка названа честно — «start (старт без api …)», весь статический старт — новая строка
+  `start+api` (≤ 129,5 КБ, правило M6). §6.14 п. 8: исключение `api` — «[решение исполнителя,
+  принято координатором]»; CHANGELOG — «+0,3 КБ» с суммами.
+- **N2 — запас старта** [решение координатора]: журналы, которые грузились при старте и которые
+  10b правит, — ленивыми чанками (`Shell.svelte`, как Insights, «Идеи», «Отчёты», «Код»): Словарь
+  5,17 КБ (предел 5,7), Вопросы 4,84 (5,3), Changelog 3,35 (3,7), Releases 3,68 (4,05). `start` —
+  101,55 → **90,62** КБ (запас 12,4 КБ), `entry` — 75,31 → 64,38, `start+api` — 128,52 → 117,58.
+  Задачи и Vault остаются в `entry`. ⚠️ Правка `Shell.svelte` — четыре ветки журналов, общий файл с
+  задачей 8.
+- **N3 — плотность окон с одним полем.** `fieldsDense` меряет и путь сверху вниз: шапка → пояснение
+  → первое поле → … (низ пояснения и рядов — по содержимому, через `Range`, низ подписи — по её
+  полю), зазор ≤ 24 px — проверка работает и у «Переоткрыть», «Задача заблокирована», «Отозвать»,
+  «Отложить», «Отказаться», «Вернуть на разбор», «Начать».
+- **N4 — заглушка загрузки окна** («Новый insight», окна «Идей») — того же вида, что окно (без
+  `confirm`): на телефоне сразу во весь экран, без скачка «маленькое → полноэкранное».
+- **N5 — фокус заголовка карточки** (`app.css`): у `h1–h3[tabindex="-1"]` — кольцо `var(--accent)`
+  только при `:focus-visible` (клавиатура, открытие по адресу), после щелчка и касания — без рамки;
+  чёрной рамки браузера нет. Проверка — в `tasks_overlay_desktop` (`tasks.spec.ts`): после щелчка по
+  плитке — не `:focus-visible` и без рамки, при открытии по адресу — сплошная рамка цвета `--accent`
+  темы. Снимок `after/task-step-phone.png` (карточка открыта по адресу) — кольцо акцента со
+  скруглением у заголовка. Снимки «после» пересняты все (156).
+
+Тесты и числа круга 2: `npm run test:build` — 102/102; `npm run check` — 0/0; `npm run build` (со
+сверкой старта); `npx size-limit` — без превышений (`entry` 64,38, `start` 90,62 / 103, `api` 26,96
+/ 29,7, `start+api` 117,58 / 129,5, `InsightsView` 11,49 / 12,6, `IdeasView` 12,17 / 13,2, новые
+журналы — выше); e2e на release-сервере worktree: `forms.spec.ts` — 344/344, полный набор — 545/545
+за 8,7 мин; проверка кольца фокуса добавлена в `tasks_overlay_desktop` после полного прогона и
+прогнана отдельно — 1/1.
+
+### M7.3 · Задача 8 — WebUI: «Внутренние работы», «Проверка памяти», «Кандидаты в Rules»; Insights — «открыто» и «Шумные»
+
+Спецификация §6.9 пп. 1–3 и §6.6 п. 3 (WebUI); worktree `.tmp/m73/wt-t8`, ветка `m7.3-t8` от
+`a2311da2` (задачи 1–7 и 10a слиты), параллельно с задачей 10b. Только WebUI и e2e, Rust не
+менялся. Формы и карточки страниц — на образце задачи 10a (`FormDialog`, карточка на виду).
+
+**Сделано.**
+- **«Внутренние работы»** (`web/src/routes/Works.svelte`, `#/works`): режим исполнителя — общий
+  (переключатели «выкл / агент / модель» с пояснением; «модель» недоступна без подключения) и по
+  видам («как общий» / режим, рядом — действующий режим с причиной `off`), меняется сразу;
+  подключённая модель — сводка (запись Vault, закреплённый адрес, модель, ключ, предел,
+  `body_extra`) и окно **«Подключение модели»**: запись личного Vault по имени (в `PATCH` — `v:<id>`),
+  над выбором — её адрес и класс (LAN, вне LAN, петля, link-local, имя) и замечание, если сервер
+  адрес не примет; модель, ключ, предел ответа, поле предела, `body_extra` (проверка JSON, ключей
+  сервера и 4 КиБ на клиенте) с рецептами; «Проверить подключение» в окне и на странице; плашка
+  «Данные памяти уходят за пределы локальной сети: <хост>»; пауза — причина, подсказка, «был →
+  стал» и «Подтвердить адрес» (окно-подтверждение; 409 `vault_changed` — новые «был → стал» в том
+  же окне, повторное подтверждение — уже их); ночь («04:30 Europe/Moscow (у вас 04:30), окно 2 ч»,
+  итог последней ночи по видам, выключатель `works.check`); очередь работ с «Запустить сейчас» по
+  виду (окно-подтверждение, у модели — опрос очереди); журнал отправок за 1/7/30/180 суток (время,
+  вид, модель, хост, «вне LAN», токены вход → выход, мс, итог — без текста); токены суток и месяца
+  к пределам (`meter`). Таблицы — `.table-wrap`, на телефоне — карточки.
+- **«Проверка памяти»** (`web/src/routes/Check.svelte`, `#/check`): вердикт последнего прогона
+  (`verdictText`), пояснение, повод и время, «Норма принята …»; «Проверить сейчас» — сразу, пока
+  прогон идёт — опрос раз в 3 с; «Принять как норму» — окно-подтверждение; метрики к медиане базы
+  (найдено поиском и среди подсказок по `test`, посторонние с подсказками, p95) и советы «Что
+  чинить»; проваленные пробы — вопрос, вид и часть, ожидаемая цель (переход к записи), где нашлась,
+  совет; активные пробы по видам; состояние ночной проверки сервера и своей памяти.
+- **«Кандидаты в Rules»** (`web/src/routes/Proposals.svelte`, `#/proposals[/<o:id>]`): список
+  (фильтр «ждут решения / принятые / отклонённые / все») и карточка — `JournalSplit`; ряд
+  «Принять» / «Отклонить» под шапкой; текст, пометка команд shell, сумма Rules и прирост, довод,
+  основание (раскрытие — исходный текст записи или заметки, «изменилось с ревизии N», недоступное —
+  «недоступно или удалено»), итог решения со ссылкой на заметку; окна «Принять кандидата» (путь в
+  Rules и текст правила, строка `rulesTokensText`, при правке текста — «по исходному тексту») и
+  «Отклонить кандидата» (причина по желанию).
+- **Оболочка** (`Shell.svelte`, `AccountMenu.svelte`, `Tree.svelte`): разделы «Проверка» (точка при
+  открытой регрессии) и «Кандидаты N»; «Внутренние работы» — пункт меню аккаунта телефона (точка
+  паузы и на кнопке меню) и ссылка «Работы» у логина на планшете и компьютере (имя ссылки —
+  полное); метка «кандидаты: N» у Rules своего пользователя; три ленивые страницы, заголовки
+  разделов телефона. Ссылка — и со страницы «Подключение агента».
+- **Insights** (`InsightsView.svelte`): «показано / открыто / полезно / бесполезно» в таблице,
+  строке компактной таблицы и карточке; фильтр «Шумные» (`noisy=1`) с пояснением и
+  предупреждением «Данные об открытии копятся с <дата>: первые 30 суток фильтр неполон».
+- **Модули**: `checkVerdict.ts` (тексты вердикта, флаги, принятая норма, правила точки и кнопки,
+  метрики, провалы — без DOM), `worksText.ts` (режимы, причины, паузы, класс адреса по диапазонам
+  §6.2 п. 6, `body_extra` и рецепты, время ночи с поясом, журнал, итог работы, кандидаты — без DOM),
+  `worksApi.ts` (REST страниц, `refRoute`), `attention.svelte.ts` (точки шапки),
+  `counts.svelte.ts` — второй экземпляр `CountsCache` для `GET /proposals/counts`, `counts.ts` —
+  решения по кандидату в `changesCounts`; `router.ts` — маршруты `works`, `check`, `proposals`;
+  `api.ts` — `UsageCounts.opened`, `EntryQuery.noisy` и `opened_since`, тип `works` настроек,
+  `proposalCounts`.
+- **e2e**: `mock-model.ts` (подставная модель на `127.0.0.1`, свободный порт; запросы — `GET
+  /__requests`), `seed-internal.ts` (записи Vault — LAN-петля, вне LAN, смена адреса; кандидат для
+  окон; эпизод регрессии для подстановки; REST агента и человека), `global-setup.ts` (запуск модели,
+  `ZAM_WORKS__ALLOW_LOOPBACK=true`, `ZAM_WORKS__CHECK=off`, `ZAM_WORKS__AT` — UTC «сейчас + 12 ч»),
+  `works.spec.ts`, `check.spec.ts`, `proposals.spec.ts`, `insights_noisy_filter` в
+  `journals.spec.ts`, шесть строк `FORM_CASES`, три адреса `mobile-pages.ts`, снимки страниц
+  `page-snaps.ts`.
+
+- [решение исполнителя, задача 8] **REST страниц — отдельный модуль `worksApi.ts`** (как `code.ts`
+  у «Кода»), его импортируют только ленивые страницы: в `api.ts` — лишь поля прежних ответов, тип
+  настроек и `proposalCounts` (оболочке при старте), строка `api` size-limit почти не выросла.
+  Ссылки записей — через `journals.ts` (реэкспорт `JOURNAL_OF_KIND`): прямой импорт `entryRefs`
+  из ленивого модуля вынес его общим чанком старта (сверка `zam-start-budget` это поймала).
+- [решение исполнителя, задача 8] **«Внутренние работы» на планшете и компьютере** — ссылка в
+  группе логина шапки: меню аккаунта есть только на телефоне (§5.1 п. 3, сценарии `mobile.spec`),
+  а §6.9 ставит пункт в меню аккаунта. На телефоне — пункт меню и точка на кнопке меню.
+- [решение исполнителя, задача 8] **«Проверить подключение» в окне проверяет сохранённое
+  подключение** (`POST /works/model/test` читает `works.model`): при набранном кнопка называется
+  «Сохранить и проверить» и сначала сохраняет; итог — строкой в окне, окно открыто.
+- [решение исполнителя, задача 8] **Плашка «вне LAN» после перезагрузки** — по закреплённому адресу
+  (`works.model.pinned`): литерал IP — по диапазонам §6.2 п. 6 (та же таблица, что у сервера,
+  `reachOfHost` с модульными тестами), имя — по последней строке журнала отправок к этому хосту
+  (`external`), без строк — до первого обращения неизвестно; сразу после сохранения — по
+  `warnings` ответа. Нового поля сервера не потребовалось.
+- [решение исполнителя, задача 8] **Точка у «Проверка» и «Принять как норму» — по последнему
+  законченному ночному прогону** (`GET /check/runs`), как строка дайджеста сервера
+  (`check::digest_line`): у `GET /check/status` `last` — любой прогон (ручной показывает идущий
+  эпизод), а в тренде нет `accepted_at`. Ручной прогон эпизода, принятого после него, показывается
+  «накопление базы 1/5». e2e `check_accept_new_norm` подставляет оба ответа, тело `{run}` — ночной
+  N1, а не последний ручной M1.
+- [решение исполнителя, задача 8] **Цель пробы и основание кандидата — переход к записи** по её
+  `space_id` (`refRoute`: запись или заметка читается, адрес — со ссылкой её пространства), а не
+  ссылкой «вслепую»: у провала пробы пространства нет.
+- [решение исполнителя, задача 8] **Метка «кандидаты: N»** — только у Rules своего пользователя:
+  страница кандидатов — своего пользователя (блок администратора — M7.4, §6.13).
+- [решение исполнителя, задача 8] **«Принять как норму» — подтверждение без `danger`** (как «→
+  выполнен» у задачи): шаг сознательный, данные не удаляются; фокус — на основной кнопке.
+- [решение исполнителя, задача 8] **Адрес выбранной записи Vault — подписью над выбором** (в
+  `aria-describedby` поля, не в его имени): поля окна идут плотно (`fieldsDense` задачи 10a).
+- [решение исполнителя, задача 8] **Строки `FORM_CASES`, которым нужно состояние, не готовое на
+  e2e-сервере** без настоящей модели или чужих сценариев (пауза `vault_changed`, режим «агент»,
+  эпизод регрессии), подставляют `page.route` только чтение (`GET /auth/settings`, `GET
+  /check/status`, `GET /check/runs`) и переходят на страницу внутри документа. Успешной отправки
+  строки `after: 'notice'` в `forms.spec.ts` не делают (она — только у `after: 'card'`): отправка
+  окна проверяется подменённым ответом 422 (`forms_server_error_keeps_input`), а настоящие
+  отправки — пауза, «Подтвердить адрес», «Запустить сейчас», «Отключить модель», «Принять как
+  норму» на подстановке, решения по кандидату — в `works.spec.ts`, `check.spec.ts`,
+  `proposals.spec.ts` (уточнено в круге правок 1, ревью r1, Minor 12).
+- [решение исполнителя, задача 8] «Шумные»: предупреждение «копятся с <дата>» — в ленте при
+  включённом фильтре (дата — `opened_since` ответа `noisy=1`); «на карточке и ленте» плана —
+  счётчики «показано / открыто / полезно / бесполезно».
+- [решение исполнителя, задача 8] После «Принять как норму», «Подтвердить адрес», «Принять» и
+  «Отклонить» фокус — на строку итога (кнопка уходит вместе с состоянием).
+- [решение исполнителя, задача 8] Выключатель ночной проверки своей памяти (`works.check`) — в
+  блоке «Ночь» страницы «Внутренние работы» (настройка задачи 1, в §6.9 не названа).
+- [решение исполнителя, задача 8] **Шапка с двумя новыми разделами не помещалась и на 1440 px**
+  (снимок «после» первого прогона: «Кандидаты» обрезаны): разделы — короткими подписями («Админ»,
+  «Агент», «Кэш», «Решения») до 1439 px (новая граница `BP_FULL_LABELS` = 1440 в `layout.ts`,
+  `layout.test.ts` пропускает 1439/1440), «Внутренние работы» у логина — подписью «Работы» на всех
+  ширинах; текущий раздел держится в видимой части полосы разделов (`revealSelected`, как у полос
+  журналов). На 1440 (`desktop_tree_fixed`) подписи — полные, как прежде. **Заменено в круге
+  правок 1** (ревью r1, I2): на 820 и 1024 px «Кандидаты» всё равно обрезались — граница 1440 и
+  `revealSelected` у шапки сняты, подписи и меню «Ещё ▾» — по замеру (ниже).
+- [решение исполнителя, задача 8] Имя поля модели — «Имя модели», а не «Модель»: имя `select`
+  записи Vault для Playwright включает тексты опций («E2E модель (LAN)»), и `getByLabel('Модель')`
+  находил оба поля (insight-ловушка `i:01M869HNBWED38AWBC0VR3RBTB`). Цель провала пробы — короткой
+  ссылкой («i:01KQ…E2EI1»), полная — в имени кнопки и подсказке.
+
+**Прежние e2e — правки ожиданий** (шапка и счётчики M7.3): `mobile.spec.ts` — разделы панели
+телефона с «Проверка» и «Кандидаты», зазоров между разделами шапки планшета — 7 (было 5),
+строка компактной таблицы Insights и заголовки столбцов на настольном — «показано / открыто /
+полезно / бесполезно»; `user-login.spec.ts` — список разделов пользователя с «Проверка» и
+«Кандидаты»; `layout.test.ts` — граница 1439/1440.
+
+**Тесты и прогоны.**
+- Модульные: `checkVerdict.test.ts` (6: `verdict_texts` — все виды вердикта, флаги, принятая
+  норма, кнопка и точка по последнему ночному прогону, статусы и провалы, метрики),
+  `worksText.test.ts` (7: диапазоны §6.2 п. 6, адрес записи, `body_extra` и рецепты, ночь с поясом
+  и переходом на летнее время, журнал и итог работы, кандидаты, плашка «вне LAN»), `counts.test.ts`
+  (решения по кандидату в `changesCounts`); `npm run test:build` — 115/115; `npm run check` — 0/0.
+- Красный шаг: e2e задачи на release-сборке ветки до правок WebUI (`target/m73-t8/baseline`) — 4
+  упали по ожидаемой причине (страниц, столбца и раздела нет: «Проверка памяти», «Показано /
+  открыто / …», «Кандидаты в Rules», «Внутренние работы»), подготовка данных REST прошла (пробы
+  агента — 7 принято, показы и открытие — 10/0 и 10/1), прочие сценарии журналов — 16/16.
+- e2e на release-сервере worktree: первый прогон своих — 63/79 (`getByLabel('Модель')` находил и
+  `select` записей; строка проб без пробела перед «·»; заголовок столбца в `mobile.spec`), после
+  правок — полный набор **623/624 за 12,4 мин**: все сценарии задачи (`works.spec` 4, `check.spec` 2,
+  `proposals.spec` 3, `insights_noisy_filter`, 6 строк `FORM_CASES` × сценарии 10a, обход узких
+  экранов с тремя страницами, `mobile.spec`, `user-login.spec`) зелёные. Одно падение —
+  `forms_open_focus_trap_esc task-create phone` (строка задачи 10a: фокус после Esc не вернулся на
+  «Новая задача»): повторы — на этой сборке 2 из 3 и 1 из 6 падений, на сборке ветки **до правок
+  задачи 8** (`baseline`) — 1 из 4 и 0 из 6: нестабильный тест ядра 10a, на сборке без изменений
+  задачи 8 тоже падает; страницы задачи 8 «Новую задачу» не трогают. ⚠️ Передать в 10a/10b.
+- `npm run build` (сверка старта `zam-start-budget` — без расхождений), `npx size-limit` — без
+  превышений. Размеры gzip (до → после): `entry` 64,38 → 65,78, `start` 90,62 → 92,05 / 103, `api`
+  26,96 → 27,00 / 29,7, `start+api` 117,58 → 119,06 / 129,5, `InsightsView` 11,49 → 12,01 / 12,6;
+  новые чанки (предел «размер + ≈ 10 %»): `Works` 10,32 / 11,3, `Check` 6,42 / 7, `Proposals` 4,98 /
+  5,45, `worksText` 4,77 / 5,25.
+
+**Снимки «до/после»** — `.tmp/e2e/screens/forms/{before,after}/` (вне git), список — `list.tsv`
+рядом: 6 окон × 4 ширины (`works-model`, `works-confirm-address`, `works-run`, `check-accept`,
+`proposal-accept`, `proposal-decline` — `phone`, `tablet`, `tabletLand`, `desktop`) и 4 страницы ×
+3 ширины (`page-works`, `page-check` — с подставленным эпизодом регрессии, `page-proposals` — с
+открытым кандидатом, `page-insights-noisy` — фильтр «Шумные»; `phone`, `tablet`, `desktop`).
+«До» (сборка ветки без задачи 8): окна не открываются — страниц нет, адреса `#/works`, `#/check`,
+`#/proposals` ведут на стартовую; у Insights нет фильтра «Шумные», столбец — «Показы / полезно /
+бесполезно». «После»: все окна — «на виду целиком» (телефон — во весь экран, «✕» и основное
+действие в шапке; подтверждения — по центру), страницы — без горизонтальной прокрутки, на
+телефоне таблицы очереди и журнала — карточками. Замечания по снимкам первого прогона «после»
+исправлены до финального: шапка 1440 px обрезала «Кандидаты» (см. решение о подписях), пробел
+перед «— петля» в адресе записи, длинная подпись варианта «Ключ» на телефоне, ссылка цели пробы
+в два ряда. Осталось: выбранный вариант «Поле предела» («авто (у api.openai.com —
+max_completion_tokens)») на телефоне 390 px обрезан в закрытом списке (в открытом — целиком).
+
+#### Круг правок 1 (ревью r1: 0 Critical / 3 Important / 13 Minor)
+
+Ревью `task-8-review-r1.md`; исправлено всё, включая Minor; ⚠️ 2 (тип коммита) — по указанию
+координатора не трогался. Rust — только для I1 и Minor 9 (разрешено координатором).
+
+- **I1 — плашка «вне LAN» по полю сервера** **[решение координатора]**. `GET /auth/settings`
+  отдаёт у `works.model` поля `host` и `external` (`WorksSettings::model_view` / `model_reach`,
+  `crates/zam-server/src/works/settings.rs`): по закреплённому адресу, класс которого сохраняется
+  при закреплении (`ModelConn.external`, пишет `resolve_model`; строки до правки — по
+  `assumed_external` хоста без DNS: литерал по диапазонам, имя — «вне LAN», если это не
+  `localhost`), при чтении DNS нет; на паузе `vault_changed` — по адресу «стал» (тем же
+  `assumed_external`: новый адрес ещё не проверен и не закреплён). В `PATCH` оба
+  поля — 400 (вход `ModelInput` строгий). WebUI: плашка — только `settings.model.external`
+  (`externalOf`/`externalHost` и `savedExternal` удалены); `PATCH` из страницы шлёт только поля
+  входа (`connInput`, `worksApi.ts`). Тест Rust `model_external_field_in_settings` — LAN-литерал,
+  `203.0.113.10`, имя, закреплённое во внешний адрес (резолвер подменён только на время
+  `PATCH`), LAN-имя, пауза по «стал», 400 на `external`/`host` во входе; модульный
+  `model_external_view_without_dns`. e2e `works_external_banner_testnet` — плашка после
+  перезагрузки у литерала, поле `host/external` в ответе, и у имени (ответ подставлен:
+  `models.example.com`, две перезагрузки). Документы: `api-compat.md` (строка `works` и раздел
+  настроек), ТЗ (подключение и §15.4), спецификация §6.2 («Предупреждение вне LAN») и §6.9 п. 1.
+- **I2 — шапка без обрезки: меню «Ещё ▾»** **[решение координатора]**. `NavMore.svelte` — кнопка
+  меню WAI-ARIA APG («Menu Button»): `aria-haspopup="menu"`, `aria-expanded`, `aria-controls`;
+  Enter/Пробел/щелчок/↓ — открыть с фокусом на первом пункте, ↑ — на последнем; в меню ↑/↓ по
+  кругу, Home/End, Esc — закрыть с фокусом на кнопку (отмечается обработанным — панель и слои
+  ниже его не берут), Tab, щелчок мимо, уход фокуса, выбор пункта и переход — закрыть; меню —
+  `position: fixed` под кнопкой (полоса его не обрезает). `Shell.svelte`: разделы — массив
+  `sectionList`; скрытая копия полосы (`.nav-measure`, все разделы полными и короткими подписями
+  и кнопка «Ещё» со всеми признаками — запас) и `ResizeObserver` на полосе и копии: подписи
+  полные, если помещаются все разделы, иначе короткие («Админ», «Агент», «Кэш»), что не
+  помещается и так — в «Ещё»; полоса — остаток шапки (`flex: 1`), без прокрутки
+  (`overflow-x: clip` — страховка до первого замера). Точка «Проверка» и число «Кандидаты» скрытых
+  разделов — на кнопке (`more-dot`, `more-count`) и у пунктов меню. `BP_FULL_LABELS` и
+  `@media (max-width: 1439px)` удалены (`layout.ts`, `layout.test.ts` — как до задачи 8),
+  `revealSelected` у полосы разделов больше не нужен (у полос журналов и администрирования —
+  прежний). e2e `header_sections_fit` (`mobile.spec.ts`): 820 и 1180 (касание), 1024, 1366, 1440 —
+  администратор и пользователь, число кандидатов «12» и точка регрессии подстановкой: у каждой
+  видимой ссылки и кнопки «Ещё» `scrollWidth ≤ clientWidth` и рамка в границах полосы, полоса не
+  переполнена и не заходит под «Поиск», полоса + меню = все разделы по порядку, признаки — на
+  кнопке и в меню, клавиатура (Enter → первый пункт, End, ↓ по кругу, Esc → фокус на кнопку),
+  цели 44 px на касании; снимки `header-<кто>-<ширина>[-more].png`. Помощник e2e `nav.ts`
+  (`sectionItem`, `openSection`, `sectionNames`) — раздел в полосе или в меню; `check.spec`,
+  `user-login.spec`, `tablet_tree_is_drawer`, `tablet_header_720` — через него.
+  Раскладка по прогону (e2e-логин `admin`, число «12»): администратор — 820: 5 в полосе, в «Ещё» —
+  «Сессии», «Проверка», «Кандидаты»; 1024: 6, в «Ещё» — «Проверка», «Кандидаты»; 1180, 1366, 1440 —
+  все 8 (1180 и 1366 — короткими подписями, 1440 — полными); пользователь — 820 и 1024: 5, в «Ещё» —
+  три; 1180: 6, в «Ещё» — два; 1366 и 1440 — все 8. Прежде на 820 и 1024 «Кандидаты» обрезались на
+  полуслове без признака прокрутки.
+- **I3 — бейджи дерева компактные.** «кандидаты: N» и «запросы: N» — одним образцом
+  (`candidatesBadge`, `requestsBadge` в `Tree.svelte`): плашка — `span.tag` внутри ссылки
+  `.badge-link`; на касании бейдж — своей строкой под именем (`.tree-badges`), цель 44 × 44 — сама
+  ссылка (прозрачная вокруг плашки), имя пространства не сжимается; мышь — в строке, как раньше.
+  `min-height: 44px` у `.tag.pending` снят. e2e `tree_badges_compact` (tabletLand, «12»
+  подстановкой): «Rules» целиком, плашка ниже 24 px и под строкой имени, ссылка 44 × 44; снимок
+  `tabletLand-tree-badges.png`. Прежний `touch_targets_44` (телефон) проверяет ссылки дерева
+  44 px — бейдж-ссылка их держит.
+- **Minor.** 1 — без сохранённого подключения кнопка окна — «Сохранить и проверить» и сохраняет
+  перед проверкой. 2 — окно «Подтвердить адрес»: «Был / Стал» списком, адреса моноширинно, каждый
+  своей строкой (`works-confirm-was`, `works-confirm-now`). 3 — «токен / токена / токенов» по
+  второму числу (`plural.ts`). 4 — без ключей конфигурации и номеров этапов: причины и подсказки
+  — «настройка администратора сервера», «эта же машина», «служебный локальный адрес»; у
+  выключателя нет `works.check`; токены — без `[works] max_*`; «Пробы» — без «M7.4»; запись Vault
+  — по имени, `v:<id>` — в `title`; кандидат — «из внутренней работы», id — в `title`; таймаут
+  прогона — без `check_max_min`. 5 — «Поле предела»: вариант «авто», пояснение — подписью над
+  выбором (`aria-describedby`). 6 — у «Принять как норму» строка «Открыта регрессия ночного
+  прогона <ночь>: …», если последний прогон — не этот ночной. 7 — плашка по действующему режиму
+  («уходят» / «уйдут, когда вид работ будет в режиме „модель“»), «Отключить модель» —
+  опасное подтверждение, строка `FORM_CASES` `works-disconnect` (хук `kept` вместо проверки записи
+  из адреса). 8 — итог выключателя ночной проверки — у него, в разделе «Ночь» (ошибка — тоже).
+  9 — `GET /check/runs?trigger=&status=` (`zam_store::check::runs_of`, 400 на неизвестное):
+  точка «Проверка» и страница берут последний законченный ночной прогон одним запросом
+  (`lastNightlyRun`), `RUNS = 60` и `latestNightly` удалены; тест Rust
+  `check_runs_filter_trigger_status`; подстановки e2e — `runsReply` (фильтр как у сервера). 10 —
+  подсказка класса адреса: вложенный IPv4 (`::a.b.c.d`, NAT64, 6to4) как у сервера (петля и
+  link-local внутри — их класс, частный — вне LAN), «в локальной сети (… сервер уточнит при
+  сохранении)»; комментарий модуля больше не обещает «те же диапазоны». 11 — каждый сценарий
+  `works.spec.ts` готовит подключение сам (`resetWorks` + `connect`). 12 — формулировка о
+  строках `FORM_CASES` в журнале уточнена (успешной отправки строки `after: 'notice'` не делают).
+  13 — подписи видов на телефоне — над выбором у обоих; «Шумных записей нет.»; видимый префикс
+  `rules:/` у поля пути.
+
+**Прогоны круга.**
+- Rust: `cargo test -p zam-server` — `works_model` 42/42 (новый `model_external_field_in_settings`),
+  `check_run` 28/28 (+1 ignored; новый `check_runs_filter_trigger_status`), `works_settings` 7,
+  `works` 32, `works_night` 7, `works_probes` 17, `--lib` 386 (+2 ignored; новый
+  `model_external_view_without_dns`); `cargo test -p zam-store check` — зелёные; `cargo clippy -p
+  zam-server -p zam-store --all-targets -D warnings` — чисто; `cargo fmt --all --check` — чисто.
+  Ловушка теста фильтра (строки прогона после 202 ещё нет) — insight
+  `i:01M86GAB70EM79VW5AS5NAEXVP`.
+- WebUI: `npm run check` — 0/0; `npm run test:build` — 115/115 (`worksText` — вложенный IPv4,
+  склонение; `checkVerdict` — без `latestNightly`); `npm run build` (сверка старта — без
+  расхождений); `npx size-limit` — без превышений. Размеры gzip (до круга → после): `entry` 65,78 →
+  67,62 / 103, `start` 92,05 → 93,90 / 103, `api` 27,00 → 27,00 / 29,7, `start+api` 119,06 → 120,90 /
+  129,5, `Works` 10,32 → 10,73 / 11,3, `Check` 6,42 → 6,51 / 7, `Proposals` 4,98 → 5,04 / 5,45,
+  `worksText` 4,77 → 4,87 / 5,25, `InsightsView` 12,01 → 12,03 / 12,6. Рост старта — меню «Ещё» и
+  замер шапки (`NavMore` — в чанке оболочки).
+- e2e на release-сборке worktree (`target/m73-t8/release`): прицельный прогон (`works`, `check`,
+  `proposals`, `user-login`, `mobile`) — 31/32: упал `check_status_and_failing` — он брал первую
+  свою пробу как проваленную, а какие пробы провалятся, зависит от записей прогона (поиск без
+  векторов находит часть по общим словам; в полном прогоне спецификации идут в другом порядке) —
+  теперь берётся первая проваленная из своих. Полный набор — **634/637 за 12,3 мин**: упал
+  `proposals_rule_accept_creates_note` — его регулярное выражение ждало «токенов», а со склонением
+  (Minor 3) вышло «64 токена»; два следующих сценария режима `serial` не запускались. Исправлено
+  (`токен(?:а|ов)?`), `proposals.spec.ts` повторно — 3/3. Нестабильный
+  `forms_open_focus_trap_esc task-create phone` (ядро 10a) в этом прогоне прошёл.
+
+**Снимки круга** (вне git): «после» круга — `.tmp/e2e/screens/forms/after/` (прежние «после» — рядом,
+`after-r0/`): 7 окон × 4 ширины (с `works-disconnect`) и 5 страниц × 3 ширины (с
+`page-works-external` — подключение вне LAN `203.0.113.10` и пауза «адрес изменён», пауза
+подставлена в ответ настроек), 43 снимка, все окна — «на виду целиком»; шапка —
+`.tmp/e2e/screens/mobile/header-{admin,user}-{820,1024,1180,1366,1440}[-more].png` (меню «Ещё»
+открыто), дерево — `tabletLand-tree-badges.png`. Глазами: подписи разделов шапки целиком на всех
+ширинах, на планшете — «Ещё ▾» с числом кандидатов, выбранная страница из меню подсвечивает «Ещё»;
+«Rules» в дереве на tabletLand — целиком, метки — компактные строкой ниже; окно «Подтвердить
+адрес» — «Был / Стал» моноширинно в две строки; «Поле предела» — «авто» с подписью; у
+«Принять кандидата» — «rules:/» перед полем и «0 → 43 токена (+43)»; подписи видов на телефоне —
+одинаково над выбором. Шапка телефона (разделы — в выдвижной панели) кругом не менялась; её снимки
+(`phone-header.png` и др.) — из полного прогона `mobile.spec`.
+
+#### Правки после ревью r2 (Approved; Minor 7 PARTIAL и N1–N4)
+
+Ревью `task-8-review-r2.md` — Approved; до слияния, в той же ветке:
+
+- **N1 (Minor 7) — текст плашки «вне LAN» на настоящей паузе.** Текст — по **выбранному** режиму
+  (`settings.mode` или режим вида), а не по действующему: на паузе сервер отдаёт действующий «выкл»
+  с причиной `paused` (`effective_mode`). «Модель» действует — «уходят: <хост>»; выбрана, пауза
+  `vault_changed` — «уйдут за пределы локальной сети на <«стал»> сразу после «Подтвердить адрес»»;
+  выбрана, пауза другого класса — «уйдут, как только пауза снимется»; выбрана, но выключена на
+  сервере — «сейчас не уходят: <причина>»; не выбрана — «уйдут, когда вид работ будет в режиме
+  «модель»». e2e `works_external_banner_real_pause` — настоящая пауза: подключение в LAN, адрес
+  записи сменён агентом на `https://203.0.113.10/v1`, «Проверить подключение» ставит паузу
+  `vault_changed` (409), плашка «… сразу после «Подтвердить адрес»» и после перезагрузки,
+  действующий режим «выкл», «Подтвердить адрес» — «уходят: 203.0.113.10», действующий «модель».
+  Снимок `page-works-external` — тоже с настоящей паузой (подготовка та же, без подстановки).
+- **N2** — пояснение «Поле предела» — `aria-hidden` в подписи и `aria-describedby` у поля (как у
+  «Записи Vault»): в имя поля не входит, читается один раз — описанием.
+- **N3** — строка у «Принять как норму» — `openRegressionNote` (`checkVerdict.ts`, модульный тест
+  `verdict_open_regression_note`): вердикт на странице тот же, что у ночного, — «„Принять как
+  норму“ относится к ночному прогону <ночь>.» без повтора вердикта; другой (или его нет) — прежняя
+  строка с вердиктом ночного. e2e `check_accept_new_norm` — короткая строка (ручной M1 с тем же
+  вердиктом).
+- **N4** — ширина «Ещё» в замере — по признакам только тех разделов, что уходят в меню: в копии
+  четыре вида кнопки (без признаков, с точкой, с числом, с обоими), разбиение ищется от большего
+  числа разделов в полосе. Администратор на 1024 px: прежде 6 в полосе («Проверка» и «Кандидаты» —
+  в «Ещё», справа ≈ 95 px пустого), теперь 7 (в «Ещё» — только «Кандидаты»). `header_sections_fit`
+  — новая проверка: если есть «Ещё», первому скрытому разделу и зазору не хватает места справа от
+  кнопки с учётом её ширины после переноса (уже — по признакам оставшихся, или кнопки нет вовсе).
+- Попутно, устойчивость e2e: `works_send_journal_no_text` создаёт себе два термина Knowledge —
+  источники проб. При выборочном прогоне (`check.spec` и `works.spec`) пробы агента разбирали все
+  записи прогона, запуск модели кончался без обращения, сценарий ждал строку журнала 60 с и падал;
+  на полном наборе записей хватало.
+
+**Прогоны.**
+- `npm run check` — 0/0; `npm run test:build` — 116/116 (новый `verdict_open_regression_note`);
+  `npm run build` (сверка старта — без расхождений); `npx size-limit` — без превышений: `entry`
+  67,62 → 67,81, `start` 93,90 → 94,08 / 103, `start+api` 120,90 → 121,09 / 129,5, `Works` 10,73 →
+  10,95 / 11,3, `Check` 6,51 → 6,56 / 7, `Proposals` 5,04, `worksText` 4,87. Rust не менялся.
+- e2e на release-сборке worktree: прицельный (`works`, `check`, шапка и планшет) — сначала 8/10
+  (`works_send_journal_no_text` — см. «Попутно», и следующий serial не шёл), после правки
+  сценария — 10/10; **полный набор — 638/638 за 10,8 мин, без падений**. Раскладка шапки:
+  администратор 820 — 5 в полосе (в «Ещё» — «Сессии», «Проверка», «Кандидаты»), 1024 — 7 (в «Ещё»
+  — «Кандидаты»), 1180/1366/1440 — 8; пользователь 820 и 1024 — 5, 1180 — 6, 1366/1440 — 8.
+- Снимки (вне git): `page-works-external` — настоящая пауза на `https://203.0.113.10/v1`, плашка
+  «уйдут … сразу после «Подтвердить адрес»», виды «действует: выкл — исполнитель на паузе»;
+  `page-check` — короткая строка «„Принять как норму“ относится к ночному прогону 2026-11-23.»;
+  `header-admin-1024.png` — «Проверка» с точкой в полосе, «Ещё» с числом 12; `list.tsv` — без
+  повторов (43 строки).
+
+### M7.3 · Задача 10b — Карточки и формы ввода WebUI: остальные места
+
+Спецификация §6.14 (перечень — строки вне ядра; пп. 1–6, 9), решения 80–94; задача владельца
+`k:01M85AS1C0EZVV95FQZ2ZEQCET`. Worktree `.tmp/m73/wt-t10b`, ветка `m7.3-t10b` от `a2311da2` (задача
+10a слита), параллельно с задачей 8. Только WebUI, Rust не менялся.
+
+**Сделано.**
+- **Словарь** (`GlossaryView.svelte`): ряд «Править» / «Отозвать» / «Удалить» — сразу под шапкой
+  карточки, до определения (правило Г); «Новый термин» — окно `FormDialog` («Добавить», после —
+  карточка созданного, `select` к нему; занятое имя или псевдоним — ссылками в окне); «Отозвать» —
+  окно с причиной (`danger`); «Править» — правка в карточке на месте (вид сменяется формой, фокус на
+  «Имя», «Сохранить» — фокус на заголовке, «Отмена» — на «Править»); 409 правки — `rebase` с
+  пометками расхождений, 409 отзыва — термин перечитан, причина цела (отозван в другом месте —
+  окно закрыто, причина — в карточке); `leaveForm` (сам спрашивал `window.confirm`) убран — окна
+  модальны и спрашивают сами, правка — `unsaved()` у `JournalSplit` и `guardLeave`.
+- **Вопросы** (`QuestionsView.svelte`): «Изменить» — `EditPanel` с `dialog` (широкое окно);
+  «отложить» вопроса-предложения — окно «Отложить до» (дата UTC, `data-autofocus`), «начать» в общем
+  решении — окно-подтверждение с предупреждением (ответ из окна: ошибка — в окне, «уже отвечен» —
+  окно закрыто, причина — у вопроса); ответ текстом — поле на виду под `guardLeave`; вопрос из
+  адреса — прокрутка к началу и фокус на заголовке (п. 2).
+- **Changelog, Releases**: «Изменить» — `EditPanel` с `dialog`; `leaveEdit()` (вопрос перед
+  фильтрами, «Корзиной», выбором релиза) убран — под модальным окном они недоступны; запись из
+  адреса — на виду и в фокусе заголовка («Открытая запись» у Changelog, заголовок сравнения у
+  Releases).
+- **Редактор заметки** (`Editor.svelte`): причина смены `certainty:` — окно `FormDialog` («Причина
+  смены надёжности», поле в фокусе, Esc — сохранение не уходит, ошибка — в окне), Ctrl+S при
+  открытом окне не сбрасывает причину.
+- **Настройки** (`Settings.svelte`): шаблон инструкции — под `guardLeave` (поле и черновики других
+  агентов и языков; согласие — черновики отпущены); «Сбросить к умолчанию» — `Prompt` `danger`.
+- **Аккаунт, Пользователи, Решения**: «Отозвать» свой токен, токен пользователя, доступ участника —
+  `Prompt` `danger` (ошибка — в окне), итог — строкой (`token-notice`, `users-notice`; у доступа —
+  состояние строки), фокус после — на итог.
+- **Импорт, копии, индекс** (кандидат линии отсечения — сделан): `ImportDialog` — на `FormDialog`
+  (`wide`; «Импортировать» — основное, «Проверить без записи» — `extra`, вопрос «Прервать
+  отправку?» — свой, вверху тела; `onsubmit` не ждёт отправки — «Отмена» и «✕» доступны во время
+  неё); «Снять копию сейчас», «Удалить копию» (`danger`), переиндексация (полная — `danger`) —
+  `FormDialog confirm`, отказ сервера — в окне.
+- `EntryEdit` в окне: первое поле получает фокус, когда чанк формы пришёл после открытия окна.
+- `FormDialog`: «Назад» на телефоне, после которой владелец окно не закрыл (импорт спросил
+  «Прервать отправку?»), — запись слоя возвращается.
+- e2e: `form-cases.ts` — 31 строка задачи 10b (вместо `SNAP_ONLY`), поля `prepare` (подмена
+  ответа до открытия страницы) и `kept` (проверка «ничего не изменилось» у подтверждений),
+  `dialog` — и регулярное выражение; `forms.spec.ts` — у `forms_confirm_danger_focus_cancel` общая
+  проверка «запроса `route` после Enter на „Отмена“ не было», данные строк (`people10b`: пользователь
+  с паролем и токеном, свой токен администратора, решение с участником; выжимка кэша; вопрос-
+  предложение общей идеи), сценарии по местам.
+
+- [решение исполнителя, задача 10b] **Поля на виду «Аккаунта» и «Пользователей»** (смена пароля,
+  новый токен, новый пользователь, выдача токена) — тоже в стеке проверок ухода: правило А
+  («набранное — под проверкой ухода») и решение 88 называют их полями на виду; в перечне плана
+  проверка ухода названа только у шаблона и ответа текстом. После удачной отправки поля очищаются
+  до перехода к «Подключению агента» — переход не спрашивает.
+- [решение исполнителя, задача 10b] Подтверждение «начать» вопроса-предложения — не `danger`
+  (задача в общем решении создаётся, ничего не удаляется): фокус — на «Начать».
+- [решение исполнителя, задача 10b] «Новый термин» отправляется кнопкой «Добавить» (§6.14 п. 6, как
+  «Новая задача»), правка — «Сохранить»; тексты итогов прежние («Термин добавлен.», «Термин
+  сохранён.», «Термин отозван.»).
+- [решение исполнителя, задача 10b] Окна «Копий» и «Индекса»: отказ сервера — в окне, окно открыто
+  (§6.14 п. 1); «копия уже идёт» (409) и «копии уже нет в каталоге» (404) — не ошибка формы: окно
+  закрыто, итог строкой на странице, фокус — на неё.
+- [решение исполнителя, задача 10b] **Запись лент из адреса — на виду и в фокусе заголовка** (§6.14
+  п. 2, последнее предложение — ленты без карточки входят в 10b): Вопросы — прокрутка вопроса к
+  началу (под шапку, `scroll-margin-top`) и фокус на `h2`; Changelog — «Открытая запись» сверху и
+  фокус на её `h3`; Releases — фокус на заголовке сравнения (и после выбора релиза в списке —
+  как карточка `split`, решение 86). Перечитывание ленты ответом фокус не трогает.
+- [решение исполнителя, задача 10b] **Контекстное меню дерева** (`ContextMenu.svelte`, не
+  `Tree.svelte`): закрытие возвращает фокус на элемент до меню («⋯» строки; образец menu button
+  WAI-ARIA APG) — окно `Prompt`, открытое пунктом меню, возвращает фокус на «⋯», а не теряет его;
+  меню — в конце `body` (`use:portal`): в широкой раскладке боковая панель липкая (своя плоскость
+  наложения), и пункты, заходящие на страницу, оказывались под формулами KaTeX — на планшете
+  горизонтально «Удалить» и «Переименовать/переместить» заметки не нажимались (так и в 0.0.15:
+  снимки «до» — «не открылась»). `Shell.svelte` (общий с задачей 8) не правился.
+- [решение исполнителя, задача 10b] `FormDialog`: пункт меню (`role="menu"`) не считается
+  кнопкой, открывшей окно; фокус при открытии, пока полей ещё нет (чанк `EntryEdit` в пути), — на
+  видимую основную кнопку (на телефоне — в шапке); «Назад», после которой владелец окно не закрыл,
+  возвращает запись слоя.
+- [решение исполнителя, задача 10b] Импорт: `onsubmit` окна не ждёт отправки и опроса (иначе окно
+  считало бы отправку своей и выключило «Отмена» и «✕» — вопрос «Прервать отправку?» стал бы
+  недостижим); файл — `required` (основная кнопка без файла — подсказка браузера); флажки и
+  варианты — `label.inline` (строкой, цель 44 px).
+- [решение исполнителя, задача 10b] Причина смены надёжности — однострочное поле «Причина»
+  (сообщение ревизии, до 500 символов); человеку сервер причину не требует (матрица §7.5), поэтому
+  e2e подменяет первый ответ `PUT` так, как сервер ответил бы агенту.
+- [решение исполнителя, задача 10b] Отзыв термина при 409: термин уже не действует (отозван или
+  заменён в другом месте) — окно закрыто, объяснение — в карточке; иначе окно открыто, причина
+  цела, текст 409 — общий.
+- [решение исполнителя, задача 10b] e2e «Сбросить к умолчанию» — «свой шаблон» подменой ответа
+  `GET /admin/settings` (`prepare`/`customTemplate`): общий шаблон сервера сценарии форм не меняют
+  (иначе — гонка версий блока с `agent-setup.spec.ts`).
+
+**TDD.** RED — сервер, собранный с WebUI из `a2311da2` (своя копия `zam-server.exe`), новые e2e
+задачи: 9 сценариев по местам — 9/9 падают по ожидаемой причине: окна «Причина смены надёжности»,
+«Отозвать токен?», «Отозвать доступ?», «Сбросить шаблон к умолчанию?» нет (`getByRole('dialog')`
+не найден; причина надёжности — системный `window.prompt`, тест его отклоняет), правка шаблона и
+переход — вопроса нет (0 вместо 1), формы «Правка термина» в карточке нет (она — под карточкой),
+запись лент из адреса — заголовок не в фокусе (Вопросы, Changelog, Releases); строки `FORM_CASES`
+(открытие окна, компьютер и планшет горизонтально, 12 мест) — 24/24 падают: окна нет (22), у
+«Удалить заметку» фокус после Esc теряется (меню без возврата фокуса), на планшете горизонтально
+пункт меню не нажимается (под формулами). GREEN — ниже.
+
+По ходу GREEN найдено и исправлено (каждое — тестом `forms.spec.ts`):
+- окна, открытые пунктом меню дерева (`Prompt` и импорт), не возвращали фокус: пункт меню уходит с
+  меню, а само меню фокус не возвращало (`forms_open_focus_trap_esc` note-new, folder-new,
+  note-move, note-delete, import) — `ContextMenu` возвращает фокус, `FormDialog` пункт меню
+  открывшим не считает;
+- на телефоне окно правки лент (`EditPanel` с `dialog`) открывалось без фокуса в поле: чанк
+  `EntryEdit` приходит после открытия, а основная кнопка внизу окна на телефоне скрыта
+  (`forms_open_focus_trap_esc` question-edit, changelog-edit, release-edit phone) — фокус на
+  видимую кнопку, затем — на первое поле;
+- пункт меню на планшете горизонтально под формулами KaTeX (`note-delete`, `note-move` tabletLand)
+  — меню в конце `body`;
+- `fieldsDense` не учитывал флажок строкой между полями (импорт на телефоне: «зазор» 64 px через
+  флажок высотой 44 px) — флажок вне группы вариантов меряется своей подписью; отчёт —
+  `kept`-проверка по странице (`GET /entries/{id}` отчёта токеном администратора — 404).
+
+**Нестабильный `forms_open_focus_trap_esc task-create phone`** (сообщение координатора: у задачи 8
+после Esc фокус иногда не возвращался на «Новая задача» — 1 из 4 и 2 из 3 повторов). Причина — в
+продукте, фокус действительно терялся: `FormDialog` возвращал его через `setTimeout(0)` и не
+трогал, если фокус «ещё где-то» (`activeElement` не `body`); bits-ui снимает содержимое окна не
+сразу (присутствие — после кадра), и под нагрузкой таймер приходил раньше — фокус ещё стоял в поле
+закрываемого окна, возврат пропускался, а после снятия окна фокус падал на `body` (человек с
+клавиатурой или программой чтения терял место). Исправление: возврат — после снятия содержимого
+окна (ожидание по кадрам, не дольше 30), фокус внутри снятого окна в счёт не идёт. Повторы на
+телефоне (`--repeat-each`, строки `task-create`, `idea-create`, `insight-new`, `term-new`): до
+исправления (сборка задачи, параллельно со сборкой сервера) — 4 из 60 падают (`task-create` 3 из
+15, `term-new` 1 из 15), всё — «фокус не на кнопке, открывшей окно» за 5 с; после — 100 из 100
+(по 25 повторов каждой строки, `task-create` — 25 из 25) под нагрузкой процессора (два своих
+процесса с циклом на время прогона), затем полный набор — ниже.
+
+**Проверки:** `npm run check` — 0 ошибок и предупреждений; `npm run test:build` — 102/102 (новой
+логики без DOM нет — модульных тестов не добавлялось); `npm run build` (со сверкой старта);
+`npx size-limit` — без превышений (таблица ниже); e2e на release-сервере worktree (`pdfium.dll`,
+Edge): `forms.spec.ts` — 734 теста (53 строки `FORM_CASES` × ширины, по местам 10a и 10b, ленты), полный
+набор — **935/935 за 14,2 мин** на последней сборке (с исправлением возврата фокуса; до него —
+935/935 за 15,1 мин и 934/935 в первом полном прогоне: `fieldsDense` у импорта, исправлен
+сценарий, повтор группы — 48/48). Rust не менялся: clippy и fmt не нужны.
+
+**Линия отсечения** не понадобилась: окна импорта, копий и индекса переведены на каркас, матрица
+e2e — полная (три ширины и `tabletLand` для открытия, ошибка сервера и карточка созданного — во
+всех трёх).
+
+**Размеры** (`npx size-limit`, gzip, до (сборка `a2311da2`) → после круга правок 1; превышений нет):
+
+| Чанк | До | После | Предел | Причина |
+|---|---|---|---|---|
+| `start` (старт без `api`) | 90,62 | 91,92 | 103 | `ContextMenu` (возврат фокуса, `portal`), подтверждения и проверки ухода «Аккаунта», «Пользователей», «Решений», «Настроек», окно «Индекса» — в `entry` |
+| `entry` | 64,38 | 65,52 | 103 | то же |
+| `start+api` | 117,58 | 118,88 | 129,5 | — |
+| `GlossaryView` | 5,18 | 6,19 | 5,7 → **6,8** | окна «Новый термин» и «Отозвать», правка в карточке, 409 — `rebase` с пометками, ссылки занятого имени в окне |
+| `QuestionsView` | 4,84 | 5,18 | 5,3 | окна «Отложить до» и «начать», правка в окне, фокус записи из адреса |
+| `ChangelogView` | 3,35 | 3,38 | 3,7 | — |
+| `ReleasesView` | 3,68 | 3,70 | 4,05 | — |
+| `EntryEdit` | 3,48 | 3,55 | 3,8 | фокус первого поля в окне после загрузки чанка |
+| `FormDialog` | 3,00 | 3,15 | 3,25 | «Назад» без закрытия, меню не открывает окно, фокус на видимой кнопке, возврат фокуса после снятия окна |
+| `ImportDialog` | 5,08 | 4,96 | 5,6 | свой `Dialog` и кнопки — у каркаса |
+| `Backups` | 4,74 | 4,57 | 5,3 | то же |
+
+**Правки прежних e2e** (поведение изменено намеренно по §6.14; другие ожидания не трогались):
+- `working-memory.spec.ts` (`glossary_*`) — «Новый термин» — окно с «Добавить»; после — окно
+  закрыто, карточка созданного; правка — в карточке (как была).
+- `mobile.spec.ts` (`glossary_unsaved_back_asks_phone`) — форма нового термина стала окном (его
+  «Назад» и несохранённое — строка `term-new` в `forms.spec.ts`), несохранённое карточки
+  проверяется на правке термина на месте; ожидания вопроса панели и уход по адресу — прежние.
+- `ideas.spec.ts` — «отложить» вопроса-предложения — окно «Отложить» (поле «Отложить до» в
+  фокусе); «начать» в общем решении — окно-подтверждение вместо строки в элементе: проверка
+  «кнопка „начать“ неактивна, пока подтверждение открыто» заменена на «фокус — на „Начать“ окна,
+  после „Отмена“ — снова на „начать“» (под модальным окном кнопка недоступна сама).
+- `journals.spec.ts` — правка записи Changelog (три сценария) и релиза — окна «Правка записи» и
+  «Правка релиза»; в `releases_edit_and_trash_restore` выбор другого релиза и «Корзина» при
+  набранном под модальным окном недоступны — вместо них Esc (вопрос в окне, «Продолжить правку»)
+  и уход по адресу (один вопрос роутера, «Отмена» — релиз и набранное на месте).
+- `admin.spec.ts`, `user-login.spec.ts` — «Отозвать» токен — подтверждение «Отозвать токен?»;
+  `access.spec.ts` — «Отозвать» доступ — «Отозвать доступ?»; `agent-setup.spec.ts` — «Сбросить к
+  умолчанию» — «Сбросить шаблон к умолчанию?».
+- `index.spec.ts` — полная переиндексация: фокус — на «Отмена» (`danger`), отказ сервера («векторный
+  индекс не запущен») — в окне, окно открыто, «Отмена» закрывает (было: окно закрывалось, ошибка —
+  на странице).
+- `import.spec.ts`, `backups.spec.ts`, `editor.spec.ts`, `notes.spec.ts` — без правок: «Закрыть»
+  импорта находит «✕» каркаса (имя «Закрыть»), подписи кнопок подтверждений прежние.
+
+**Снимки «до/после»** (§6.14 п. 9; `.tmp/e2e/screens/forms/{before,after}/<форма>-<ширина>.png` в
+worktree, вне git; ширины — как у задачи 10a). «До» — сервер, собранный из `a2311da2` (задача 10a
+слита, места 10b — как в 0.0.15), `forms.spec.ts` в режиме `E2E_FORMS_SNAP=before` с прежним
+перечнем (`SNAP_ONLY` и семь новых мест — открыть без нажатия необратимого): 49 мест × 4 = 196
+снимков, список — `before/list-before.tsv`. «После» — сборка задачи, 53 строки `FORM_CASES` × 4 =
+212 снимков, `after/list.tsv`. Значения: «окно» — окно на виду целиком; «окна нет — сразу» —
+кнопка срабатывала без вопроса (на снимке — страница с кнопкой); «в карточке, видно частично (низ
+N)» — форма раскрылась под кнопкой, её низ — на N px при высоте окна 844 / 1180 / 820 / 900.
+
+| Форма | Перечень §6.14 | До | После |
+|---|---|---|---|
+| `term-new` | Новый термин | тел.: в карточке, видно частично (низ 1023); план.: в карточке; план. гориз.: в карточке, видно частично (низ 1035); комп.: в карточке, видно частично (низ 943) | окно |
+| `term-retract` | Отозвать термин | в карточке, внизу карточки | окно |
+| `term-edit` | Править термин | в карточке под рядом кнопок, ниже определения; видно частично (тел. низ 1204, план. гориз. 1216, комп. 1116) | в карточке сразу под шапкой, вместо вида: начало формы и «Имя» (фокус) на виду, низ длинной формы — 1090 / 1102 / 1010 (тел. / план. гориз. / комп.) |
+| `question-edit` | Правка вопроса | в элементе ленты; тел.: видно частично (низ 862) | окно (широкое) |
+| `question-obsolete` | Вопрос неактуален | окно | окно |
+| `question-defer` | Отложить до (вопрос-предложение) | строка-форма в элементе ленты | окно |
+| `question-start` | «начать» в общем решении | строка подтверждения в элементе ленты | окно-подтверждение |
+| `question-answer` | Ответ текстом (поле на виду) | в элементе ленты | в элементе ленты (вопрос из адреса — сверху, заголовок в фокусе) |
+| `changelog-edit` | Правка записи Changelog | в элементе ленты; тел.: видно частично (низ 1049), план. гориз. — 926 | окно (широкое) |
+| `changelog-delete` | Удалить запись журнала | окно | окно |
+| `release-edit` | Правка релиза | под заголовком сравнения; тел.: видно частично (низ 981), план. гориз. — 898 | окно (широкое) |
+| `note-new`, `folder-new` | Новая заметка, папка | окно | окно |
+| `note-move`, `note-delete` | Переименовать или переместить, удалить заметку | окно; план. гориз.: не открылась (пункт меню под формулами страницы) | окно во всех ширинах |
+| `attachment-detach`, `history-revert`, `report-delete` | Открепить вложение, откатить ревизию, удалить отчёт | окно | окно |
+| `cache-note`, `cache-delete` | Превратить выжимку в заметку, удалить выжимку | снимка нет (места не было в перечне снимков 10a) | окно |
+| `user-password` | Пароль пользователя | окно | окно |
+| `user-close` | Закрыть вход | снимка нет (у пользователей «до» не было пароля) | окно-подтверждение |
+| `user-revoke`, `account-revoke`, `access-revoke` | «Отозвать» токен пользователя, свой токен, доступ | окна нет — сразу | окно-подтверждение `danger` |
+| `template-reset` | Сбросить шаблон к умолчанию | окна нет — сразу | окно-подтверждение `danger` |
+| `template-edit` | Шаблон инструкции (поле на виду) | на странице, ниже первого экрана (низ поля 1324 / 1243 / 1301 / 1221) | на странице на месте (снимок прокручен к полю: низ 1043 / на виду / 1032 / 1034 — поле в 12 строк выше окна телефона) |
+| `import` | Импорт архива | своё окно | окно на каркасе (на телефоне — во весь экран) |
+| `backup-run`, `reindex` | Снять копию сейчас, переиндексация | своё окно | окно-подтверждение на каркасе |
+| `reindex-full` | Полная переиндексация | снимка нет (в перечне снимков 10a — одна строка переиндексации) | окно-подтверждение `danger` |
+
+Причина смены надёжности в редакторе (`window.prompt` «до») — системное окно, Playwright его не
+снимает; «после» — e2e `editor_certainty_reason_dialog`.
+
+**Круг правок 1** (ревью r1: Approved, 0 Critical, 0 Important, 3 ⚠️, 15 Minor; исправлено всё,
+кроме Minor 14 — заметка координатору о слиянии с задачей 8):
+- **⚠️ 1 — перечень e2e.** Новые строки `FORM_CASES`: `access-reject` («Отклонить запрос?» с
+  причиной; в данных строк — второй пользователь с запросом доступа, ждущим решения) и
+  `backup-delete` («Удалить копию?», `danger`; копия в списке — подменой ответа `GET
+  /admin/backups` (`prepare`/`fakeBackup`): снимать настоящую копию для окна долго, настоящую удаляет
+  `backups.spec.ts`; фокус на «Отмена» и «запроса `DELETE` нет» — общий сценарий подтверждений).
+- **⚠️ 2 — импорт с вопросом о несохранённом.** `ImportDialog` передаёт окну `dirty`: выбран архив
+  или изменены параметры, а запуска ещё не было — Esc, «✕», «Отмена» и «Назад» спрашивают в окне,
+  уход по адресу — один вопрос стека; после итога или ошибки запуска — нет (запуск был). Строка
+  `import` получила `fill` (пустой `.zip`) и `route` (отказ приёма 422 — в окне, файл в поле цел).
+  [решение исполнителя, круг 1] Minor 3: без файла выключены обе кнопки запуска — у `FormDialog`
+  новое необязательное свойство `canSubmit` (основная кнопка выключена без `aria-busy`, Enter не
+  отправляет).
+- **⚠️ 3** — `forms_phone_create_then_back` и для `term-new` (одна «Назад» после «Добавить» — к
+  списку Словаря, «Новый термин» на виду).
+- Minor 1 — «Снять копию сейчас»: строка итога «Копия запущена: её ход — ниже.» ставится и ход
+  копии перечитывается до закрытия окна, фокус — на итог (гонки с выключаемой кнопкой нет); строка
+  уходит, когда копия кончилась. Minor 4 — отказ сброса шаблона — одной строкой в окне (на странице
+  не дублируется). Minor 5 — у «Решений» строка итога (`solutions-notice`: «Доступ … одобрен /
+  отозван», «Запрос … отклонён») и фокус на неё после одобрения, отклонения и отзыва. Minor 6 —
+  заголовки подтверждений — вопросом: «Снять копию сейчас?», «Удалить копию?»,
+  «Переиндексировать из embeddings?», «Запустить полную переиндексацию?», «Отклонить запрос?»;
+  «Снять копию сейчас» при автокопиях (`schedule = daily`: удаляет старшие копии сверх `keep`) —
+  `danger`. Minor 7 — подпись поля термина с пометкой «(по одному в строке)» — одной строкой и в
+  карточке (закреплённый ряд «Сохранить / Отмена» длинной правки на месте — общая черта 10a, на
+  будущее). Minor 8 — подзаголовок окон «Отложить» и «Начать идею в общем решении?» — «Вопрос: …».
+  Minor 9 — текст 409 окна отзыва — «…проверьте и отзовите снова» (`rebaseText(…, again)`, тест
+  `rebase_text_action_verb`). Minor 10 — проверка ухода «Аккаунта» без текущего пароля (его
+  подставляет менеджер паролей). Minor 11 — мёртвое `actionErr` «Копий» убрано. Minor 12 —
+  `restoreAfter` не трогает фокус, если окно открыли снова. Minor 13 — контексты `adminSession`
+  закрываются после файла. Minor 15 — коммит правок — `fix(web): …`, как в брифе (первый коммит
+  `feat(m7.3): …` не переписывается: rebase запрещён).
+- Найдено по ходу полного e2e круга: (а) `forms_phone_back_closes access-reject phone` — повторное
+  открытие окна после «Назад» искало «Доступ», а участники уже раскрыты (кнопка — «Скрыть»):
+  открытие строк `access-*` и `user-revoke` раскрывает таблицу, только если строка не на виду;
+  (б) `feed_entry_in_view_on_open release phone` (1 раз из трёх полных прогонов) — дефект продукта:
+  на телефоне список релизов стоит над сравнением, и если сравнение приходило раньше списка,
+  прокрутка к заголовку уезжала вниз, когда список вырастал; теперь фокус и прокрутка — когда пришли
+  и сравнение, и список (`ReleasesView`, эффект по `revealFor`), прокрутка — к началу заголовка.
+
+Прогоны круга 1: `npm run check` — 0/0; `npm run test:build` — 103/103 (новый
+`rebase_text_action_verb`); `npm run build`; `npx size-limit` — без превышений (таблица размеров
+выше — числа круга 1); e2e на release-сервере worktree: `forms.spec.ts` — 771 тест (55 строк
+`FORM_CASES`), `feed_entry_in_view_on_open` — 72/72 (`--repeat-each=8`, три ленты × три ширины)
+после исправления (б), **полный набор — 972/972 за 16,5 мин** на последней сборке (до (а) и (б) —
+971/972). Снимки «после» пересняты: 55 строк × 4 = 220 (`after/list.tsv`), новые —
+`access-reject-*` (окно «Отклонить запрос?» с полем «Причина»; на телефоне — «✕ · Отклонить
+запрос? · Отклонить» красной, пояснение с именем пользователя, поле в фокусе), `backup-delete-*`
+(подтверждение «Удалить копию?» во всю ширину над страницей «Копии», жёлтая плашка с датой и
+именем копии, «Удалить» красная и «Отмена»; копия под окном — подменённая); `import-phone` — без
+файла «Импортировать» в шапке и «Проверить без записи» внизу выключены обе; `term-edit-phone` —
+«Псевдонимы (по одному в строке)» и прочие пометки — в строке подписи.
+
+Сравнение глазами, **телефон** (по каждому снимку задачи 10b):
+- `term-new-phone` — «✕ · Новый термин · Добавить» в шапке; «Имя» (в фокусе), «Определение»,
+  «Псевдонимы», «Не путать с», «Имена в коде» (пометка «по одному в строке» — в строке подписи),
+  «Пояснение» — подряд, ниже — пусто.
+- `term-retract-phone` — «✕ · Отозвать термин / Окно формы · Отозвать» (красная); пояснение
+  «Запись остаётся в истории…»; «Причина» в фокусе.
+- `term-edit-phone` — правка на месте: вкладки журналов, «← Словарь», карточка с заголовком,
+  статусом и ревизией; под шапкой — рамка «Правка термина»: «Имя» (фокус, верх ≈ 385 px),
+  «Определение», «Псевдонимы» …; «Сохранить» / «Отмена» — ниже края экрана (форма длиннее экрана,
+  к кнопкам прокручивают; Enter в «Имени» отправляет).
+- `question-edit-phone` — «✕ · Правка вопроса / заголовок вопроса (две строки) · Сохранить»;
+  «Заголовок» (фокус), «Текст», «Теги», «Область».
+- `question-obsolete-phone` — «✕ · Вопрос неактуален? · Неактуален»; пояснение; «Причина» (фокус).
+- `question-defer-phone` — «✕ · Отложить / „Начать идею «…»?“ · Отложить»; пояснение «Идея
+  вернётся к разбору не раньше этой даты»; «Отложить до» — дата (фокус) и «UTC» в одной строке.
+- `question-start-phone` — окно-подтверждение во всю ширину посреди экрана над затемнённой лентой:
+  «Начать идею в общем решении?», вопрос, жёлтая плашка «Задача появится в решении «Идеи E2E»,
+  её увидят участники.», «Начать» (синяя, фокус) и «Отмена».
+- `question-answer-phone` — вопрос из адреса сверху, заголовок в кольце фокуса; варианты «окна» и
+  «карточка», поле «или свой ответ» и «Ответить» в ряд, «Изменить», «Неактуален», «Удалить».
+- `changelog-edit-phone`, `release-edit-phone` — «✕ · Правка записи / Правка релиза / запись ·
+  Сохранить»; «Заголовок» (фокус), «Текст», у записи — «Вид», «Теги», «Область».
+- `changelog-delete-phone`, `note-delete-phone`, `attachment-detach-phone`, `history-revert-phone`,
+  `report-delete-phone`, `cache-delete-phone`, `user-close-phone` — окна-подтверждения во всю
+  ширину над затемнённой страницей, текст — что именно уйдёт (у отката — новая ревизия, прежние
+  остаются), красная кнопка действия и «Отмена» (фокус на ней; кольца на снимке нет — фокус не с
+  клавиатуры, кольцо — `:focus-visible`).
+- `user-revoke-phone`, `account-revoke-phone`, `access-revoke-phone` — «Отозвать токен?» /
+  «Отозвать доступ?»: имя и префикс токена (или пользователь, решение и режим), «перестанет работать
+  сразу… вернуть нельзя», «Отозвать» (красная) и «Отмена» (фокус); под окном — раскрытая таблица
+  токенов (участников) с кнопкой «Отозвать».
+- `template-reset-phone` — «Сбросить шаблон к умолчанию?»: «Свой текст шаблона «Claude Code · ru»
+  заменится текстом по умолчанию; версия блока вырастет…», «Сбросить» (красная), «Отмена» (фокус);
+  метка «свой шаблон» под окном — подменой ответа сценария.
+- `template-edit-phone` — страница «Настройки», поле шаблона прокручено к середине экрана: «Версия
+  блока», выбор агента и языка, поле (12 строк), «Сохранить» (неактивна, правки нет) и «Сбросить к
+  умолчанию», ниже — «Предпросмотр».
+- `note-new-phone`, `folder-new-phone`, `note-move-phone`, `cache-note-phone`, `user-password-phone`
+  — окна `Prompt` с полем во весь экран: «✕ · заголовок · действие» в шапке, пояснение и поле (в
+  фокусе, у пути — выделен) сразу под ней.
+- `import-phone` — «✕ · Импорт архива · Импортировать»; пояснение; «Архив (.zip)» (выбор файла),
+  флажок «Это мой архив…», группы «Если запись уже есть» и «Аксиомы чужого архива» (варианты в
+  строку), жёлтое предупреждение о закрытии; внизу экрана — «Проверить без записи» (неактивна без
+  файла).
+- `backup-run-phone`, `reindex-phone`, `reindex-full-phone` — окна-подтверждения во всю ширину:
+  «Снять копию» (синяя, фокус), «Запустить» (синяя / красная у полной, у полной фокус — «Отмена»).
+
+### M7.3 · Финальное ревью и волна правок
+
+Финальное ревью ветки `7e15b5a5..3dc60d0e` (отчёт — `final-review.md` каталога SDD волны): «With
+fixes», Critical 0, Important 0, Minor 12. Решения координатора (`fix-wave-brief.md`): исправить
+все 12 одной волной. Worktree `.tmp/m73/wt-fix`, ветка `m7.3-fix` от `3dc60d0e`, сборка
+`target\m73-fix` (release для e2e — `target\m73-fix-rel`: параллельно с прогонами, без замка
+каталога сборки).
+
+- **1 — проба «принято», которой нет.** `ItemWrite::Probe` (`zam_store::works::apply_write`) при
+  исчерпанном к закрытию пределе новых проб, повторе вопроса (`Duplicate`) и пределе активных
+  (`Full`) возвращает предупреждение «`<ref>`: проба не записана — …» — общий механизм
+  `Closed::Closed {warnings}` (`result.warnings`, `result.response.warnings`, ответ итога), как у
+  кандидатов в Rules. WebUI: «принято N · не записано K» (`workResultText`).
+- **2 — «0 мс» в журнале отправок.** `WorkCall.ms: number | null`; столбец «мс» — «—» с подсказкой
+  `title` «ответа не было…» (`callMsText`, `CALL_NO_MS_HINT`), карточка телефона —
+  `callDurationText`.
+- **3 — итог хранит элемент как есть.** `kinds::kept_item(rows)` — элемент итога по записям,
+  которые он даёт: `{question}` у `probes`, `{rule: {path, content}, reason}` у `rules` (путь
+  нормализован, `title` — в `content`), `{text}` у `echo`; `queue::accept` кладёт его вместо
+  присланного JSON.
+- **4 — срок хранения `works`.** `zam_store::works::gc` (закрытые `done`, `cancelled`, `failed`,
+  `expired` с `finished_at` раньше среза), `RETENTION_DAYS = REFS_HORIZON_DAYS = 365`,
+  `maintenance::gc_works` (`WORKS_TTL`) в проходе обслуживания рядом с `work_calls` и
+  `check_runs`; индекс `works_finished (kind, finished_at)` — в 0027 (не выпущена; как
+  `work_calls_run`). **[решение исполнителя]** «Считать отсев один раз на запуск вида» не сделано:
+  после срока хранения и п. 3 объём разбора ограничен годом итогов вида (≲ 1,5 тыс. небольших
+  строк), а вынос отсева из сборщиков меняет их общий вход (`kinds::collect` зовут тесты и
+  постановка) — лучше сделать вместе с рекомендацией 4 ревью (одно место «отсеянных ссылок» для
+  M7.5).
+- **5 — один вид «выключено».** `POST /works/model/test` при `model_access = "off"` —
+  `ApiError::WorksDisabled` (`/problems/works-disabled`, причина в `detail`).
+- **6 — дубли.** `works::exec::token_limits` — пределы и у отказа (`fits_limits`), и у `GET
+  /works/usage`; `zam_store::time::month_start_utc` (тест перенесён в `time.rs`); выбор
+  пользователя — `api::works::works_user` у обоих маршрутов модели (токену — 403 до него;
+  администратор без `?user=` теперь получает `X-Zam-User`, как у очереди); `ApiError::conflict_code`
+  вместо двух местных `conflict` (и `works_off`).
+- **7 — api-compat.** Пункты `POST /works/model/test` (тело ответа, 409 `works-disabled`,
+  `vault_changed {was, now}`, `model_busy`, 422), `GET /works/calls` (`{days, calls}`, `days`
+  1..=180, исходы с `aborted` и `internal`, `ms = null`), аудит `works.model.*`, `check.accept`,
+  `proposal.accept`/`decline`; `memory_check` — «M7.3 §6.4–§6.5»; `warnings` у проб и поля
+  принятого элемента; срок хранения работ; `check` у `usage` и `check/status`; пометка `shell`.
+- **8 — ТЗ §6.3 и комментарий 0027.** `work_calls.run`, индекс `work_calls_run`, исход `internal`,
+  `ms` без ответа; индекс `works_finished` и срок хранения `works`.
+- **9 — тайминг.** `MockReply::held(&Gate)` (подставная модель держит ответ до `Gate::open`):
+  `mode_rechecked_before_retry` отпускает `500` только после `PATCH` режима; задержка 600 мс и
+  сон 100 мс убраны.
+- **10 — фокус «Подтвердить адрес».** Признак каркаса `cautious` у `FormDialog` (фокус на
+  «Отмена», кнопка не красная); у строки перечня форм `works-confirm-address` — `danger` и `kept`
+  (Enter на «Отмена» — `PATCH` нет, пауза на месте); ожидание фокуса — в
+  `works_pause_dot_and_confirm_address`.
+- **11 — пометка «команды shell».** `rules::has_shell`: приглашение `$ `/`PS> `, конвейер в
+  оболочку после `|` (кроме `||` и строк таблиц Markdown), фразы на границе слов (`cmd /c`,
+  `powershell`, `pwsh`, `bash -c`, `curl`, `wget`, `iwr`, `irm`, `iex`, `Invoke-Expression`,
+  `-EncodedCommand`, `rm -rf`, `chmod +x`, `sudo`, `rd /s`, …), в том числе внутри однострочного
+  кода; тест `shell_cases` — 20 «да» и 8 «нет».
+- **12 — выключатель ночной проверки.** `api::check::check_json` — `{server, user, reason}` у
+  `GET /check/status` и `GET /works/usage` (`reason`: `disabled` | `check_off`); «Ночная проверка
+  моей памяти» неактивна с причиной (`checkOffText`), если сервер её не проводит.
+
+RED (новые тесты на снимке базы `3dc60d0e`, `target\m73-red`): `shell_cases` — нет пометки у
+`PS> Get-ChildItem`; `probes_write_rechecks_in_transaction` — `warnings` пусты;
+`probes_parallel_results_once` — два `accepted` без предупреждений (гонка на базе случилась);
+`rules_work_sources_and_skip` — `junk` и `rule.extra` в итоге; `model_access_off_zero_requests` —
+`/problems/conflict`; `user_db::migrate_v26_to_v27_new_tables_only` — нет `works_finished`;
+`works` — не собирается (нет `RETENTION_DAYS`, `gc_works`); `worksText.test.ts` — нет экспортов;
+`mode_rechecked_before_retry` — зелёный и на базе (правка самого теста).
+
+Прогоны волны (`ZAM_REQUIRE_ML=1`): `zam-server --lib` 386 passed (2 ignored), `zam-store --lib`
+131, `works` 34, `works_model` 42, `works_probes` 17, `proposals_rules` 26, `check_run` 28 (1
+ignored), `works_night` 7, `works_settings` 7, `mcp` 84, `boot` 15, `m57_acceptance` 13,
+`m65_acceptance` 7, `zam-store` `user_db` 11, `migrate_rebuild` 11 — всё passed; clippy `-p
+zam-server -p zam-store --all-targets -D warnings` и `cargo fmt --all --check` — чисто. WebUI:
+`npm run check` — 0 ошибок, 0 предупреждений; `test:build` — 118 passed (1 skip без `dist`);
+`build`; `size-limit` — в пределах (`Works` 11,08 из 11,3 КБ, `worksText` 5,09 из 5,25,
+`FormDialog` 3,15 из 3,25, старт 95,3 из 103); e2e на release-сборке (`pdfium.dll` рядом,
+`E2E_ZAM` — свой `zam.exe`) — `works.spec` 6/6, полный `npm run e2e` — 1069 passed (16,5 мин).
+
+### M7.3 · Задача 10c — Числа доски задач и шаги планов
+
+Спецификация §6.14 п. 10, решение 96; вопрос владельца 2026-11-24 (дословно — в спецификации):
+«на вкладке Задачи 109, а в колонках в сумме 37 — где остальные?». Worktree `.tmp/m73/wt-t10c`,
+ветка `m7.3-t10c` от `016c1cbf` (задачи 10a и 10b слиты).
+
+**Причина** (рабочая память, проверено координатором): число журнала «Задачи» — все живые записи
+(§5.3), доска по умолчанию — верхний уровень (`top_level=1`), шаги планов `part_of` свёрнуты под
+общими (§5.5): 109 = 37 задач + 72 шага; по статусам — открыт 51/33 (+18), в работе 3/1 (+2),
+выполнен 54/2 (+52), снят 1/1.
+
+**Сделано.**
+- `plural.ts` — формы `PLAN_STEP_FORMS` («1 шаг плана, 2 шага планов, 72 шага планов») и
+  `STEP_FORMS` («+18 шагов»).
+- `taskBoard.ts` — `stepCounts(top, all)` (шаги статуса — разность, не меньше 0: два запроса — два
+  снимка), `boardSummary(c, mode)` (строка над доской: «37 задач · 72 шага планов внутри них —» +
+  «показать на доске»; включён переключатель — «37 задач · показаны и 72 шага планов —» +
+  «свернуть»; «Из идей» — «Из идей — 7 задач и 5 шагов планов», без кнопки; шагов нет — строки нет,
+  кроме «Из идей»; одна задача — «внутри неё»), `stepsTag`, `stepsHint`, `stepsName`.
+- `TasksView.svelte` — числа доски двумя запросами `entries/counts` сразу (верхний уровень и все
+  записи, с «Из идей»), числа колонок — `flat ? все : верхний уровень`; строка над доской
+  (`data-testid="task-steps-line"`), её кнопка — тот же переключатель «Подзадачи на доске» (имя —
+  видимый текст, описание — текст строки); «+K шагов» у заголовка колонки с подсказкой (`title`);
+  у вкладок — «+K» (`StatusTabs`: `extra`, `extraName`, `extraHint`; имя вкладки «Открыт, 33 задачи
+  и 18 шагов планов»). Переключатель «Подзадачи на доске» больше не сбрасывает числа (`resetBoard(
+  true)`): оба набора уже есть — строка и её кнопка не пропадают, фокус на кнопке цел, свежие числа
+  приходят следом.
+- `counts.ts` — `tasksSplit(n, steps)`: подсказка и описание числа «Задач» в полосе журналов и
+  дереве — «109 записей: 37 задач и 72 шага планов» (`Shell.svelte`, `Tree.svelte`); без шагов и у
+  сервера без поля — прежние «всего записей, без корзины» и «N записей».
+- Сервер: `GET /spaces/{space}/counts` → поле `task_steps`, признак `space_counts_steps`
+  (`health.rs`, `docs/api-compat.md`). Хранилище: `space_counts` — пятое чтение в том же снимке:
+  рёбра `part_of` между живыми задачами пространства (`STEPS_SQL`), число — `tasks::subtask_count`
+  (то же правило, что `TaskTree::build`: повторы не в счёт, задачи цикла — верхнего уровня).
+- [решение исполнителя, задача 10c] **Поле сервера, а не запрос клиента** для подсказки числа
+  «Задач»: число видно в полосе журналов на каждой странице журнала и в дереве; без поля подсказка
+  требовала бы `entries/counts?top_level=1` на каждое открытие журнала и пространство дерева.
+  Числа доски по статусам сервер не меняет — два запроса `entries/counts`, которые уже есть.
+- [решение исполнителя, задача 10c] **Порядок соединения `STEPS_SQL` — `CROSS JOIN`**: первый
+  вариант с `JOIN … ON` планировщик без статистики начал с `edges_dst (dst_kind=?)` (все рёбра на
+  записи базы) и искал задачу диапазоном `entries_feed` на каждое ребро — модульный тест
+  `queries_use_indexes` это поймал. Теперь — задачи пространства (`entries_feed`) → их рёбра
+  (`edges_src`) → родитель по ключу.
+- [решение исполнителя, задача 10c] Строка «Из идей» — без «все на доске»: что шаги из идей на
+  доске, уже говорит строка у неактивного переключателя («с «Из идей» — все задачи из идей, и шаги
+  тоже»).
+
+**Прежние e2e — ожидания чисел** (`tasks.spec.ts`; только там, где в наборе есть шаги):
+`tasks_subtasks_progress_and_fold` — заголовки «в работе 1 +2 шага», «открыт 1 +4 шага»,
+«выполнен 0 +9 шагов» (и после выключения переключателя), строка над доской, запросы чисел —
+`['1', null]`; `tasks_from_idea_shows_steps` — запросы чисел с «Из идей» — `['1|true', '1|false']`;
+`tasks_tabs_count_top_level` — вкладки «Открыт 1 +1», «В работе 1 +2», «Выполнен 0 +3», имя «В
+работе, 1 задача и 2 шага планов», запросы `['1', null]`, после переключателя — `[true, false]`.
+
+**Тесты.** WebUI: `npm run test:build` — 108/108 (новые `board_steps_counts`, `board_steps_summary`,
+`board_steps_tag`, `plural_plan_steps`, `count_tasks_split_steps`); `npm run check` — 0/0; `npm run
+build` со сверкой старта. Rust: `zam-store` — `tasks::tests::subtask_count_matches_tree` (200
+псевдослучайных графов и графы тестов дерева: число совпадает с `TaskTree::build`),
+`counts::tests::queries_use_indexes` (план `STEPS_SQL`: `entries_feed` → `edges_src` →
+`sqlite_autoindex_entries_1 (id=?)`), `tests/tasks.rs` `space_counts_task_steps_match_tree` (два
+родителя, шаг шага, цикл и задача, ведущая в цикл, снятое ребро, удалённая задача, рёбра в
+Knowledge и из него: 5 шагов = `task_tree(…).parent.len()`, верхний уровень + шаги = число журнала),
+`--lib` (12), `--test tasks --test entries` — зелёные; `zam-server` — `tests/journals.rs`
+`space_counts_task_steps` (два родителя — один шаг, сумма `entries/counts?top_level=1` + шаги =
+`journals.tasks` у сессии и токена, снятое ребро при втором родителе — шаг остаётся, Knowledge и
+Human — 0), Human — `task_steps: 0` в точном ответе `space_counts_by_journal`, `--test journals`
+21/21, `--test boot` 15/15 (`health_features_documented` с `space_counts_steps`); clippy `zam-store`,
+`zam-server` `--all-targets -D warnings` — чисто; `cargo fmt --all --check` — чисто. e2e на
+release-сервере worktree: `tasks_steps_explained` в `phone`, `tablet`, `tabletLand`, `desktop` —
+4/4, `tasks.spec.ts` — 34/34, полный набор — **976/976** за 16,5 мин.
+
+**Размеры** (`npx size-limit`, gzip; до — сборка `016c1cbf`, числа задачи 10b): старт без `api` —
+91,92 → **92,61** КБ (предел 103), `entry` — 65,52 → 66,21, весь статический старт — 118,88 →
+119,68 (129,5); прочие строки не менялись, превышений нет. Рост — строка над доской, «+K» колонок и
+вкладок, второй запрос чисел (`TasksView`, `StatusTabs`, `taskBoard.ts`, `counts.ts` — в `entry`).
+
+**Цена `space_counts`** (`space_counts_2000_cost`, release, к прежнему набору добавлены 400 шагов:
+задачи с 101-й — `part_of` одной из первых 100; 20 чтений): медиана **1,34 мс**, наибольшее 4,5 мс
+(первый замер — под параллельной release-сборкой: 1,45 / 4,3 мс). В M7.2 без чтения шагов — 0,72
+мс: чтение рёбер задач пространства добавляет ≈ 0,6 мс на 500 задач.
+
+**Снимки** доски «до/после» — `.tmp/e2e/screens/forms/before/tasks-board-<ширина>.png` (сборка
+`016c1cbf`) и `.tmp/e2e/screens/forms/after/tasks-board{,-shown,-ideas}-<ширина>.png` (ширины
+`phone`, `tablet`, `tabletLand`, `desktop`; набор `stepsFixture`: 5 задач верхнего уровня, 10 шагов,
+15 записей):
+- «до», `desktop`: «Задачи 15», колонки 3 + 1 + 0 + 1 + 0 = 5 — ровно вопрос владельца; `phone`:
+  вкладки «Открыт 3 … Снят 0», объяснения нет;
+- «после», `desktop` и `tabletLand`: строка «5 задач · 10 шагов планов внутри них — показать на
+  доске», колонки «открыт 3 +4 шага», «в работе 1 +1 шаг», «заблокирован 0 +1 шаг», «выполнен 1 +3
+  шага», «снят 0 +1 шаг»; `phone` и `tablet`: та же строка, вкладки «Открыт 3 +4», «В работе 1 +1»,
+  «Заблокирован 0 +1», «Выполнен 1 +3», «Снят 0 +1»; `-shown` — «5 задач · показаны и 10 шагов
+  планов — свернуть», числа 7 + 2 + 1 + 4 + 1 = 15 без «+K»; `-ideas` — «Из идей — 1 задача и 1 шаг
+  плана». Строка — 13 px (первый вариант 12 px по снимкам читался мелко — поднят до 13 px).
+
+#### Ревью r1 — правки (Approved, Minor 1–8; поверх слияния с задачей 8 `6a40a4f1`)
+
+1. **Согласование причастия** (`taskBoard.ts`): «показан/показаны», «свёрнут/свёрнуты» — по
+   `plural(k, …)`: «5 задач · показан и 1 шаг плана», «… показан и 21 шаг плана», «Ещё 1 шаг плана
+   … на доске свёрнут». Модульные — случаи 1, 2, 11, 21 (`board_steps_summary`, `board_steps_tag`).
+2. **Пустая колонка или вкладка со свёрнутыми шагами** — `listStepsText`: «Задач нет — 2 шага
+   планов этого статуса внутри общих задач.» вместо «Задач нет.» (у колонки раньше — пусто); у
+   вкладки — с «Показать на доске» (описание — текст строки; после нажатия шаги на доске, кнопка
+   вкладки пропадает — фокус на «свернуть» строки над доской, `showStepsHere`).
+3. **«+K» у вкладок узкой области убран** [решение исполнителя по ревью, Minor 3]: на касании
+   подсказки у «+K» нет, «+4» без слова читался двусмысленно, вкладки на телефоне уходили в третий
+   ряд. Видимо у вкладки — только число задач (как до задачи), шаги — в имени вкладки («Открыт, 3
+   задачи и 4 шага планов», `StatusTabs.nameExtra`; `extra`/`extraHint` удалены) и строкой в
+   панели выбранной вкладки «Ещё 4 шага планов этого статуса — внутри общих задач» — видимый текст
+   и на касании. У колонок «+K шагов» с `title` остаётся: слово рядом, строка над доской на виду.
+4. **Тире перед кнопкой строки** — отдельный `aria-hidden` узел; `lead` без тире, описание кнопки —
+   «5 задач · 10 шагов планов внутри них» (e2e `toHaveAccessibleDescription`).
+5. **Серверный тест** `space_counts_task_steps` дописан: снято второе ребро — шагов 2, снято и
+   первое — 1; на каждом шаге сумма `entries/counts?top_level=1` + шаги = `journals.tasks`;
+   комментарий — по факту.
+6. **Переключатель числа не перечитывает**: `resetBoard(true)` при обоих наборах на руках
+   возвращается до `loadCounts()` (не пришли — перечитывает). e2e: число запросов `entries/counts`
+   после переключателя не меняется (`tasks_subtasks_progress_and_fold`, `tasks_tabs_count_top_level`,
+   `tasks_steps_explained`).
+7. **Масштаб цены `space_counts`**: (1,34 − 0,72) мс / 500 задач ≈ **1,2 мкс на задачу**, линейно
+   по числу живых задач пространства (поиск `edges_src` и чтение строки на задачу; рёбра —
+   `subtask_count` O(V + E)). На базе владельца (~110 задач) — ≈ 0,15 мс; на 10 000 задач —
+   ≈ 12 мс на чтение чисел (кэш клиента — 30 с). Если пространства вырастут до десятков тысяч
+   задач — хранить число шагов при записи рёбер (счётчик) вместо чтения.
+8. **План** («Task 10c»): тест `task_steps` против `task_tree` — `crates/zam-store/tests/tasks.rs`
+   (`space_counts_task_steps_match_tree`), цена — `tests/entries.rs`; добавлены «Interfaces» и
+   шаги `- [x] Step 1–5`, как у соседних задач.
+
+**Слияние с задачей 8** (`6a40a4f1`, без конфликтов): строка над доской и «+K» уживаются с «Ещё ▾» в
+шапке, метками дерева и числами задачи 8 — `Shell.svelte` и `Tree.svelte` передают `task_steps` в
+`countHint`/`countDescription` (полоса журналов и дерево); `counts.ts` (правило `changesCounts`
+задачи 8) и `api.ts` (поля задачи 8) с полем `task_steps` не пересекаются. Проверено: e2e на
+слитом дереве, снимки «после» на четырёх ширинах (ниже).
+
+**Тесты круга** (слитое дерево): `npm run check` — 0/0; `npm run test:build` — 123/123 (новый
+`board_list_steps_text`); `npm run build` со сверкой старта; `npx size-limit` — без превышений:
+старт без `api` 96,21 / 103, `entry` 69,83, весь статический старт 123,32 / 129,5 КБ (вместе с
+задачами 8 и 10b; собственный прирост правок круга — ≈ +0,1 КБ, оценка по сумме чисел задач, не
+замер); `cargo fmt --all --check`; `zam-store` `--lib` 12/12, `--test tasks --test entries`;
+`zam-server` `--test journals` 21/21, `--test boot` 15/15; clippy `zam-store`, `zam-server`
+`--all-targets -D warnings` — чисто. e2e на release-сборке слитого дерева: первый полный прогон —
+1068/1069, упал `code.spec.ts` `code_overview_rereads_status_new_snapshot` (заголовок «Код» не
+появился за 5 с после `page.goto`; к доске задач не относится); отдельно — `code.spec.ts` 16/16 и
+этот тест `--repeat-each=8` 8/8 (плавающий); повторный полный прогон — **1069/1069** за 21,2 мин, 0 падений.
+`tasks_steps_explained` — 4/4. Снимки «после» пересняты (`after/tasks-board{,-shown,-ideas,
+-empty-tab}-<ширина>.png`): вкладки телефона и планшета — снова в два ряда («Открыт 3 · В работе 1
+· …»), под ними «Ещё 1 шаг плана этого статуса — внутри общих задач»; пустая вкладка «Заблокирован»
+— «Задач нет — 1 шаг плана этого статуса внутри общих задач.» и «Показать на доске»; пустые колонки
+«заблокирован 0 +1 шаг» и «снят 0 +1 шаг» (`desktop`, `tabletLand`) — та же строка; «Ещё ▾»,
+«Проверка», «Кандидаты» шапки и метки дерева задачи 8 строке над доской не мешают.
+
+### M7.3 · Итог
+
+Волна реализована, выпуск `0.0.16-m7.3` (2026-11-28; ТЗ v1.29, CHANGELOG `[0.0.16-m7.3]`). Ветка
+`m7.3-internal` от `main` `2e372bde` (выпуск `v0.0.15-m7.2`); рабочие задачи 1–8, 10a, 10b — ветки
+`m7.3-t<N>` в своих worktree, по две параллельно (круги 1 ‖ 2 → 3 ‖ 5 → 4 ‖ 7 → 10a ‖ 6 → 8 ‖ 10b),
+слиты в неё координатором (последнее слияние до итога — `3dc60d0e`, CI — success); задача 9 —
+ветка `m7.3-t9` (версия и документы), параллельно с финальным ревью ветки `7e15b5a5..3dc60d0e`.
+Малая задача 10c (пояснение чисел доски задач: строка над доской, «+N шагов» у колонок, подсказка
+у счётчика вкладки — по вопросу владельца 2026-11-24, `k:01M86MDJHXEMHTBNDEXFS73NGN`) проходит своё
+ревью и сливается после итога: её строки `[Unreleased]` координатор переносит в раздел выпуска.
+Одна миграция — `0027_internal_works.sql` (только новые таблицы, `bak-v26`); блок инструкции v8 и
+11 инструментов MCP — прежние (новое — событием `work` у `memory_recall`, видом `work` у
+`memory_log`, полем `candidate` у `memory_write`), правила агенту — протокол `zam guide`; новых
+крейтов и зависимостей npm нет (`git diff main -- Cargo.lock` — только версии пакетов workspace).
+Линия отсечения (решение 54) не понадобилась: «Новый insight», окна импорта, копий и индекса на
+каркасе `FormDialog`, полная матрица e2e форм и фильтр «Шумные» — в волне.
+
+Что сделано по задачам (подробности, решения исполнителей, RED и прогоны — разделы задач выше):
+1. **Схема 0027, `[works]`, настройки `works.*`, время с поясом, `NightRunner`** (§6 «Общее», §6.1;
+   круги правок 1–2): семь таблиц и строка `meta`, секция `[works]` и `[backup] tz` (`jiff`,
+   встроенная база поясов), настройки исполнителя и выключатель проверки пользователя, ночной
+   исполнитель с клоном `AppState` в поле раннера, учтёнными ручными запусками и остановкой первым
+   (≤ 5 с); замер миграции на копии базы 406 МБ — 5,09 с (SQL — 41 мс).
+2. **Клиент модели** (§6.2; этапы 1–2, круги правок 1–2): OpenAI-совместимый Chat Completions,
+   рассуждение ответом не считается (класс `thinking`), классы адресов по всем адресам имени,
+   соединение по проверенным адресам (кроме прокси), закрепление адреса записи Vault и
+   подтверждение `confirm_url`, второй скан тела, пределы суток и месяца, паузы и «стоп до
+   следующей ночи» по журналу отправок, проверка подключения, журнал отправок без текста, аудит.
+3. **Очередь работ, пакет и итог, режим «агент», ночь и ручной запуск** (§6.3; круг правок 1):
+   `memory_recall event=work` → `memory_log kind=work` (`session_id`), одна проверка итога для
+   агента и модели, итог и закрытие работы — одной транзакцией, повтор по `Idempotency-Key`,
+   аренды и `expired`, ручной запуск сразу и вне окна, строка дайджеста работ.
+4. **Вид работы `probes`** (§6.4; круг правок 1): сборщик по слоям без записей участников,
+   проверка вопроса (длина, пересказ заголовка, повтор), две пробы длинной записи, пределы 40/500,
+   отсев `(ref, rev)` и отправленного этой ночью (`offered_refs`, решение 95).
+5. **Ночная проверка** (§6.5; круг правок 1, слияние с задачей 3): прогон тем же поиском и
+   `/recall` без следов, пробы из кэша и посторонние, отпечаток `fp_hash` и `context`, вердикт к
+   медиане пяти ночных, эпизод регрессии, «Принять как норму» только человеком, строка дайджеста
+   (с версией после обновления — решение 79), `/check/*`, `zam check`; сессии замеров `xtask` — без
+   ночной проверки.
+6. **«Открыл ли агент подсказку» и «Шумные» — сервер и CLI** (§6.6; круг правок 1): таблица
+   `usage_opened` (сессия + цель, та же эпоха после показа), `usage.opened`, лента `noisy=1` с
+   `opened_since` (`useful` — за всё время, показы и открытия — в окне), `zam insight show`.
+7. **Кандидаты в Rules** (§6.7; круг правок 1, слияние с задачей 4): `memory_write … candidate`,
+   `POST /proposals` и `zam rules`, проверка (200 токенов, без маски, URL и блоков кода по разбору
+   Markdown, почти-дубль по заголовку и вектору), вид работы `rules`, принятие и отказ только
+   человеком, происхождение — сообщение ревизии, аудит.
+8. **WebUI: «Внутренние работы», «Проверка памяти», «Кандидаты в Rules»; Insights — «открыто» и
+   «Шумные»** (§6.9, §6.6 п. 3; круг правок 1, слияние с 10b): режимы, окно подключения модели с
+   рецептами и проверкой, плашка «вне LAN» по классу закреплённого адреса от сервера, пауза «был →
+   стал» с «Подтвердить адрес», ночь в поясе сервера и у пользователя, очередь и «Запустить сейчас»,
+   журнал отправок; вердикт и проваленные пробы, «Принять как норму»; кандидаты с правкой и оценкой
+   Rules; шапка с меню «Ещё ▾».
+9. **Итог волны** (этот раздел; отчёт исполнителя — в `.superpowers/`, вне git): версия
+   `0.0.16-m7.3` (`Cargo.toml`, `Cargo.lock`, `Cargo.lock` фаззинга `zam-code`, `web/package.json`,
+   `web/package-lock.json`, `config.example.toml`), CHANGELOG (вводная, совместимость, «Изменения
+   ответа», Added, Changed, Fixed, «Known limitations», «Для разработчиков»), README,
+   `docs/journal.md`, руководство («Внутренние работы», «С 0.0.15-m7.2 на 0.0.16-m7.3», «Известные
+   ограничения (0.0.16-m7.3)»), ТЗ v1.29 (тексты §6.10 в §2.1–§2.3, §4.1; сверка подпунктов задач;
+   дописаны §7.15 — вступление, §12 — блок M7.3, §16.4, §17, §18.1, §19–§21 п. 23, история),
+   статус спецификации, строка Global Constraints плана о `FEATURES` («в конец»);
+   `docs/api-compat.md` сверен с `FEATURES` (источник у трёх строк — «M7 §…», как у прочих).
+10. **Карточки и формы ввода WebUI** — ядро (10a; круг правок 1, задача владельца 2026-11-24):
+    `FormDialog` (на телефоне — во весь экран, действие в шапке, «Назад» закрывает окно), `Prompt`
+    на нём, карточка на виду с фокусом на заголовке, стек проверок ухода `pushGuard`, `rebase` при
+    409, «Новый insight», Задачи, Insights, Идеи; строки size-limit `start`/`api`/`start+api` и
+    сверка с `index.html` при сборке; остальные места (10b; круг правок 1): Словарь, Вопросы,
+    Changelog, Releases, редактор (причина надёжности), «Аккаунт», «Пользователи», «Решения»,
+    шаблон инструкции, окна импорта, копий и индекса, меню дерева; найденный дефект возврата фокуса
+    после закрытия окна bits-ui исправлен.
+
+**Решения координатора** — спецификация §12, пп. 32–95 (64 пункта с ценой ошибки, на проверку
+владельцу; краткий смысл каждого — ТЗ §21 п. 23). Решения по ходу задач — пометки «[решение
+координатора, …]» в разделах выше и `Ruling` в `progress.md` SDD; перенесены в ТЗ §21 п. 23. Из
+них меняли план или спецификацию: уборка памяти — M7.5, родной протокол Anthropic — M7.6, WebUI
+урезан до трёх страниц (решения 37, 53–55); пре-флайт плана — решения 66–78; клон `AppState` в
+поле раннера, учтённые ручные запуски, шаги старта в фоне (п. 56, задача 1); подтверждение адреса
+`confirm_url`, висящий вызов отпускается по сроку остановки, `work_calls.run` в 0027, отступление
+от п. 78 через прокси (пп. 35, 56, 77, 78, задача 2); новые флаги — в конец `FEATURES` (Global
+Constraints плана, задачи 3 и 7); ленивая пометка прерванных прогонов, строка «после обновления»
+с версией без флага (§6.1 п. 5, п. 79, задача 5); `useful` — за всё время (п. 68, задача 6);
+отправленное этой ночью не повторяется (п. 95, задача 4); задача владельца о формах — задачами 10a
+и 10b до страниц M7.3 (пп. 80–94); `works.model.host`/`external` и меню «Ещё ▾» (задача 8);
+проверка слитого — ещё `m57`, `m56`, `m45`, `m6` после сбоя CI на составе схемы 0027.
+
+**Сверка таблицы поставщиков руководства** (ревью r1 задачи 2 — задаче итога; повторно
+2026-11-28, по тем же страницам, что у задачи 2 выше). Совпало: OpenAI — `max_tokens` устарел,
+`max_completion_tokens`, `reasoning_effort` от `none` и `minimal` до `max`, `json_object`;
+Anthropic — вход `https://api.anthropic.com/v1/`, `response_format` — только `json_schema` со
+`strict: true` (`json_object` и `text` — 400), у Claude 5 размышления включены и в ответ не
+попадают, у прочих — `thinking {type: enabled, budget_tokens ≥ 1024}`, `reasoning_effort`
+игнорируется, вход — «для проверки и сравнения», ключ без рабочей области требует заголовка
+`anthropic-workspace-id`; DeepSeek — `https://api.deepseek.com`, размышления включены по
+умолчанию, `thinking {type: disabled}`, `reasoning_content`; Kimi — `https://api.moonshot.ai/v1`,
+`max_tokens` устарел, K2.6 — `thinking {type: disabled}`, K3 — только `reasoning_effort` (`low`,
+`high`, `max`), `json_object`; OpenRouter — `https://openrouter.ai/api/v1`, `reasoning.effort:
+none` (кроме моделей с обязательными размышлениями), `reasoning.exclude` — скрывает, токены
+оплачиваются, поле `reasoning`; vLLM — пример `:8000/v1`, `--api-key`, `chat_template_kwargs`;
+LM Studio — `:1234/v1`; llama.cpp — `--port` (по умолчанию 9931), `--host` 127.0.0.1, `--api-key`,
+`--reasoning-format deepseek`, `--reasoning-budget`. Поправлено в таблице: Qwen DashScope —
+страница «deep thinking» больше не говорит, что у открытых гибридных Qwen3 размышления включены
+по умолчанию и что без потока их нужно выключить, и не связывает «только размышления» с
+суффиксом `-thinking`: строка — «`enable_thinking: false` выключает у гибридной модели, у
+коммерческих Plus и Flash выключены по умолчанию, модели „только размышления“ не выключают, часть
+открытых — только с потоком»; адреса — по странице совместимости (рабочие области
+`<WorkspaceId>.<регион>.maas.aliyuncs.com`, прежние домены Пекина и Сингапура работают); Ollama —
+`reasoning_effort: none` выключает размышления только у моделей с выключателем, у GPT-OSS
+становится `low`. Рецепт рабочего сервера (`chat_template_kwargs.enable_thinking = false`) —
+llama.cpp и vLLM; живую проверку дают `POST /works/model/test` (`thinking`) и ночь 1.
+
+**Передано дальше** (спецификация §6.13 и ревью задач; задачи памяти с причиной — координатор):
+- уборка памяти (вид `tidy`, заготовка — спецификация §8) и доля открытых подсказок в `zam
+  sessions tokens` и `cargo xtask ab` — M7.5 (данные `usage_opened` и провалов проб копятся с
+  выпуска);
+- родной протокол Anthropic Messages — M7.6;
+- WebUI внутренних работ: тренд проверки, ввод и снятие проб (`POST/DELETE /check/probes`, `zam
+  check probes add|retire`, снятие — только человеком с аудитом), блок администратора и `GET
+  /admin/works`; строка `zam-server doctor` о ночной проверке — M7.4;
+- режим «модель» для разбора идей — после замера качества модели на пробах, по запросу владельца;
+- перенос insight решения в Knowledge (К5) и судья ответов (К7) — после M7;
+- поток, инструменты модели, кэш промптов, пакетные API поставщиков — по замеру; свои корневые
+  сертификаты TLS для модели в LAN по `https` и SOCKS-прокси — по запросу;
+- пробы по вложениям и карте кода — после M7.5; калибровка порогов регрессии — после 14 ночных
+  прогонов (задача в памяти);
+- вопрос о несохранённом при уходе по адресу — окном продукта, а не `window.confirm` (асинхронный
+  вопрос роутера, решение 92) — отдельной задачей.
+
+**Отложено** (Minor ревью задач, не закрытые в кругах правок) — решение по ним — финальное ревью
+ветки (идёт параллельно с итогом); его итог и волна правок — раздел «M7.3 · Финальное ревью и
+волна правок» (координатор).
+
+Журнал хода координатора (отправки, ревью, круги правок, решения `Ruling` с ценой ошибки) —
+`.superpowers/sdd/2026-11-23-m7.3-internal/progress.md` (в репозиторий — после выпуска, по образцу
+`docs/plans/2026-11-21-m7.1-foundation-ledger.md`).
+
+#### Приёмка: числа
+
+Итоговая приёмка на голове ветки `…` (… (числа впишет координатор); Windows 11, HDD).
+
+| Проверка | Итог |
+|---|---|
+| Полный прогон workspace `ZAM_REQUIRE_ML=1` (Windows 11, HDD) | … (числа впишет координатор) |
+| `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` | … |
+| CI `ci.yml` — Windows и Linux; Edge; CUDA | … |
+| `package.yml` / `package-smoke` | … |
+| WebUI: `npm run check`, `npm run test:build`, `npm run build` | … |
+| e2e WebUI (release-сборка) | … passed (у 0.0.15-m7.2 — 201; полный набор задачи 8 после слияния с 10b — 1065/1065: матрица форм в трёх ширинах и `tabletLand`) |
+| `npx size-limit` — чанки до (`v0.0.15-m7.2`) и после | … (таблица — координатор; строки `start`, `api`, `start+api` и новые чанки — CHANGELOG, «Для разработчиков») |
+| Тихое окно `m4` (`hook_budgets`) | … |
+| Тихое окно `m57` (`acceptance_recall_p95_with_50_ideas`) | … |
+| Тихое окно `m6` (`acceptance_hook_budgets`, медиана отношения p95 `/recall(prompt)` к v0.0.15-m7.2 ≤ 1,10) | … |
+| Блок v8 ru/en (500/497), MCP — 11 инструментов, описания ≤ 300 | … |
+| Финальное ревью ветки и волна правок | … |
+| Тег `v0.0.16-m7.3`, Release, развёртывание на рабочий сервер памяти (с копией данных) и тестовый стенд, клиент владельца | … |
+| Миграция 0027 на рабочем сервере памяти и тестовом стенде (размер баз, время, `bak-v26`) | … (замер задачи 1 на копии локальной базы 406 МБ — 5,09 с, SQL — 41 мс) |
+| День выпуска: `POST /works/model/test` (класс, мс, `thinking`) | … |
+| День выпуска: ручной `POST /works/run {kind: "probes"}` — токены вход/выход, мс пакета (≤ `call_timeout_s`), исход | … |
+| День выпуска: `POST /check/run` — пробы по видам, время, вердикт | … |
+| Пробы: принято и отклонено по причинам (ручные и ночные) | … |
+| Ночь 1 (дата, начало и конец, прогон проверки, пакеты `done`, принятых проб к концу ночи ≥ 20, обращения вне окна и при `off` — 0) | … |
+| Ночь 2 (прогон с пробами обеих ночей, вердикт `baseline` 2/5, пакеты `done`) | … |
+| Следы прогона: `usage`, `usage_opened`, `session_seen`, `answer_cache.hits` до и после — совпадают; строки `work_calls` без текста | … |
+| Остановка службы при висящем вызове модели (SIGTERM) | … |
+| Окна и карточки на телефоне и планшете владельца (§6.11 п. 6) | … |
+
+#### Живая приёмка: чек-лист (спецификация §6.11)
+
+Делает координатор после развёртывания. Модель рабочего сервера — «локальная модель владельца в
+LAN»: её адрес, ключ и значения Vault в журнал, отчёты и коммиты не пишутся — только поля, классы
+адресов и числа.
+
+**До выпуска.**
+1. Поля записи личного Vault `llm-local-qwen` без раскрытия значения (`GET /api/v1/vault/{id}` без
+   `reveal`): адрес — в `data.url` или запасном `data.address`, есть ли в нём `/v1` (протокол —
+   `POST <адрес>/chat/completions`; без `/v1` — 404 и пауза `not_found`). При нужде запись правит
+   владелец. В журнал — «поле, `/v1` да/нет, класс LAN».
+2. Ответ владельца: включена ли машина с моделью в 04:30 МСК («Уточнить у владельца», п. 16); нет —
+   время ночи меняет `[works] at` (или `window_min`).
+3. Копия каталога данных рабочего сервера памяти до замены файлов (`zam-server backup` прежнего
+   комплекта; руководство, «Обновление», «С 0.0.15-m7.2 на 0.0.16-m7.3»).
+
+**Развёртывание** (на оба сервера — решение владельца 2026-11-16).
+4. Рабочий сервер памяти: в конфигурацию — `[works]` с `tz = "Europe/Moscow"` (остальное —
+   умолчания: `at = "04:30"`, `window_min = 120`, `check = "nightly"`, `default_mode = "off"`,
+   `model_access = "any"`, `allow_loopback = false` — модель на другой машине LAN). После старта:
+   миграция 0027 — время и `bak-v26` каждой базы; `/health` — `0.0.16-m7.3`, флаги `works`,
+   `memory_check`, `proposals`, `usage_opened`; в журнале службы — без ERROR.
+5. Тестовый стенд — `[works]` не вписывать (умолчания: исполнитель `off`, ночная проверка в 04:30
+   UTC на посторонних вопросах и кэше); утром — прогон есть, журнал отправок пуст.
+6. Клиент `zam` владельца — 0.0.16-m7.3: `zam status`, `zam work status`, `zam check status`.
+
+**День выпуска — настройки аккаунта владельца** (WebUI «Внутренние работы», сессия владельца).
+7. «Подключить модель»: запись личного Vault `llm-local-qwen` (до сохранения — класс «в LAN»),
+   модель — по записи или серверу модели, `auth` — по записи (ключа нет — `none`), предел ответа —
+   4000, `body_extra` — рецепт «Qwen без размышлений» `{"chat_template_kwargs": {"enable_thinking":
+   false}}`. «Сохранить и проверить» — `ok`, без `thinking`; мс — в таблицу.
+8. Режим исполнителя — «модель»: общий и для видов `probes` и `rules` — по ответу владельца
+   («Уточнить у владельца», п. 14; без ответа — оба вида, как рекомендовано).
+9. «Запустить сейчас» (`POST /works/run {kind: "probes"}`) — выполняется сразу, вне окна: работа
+   `done`, принятые и отклонённые пробы по причинам; строка журнала отправок — `run:
+   manual:<id>`, токены, мс (≤ `call_timeout_s`), `outcome = ok`, без текста.
+10. «Проверить сейчас» (`POST /check/run`) — прогон: пробы по видам (`cache`, `negative`, `probe`),
+    время, вердикт (`baseline`; ручной прогон в базу не входит).
+11. Следы: до и после ручного прогона — число строк `usage`, `usage_opened`, `session_seen` и сумма
+    `answer_cache.hits` базы владельца совпадают (только чтение базы на сервере, данные не
+    выносятся).
+
+**Утро после ночи 1** (04:30 МСК = 01:30 UTC, окно — до 06:30 МСК).
+12. `/check/status` (`zam check status`): последний ночной прогон — законченный, повод `nightly`,
+    ночь — эта дата, время ≤ `check_max_min` (30 мин), пробы — кэш, посторонние и пробы дня
+    выпуска; вердикт `baseline` 1/5.
+13. `work_calls` (`GET /works/calls?days=2`, страница «Внутренние работы» → журнал отправок):
+    обращения ночи — только внутри окна (`ts`), кроме ручных дня выпуска; `kind` — `probes`
+    (и `rules`); исходы и мс; ни одной строки на тестовом стенде (`off`).
+14. Работы (`GET /works`): не меньше одного пакета `done` за ночь; принятых проб к концу ночи 1 —
+    не меньше 20 (ручные и ночные вместе; пределы у них раздельные); доли отказов по причинам — в
+    таблицу (порог не ставится до калибровки).
+15. Ошибок нет: журнал службы — без ERROR, исполнитель не на паузе (`GET /works/usage` — без
+    `paused`), `/health` — `ok`; кандидаты в Rules (если вид `rules` у модели) — на странице
+    «Кандидаты в Rules», ни одной новой заметки Rules без человека.
+16. Время: начало и конец прогона проверки и каждого пакета — в таблицу.
+
+**Утро после ночи 2.**
+17. Прогон проверки с пробами обеих ночей: вердикт `baseline` 2/5 (или `ok` после пяти); не
+    меньше одного пакета `done`; обращений вне окна нет. Итоги — insight `experiment`, `zam report`
+    владельцу, таблица выше.
+
+**Остановка при висящей модели** (ревью r2 задачи 2; решение 56) — на тестовом стенде, не на
+рабочем сервере.
+18. Временно `[works] allow_loopback = true` и слушатель на петле, который принимает соединение и
+    не отвечает (например, `python3 -c 'import socket,time; s=socket.socket();
+    s.bind(("127.0.0.1",18080)); s.listen(); c,_=s.accept(); time.sleep(3600)'`); запись Vault с
+    `data.url = "http://127.0.0.1:18080/v1"`, `auth: none`, режим `model`, «Запустить сейчас».
+    Во время висящего обращения — `systemctl stop zam-server` (SIGTERM): служба останавливается за
+    секунды (раннер — ≤ 5 с, весь стоп — в `TimeoutStopSec=90`), строка журнала отправок —
+    `aborted`; после старта работа — снова `queued`, прогон не блокирует ни ночь, ни ручной запуск.
+    Затем вернуть умолчания `[works]` стенда и удалить запись Vault.
+
+**Окна и карточки на живых устройствах** (§6.11 п. 6, §6.14) — на телефоне и планшете владельца,
+что увидено — в журнал (устройство, браузер):
+19. Телефон: «Новая задача» — окно во весь экран; с открытой экранной клавиатурой шапка «✕ ·
+    заголовок · Добавить» видна, поле в фокусе не закрыто; системная «Назад» (жест iOS, кнопка
+    Android) закрывает окно, с набранным — сначала вопрос внутри окна («Продолжить правку» — текст
+    цел); после «Добавить» — карточка созданной задачи, одна «Назад» — к доске.
+20. Телефон: карточка задачи с доски открывается на виду, ряд статусов и поле шага — сразу под
+    шапкой; «→ выполнен» — окно-подтверждение не во весь экран; «Новый insight» и окно
+    подключения модели на «Внутренних работах» — так же, как п. 19.
+21. Планшет (портрет и альбом): окно формы с клавиатурой — основное действие видно; карточка рядом
+    со списком — фокус на её заголовке; шапка — меню «Ещё ▾» без обрезанных подписей.
+
+**После приёмки.** Задачи памяти волны закрыть (`k:01M84DRVYDE0VR3Y2J8BMT1HQ5` и задачи по шагам
+плана, `k:01M7Z8MEMEEYGRJ2E6VQE0JVM4`, `k:01M7WHJY5TEVHR1EQJF4GB06BK`,
+`k:01M7GAQQGBERPTY57K706BBTBS`, `k:01M85AS1C0EZVV95FQZ2ZEQCET`, `k:01M86MDJHXEMHTBNDEXFS73NGN`),
+перенесённое (§6.13) — задачами с причиной; ловушки и решения волны — в память.
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия
@@ -5138,3 +7674,26 @@ Markdown-выдаче агенту (31). Решения по ходу задач
 13. **Кнопки правки у участника «только чтение».** Участник общего решения с правом только чтения
     видит «Изменить», «Удалить» и «Корзину»; нажатие отвечает «Недостаточно прав». Скрывать эти
     кнопки у таких участников?
+
+**M7.3 — внутренние работы (на проверку; работа шла по решению координатора, вопросы — по
+одному, простыми словами):**
+
+14. **Что поручить вашей модели Qwen ночью?** Работ две: писать пробные вопросы, по которым ночная
+    проверка замечает, что память стала хуже находить нужное, и искать среди ваших решений и
+    полезных ловушек правила для всех проектов. Найденное правило модель только **предлагает** — в
+    общие правила оно попадёт, только когда вы нажмёте «Принять». Варианты: «только пробы» или
+    «пробы и правила» (рекомендую «пробы и правила»: та же модель в ту же ночь, решаете всё равно
+    вы).
+15. **Разрешать ли по умолчанию модели в интернете?** Если подключить модель OpenAI, Anthropic или
+    другую в интернете, ей уходят тексты записей памяти — секреты в них заменены заглушкой, Vault и
+    раздел Human не уходят никогда. Сейчас по умолчанию это можно, а страница показывает постоянное
+    предупреждение. Варианты: «можно, с предупреждением» (так сейчас) или «по умолчанию только
+    модели в вашей локальной сети» (внешние включает администратор настройкой).
+16. **Включён ли компьютер с моделью Qwen в 04:30 по Москве?** Ночные работы в это время обращаются
+    к модели. Если компьютер выключен или спит, работы остановятся с «модель недоступна» до
+    следующей ночи; сама проверка памяти модели не требует и пройдёт. Варианты: «включён» или «нет
+    — назову удобное время» (время работ меняется одной настройкой).
+17. **Живая проверка окон.** После выпуска — открыть на вашем телефоне и планшете «Новая задача» и
+    карточку задачи: видна ли кнопка «Добавить» с открытой клавиатурой, закрывает ли окно кнопка
+    «Назад» телефона. Тесты имитируют телефон в браузере Edge, но клавиатуру и жест «Назад» iPhone
+    не заменяют.

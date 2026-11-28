@@ -93,9 +93,18 @@ button.danger-fill { color: #fff; background: var(--danger); border-color: var(-
 /* переключатели журналов («Корзина», «Из идей»…) и мелкие кнопки действий записи (M7.2, §5.9) */
 button.toggle[aria-pressed='true'] { color: var(--accent); background: var(--selected); border-color: var(--accent); }
 button.small-btn { padding: 2px 8px; font-size: 12px; }
-button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible {
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
+}
+/* заголовок карточки, на который журнал переводит фокус (§6.14 п. 2; `tabindex="-1"`): кольцо в
+   цвете продукта — только при фокусе с клавиатуры и при открытии по адресу (`:focus-visible`),
+   после щелчка мышью и касания — без рамки; чёрной рамки браузера нет */
+:is(h1, h2, h3)[tabindex='-1']:focus { outline: none; }
+:is(h1, h2, h3)[tabindex='-1']:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 4px;
 }
 a { color: var(--accent); }
 button:disabled { opacity: 0.5; cursor: default; }
@@ -109,7 +118,25 @@ button:disabled { opacity: 0.5; cursor: default; }
   position: fixed; top: 50%; left: 50%; z-index: 51; transform: translate(-50%, -50%);
   width: min(var(--dialog-w, 520px), 92vw);
 }
+/* окно формы (`FormDialog`, M7.3 §6.14 п. 1): шапка и кнопки закреплены, прокручивается тело;
+   высота — до 90 % окна; `fd-wide` — 720 px */
+.dialog.fd {
+  display: flex;
+  flex-direction: column;
+  max-height: 90vh;
+  max-height: 90dvh;
+  padding: 0;
+  overflow: hidden;
+}
+.dialog.fd-wide { --dialog-w: 720px; }
 .warn { background: var(--warn-bg); color: var(--warn-text); padding: 8px 10px; border-radius: 6px; }
+/* поле — расхождение 409 (§6.14 п. 5): изменено и здесь, и в другом месте — рамка и пометка в
+   подписи (её читает и программа чтения с экрана) */
+.clash > :is(input, select, textarea), .clash:is(fieldset, ul) { border-color: var(--danger); }
+.clash:is(fieldset, ul) { outline: 1px solid var(--danger); outline-offset: 2px; border-radius: 4px; }
+.clash-note { margin-left: 6px; color: var(--danger); font-size: 12px; }
+/* карточка записи журнала: прокрутка к ней не прячет её начало под шапкой (§6.14 пп. 2–3) */
+article.card { scroll-margin-top: calc(var(--header-h) + 8px); }
 table { width: 100%; border-collapse: collapse; }
 th, td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border); }
 code { font-family: ui-monospace, Consolas, monospace; }
@@ -152,7 +179,10 @@ code { font-family: ui-monospace, Consolas, monospace; }
   .strip { flex-wrap: wrap; overflow: visible; }
 }
 
-/* Телефон: диалог во всю ширину, высота — до 90 % окна, прокрутка внутри (§5.1 п. 7). */
+/* Телефон: диалог во всю ширину, высота — до 90 % окна, прокрутка внутри (§5.1 п. 7). Окно формы
+   (`FormDialog` с полями, M7.3 §6.14 п. 1, решение 81) — во весь экран: шапка с «✕» и основным
+   действием закреплена, прокручивается тело, отступы — с безопасными областями; окно-подтверждение
+   без полей — прежний `.dialog` во всю ширину. */
 @media (max-width: 719px) {
   .dialog {
     width: 100%;
@@ -160,6 +190,17 @@ code { font-family: ui-monospace, Consolas, monospace; }
     max-height: 90dvh;
     overflow-y: auto;
     overscroll-behavior: contain;
+  }
+  .dialog.fd { overflow: hidden; }
+  .dialog.fd-form {
+    inset: 0;
+    transform: none;
+    width: 100%;
+    height: var(--app-h);
+    max-height: none;
+    border: 0;
+    border-radius: 0;
+    padding: var(--safe-top) var(--safe-right) var(--safe-bottom) var(--safe-left);
   }
 }
 

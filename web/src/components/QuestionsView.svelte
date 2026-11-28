@@ -10,13 +10,17 @@
   // Правка и корзина (M7.2, спецификация §5.9): у открытого вопроса — «Изменить» (`EntryEdit`:
   // текст вопроса, теги, область) и «Неактуален» (`status: obsolete` с причиной); у любого —
   // «Удалить» (в корзину, с подтверждением); «Корзина» — удалённые вопросы с «Восстановить»
-  // (`JournalTrash`). Форма и корзина — ленивые чанки. Форма привязана к вопросу: переход по адресу,
-  // «Изменить» другого вопроса и «Корзина» её закрывают, при несохранённом — сначала вопрос
-  // (`EntryEdit`: проверка ухода и `leave()`); вопрос, отвеченный в другом месте за время правки,
-  // закрывает форму с объяснением. Переход к записи выключает «Корзину».
-
-  import { tick, untrack } from 'svelte';
+  // (`JournalTrash`). Форма и корзина — ленивые чанки. Вопрос, отвеченный в другом месте за время
+  // правки, закрывает форму с объяснением. Переход к записи выключает «Корзину».
+  //
+  // Формы (M7.3, спецификация §6.14, решения 80–85): лента без карточки — «Изменить» открывает
+  // правку в широком окне формы (`EditPanel` с `dialog`, правило В); «Отложить до» вопроса-
+  // предложения — окно с датой, «начать» в общем решении — окно-подтверждение с предупреждением
+  // (правило Б); вариант без полей — сразу (Д); ответ текстом — поле на виду (А), набранное — в
+  // стеке проверок ухода (п. 4). Вопрос из адреса — на виду и в фокусе его заголовка (п. 2).
+  import { onMount, tick, untrack } from 'svelte';
   import EditPanel from './EditPanel.svelte';
+  import FormDialog from './FormDialog.svelte';
   import Notice from './Notice.svelte';
   import Prompt, { type Ask } from './Prompt.svelte';
   import TrashPanel from './TrashPanel.svelte';
@@ -32,9 +36,10 @@
     type Space,
   } from '../lib/api';
   import { trashAsk } from '../lib/entryTrash';
-  import { focusSoon } from '../lib/focus';
+  import { focusNow, focusSoon } from '../lib/focus';
   import { DEFER_FORM, START_SUBMIT, deferDefault, deferError, deferMin, sharedWarning } from '../lib/ideaForms';
   import { AUTHOR_TEXT, STATUS_TEXT, entryRef, fmtTime } from '../lib/journals';
+  import { guardLeave } from '../lib/leaveEdit';
   import { href } from '../lib/router';
 
   interface Props {
@@ -67,20 +72,34 @@
   let texts = $state<Record<string, string>>({});
   /** Решение, созданное ответом только что (до перечитывания списка). */
   let created = $state<Record<string, string>>({});
-  /** Вопрос-предложение, у которого открыт выбор даты «отложить», и сама дата. */
-  let deferFor = $state('');
+  /** Окно «Отложить до» вопроса-предложения: вопрос, дата и дата при открытии. */
+  let deferQ = $state<Entry | null>(null);
   let deferDate = $state('');
+  let deferAt = '';
+  /** Окно-подтверждение «начать» в общем решении. */
+  let startQ = $state<Entry | null>(null);
+  /** Ошибка окна (отложить, начать). */
+  let dlgError = $state('');
   /** «Корзина»: вместо списка — удалённые вопросы. */
   let trash = $state(false);
-  /** Вопрос с открытой формой правки. */
+  /** Вопрос с открытым окном правки. */
   let editing = $state('');
   let notice = $state('');
   let ask = $state<Ask | null>(null);
+  /** Вопрос из адреса, заголовок которого получит фокус после загрузки ленты (п. 2). */
+  let revealFor = '';
 
   function fail(e: unknown, set: (m: string) => void) {
     if (e instanceof ApiError && e.status === 401) return onexpired();
     set(errorText(e));
   }
+
+  /** Набранный ответ текстом у открытого вопроса (поле на виду, правило А). */
+  const typed = (): boolean => items.some((q) => q.status === 'open' && (texts[q.id] ?? '').trim() !== '');
+
+  // ответ текстом — в стеке проверок ухода (§6.14 п. 4): уход по адресу спрашивает; согласие —
+  // набранное отпущено
+  onMount(() => guardLeave(typed, () => (texts = {})));
 
   /** Пространство, для которого сброшены корзина, форма и итог: эффект ниже перезапускается на
    * каждый переход (свойства — из объекта маршрута), а сброс нужен только при смене пространства —
@@ -96,13 +115,16 @@
         trash = false;
         notice = '';
       }
-      // переход: форма закрывается (уход с несохранённым спросил `EntryEdit`), к записи — корзина
-      // выключается, прежний итог убирается
+      // переход: окна закрываются (уход с несохранённым спросил окно и стек проверок ухода), к
+      // записи — корзина выключается, прежний итог убирается
       editing = '';
+      deferQ = null;
+      startQ = null;
       if (id) {
         trash = false;
         notice = '';
       }
+      revealFor = id ?? '';
       load(u, s, true);
     });
   });
@@ -118,7 +140,7 @@
       next = r.next_cursor;
       if (reset && entry) {
         await tick();
-        document.querySelector(`[data-question="${CSS.escape(entry)}"]`)?.scrollIntoView({ block: 'nearest' });
+        reveal(entry);
       }
     } catch (e) {
       if (my !== seq) return;
@@ -127,6 +149,17 @@
     } finally {
       if (my === seq) loading = false;
     }
+  }
+
+  /** Вопрос из адреса — на виду; после перехода к нему (не после перечитывания ленты ответом) —
+   * ещё и фокус на заголовке (§6.14 п. 2, как карточка журнала). */
+  function reveal(id: string) {
+    const el = root?.querySelector<HTMLElement>(`[data-question="${CSS.escape(id)}"]`);
+    if (!el) return;
+    el.scrollIntoView({ block: revealFor === id ? 'start' : 'nearest' });
+    if (revealFor !== id) return;
+    revealFor = '';
+    focusNow(el.querySelector('h2'));
   }
 
   const optionsOf = (e: Entry): Opt[] =>
@@ -139,9 +172,6 @@
   const ideaOf = (e: Entry): string => (typeof e.data.idea === 'string' ? e.data.idea : '');
   const ideaHref = (id: string) => href({ name: 'journal', user, space, journal: 'ideas', entry: id });
 
-  /** Вопрос-предложение, у которого ждёт подтверждения «начать» в общем решении. */
-  let confirmFor = $state('');
-
   /** Общее решение, где «начать» поставит задачу идеи Knowledge (иначе `null`). */
   function sharedTarget(q: Entry): Space | null {
     const here = spaces.find((s) => s.kind === 'knowledge');
@@ -151,32 +181,69 @@
     return sp && sp.kind === 'solution' && sp.shared ? sp : null;
   }
 
+  /** Вариант ответа: без полей — сразу (правило Д); «начать» в общем решении — подтверждение,
+   * «отложить» — окно с датой (правило Б). */
   function pick(q: Entry, key: string) {
-    if (ideaOf(q) && key === 'accept' && sharedTarget(q) && confirmFor !== q.id) {
-      confirmFor = q.id;
-      deferFor = '';
-      errors[q.id] = '';
+    errors[q.id] = '';
+    dlgError = '';
+    if (ideaOf(q) && key === 'accept' && sharedTarget(q)) {
+      startQ = q;
       return;
     }
     if (ideaOf(q) && key === 'defer') {
-      confirmFor = '';
-      deferFor = q.id;
       deferDate = deferDefault();
-      errors[q.id] = '';
+      deferAt = deferDate;
+      deferQ = q;
       return;
     }
     answer(q, { option: key });
   }
 
-  function submitDefer(e: SubmitEvent, q: Entry) {
-    e.preventDefault();
-    const err = deferError(deferDate);
-    if (err) {
-      errors[q.id] = err;
+  /** Ответ из окна: ошибка — в окне (исключение), окно открыто; вопрос уже отвечен в другом месте —
+   * окно закрыто, лента перечитана, причина — у вопроса. */
+  async function answerIn(q: Entry, a: { option: string; horizon?: string }, close: () => void) {
+    answeredIn = q.id;
+    try {
+      const r = await answerQuestion(user, q.id, a);
+      created[q.id] = r.decision_id;
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) return onexpired();
+      const d = answeredDecision(e);
+      if (d === null) throw new Error(errorText(e));
+      if (d) created[q.id] = d;
+      close();
+      await load(user, space, true);
+      errors[q.id] = errorText(e);
       return;
     }
-    answer(q, { option: 'defer', horizon: deferDate });
+    close();
+    await load(user, space, true);
   }
+
+  function submitDefer() {
+    const q = deferQ;
+    if (!q) return;
+    const err = deferError(deferDate);
+    if (err) {
+      dlgError = err;
+      return;
+    }
+    dlgError = '';
+    return answerIn(q, { option: 'defer', horizon: deferDate }, () => (deferQ = null));
+  }
+
+  function submitStart() {
+    const q = startQ;
+    if (!q) return;
+    dlgError = '';
+    return answerIn(q, { option: 'accept' }, () => (startQ = null));
+  }
+
+  /** Вопрос, на который ответили из окна: окно закрыто владельцем до своего закрытия. */
+  let answeredIn = '';
+  /** Заголовок вопроса, на который ответили из окна, — фокус после закрытия окна (кнопки вариантов
+   * ушли вместе с ответом). */
+  const answeredHeading = () => (answeredIn ? root?.querySelector(`[data-question="${CSS.escape(answeredIn)}"] h2`) : null);
 
   const recommended = (e: Entry): string =>
     typeof e.data.recommendation === 'string' ? e.data.recommendation : '';
@@ -209,8 +276,6 @@
       const r = await answerQuestion(user, q.id, a);
       created[q.id] = r.decision_id;
       texts[q.id] = '';
-      if (deferFor === q.id) deferFor = '';
-      if (confirmFor === q.id) confirmFor = '';
       await load(user, space, true);
     } catch (e) {
       const d = answeredDecision(e);
@@ -241,20 +306,10 @@
   /** Вопрос `e` в списке — новой ревизией (после правки или перечитывания). */
   const replace = (e: Entry) => (items = items.map((x) => (x.id === e.id ? e : x)));
 
-  /** Открытая форма правки (`EditPanel`): её несохранённое — в `leaveEdit`. */
-  let editor = $state<{ leave: () => boolean; release: () => void } | null>(null);
-
-  /** Действие закроет открытую форму: при несохранённом — сначала вопрос; `false` — остаться. */
-  function leaveEdit(): boolean {
-    if (!editing) return true;
-    if (editor && !editor.leave()) return false;
-    editor?.release();
-    editing = '';
-    return true;
-  }
+  /** Вопрос с открытым окном правки (из ленты: новая ревизия после перечитывания — в окне). */
+  let editingEntry = $derived(editing ? (items.find((x) => x.id === editing) ?? null) : null);
 
   function startEdit(q: Entry) {
-    if (editing !== q.id && !leaveEdit()) return;
     editing = q.id;
     errors[q.id] = '';
     notice = '';
@@ -265,7 +320,7 @@
   const action = (id: string, name: string) =>
     root?.querySelector(`[data-question="${CSS.escape(id)}"] .acts button[aria-label^="${name}"]`);
 
-  /** Форма закрыта (сохранено или «Отмена»): фокус — на «Изменить» вопроса. */
+  /** Окно правки закрыто (сохранено или «Отмена»): фокус — на «Изменить» вопроса. */
   function closeEdit(id: string) {
     editing = '';
     focusSoon(() => action(id, 'Изменить') ?? action(id, 'Удалить'));
@@ -277,8 +332,8 @@
     notice = `Вопрос «${e.title}» сохранён.`;
   }
 
-  /** 409 формы правки: вопрос перечитан. Ответили или сняли его в другом месте — правки больше нет
-   * (правится только открытый): форма закрывается, причина — у карточки, «Удалить» снова видна. */
+  /** 409 окна правки: вопрос перечитан. Ответили или сняли его в другом месте — правки больше нет
+   * (правится только открытый): окно закрывается, причина — у вопроса, «Удалить» снова видна. */
   function reread(e: Entry) {
     replace(e);
     if (editing === e.id && e.status !== 'open') {
@@ -336,7 +391,6 @@
   }
 
   function toggleTrash() {
-    if (!leaveEdit()) return;
     trash = !trash;
     notice = '';
     // назад к списку: восстановленные из корзины — в нём
@@ -373,16 +427,14 @@
             <p><a href={ideaHref(ideaOf(q))} data-testid="idea-link">Идея {entryRef('idea', ideaOf(q))}</a></p>
           {/if}
 
-          {#if q.status === 'open' && editing === q.id}
-            <EditPanel bind:this={editor} {user} entry={q} onsaved={saved} oncancel={() => closeEdit(q.id)} onreread={reread} {onexpired} />
-          {:else if q.status === 'open'}
+          {#if q.status === 'open'}
             {#if opts.length}
               <div class="row opts" role="group" aria-label="Варианты ответа">
                 {#each opts as o (o.key)}
                   <button
                     type="button"
                     class:primary={o.key === recommended(q)}
-                    disabled={busy !== '' || (confirmFor === q.id && o.key === 'accept')}
+                    disabled={busy !== ''}
                     title={o.key === recommended(q) ? 'Рекомендация агента' : ''}
                     onclick={() => pick(q, o.key)}
                   >
@@ -391,26 +443,8 @@
                 {/each}
               </div>
             {/if}
-            {#if confirmFor === q.id}
-              {@const sp = sharedTarget(q)}
-              <div class="row" role="group" aria-label="Подтверждение «начать»">
-                <p class="warn" data-testid="shared-warning">{sharedWarning(sp?.name ?? '')}</p>
-                <button type="button" class="primary" disabled={busy !== ''} onclick={() => pick(q, 'accept')}>{START_SUBMIT}</button>
-                <button type="button" onclick={() => (confirmFor = '')}>Отмена</button>
-              </div>
-            {/if}
-            {#if deferFor === q.id}
-              <form class="row" onsubmit={(e) => submitDefer(e, q)} aria-label={DEFER_FORM.aria}>
-                <label class="row">
-                  Не раньше
-                  <input type="date" bind:value={deferDate} min={deferMin()} required aria-label="Отложить до" />
-                  <span class="muted small" title="Даты хранятся в UTC">UTC</span>
-                </label>
-                <button type="submit" disabled={busy !== ''}>{DEFER_FORM.submit}</button>
-                <button type="button" onclick={() => (deferFor = '')}>Отмена</button>
-              </form>
-            {/if}
             {#if !ideaOf(q)}
+              <!-- ответ текстом — поле на виду (правило А): ошибка — под ним -->
               <form class="row" onsubmit={(e) => submitText(e, q)} aria-label="Ответ текстом">
                 <input
                   bind:value={texts[q.id]}
@@ -438,17 +472,15 @@
             <p><a href={decisionHref(created[q.id])} data-testid="decision-link">Созданное решение</a></p>
           {/if}
           {#if errors[q.id]}<p class="error" role="alert">{errors[q.id]}</p>{/if}
-          {#if editing !== q.id}
-            <!-- правка, «Неактуален» и корзина (§5.9 пп. 1–2); имена — с вопросом: в списке кнопок диктора
-                 вопросы различимы -->
-            <div class="row acts" role="group" aria-label="Действия с вопросом">
-              {#if q.status === 'open'}
-                <button type="button" class="small-btn" aria-label="Изменить «{q.title}»" onclick={() => startEdit(q)}>Изменить</button>
-                <button type="button" class="small-btn" aria-label="Неактуален «{q.title}»" onclick={() => askObsolete(q)}>Неактуален</button>
-              {/if}
-              <button type="button" class="small-btn danger" aria-label="Удалить «{q.title}»" onclick={() => askDelete(q)}>Удалить</button>
-            </div>
-          {/if}
+          <!-- правка, «Неактуален» и корзина (§5.9 пп. 1–2); имена — с вопросом: в списке кнопок диктора
+               вопросы различимы -->
+          <div class="row acts" role="group" aria-label="Действия с вопросом">
+            {#if q.status === 'open'}
+              <button type="button" class="small-btn" aria-label="Изменить «{q.title}»" onclick={() => startEdit(q)}>Изменить</button>
+              <button type="button" class="small-btn" aria-label="Неактуален «{q.title}»" onclick={() => askObsolete(q)}>Неактуален</button>
+            {/if}
+            <button type="button" class="small-btn danger" aria-label="Удалить «{q.title}»" onclick={() => askDelete(q)}>Удалить</button>
+          </div>
         </article>
       {/each}
     </div>
@@ -458,10 +490,69 @@
   {/if}
 </section>
 
+<!-- «Изменить» — правка в широком окне формы (лента без карточки, правило В) -->
+{#if editingEntry && editingEntry.status === 'open'}
+  {@const q = editingEntry}
+  {#key q.id}
+    <EditPanel
+      dialog
+      {user}
+      entry={q}
+      onsaved={saved}
+      oncancel={() => closeEdit(q.id)}
+      onreread={reread}
+      {onexpired}
+      refocus={() => action(q.id, 'Изменить')}
+    />
+  {/key}
+{/if}
+
+<!-- «отложить» вопроса-предложения — окно с датой (правило Б) -->
+<FormDialog
+  open={deferQ !== null}
+  title={DEFER_FORM.title}
+  subject={deferQ ? `Вопрос: ${deferQ.title}` : undefined}
+  description="Идея вернётся к разбору не раньше этой даты."
+  submit={DEFER_FORM.submit}
+  error={dlgError}
+  dirty={() => deferDate !== deferAt}
+  refocus={answeredHeading}
+  onsubmit={submitDefer}
+  onclose={() => ((deferQ = null), (dlgError = ''))}
+>
+  <!-- видимая подпись — та же, что имя поля (WCAG 2.5.3) -->
+  <label>
+    Отложить до
+    <span class="row">
+      <input type="date" bind:value={deferDate} min={deferMin()} required aria-label="Отложить до" data-autofocus />
+      <span class="muted small" title="Даты хранятся в UTC">UTC</span>
+    </span>
+  </label>
+</FormDialog>
+
+<!-- «начать» идеи Knowledge с задачей в общем решении — окно-подтверждение (правило Б) -->
+<FormDialog
+  open={startQ !== null}
+  confirm
+  title="Начать идею в общем решении?"
+  subject={startQ ? `Вопрос: ${startQ.title}` : undefined}
+  submit={START_SUBMIT}
+  error={dlgError}
+  refocus={answeredHeading}
+  onsubmit={submitStart}
+  onclose={() => ((startQ = null), (dlgError = ''))}
+>
+  <p class="warn" data-testid="shared-warning">{sharedWarning((startQ && sharedTarget(startQ)?.name) ?? '')}</p>
+</FormDialog>
+
 <style>
   .list {
     display: grid;
     gap: 10px;
+  }
+  /* вопрос из адреса прокручивается к началу — под шапку приложения */
+  .q {
+    scroll-margin-top: calc(var(--header-h) + 8px);
   }
   .q.selected {
     border-color: var(--accent);

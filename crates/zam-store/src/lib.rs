@@ -8,7 +8,10 @@
 //! цель индексации (`attachment_docs`, кэш извлечения `blob_extract`; M5), отчёты (вид записи
 //! `report`, файлы `entry_attachments`; M5.5), карта кода решения (`code_*`, ссылки на символы;
 //! M5.6), журнал идей (вид записи `idea`; M5.7), эпохи выданного сессии, учёт без сессии и
-//! снимки сессий (`session_snapshots`; M6).
+//! снимки сессий (`session_snapshots`; M6), виды внутренних работ и открытия подсказок
+//! (`works`, `usage_opened`; M7.3), журнал отправок подключённой модели (`work_calls`; M7.3), пробы
+//! ночной проверки памяти, её прогоны и результаты (`probes`, `check_runs`, `check_results`; M7.3),
+//! предложения человеку — кандидаты в Rules (`proposals`; M7.3).
 
 pub mod access;
 pub mod archive;
@@ -17,6 +20,7 @@ pub mod backup;
 pub mod blobs;
 pub mod cache;
 pub mod certainty;
+pub mod check;
 pub mod code;
 pub mod counts;
 pub mod datadir;
@@ -34,6 +38,8 @@ pub mod links;
 pub mod migrate;
 pub mod nodes;
 pub mod paths;
+pub mod probes;
+pub mod proposals;
 pub mod questions;
 mod schema_repair;
 pub mod search;
@@ -49,6 +55,8 @@ pub mod time;
 pub mod usage;
 pub mod user_db;
 pub mod vault;
+pub mod work_calls;
+pub mod works;
 
 pub use access::{AccessDecision, AccessEntry, AccessState, SolutionInfo, SolutionRole};
 pub use attachments::{
@@ -75,9 +83,9 @@ pub use blobs::{
 pub use cache::{
     CACHE_LOOKUP_MAX, CACHE_QUERY_MAX_CHARS, CACHE_SOURCES_MAX, CacheDep, CacheEntry, CacheError,
     CacheFilter, CacheGc, CacheHit, CachePut, CacheQuery, PromoteAs, SourceSpec, StaleKind,
-    StaleSource, cache_count, cache_delete, cache_get, cache_list, cache_lookup, cache_promote,
-    cache_put, cache_put_with, gc_cache, invalidate_target, mark_new_sources, normalize_query,
-    scope_hash, section_text,
+    StaleSource, cache_count, cache_delete, cache_get, cache_list, cache_lookup, cache_lookup_with,
+    cache_promote, cache_put, cache_put_with, gc_cache, invalidate_target, mark_new_sources,
+    normalize_query, scope_hash, section_text,
 };
 pub use certainty::{
     CertaintyChange, CertaintyError, Evidence, check_certainty, check_final_state,
@@ -175,7 +183,7 @@ pub use sessions::{
     QueueShown, RECALL_PART, REVIEW_QUEUE_PART, SESSION_ID_MAX_CHARS, SeenItem, SeenKey,
     SeenTarget, Session, SessionFilter, SessionTouch, TOKEN_EVENT_MAX_CHARS, TokenCount, TokenStat,
     WHOLE_TARGET, add_memory_write, add_token_counts, add_tokens, bump_epoch, check_session_id,
-    end_session, gc_sessions, get_session, latest_session, list_sessions, mark_seen,
+    end_session, gc_sessions, get_session, hint_shown, latest_session, list_sessions, mark_seen,
     mark_seen_with_tokens, register_session, review_queue_shown, seen_entry_ids, seen_revs,
     seen_revs_any_epoch, session_epoch, session_holdout, session_tokens, sessions_tokens,
     set_holdout, touch_session,
@@ -194,6 +202,8 @@ pub use tasks::{
     TaskData, TaskError, TaskNode, TaskTree, check_task, check_task_transition, claim_task,
     claimed_tasks, open_tasks, release_task, task_tree,
 };
+pub use usage::{NOISY_MIN_SHOWN, NOISY_WINDOW_DAYS, noisy_ids, open_source};
+pub use usage::{OpenedEvent, opened_counts_many, record_opened, usage_opened_since};
 pub use usage::{
     UnattributedRow, UsageCounts, UsageEvent, UsageKind, UsageSource, add_unattributed,
     record_usage, record_usages, unattributed_tokens, usage_counts, usage_counts_many,

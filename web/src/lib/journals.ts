@@ -1,7 +1,7 @@
 // Подписи журналов решения для WebUI (§7.2–7.6): виды записей, статусы, надёжность.
 import { IDEA_STATUS_TEXT } from './ideaStatus';
 import { localTime } from './time';
-import type { Certainty, EntryStatus, TriggerType } from './api';
+import type { Certainty, EntryKind, EntryStatus, TriggerType } from './api';
 import type { Journal } from './router';
 
 export const JOURNAL_TITLE: Record<Journal, string> = {
@@ -15,6 +15,14 @@ export const JOURNAL_TITLE: Record<Journal, string> = {
   ideas: 'Идеи',
   questions: 'Вопросы',
   vault: 'Vault',
+};
+
+/** Заголовок формы правки записи (`EntryEdit` — в карточке и в окне `EditPanel`). */
+export const EDIT_TITLE: Partial<Record<EntryKind, string>> = {
+  changelog: 'Правка записи',
+  release: 'Правка релиза',
+  task: 'Правка задачи',
+  question: 'Правка вопроса',
 };
 
 /** Журналы пространства: у решения — все, у Knowledge — без Changelog, Releases, Отчётов
@@ -33,7 +41,8 @@ export function journalsOf(kind: string): Journal[] {
 export { JOURNAL_OF_KIND, entryRef } from './entryRefs';
 
 /** Колонки доски задач (M4.5 §3) и вкладка по умолчанию в узкой области (M7.2, §5.2 п. 1) — в
- * `taskBoard.ts` (без зависимостей: его проверяет `node --test`). */
+ * `taskBoard.ts` (из зависимостей — только `plural.ts`: его проверяет `node --test`); там же числа
+ * шагов планов доски (M7.3, §6.14 п. 10). */
 export { TASK_COLUMNS, boardTab } from './taskBoard';
 
 /** Подпись статуса с заглавной буквы: вкладки доски («В работе»). */

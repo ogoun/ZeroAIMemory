@@ -6,6 +6,7 @@ pub mod backups;
 pub mod big_body;
 pub mod blobs;
 pub mod cache;
+pub mod check;
 pub mod code;
 pub mod doc_locator;
 pub mod downloads;
@@ -19,7 +20,9 @@ pub mod ideas;
 pub mod index;
 pub mod insights;
 pub mod nodes;
+pub mod opened;
 pub mod previews;
+pub mod proposals;
 pub mod questions;
 pub mod read;
 pub mod read_focus;
@@ -40,6 +43,8 @@ pub mod transfer;
 pub mod triggers;
 pub mod user_settings;
 pub mod vault;
+pub mod works;
+pub mod works_model;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -231,6 +236,13 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
         .route("/api/v1/code/symbols", get(code::symbols))
         .route("/api/v1/code/symbols/{id}", get(code::symbol))
         .route("/api/v1/code/impact", post(code::impact).layer(code_limit))
+        // ночная проверка памяти (M7.3 §6.4–§6.5): чтение и ручной прогон — не запись памяти
+        .route("/api/v1/check/status", get(check::status))
+        .route("/api/v1/check/runs", get(check::runs))
+        .route("/api/v1/check/runs/{id}", get(check::run))
+        .route("/api/v1/check/run", post(check::start))
+        .route("/api/v1/check/accept", post(check::accept))
+        .route("/api/v1/check/probes", get(check::probes))
         .route("/api/v1/health", get(health::health))
         .route("/api/v1/ready", get(health::ready))
         .route("/api/v1/auth/login", post(login::login))
@@ -246,6 +258,27 @@ fn service_routes(cfg: &ServerConfig) -> Router<AppState> {
             "/api/v1/auth/settings",
             get(user_settings::get_own).patch(user_settings::patch_own),
         )
+        // подключённая модель исполнителя (M7.3 §6.2 пп. 8, 9): только человек, токену — 403
+        .route("/api/v1/works/model/test", post(works_model::test))
+        .route("/api/v1/works/calls", get(works_model::calls))
+        // очередь внутренних работ (M7.3 §6.3): итог — пробы и предложения, не знания (вне
+        // `memory_routes`); ручной запуск — только человек
+        .route("/api/v1/works", get(works::list))
+        .route("/api/v1/works/usage", get(works::usage))
+        .route("/api/v1/works/run", post(works::run))
+        .route("/api/v1/works/{id}/result", post(works::result))
+        .route("/api/v1/works/{id}/release", post(works::release))
+        // кандидаты в Rules (M7.3 §6.7): предложения человеку, не память — заметку создаёт
+        // только принятие человеком (`accept`, тем же кодом, что заметка WebUI)
+        .route(
+            "/api/v1/proposals",
+            get(proposals::list).post(proposals::create),
+        )
+        .route("/api/v1/proposals/counts", get(proposals::counts))
+        .route("/api/v1/proposals/{id}", get(proposals::get))
+        .route("/api/v1/proposals/{id}/accept", post(proposals::accept))
+        .route("/api/v1/proposals/{id}/decline", post(proposals::decline))
+        .route("/api/v1/proposals/{id}/withdraw", post(proposals::withdraw))
         .route("/api/v1/spaces", get(spaces::list))
         .route("/api/v1/spaces/{space}/tree", get(spaces::tree))
         // число записей разделов (M7 §5.3): чтение, не запись памяти

@@ -1482,6 +1482,8 @@ pub fn main(a: BenchArgs, repo: &Path) -> Result<()> {
         );
     }
     let server = build_server(repo, a.server_bin.as_deref())?;
+    // проба `works.check` (M7.3) — до замеров: первый замеренный старт её не включает
+    crate::eval::run::night_check_known(&paths, &server)?;
     let c = Ctx {
         paths,
         server,

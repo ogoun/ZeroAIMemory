@@ -5,11 +5,13 @@
 //! фиксирована: принадлежность сценария определяют только id его вида (порядок файла и другие
 //! виды не влияют). Сетки подбираются на dev, приёмка — только на holdout (`--grid` с
 //! `--split holdout` — ошибка, [`crate::eval::grid::refuse_holdout`]).
+//!
+//! С M7.3 (§6.4 п. 2) функция разбиения — `zam_search::eval::split_by_rank` (рядом с
+//! поэлементным разбиением проб ночной проверки сервера); здесь — прежнее имя [`split`] и часть
+//! прогона [`Part`] с разбором флага `--split`. Поведение прежнее — сторож
+//! `split_by_rank_unchanged`.
 
-use std::collections::{BTreeMap, BTreeSet};
-
-/// Соль разбиения.
-pub const SPLIT_SALT: &str = "m6-2026-11-04";
+pub use zam_search::eval::split_by_rank as split;
 
 /// Часть набора прогона.
 #[derive(
@@ -28,29 +30,6 @@ impl Part {
             Part::Holdout => "holdout",
         }
     }
-}
-
-/// Ключ сортировки id внутри вида.
-fn key(id: &str) -> blake3::Hash {
-    let mut h = blake3::Hasher::new();
-    h.update(SPLIT_SALT.as_bytes());
-    h.update(id.as_bytes());
-    h.finalize()
-}
-
-/// id holdout из пар `(id, вид)`: в каждом виде первые ⌈n/3⌉ по [`key`].
-pub fn split(items: &[(String, String)]) -> BTreeSet<String> {
-    let mut by_kind: BTreeMap<&str, Vec<(blake3::Hash, &str)>> = BTreeMap::new();
-    for (id, kind) in items {
-        by_kind.entry(kind).or_default().push((key(id), id));
-    }
-    let mut out = BTreeSet::new();
-    for mut v in by_kind.into_values() {
-        v.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()).then(a.1.cmp(b.1)));
-        let n = v.len().div_ceil(3);
-        out.extend(v.into_iter().take(n).map(|(_, id)| id.to_string()));
-    }
-    out
 }
 
 #[cfg(test)]
@@ -78,6 +57,39 @@ mod tests {
             (0..4).map(|i| (format!("s{i}"), "k".to_string())).collect();
         assert_eq!(split(&small).len(), 2);
         assert_eq!(split(&small[..1]).len(), 1);
-        assert_eq!(SPLIT_SALT, "m6-2026-11-04");
+        assert_eq!(zam_search::eval::SPLIT_SALT, "m6-2026-11-04");
+    }
+
+    /// Holdout ТС-1 (сценарии `eval/scenarios.toml`, по виду сценария) — до переноса функции.
+    const HOLDOUT_TS1: &[&str] = &[
+        "s-07", "s-10", "s-11", "s-12", "s-13", "s-14", "s-19", "s-23", "s-24", "s-29", "s-30",
+        "s-31", "s-35", "s-36", "s-41", "s-43", "s-44", "s-45",
+    ];
+    /// Holdout ТС-2 (сессии `eval/sessions.toml`, по профилю) — до переноса функции.
+    const HOLDOUT_TS2: &[&str] = &[
+        "sh-02", "sh-03", "ss-02", "ss-08", "ss-10", "ss-11", "ss-14", "ss-15",
+    ];
+
+    /// Сторож переноса (M7.3 §6.4 п. 2): ранговое разбиение переехало в `zam_search::eval` без
+    /// изменения поведения — множества holdout ТС-1 и ТС-2 прежние.
+    #[test]
+    fn split_by_rank_unchanged() {
+        let repo = crate::eval::tests_repo();
+        let (sc, _) =
+            crate::eval::tokens::load_scenarios(&repo.join("eval").join("scenarios.toml")).unwrap();
+        let ts1: Vec<(String, String)> = sc
+            .iter()
+            .map(|s| (s.id.clone(), s.kind().to_string()))
+            .collect();
+        let set =
+            crate::eval::sessions::load_set(&repo.join("eval").join("sessions.toml")).unwrap();
+        let ts2: Vec<(String, String)> = set
+            .iter()
+            .map(|s| (s.id.clone(), s.profile.as_str().to_string()))
+            .collect();
+        let got1: Vec<String> = split(&ts1).into_iter().collect();
+        let got2: Vec<String> = split(&ts2).into_iter().collect();
+        assert_eq!(got1, HOLDOUT_TS1, "ТС-1: {got1:?}");
+        assert_eq!(got2, HOLDOUT_TS2, "ТС-2: {got2:?}");
     }
 }

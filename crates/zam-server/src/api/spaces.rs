@@ -3,7 +3,8 @@
 //! пространства чужих решений из баз владельцев (`role: member`, `access`, `owner`);
 //! `access_requests_pending` — ожидающие запросы к решениям пользователя.
 //! `GET /spaces/{space}/tree` — дерево узлов пространства.
-//! `GET /spaces/{space}/counts` — число записей разделов (журналы, открытые, заметки; M7 §5.3).
+//! `GET /spaces/{space}/counts` — число записей разделов (журналы, открытые, заметки, шаги планов;
+//! M7 §5.3, M7.3 §6.14 п. 10).
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
@@ -133,14 +134,17 @@ pub async fn tree(
     Ok(Json(json!({ "space": sc.space, "items": items })))
 }
 
-/// `GET /spaces/{space}/counts` → `{journals: {<журнал>: n}, open: {questions, tasks}, notes}` —
+/// `GET /spaces/{space}/counts` → `{journals: {<журнал>: n}, open: {questions, tasks}, notes,
+/// task_steps}` —
 /// число записей разделов для дерева и полосы журналов WebUI (спецификация M7 §5.3 п. 1, признак
 /// `space_counts`). Журналы вида пространства, число — живые записи без корзины, все статусы:
 /// длина ленты `GET …/entries?kind=` того же зрителя ([`space_counts`]); `code` — файлы карты
 /// кода (карта выключена — 0: её маршруты отвечают 404); `vault` — записи Vault зрителя тем же
 /// чтением и базой, что `GET …/vault` ([`super::vault::count_of`]: Vault участника — в его базе).
 /// Права — чтение пространства, как у ленты: участнику — только пространство решения; токену
-/// журнала `reports` нет (отчёт агенту не виден нигде, M5.5 §7).
+/// журнала `reports` нет (отчёт агенту не виден нигде, M5.5 §7). `task_steps` (признак
+/// `space_counts_steps`, M7.3 §6.14 п. 10) — шаги планов (подзадачи `part_of`) среди
+/// `journals.tasks` по правилу `top_level=1`: подсказка числа «Задач» в WebUI.
 pub async fn counts(
     State(st): State<AppState>,
     p: Principal,
@@ -165,6 +169,7 @@ pub async fn counts(
         "journals": journals,
         "open": { "questions": c.open_questions, "tasks": c.open_tasks },
         "notes": c.notes,
+        "task_steps": c.task_steps,
     })))
 }
 

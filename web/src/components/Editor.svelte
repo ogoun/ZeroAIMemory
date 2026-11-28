@@ -4,10 +4,14 @@
   // конфликт — окно с диффом и выбором. Уход с несохранёнными правками — с подтверждением.
   // Окно уже 1024 px (M7.2, §5.2 п. 4) — две панели не рядом, а вкладками «Текст | Предпросмотр»
   // (ARIA tablist; панели не пересоздаются — CodeMirror и правки целы); гибридного режима нет.
+  // Причина смены `certainty:` (сервер требует сообщение ревизии, §7.5) — окно формы `FormDialog`
+  // (M7.3, §6.14, правило Б), а не системное `window.prompt`: поле в фокусе, Esc и «Отмена» —
+  // сохранение не уходит, ошибка сервера — в окне, набранное цело.
   import '../doc.css';
   import { Dialog } from 'bits-ui';
   import { onMount, tick, untrack } from 'svelte';
   import DiffView from './DiffView.svelte';
+  import FormDialog from './FormDialog.svelte';
   import {
     ApiError,
     conflictOf,
@@ -23,7 +27,7 @@
   import type { EditorHandle } from '../lib/editor/codemirror';
   import { codeOf, flashButton } from '../lib/hydrate/dom';
   import { hydrateRendered } from '../lib/hydrate/render';
-  import { anchorId, href, parse, setGuard } from '../lib/router';
+  import { anchorId, href, parse, pushGuard } from '../lib/router';
   import { onTabKey } from '../lib/tabs';
   import { viewport } from '../lib/viewport.svelte';
 
@@ -63,6 +67,10 @@
   let conflict = $state<{ current_rev: number; diff: string; text: string } | null>(null);
   let conflictError = $state('');
   let conflictBusy = $state(false);
+  /** Окно причины смены `certainty:` — базовая ревизия сохранения, которое его открыло. */
+  let reasonFor = $state<{ base?: number } | null>(null);
+  let reason = $state('');
+  let reasonError = $state('');
 
   let previewSeq = 0;
   let previewTimer: ReturnType<typeof setTimeout> | undefined;
@@ -132,21 +140,16 @@
       }
     })();
 
-    // уход по адресу (дерево, ссылка, назад) — подтверждение; внутри заметки — свободно
-    const offGuard = setGuard(
-      (next) =>
-        (next.name === 'node' && next.user === user && next.node === node) ||
-        !isDirty() ||
-        window.confirm(LEAVE_QUESTION),
-    );
-    const onbeforeunload = (e: BeforeUnloadEvent) => {
-      if (isDirty()) e.preventDefault();
-    };
-    window.addEventListener('beforeunload', onbeforeunload);
+    // уход по адресу (дерево, ссылка, назад) — подтверждение своим вопросом; внутри заметки —
+    // свободно. Проверка — в стеке проверок ухода (M7.3, §6.14 п. 4): с окном формы поверх
+    // редактора вопрос один; закрытие вкладки — `beforeunload` роутера
+    const offGuard = pushGuard({
+      dirty: (next) => !(next && next.name === 'node' && next.user === user && next.node === node) && isDirty(),
+      question: LEAVE_QUESTION,
+    });
     return () => {
       alive = false;
       offGuard();
-      window.removeEventListener('beforeunload', onbeforeunload);
       clearTimeout(previewTimer);
       previewSeq++;
       cm?.destroy();
@@ -225,12 +228,10 @@
         conflictError = '';
         conflict = { ...c, text };
       } else if (needsCertaintyReason(e) && revMessage === undefined) {
-        const why = window.prompt('Статус certainty изменён: укажите причину (сообщение ревизии)');
-        if (why?.trim()) {
-          saving = false;
-          return save(base, why.trim());
-        }
-        error = 'Не сохранено: смена certainty требует причины';
+        // причина — окном формы; сохранение повторит «Сохранить» окна
+        reason = '';
+        reasonError = '';
+        reasonFor = { base };
       } else if (!expired(e)) {
         error =
           e instanceof ApiError && e.status === 413
@@ -241,6 +242,33 @@
     } finally {
       saving = false;
     }
+  }
+
+  /** «Сохранить» окна причины: сохранение с причиной в сообщении ревизии; удалось или открылся
+   * конфликт — окно закрыто; ошибка — в окне, причина цела. */
+  async function submitReason() {
+    const f = reasonFor;
+    const why = reason.trim();
+    if (!f) return;
+    if (!why) {
+      reasonError = 'Укажите причину смены статуса.';
+      return;
+    }
+    reasonError = '';
+    const ok = await save(f.base, why);
+    if (ok || conflict) {
+      reasonFor = null;
+      return;
+    }
+    reasonError = error || 'Не сохранено.';
+    error = '';
+  }
+
+  /** Окно причины закрыли без сохранения (Esc, «Отмена», «✕»): текст в редакторе цел. */
+  function closeReason() {
+    reasonFor = null;
+    reasonError = '';
+    error = 'Не сохранено: смена certainty требует причины';
   }
 
   async function overwrite() {
@@ -366,6 +394,8 @@
   function onkeydown(e: KeyboardEvent) {
     if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 's' && !e.defaultPrevented) {
       e.preventDefault();
+      // окно причины открыто: сохраняет его «Сохранить» (иначе причина сбросилась бы)
+      if (reasonFor) return;
       void save();
     }
   }
@@ -478,6 +508,21 @@
     </Dialog.Content>
   </Dialog.Portal>
 </Dialog.Root>
+
+<!-- причина смены `certainty:` — окно формы (правило Б) -->
+<FormDialog
+  open={reasonFor !== null}
+  title="Причина смены надёжности"
+  description="Статус certainty в тексте заметки изменён: сервер записывает причину в сообщение ревизии."
+  submit="Сохранить"
+  busy={saving}
+  error={reasonError}
+  dirty={() => reason.trim() !== ''}
+  onsubmit={submitReason}
+  onclose={closeReason}
+>
+  <label>Причина <input bind:value={reason} required maxlength="500" data-autofocus /></label>
+</FormDialog>
 
 <style>
   .editor {

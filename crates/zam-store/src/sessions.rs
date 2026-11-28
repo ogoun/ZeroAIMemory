@@ -19,7 +19,8 @@
 //!   срока сессии (аналитика). Показ идей — без эпохи (§7.2, «одна идея — один показ за
 //!   сессию»): раздел идей дайджеста читает [`seen_entry_ids`], подсказка идей к запросу —
 //!   [`seen_revs_any_epoch`]; показ очереди разбора (M7.1 §4.5: строка к запросу, раздел
-//!   дайджеста) — своя отметка [`REVIEW_QUEUE_PART`] по эпохе, [`review_queue_shown`];
+//!   дайджеста) — своя отметка [`REVIEW_QUEUE_PART`] по эпохе, [`review_queue_shown`]; показ
+//!   подсказкой в эпоху для «открыл подсказку» (M7 §6.6 п. 2) — [`hint_shown`];
 //! - `holdout` — сессия контрольной группы агентного A/B ([`set_holdout`], M6 §12); признак с
 //!   наследованием от родителя — [`session_holdout`];
 //! - `parent_id`, `agent_type` — сессия субагента (спецификация M4.5 §9.4): хук
@@ -671,6 +672,39 @@ async fn seen_revs_in(
         Ok(out)
     })
     .await
+}
+
+/// Цели из `targets` (владелец базы цели, узел или запись), показанные сессии подсказкой `/recall`
+/// ([`RECALL_PART`], любая ревизия) **в эпоху `epoch`** (M7 §6.6 п. 2: «открыл подсказку» — чтение
+/// после показа в той же эпохе; показ прежней эпохи не считается, в отличие от
+/// [`seen_entry_ids`]). Вложения подсказкой не отмечаются — их в ответе нет.
+pub async fn hint_shown(
+    db: &Db,
+    session: &str,
+    epoch: u32,
+    targets: &[(Id, TargetRef)],
+) -> Result<Vec<(Id, TargetRef)>, StoreError> {
+    let keys: Vec<SeenKey> = targets
+        .iter()
+        .filter(|(_, t)| t.kind != TargetKind::Attachment)
+        .map(|(owner, t)| SeenKey {
+            owner_id: *owner,
+            target: SeenTarget::Ref(*t),
+            part: RECALL_PART.to_string(),
+        })
+        .collect();
+    let seen = seen_revs(db, session, epoch, &keys).await?;
+    Ok(targets
+        .iter()
+        .filter(|(owner, t)| {
+            seen.contains_key(&SeenKey {
+                owner_id: *owner,
+                target: SeenTarget::Ref(*t),
+                part: RECALL_PART.to_string(),
+            })
+        })
+        .copied()
+        .collect())
 }
 
 /// Записи журналов (`target_kind = entry`) базы владельца `owner`, выданные сессии с частью

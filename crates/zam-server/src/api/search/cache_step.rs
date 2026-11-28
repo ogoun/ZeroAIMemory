@@ -12,7 +12,7 @@
 //! другой области выдавалась бы как своя **[решение исполнителя]**.
 use axum::http::HeaderMap;
 use serde_json::{Value, json};
-use zam_store::{CACHE_LOOKUP_MAX, CacheHit, CacheQuery, Space, TargetFilter, cache_lookup};
+use zam_store::{CACHE_LOOKUP_MAX, CacheHit, CacheQuery, Space, TargetFilter, cache_lookup_with};
 
 use super::targets::{ScopeReq, request_solution};
 use super::{md_inline, scope_key};
@@ -20,6 +20,7 @@ use crate::api::cache::{cache_ref, cache_space};
 use crate::api::scope::{Mode, Role};
 use crate::app::AppState;
 use crate::auth::Principal;
+use crate::check::Accounting;
 
 /// Выжимка шага 0.
 pub(super) struct CacheItem {
@@ -51,7 +52,8 @@ impl CacheItem {
     }
 }
 
-/// Выжимки шага 0 для запроса (см. модуль); `dense` — вектор запроса векторного канала.
+/// Выжимки шага 0 для запроса (см. модуль); `dense` — вектор запроса векторного канала; `acc` —
+/// учёт обращения к выжимкам (`Off` — ночная проверка памяти: `hits` и `last_used_at` прежние).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn lookup(
     st: &AppState,
@@ -62,6 +64,7 @@ pub(super) async fn lookup(
     query: &str,
     session: Option<&str>,
     dense: Option<&[f32]>,
+    acc: Accounting,
 ) -> Vec<CacheItem> {
     let query_norm = zam_store::normalize_query(query);
     // явный список пространств и «все решения» ключ кэша не описывает — шага 0 нет
@@ -94,7 +97,7 @@ pub(super) async fn lookup(
         limit: CACHE_LOOKUP_MAX,
         visible_spaces: matches!(sc.role, Role::Member(_)).then(|| vec![sc.space.id]),
     };
-    let hits = match cache_lookup(&sc.db, &q).await {
+    let hits = match cache_lookup_with(&sc.db, &q, acc.records()).await {
         Ok(h) => h,
         Err(e) => {
             tracing::warn!(error = %e, "поиск: кэш выжимок не прочитан, ответ без шага 0");

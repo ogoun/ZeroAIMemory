@@ -9,8 +9,15 @@
   // (`onclose(note)`); после 202 закрытие задание не отменяет (оно на сервере, итог живёт там час),
   // опрос останавливается, итог после закрытия не показывается **[решение координатора 26]** —
   // окно предупреждает по фазе. Ход и итог — живая область `role="status"` (есть в DOM заранее).
-  import { Dialog } from 'bits-ui';
-  import { onDestroy } from 'svelte';
+  // Каркас окна — общий `FormDialog` (M7.3, §6.14 п. 1, решение 81): шапка с «✕», основное действие
+  // «Импортировать», затем «Отмена» справа, «Проверить без записи» — дополнительной кнопкой слева;
+  // на телефоне — во весь экран («✕ · Импорт архива · Импортировать», «Назад» закрывает окно).
+  // Логика отправки прежняя: вопрос «Прервать отправку?» — свой, внутри окна, вверху тела.
+  // Несохранённое — выбранный архив или изменённые параметры до запуска (`dirty`): Esc, «✕»,
+  // «Отмена» и «Назад» сначала спрашивают в окне, как у прочих окон; после итога или ошибки
+  // запуска — нет (запуск был). Без файла обе кнопки запуска выключены.
+  import { onDestroy, tick } from 'svelte';
+  import FormDialog from './FormDialog.svelte';
   import {
     ApiError,
     errorText,
@@ -65,6 +72,11 @@
   let keepBtn = $state<HTMLButtonElement | null>(null);
 
   let busy = $derived(phase !== 'idle');
+  /** Запуск был (итог или ошибка): выбранное «отправлено», вопрос о несохранённом не нужен. */
+  let ran = $state(false);
+
+  /** Выбран архив или изменены параметры, а запуска ещё не было. */
+  const unsent = (): boolean => phase === 'idle' && !ran && (file !== null || own || onConflict !== 'skip' || axioms !== 'demote');
 
   /** Отправка тела (до 202): прервать — `abort()`. */
   let sending: AbortController | null = null;
@@ -85,9 +97,14 @@
     askAbort = true;
   }
 
-  // вопрос показан — фокус на безопасный выбор «Продолжить отправку»
+  // вопрос показан — на виду (тело окна могло быть прокручено к итогу) и фокус на безопасный выбор
+  // «Продолжить отправку»
   $effect(() => {
-    if (askAbort) keepBtn?.focus();
+    if (!askAbort) return;
+    void tick().then(() => {
+      keepBtn?.scrollIntoView({ block: 'nearest' });
+      keepBtn?.focus();
+    });
   });
 
   function abortSending() {
@@ -201,6 +218,7 @@
     job = null;
     sent = 0;
     total = f.size;
+    ran = true;
     phase = 'sending';
     askAbort = false;
     sending = new AbortController();
@@ -276,142 +294,127 @@
   }
 </script>
 
-<!-- открыто, пока окно смонтировано: Esc, щелчок мимо и «Закрыть» идут в `requestClose` (во время
+<!-- открыто, пока окно смонтировано: Esc, щелчок мимо, «✕» и «Отмена» идут в `requestClose` (во время
      отправки — вопрос, окно остаётся) -->
-<Dialog.Root
-  bind:open={
-    () => true,
-    (v) => {
-      if (!v) requestClose();
-    }
-  }
+<FormDialog
+  open
+  wide
+  title="Импорт архива"
+  description={`В пространство «${spaceName}»${userName ? ` пользователя ${userName}` : ''}: архив экспорта (.zip) или zip папки с заметками .md. Отчёты переносятся только импортом из WebUI.`}
+  submit="Импортировать"
+  {busy}
+  canSubmit={!!file}
+  dirty={unsent}
+  {error}
+  onsubmit={() => {
+    void start(false);
+  }}
+  onclose={requestClose}
 >
-  <Dialog.Portal>
-    <Dialog.Overlay class="overlay" />
-    <Dialog.Content class="panel dialog import">
-      <Dialog.Title>Импорт архива</Dialog.Title>
-      <Dialog.Description class="muted">
-        В пространство «{spaceName}»{userName ? ` пользователя ${userName}` : ''}: архив экспорта (.zip) или zip
-        папки с заметками .md. Отчёты переносятся только импортом из WebUI.
-      </Dialog.Description>
-      <form class="form" onsubmit={(e) => e.preventDefault()}>
-        <fieldset class="plain" disabled={busy}>
-          <label class="field">
-            Архив (.zip)
-            <input
-              type="file"
-              accept=".zip"
-              onchange={(e) => {
-                file = e.currentTarget.files?.[0] ?? null;
-                result = null;
-                error = '';
-              }}
-            />
-          </label>
-          <label class="check"><input type="checkbox" bind:checked={own} /> Это мой архив (перенос с другого сервера)</label>
-          <fieldset class="choice">
-            <legend>Если запись уже есть</legend>
-            <label class="check"><input type="radio" bind:group={onConflict} value="skip" /> пропустить</label>
-            <label class="check"><input type="radio" bind:group={onConflict} value="revision" /> новой ревизией</label>
-          </fieldset>
-          <fieldset class="choice" disabled={own}>
-            <legend>Аксиомы чужого архива</legend>
-            <label class="check"><input type="radio" bind:group={axioms} value="demote" /> понизить до theorem</label>
-            <label class="check"><input type="radio" bind:group={axioms} value="keep" /> оставить</label>
-            {#if own}<p class="muted small">Свой архив — аксиомы и id как есть.</p>{/if}
-          </fieldset>
-        </fieldset>
-      </form>
-      <p class="warn small" data-testid="import-warning">{closeWarning}</p>
-
-      <!-- ход и итог — живая область, есть в DOM заранее: объявляются начало отправки, смена этапа
-           и итог; счётчики байт и записей — вне объявления (числа — у `progress`) -->
-      <div class="progress" role="status" data-testid="import-status">
-        {#if phase === 'sending'}
-          <p>Отправка архива<span aria-hidden="true">: {bytesText(sent)} из {bytesText(total)}</span></p>
-        {:else if phase === 'running'}
-          <p data-testid="import-stage">Этап: {stageName(job)}<span aria-hidden="true">{stageCount(job)}</span></p>
-        {:else if result}
-          <p class="sr">{summary(result)}</p>
-        {/if}
+  {#if askAbort && phase === 'sending'}
+    <div class="ask warn" role="group" aria-labelledby="import-ask">
+      <p id="import-ask"><b>Прервать отправку?</b> Архив ещё не дошёл до сервера: задание не будет создано.</p>
+      <div class="row actions">
+        <button type="button" class="danger-fill" onclick={abortSending}>Прервать отправку</button>
+        <button type="button" bind:this={keepBtn} onclick={() => (askAbort = false)}>Продолжить отправку</button>
       </div>
-      {#if phase === 'sending'}
-        <progress max={total || 1} value={sent} aria-label="Отправка архива"></progress>
-      {:else if phase === 'running' && job && job.progress.total > 0}
-        <progress max={job.progress.total} value={job.progress.done} aria-label="Запись"></progress>
-      {/if}
-      {#if note}<p class="muted small">{note}</p>{/if}
-      {#if error}<p class="error" role="alert">{error}</p>{/if}
+    </div>
+  {/if}
+  <div class="form">
+    <fieldset class="plain" disabled={busy}>
+      <label class="field">
+        Архив (.zip)
+        <input
+          type="file"
+          accept=".zip"
+          required
+          data-autofocus
+          onchange={(e) => {
+            file = e.currentTarget.files?.[0] ?? null;
+            result = null;
+            error = '';
+            ran = false;
+          }}
+        />
+      </label>
+      <label class="check inline"><input type="checkbox" bind:checked={own} /> Это мой архив (перенос с другого сервера)</label>
+      <fieldset class="choice">
+        <legend>Если запись уже есть</legend>
+        <label class="check inline"><input type="radio" bind:group={onConflict} value="skip" /> пропустить</label>
+        <label class="check inline"><input type="radio" bind:group={onConflict} value="revision" /> новой ревизией</label>
+      </fieldset>
+      <fieldset class="choice" disabled={own}>
+        <legend>Аксиомы чужого архива</legend>
+        <label class="check inline"><input type="radio" bind:group={axioms} value="demote" /> понизить до theorem</label>
+        <label class="check inline"><input type="radio" bind:group={axioms} value="keep" /> оставить</label>
+        {#if own}<p class="muted small">Свой архив — аксиомы и id как есть.</p>{/if}
+      </fieldset>
+    </fieldset>
+  </div>
+  <p class="warn small" data-testid="import-warning">{closeWarning}</p>
 
-      {#if result}
-        {@const r = result}
-        <section class="report" aria-label="Итог импорта">
-          <div class="head">
-            <h3>{r.dry_run ? 'Проверка без записи' : 'Импорт завершён'}</h3>
-            {#if r.dry_run}<span class="tag">проверка</span>{/if}
-          </div>
-          {#if r.dry_run}<p class="muted small">Ничего не записано: ниже — что сделал бы импорт.</p>{/if}
-          <ul class="counts">
-            {#each rows(r) as [label, n] (label)}
-              <li class:zero={n === 0}>{label}: <b>{formatCount(n)}</b></li>
-            {/each}
-          </ul>
-          {#if r.conflicts.length}
-            <h4>
-              Конфликты{r.conflicts_total > Math.min(SHOW, r.conflicts.length)
-                ? ` — первые ${Math.min(SHOW, r.conflicts.length)}, всего ${formatCount(r.conflicts_total)}`
-                : ''}
-            </h4>
-            <ul class="list">
-              {#each r.conflicts.slice(0, SHOW) as c, i (i)}
-                <li><code>{c.id ?? c.path ?? '—'}</code> — {REASON[c.reason] ?? c.reason}</li>
-              {/each}
-            </ul>
-          {/if}
-          {#if r.warnings.length}
-            <h4>
-              Предупреждения{r.warnings_total > Math.min(SHOW, r.warnings.length)
-                ? ` — первые ${Math.min(SHOW, r.warnings.length)}, всего ${formatCount(r.warnings_total)}`
-                : ''}
-            </h4>
-            <ul class="list">
-              {#each r.warnings.slice(0, SHOW) as w, i (i)}<li>{w}</li>{/each}
-            </ul>
-          {/if}
-        </section>
-      {/if}
+  <!-- ход и итог — живая область, есть в DOM заранее: объявляются начало отправки, смена этапа
+       и итог; счётчики байт и записей — вне объявления (числа — у `progress`) -->
+  <div class="progress" role="status" data-testid="import-status">
+    {#if phase === 'sending'}
+      <p>Отправка архива<span aria-hidden="true">: {bytesText(sent)} из {bytesText(total)}</span></p>
+    {:else if phase === 'running'}
+      <p data-testid="import-stage">Этап: {stageName(job)}<span aria-hidden="true">{stageCount(job)}</span></p>
+    {:else if result}
+      <p class="sr">{summary(result)}</p>
+    {/if}
+  </div>
+  {#if phase === 'sending'}
+    <progress max={total || 1} value={sent} aria-label="Отправка архива"></progress>
+  {:else if phase === 'running' && job && job.progress.total > 0}
+    <progress max={job.progress.total} value={job.progress.done} aria-label="Запись"></progress>
+  {/if}
+  {#if note}<p class="muted small">{note}</p>{/if}
 
-      {#if askAbort && phase === 'sending'}
-        <div class="ask warn" role="group" aria-labelledby="import-ask">
-          <p id="import-ask"><b>Прервать отправку?</b> Архив ещё не дошёл до сервера: задание не будет создано.</p>
-          <div class="row actions">
-            <button type="button" class="danger-fill" onclick={abortSending}>Прервать отправку</button>
-            <button type="button" bind:this={keepBtn} onclick={() => (askAbort = false)}>Продолжить отправку</button>
-          </div>
-        </div>
-      {:else}
-        <div class="row actions">
-          <button type="button" disabled={busy || !file} onclick={() => start(true)}>Проверить без записи</button>
-          <button type="button" class="primary" disabled={busy || !file} onclick={() => start(false)}>Импортировать</button>
-          <button type="button" onclick={requestClose}>Закрыть</button>
-        </div>
+  {#if result}
+    {@const r = result}
+    <section class="report" aria-label="Итог импорта">
+      <div class="head">
+        <h3>{r.dry_run ? 'Проверка без записи' : 'Импорт завершён'}</h3>
+        {#if r.dry_run}<span class="tag">проверка</span>{/if}
+      </div>
+      {#if r.dry_run}<p class="muted small">Ничего не записано: ниже — что сделал бы импорт.</p>{/if}
+      <ul class="counts">
+        {#each rows(r) as [label, n] (label)}
+          <li class:zero={n === 0}>{label}: <b>{formatCount(n)}</b></li>
+        {/each}
+      </ul>
+      {#if r.conflicts.length}
+        <h4>
+          Конфликты{r.conflicts_total > Math.min(SHOW, r.conflicts.length)
+            ? ` — первые ${Math.min(SHOW, r.conflicts.length)}, всего ${formatCount(r.conflicts_total)}`
+            : ''}
+        </h4>
+        <ul class="list">
+          {#each r.conflicts.slice(0, SHOW) as c, i (i)}
+            <li><code>{c.id ?? c.path ?? '—'}</code> — {REASON[c.reason] ?? c.reason}</li>
+          {/each}
+        </ul>
       {/if}
-    </Dialog.Content>
-  </Dialog.Portal>
-</Dialog.Root>
+      {#if r.warnings.length}
+        <h4>
+          Предупреждения{r.warnings_total > Math.min(SHOW, r.warnings.length)
+            ? ` — первые ${Math.min(SHOW, r.warnings.length)}, всего ${formatCount(r.warnings_total)}`
+            : ''}
+        </h4>
+        <ul class="list">
+          {#each r.warnings.slice(0, SHOW) as w, i (i)}<li>{w}</li>{/each}
+        </ul>
+      {/if}
+    </section>
+  {/if}
+
+  {#snippet extra()}
+    <button type="button" disabled={busy || !file} onclick={() => start(true)}>Проверить без записи</button>
+  {/snippet}
+</FormDialog>
 
 <style>
-  :global(.dialog.import) {
-    /* ширина — переменной: на телефоне окно во всю ширину (app.css); длинный итог — прокрутка */
-    --dialog-w: 640px;
-    max-height: 90vh;
-    max-height: 90dvh;
-    overflow-y: auto;
-    overscroll-behavior: contain;
-  }
-  .form {
-    margin-top: 12px;
-  }
   fieldset {
     margin: 0;
     padding: 0;
@@ -465,9 +468,6 @@
     overflow: hidden;
     clip-path: inset(50%);
     white-space: nowrap;
-  }
-  .ask {
-    margin-top: 16px;
   }
   .ask p {
     margin: 0;

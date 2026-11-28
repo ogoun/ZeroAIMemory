@@ -40,6 +40,7 @@
 //!   /sessions/unattributed`). Явную сессию задаёт `zam mcp` (`ZAM_SESSION_ID` или
 //!   файл привязки хука `session-start`; `.mcp.json` Claude Code с M6 — stdio `zam mcp`) или
 //!   нативный клиент аргументом `session_id` у `memory_recall`, `memory_search`, `memory_read`
+//!   (с M7.3 — и `memory_log`: итог внутренней работы)
 //!   (M6 §16 п. 19, CR-8; [`tools::SESSION_ARG_TOOLS`]): аргумент без заголовка становится
 //!   `X-Zam-Session` внутренних запросов и учёта; оба заданы и совпадают — та же сессия;
 //!   различаются — ответ-ошибка 400 без вызова REST (учёт ответа — в сессии заголовка). В
@@ -263,7 +264,7 @@ impl ServerHandler for McpServer {
         // учёт — по заголовкам запроса и сессии вызова (заголовок или аргумент `session_id`)
         let mut acct = parts.headers.clone();
         // явная сессия (M6 §7.1, §16 п. 19 CR-8) — заголовок запроса (`zam mcp` с привязкой) или
-        // аргумент `session_id` (`memory_recall|search|read`): оба — одна сессия, разные — 400
+        // аргумент `session_id` (`memory_recall|search|read|log`): оба — одна сессия, разные — 400
         // без вызова REST (учёт ответа — в сессии заголовка: он важнее); иначе — неявная сессия
         // R13 только для счётчика записей
         let header = rest.header(SESSION_HEADER).map(str::to_string);

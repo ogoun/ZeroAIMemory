@@ -1,6 +1,7 @@
 //! Команды `zam`. Общее: флаги подключения, разрешение цели, вывод в stdout.
 pub mod attach;
 pub mod cache;
+pub mod check;
 pub mod code;
 pub mod glossary;
 pub mod guide;
@@ -17,6 +18,7 @@ pub mod read;
 pub mod refs;
 pub mod release;
 pub mod report;
+pub mod rules;
 pub mod search;
 pub mod session_snapshot;
 pub mod sessions;
@@ -26,6 +28,7 @@ pub mod task;
 pub mod transfer;
 pub mod tree;
 pub mod vault;
+pub mod work;
 pub mod write;
 
 use std::io::Write;

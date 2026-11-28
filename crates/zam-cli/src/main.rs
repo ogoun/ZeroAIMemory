@@ -283,6 +283,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: IdeaCmd,
     },
+    /// Внутренние работы памяти (агент): состояние, пакет работы, итог, возврат в очередь
+    Work {
+        #[command(subcommand)]
+        cmd: WorkCmd,
+    },
+    /// Кандидаты в Rules: предложить правило (решает человек в WebUI), свои кандидаты
+    Rules {
+        #[command(subcommand)]
+        cmd: RulesCmd,
+    },
     /// Словарь домена: список терминов «имя — определение» или карточка по имени или псевдониму
     Glossary {
         /// Имя или псевдоним термина (без него — весь список)
@@ -302,6 +312,11 @@ enum Cmd {
     Cache {
         #[command(subcommand)]
         cmd: CacheCmd,
+    },
+    /// Ночная проверка памяти: последний вердикт, отчёт с советами, ручной прогон
+    Check {
+        #[command(subcommand)]
+        cmd: CheckCmd,
     },
     /// Сессии агентов: выданное по событию (токены, «уже выдавалось»), снимок сессии
     #[command(alias = "session")]
@@ -1024,6 +1039,107 @@ enum IdeaCmd {
     },
 }
 
+/// `zam work` (M7.3 §6.3 п. 8).
+#[derive(Subcommand)]
+enum WorkCmd {
+    /// Режимы видов, очередь, последняя ночь, расход токенов модели
+    Status {
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Пакет внутренней работы для сессии агента (ZAM_SESSION или сессия хуков): захват
+    /// старейшей работы; итог — zam work put
+    Next {
+        /// Вид работы: probes, rules (иначе любой)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Бюджет пакета, токенов (1–20000; по умолчанию 6000)
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=20000))]
+        budget: Option<u32>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Итог работы из файла JSON {work: "j:<id>", items: […], skip?} той же сессией
+    Put {
+        /// Файл итога (как data у memory_log kind=work)
+        file: PathBuf,
+        /// Ключ идемпотентности: повтор с тем же ключом — прежний ответ
+        #[arg(long)]
+        key: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Вернуть захваченную работу в очередь без итога
+    Release {
+        /// j:<id> работы
+        work: String,
+        #[command(flatten)]
+        common: Common,
+    },
+}
+
+fn work(c: WorkCmd) -> Result<(), CliError> {
+    use cmd::work as w;
+    match c {
+        WorkCmd::Status { common } => w::status(&cmd::connect(&common)?),
+        WorkCmd::Next {
+            kind,
+            budget,
+            common,
+        } => w::next(&cmd::connect(&common)?, kind.as_deref(), budget),
+        WorkCmd::Put { file, key, common } => {
+            w::put(&cmd::connect(&common)?, &file, key.as_deref())
+        }
+        WorkCmd::Release { work, common } => w::release(&cmd::connect(&common)?, &work),
+    }
+}
+
+/// `zam rules` (M7.3 §6.7 п. 2).
+#[derive(Subcommand)]
+enum RulesCmd {
+    /// Предложить правило для Rules: текст из файла (до 200 токенов, без URL и блоков кода);
+    /// принимает или отклоняет человек
+    Candidate {
+        /// Путь заметки Rules (rules:/<путь> или путь)
+        path: String,
+        /// Файл с текстом правила
+        #[arg(long)]
+        file: PathBuf,
+        /// Почему это правило для всех проектов (20–2000 символов)
+        #[arg(long)]
+        reason: String,
+        /// Ссылка основания (i:<id>, n:<id>, …); можно несколько раз
+        #[arg(long)]
+        basis: Vec<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Свои кандидаты в Rules (без --status — все, кроме отказов исполнителя)
+    Candidates {
+        /// Статус: proposed, accepted, declined, withdrawn
+        #[arg(long)]
+        status: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+}
+
+fn rules(c: RulesCmd) -> Result<(), CliError> {
+    use cmd::rules as r;
+    match c {
+        RulesCmd::Candidate {
+            path,
+            file,
+            reason,
+            basis,
+            common,
+        } => r::candidate(&cmd::connect(&common)?, &path, &file, &reason, &basis),
+        RulesCmd::Candidates { status, common } => {
+            r::candidates(&cmd::connect(&common)?, status.as_deref())
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum InsightCmd {
     /// Лента insight решения (или Knowledge с --global; страница — 50, умолчание сервера)
@@ -1271,6 +1387,37 @@ enum CacheCmd {
         #[command(flatten)]
         common: Common,
     },
+}
+
+#[derive(Subcommand)]
+enum CheckCmd {
+    /// Последний прогон и вердикт, пробы, выключатели ночной проверки
+    Status {
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Вердикт, метрики к медиане базы, тренд, проваленные пробы с советами (--json — ответ
+    /// сервера)
+    Report {
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Ручной прогон проверки (ночная настройка его не выключает); ждёт конца
+    Run {
+        /// Не ждать конца прогона
+        #[arg(long)]
+        no_wait: bool,
+        #[command(flatten)]
+        common: Common,
+    },
+}
+
+fn check(c: CheckCmd) -> Result<(), CliError> {
+    match c {
+        CheckCmd::Status { common } => cmd::check::status(&cmd::connect(&common)?),
+        CheckCmd::Report { common } => cmd::check::report(&cmd::connect(&common)?),
+        CheckCmd::Run { no_wait, common } => cmd::check::run(&cmd::connect(&common)?, !no_wait),
+    }
 }
 
 #[derive(Subcommand)]
@@ -2318,8 +2465,11 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
         Cmd::Task { cmd } => task(cmd),
         Cmd::Question { cmd } => question(cmd),
         Cmd::Idea { cmd } => idea(cmd),
+        Cmd::Work { cmd } => work(cmd),
+        Cmd::Rules { cmd } => rules(cmd),
         Cmd::Cache { cmd } => cache(cmd),
         Cmd::Sessions { cmd } => sessions(cmd),
+        Cmd::Check { cmd } => check(cmd),
         Cmd::Vault { cmd } => vault(cmd),
         Cmd::Release {
             cmd:

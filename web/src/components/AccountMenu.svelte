@@ -1,11 +1,18 @@
 <script lang="ts">
-  // Меню аккаунта шапки телефона (M7.2, спецификация §5.1 п. 3): логин и «Выйти». Раскрывашка
-  // (`aria-expanded`, панель в DOM всегда — `hidden`, поэтому `aria-controls` ссылается на
-  // существующий узел); закрывается Esc (где бы ни был фокус; фокус из меню — на кнопку меню),
-  // щелчком мимо, уходом фокуса из меню и сменой `closeKey` (переход по адресу).
+  // Меню аккаунта шапки телефона (M7.2, спецификация §5.1 п. 3): логин, «Внутренние работы» (M7.3
+  // §6.9 п. 1 — с точкой, пока исполнитель на паузе; точка видна и на самой кнопке меню) и
+  // «Выйти». Раскрывашка (`aria-expanded`, панель в DOM всегда — `hidden`, поэтому `aria-controls`
+  // ссылается на существующий узел); закрывается Esc (где бы ни был фокус; фокус из меню — на
+  // кнопку меню), щелчком мимо, уходом фокуса из меню и сменой `closeKey` (переход по адресу).
   import { untrack } from 'svelte';
+  import { href } from '../lib/router';
 
-  let { login, onlogout, closeKey }: { login: string; onlogout: () => void; closeKey?: unknown } = $props();
+  let {
+    login,
+    onlogout,
+    closeKey,
+    paused = false,
+  }: { login: string; onlogout: () => void; closeKey?: unknown; paused?: boolean } = $props();
 
   let open = $state(false);
   let root = $state<HTMLElement | null>(null);
@@ -44,6 +51,7 @@
     class="account-btn"
     bind:this={button}
     aria-label="Меню аккаунта"
+    aria-describedby={paused ? 'account-paused' : undefined}
     aria-expanded={open}
     aria-controls="account-menu"
     onclick={() => (open = !open)}
@@ -57,9 +65,14 @@
         stroke-linecap="round"
       /></svg
     >
+    {#if paused}<span class="dot btn-dot" aria-hidden="true"></span>{/if}
   </button>
+  {#if paused}<span id="account-paused" hidden>исполнитель внутренних работ на паузе</span>{/if}
   <div id="account-menu" class="account-menu panel" hidden={!open}>
     <span class="muted">{login}</span>
+    <a class="item" href={href({ name: 'works' })} aria-describedby={paused ? 'account-paused' : undefined}
+      >Внутренние работы{#if paused}<span class="dot" aria-hidden="true" data-testid="works-dot"></span>{/if}</a
+    >
     <button type="button" onclick={onlogout}>Выйти</button>
   </div>
 </div>
@@ -70,11 +83,31 @@
     flex: none;
   }
   .account-btn {
+    position: relative;
     display: grid;
     place-items: center;
     padding: 6px;
     border: 0;
     background: transparent;
+  }
+  .dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin-left: 6px;
+    border-radius: 50%;
+    background: var(--danger);
+  }
+  .btn-dot {
+    position: absolute;
+    top: 6px;
+    right: 4px;
+    margin: 0;
+  }
+  .item {
+    display: flex;
+    align-items: center;
+    text-decoration: none;
   }
   .account-btn svg {
     display: block;
@@ -98,7 +131,8 @@
     display: none;
   }
   @media (pointer: coarse) {
-    .account-btn {
+    .account-btn,
+    .item {
       min-width: 44px;
       min-height: 44px;
     }

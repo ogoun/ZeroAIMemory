@@ -48,6 +48,11 @@ pub const FEATURES: &[&str] = &[
     "backup_api",
     "entries_trash",
     "agent_text_masked",
+    "works",
+    "memory_check",
+    "proposals",
+    "usage_opened",
+    "space_counts_steps",
 ];
 
 pub async fn health(State(st): State<AppState>) -> Json<Value> {

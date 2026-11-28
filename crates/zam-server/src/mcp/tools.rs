@@ -110,16 +110,16 @@ impl ToolName {
                  с префиксом пространства (rules:/a), depth 1–5."
             }
             ToolName::Write => {
-                "Запись заметки по пути [<пространство>:/]<путь>: без base_rev — создать (content); \
-                 с base_rev — заменить content или применить ops к секциям. Ревизия устарела — \
-                 ошибка 409 с диффом: перечитать и повторить. Ссылки на файлы — refs: [пути] во \
-                 frontmatter."
+                "Заметка по пути [<пространство>:/]<путь>: без base_rev — создать (content), с \
+                 base_rev — заменить content или ops к секциям; 409 с диффом — перечитать и \
+                 повторить. Файлы — refs: [пути] во frontmatter. rules:/<путь> с candidate \
+                 {reason} — кандидат в Rules (решает человек)."
             }
             ToolName::Log => {
                 "Запись журнала: kind changelog|release, insight (data.kind, triggers, scope, \
-                 certainty), term (data.definition, aliases), task, idea, question (data.options); \
-                 refs.files — файлы. report — отчёт пользователю, неизменяем: images [{name, \
-                 data base64}], большой — zam report. Дубль insight — 409: force."
+                 certainty), term, task, idea, question (поля data — в схеме); refs.files — \
+                 файлы. report — отчёт, неизменяем: images [{name, data base64}], большой — zam \
+                 report. work — итог работы (без title). Дубль insight — 409: force."
             }
             ToolName::UpdateEntry => {
                 "Правка записи: action supersede|retract|revisit|certify|append|status|triggers \
@@ -134,9 +134,9 @@ impl ToolName {
             }
             ToolName::Recall => {
                 "Подсказки памяти к событию: session_start — дайджест, prompt — к запросу, \
-                 post_tool — к ошибке инструмента (error, tool); повторы в сессии отсекаются. \
-                 Пакеты без отсева: recovery — после сжатия контекста, brief — под задачу task \
-                 (первый вызов субагента), idea_review — идеи на разбор (limit)."
+                 post_tool — к ошибке (error, tool); повторы в сессии отсекаются. Пакеты: \
+                 recovery — после сжатия, brief — под задачу task, idea_review — идеи на разбор \
+                 (limit), work — внутренняя работа (kind; итог — memory_log kind=work)."
             }
             ToolName::Vault => {
                 "Vault: list — без значений (name — поиск); get — по name или id v:<id> (раскрытие \
@@ -153,7 +153,9 @@ impl ToolName {
         }
     }
 
-    /// Только чтение памяти (подсказка клиенту; `memory_recall` пишет лишь учёт показов).
+    /// Только чтение памяти (подсказка клиенту; `memory_recall` пишет лишь учёт показов и захват
+    /// внутренней работы `event=work` — служебное состояние очереди, а не память; захват — только
+    /// токеном `rw`, M7.3 §6 «Общее», решение координатора 52).
     fn read_only(self) -> bool {
         matches!(
             self,
@@ -264,14 +266,22 @@ impl ToolName {
                     "l0": {"type": "string"},
                     "idempotency_key": {"type": "string", "description":
                         "повтор с тем же ключом не пишет второй раз (сбой связи); другое тело — 422"},
+                    // кандидат в Rules (M7.3 §6.7 п. 2, решение координатора 52)
+                    "candidate": {"type": "object", "description":
+                        "кандидат в Rules вместо записи (path rules:/<путь>, content до 200 токенов, без URL и блоков кода): reason — почему правило для всех проектов (20–2000 символов), basis — ссылки; принимает человек",
+                        "properties": {
+                            "reason": {"type": "string"},
+                            "basis": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["reason"]},
                     "format": fmt,
                 }),
                 &["path"],
             ),
             ToolName::Log => (
                 json!({
-                    "kind": {"type": "string", "enum": ["changelog", "insight", "release", "term", "task", "idea", "question", "report"]},
-                    "title": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["changelog", "insight", "release", "term", "task", "idea", "question", "report", "work"]},
+                    "title": {"type": "string", "description": "обязателен у всех видов, кроме work"},
                     "body": {"type": "string"},
                     "data": log_data_schema(),
                     "images": {"type": "array", "description": "report: файлы по ссылкам тела ![…](figs/a.png); name — путь из ссылки, data — base64",
@@ -288,9 +298,12 @@ impl ToolName {
                     "force": {"type": "boolean"},
                     "message": {"type": "string"},
                     "idempotency_key": {"type": "string"},
+                    "session_id": session_id(),
                     "format": fmt,
                 }),
-                &["kind", "title"],
+                // у итога работы заголовка нет (решение координатора 71): `title` прочих видов
+                // проверяет обработчик
+                &["kind"],
             ),
             ToolName::UpdateEntry => (
                 json!({
@@ -374,7 +387,10 @@ impl ToolName {
             ),
             ToolName::Recall => (
                 json!({
-                    "event": {"type": "string", "enum": ["session_start", "prompt", "post_tool", "recovery", "brief", "idea_review"]},
+                    "event": {"type": "string", "enum": ["session_start", "prompt", "post_tool", "recovery", "brief", "idea_review", "work"]},
+                    "kind": {"type": "string",
+                        "enum": zam_store::works::WorkKind::ALL.iter().map(|k| k.as_str()).collect::<Vec<_>>(),
+                        "description": "work: вид работы (по умолчанию любой); пакет захватывает работу для сессии, токен rw"},
                     "limit": {"type": "integer", "minimum": 1,
                         "maximum": crate::api::recall::IDEA_REVIEW_LIMIT_MAX,
                         "description": format!("idea_review: идей в пакете (по умолчанию {})",
@@ -495,6 +511,11 @@ fn log_data_schema() -> Value {
                             "maxItems": DECISION_OPTIONS_MAX},
                 "decided_by": {"type": "string", "enum": ["human", "agent"]},
             }},
+        // итог внутренней работы (M7.3 §6.3 п. 4)
+        "work": {"type": "string", "description": "work: j:<id> работы из пакета memory_recall event=work"},
+        "items": {"type": "array", "items": {"type": "object"}, "description":
+            "work: итог по элементам пакета [{n | target, …}] по его схеме; отказ от элемента — {n | target, skip: причина}"},
+        "skip": {"type": "string", "description": "work: отказ от всей работы — причина, без items"},
     }})
 }
 
@@ -617,8 +638,15 @@ pub async fn call(tool: ToolName, rest: &Rest, mut args: JsonObject) -> Output {
     }
 }
 
-/// Инструменты с аргументом `session_id` — явной сессией вызова (M6 §16 п. 19, CR-8).
-pub const SESSION_ARG_TOOLS: [ToolName; 3] = [ToolName::Recall, ToolName::Search, ToolName::Read];
+/// Инструменты с аргументом `session_id` — явной сессией вызова (M6 §16 п. 19, CR-8); у
+/// `memory_log` — с M7.3: итог внутренней работы принимает только захватившая сессия, а клиент
+/// без заголовка захватывает работу `memory_recall {event: "work", session_id}`.
+pub const SESSION_ARG_TOOLS: [ToolName; 4] = [
+    ToolName::Recall,
+    ToolName::Search,
+    ToolName::Read,
+    ToolName::Log,
+];
 
 /// Аргумент `session_id` инструмента из [`SESSION_ARG_TOOLS`] без пробелов по краям (пусто или
 /// нет — `None`; у прочих инструментов не читается). Не строка — текст ошибки.
@@ -1200,6 +1228,9 @@ async fn node_id(rest: &Rest, space: &str, path: &str) -> Result<String, Fail> {
 }
 
 async fn write(rest: &Rest, args: &JsonObject) -> Res {
+    if let Some(c) = args.get("candidate").filter(|v| !v.is_null()) {
+        return candidate(rest, args, c).await;
+    }
     let f = fmt(args)?;
     let (space, path) = split_path(rest, req_str(args, "path")?)?;
     let content = opt_str(args, "content")?;
@@ -1279,6 +1310,53 @@ async fn write(rest: &Rest, args: &JsonObject) -> Res {
             v["current_rev"],
             warnings_md(v)
         )
+    })
+}
+
+/// Кандидат в Rules `memory_write {path: "rules:/<путь>", content, candidate: {reason, basis?}}`
+/// → `POST /proposals {type: "rule", path, content, reason, basis}` (M7.3 §6.7 п. 2): путь —
+/// только Rules, без `base_rev`, `ops` и `l0`; решает человек в WebUI.
+async fn candidate(rest: &Rest, args: &JsonObject, c: &Value) -> Res {
+    let f = fmt(args)?;
+    let (space, path) = split_path(rest, req_str(args, "path")?)?;
+    if space != "rules" {
+        return Err(Fail::Invalid(
+            "candidate — только для пути rules:/<путь>: кандидат бывает только в Rules".into(),
+        ));
+    }
+    for k in ["ops", "base_rev", "l0"] {
+        if args.get(k).is_some_and(|v| !v.is_null()) {
+            return Err(Fail::Invalid(format!(
+                "{k} и candidate вместе не передаются: кандидат — новый текст правила (content)"
+            )));
+        }
+    }
+    let content = opt_str(args, "content")?
+        .ok_or_else(|| Fail::Invalid("candidate: нужен content — текст правила".into()))?;
+    let c = c
+        .as_object()
+        .ok_or_else(|| Fail::Invalid("candidate: {reason, basis?}".into()))?;
+    let reason = c.get("reason").and_then(Value::as_str).ok_or_else(|| {
+        Fail::Invalid("candidate.reason: почему это правило для всех проектов".into())
+    })?;
+    let mut body = json!({"type": "rule", "path": path, "content": content, "reason": reason});
+    if let Some(b) = c.get("basis").filter(|v| !v.is_null()) {
+        body["basis"] = b.clone();
+    }
+    let r = call_rest(rest, Method::POST, "/api/v1/proposals", Some(&body), &[]).await?;
+    done(f, &r, |v| {
+        let o = v["proposal"].as_str().unwrap_or("?");
+        if v["existing"] == true {
+            format!(
+                "Кандидат уже есть: {o} rules:/{path} ({}) — тот же путь и текст",
+                v["status"].as_str().unwrap_or("?")
+            )
+        } else {
+            format!(
+                "Кандидат в Rules {o} rules:/{path} — решает человек (WebUI «Кандидаты в \
+                 Rules»); свои — GET /proposals?author=me"
+            )
+        }
     })
 }
 
@@ -1386,9 +1464,13 @@ fn entry_line(e: &Value) -> String {
 async fn log(rest: &Rest, args: &mut JsonObject) -> Res {
     let f = fmt(args)?;
     let kind = req_str(args, "kind")?;
+    // итог внутренней работы (M7.3 §6.3 п. 4): без заголовка, не запись журнала
+    if kind == "work" {
+        return work_result(rest, args, f).await;
+    }
     if zam_store::EntryKind::parse(kind).is_none() {
         return Err(Fail::Invalid(
-            "kind: changelog, insight, release, term, task, idea, question или report".into(),
+            "kind: changelog, insight, release, term, task, idea, question, report или work".into(),
         ));
     }
     req_str(args, "title")?;
@@ -1449,6 +1531,74 @@ async fn log(rest: &Rest, args: &mut JsonObject) -> Res {
         s.push_str(&warnings_md(v));
         s
     })
+}
+
+/// Итог внутренней работы `memory_log {kind: "work", data: {work: "j:<id>", items: […],
+/// skip?}}` → `POST /works/{id}/result` (M7.3 §6.3 п. 4); `idempotency_key` — заголовок
+/// `Idempotency-Key`. Ответ — принято, отклонено с причинами, пропущено.
+async fn work_result(rest: &Rest, args: &JsonObject, f: Fmt) -> Res {
+    let data = args.get("data").and_then(Value::as_object).ok_or_else(|| {
+        Fail::Invalid("work: data {work: \"j:<id>\", items: […], skip?: \"<причина>\"}".into())
+    })?;
+    let work = data
+        .get("work")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Fail::Invalid("data.work: j:<id> работы из пакета".into()))?;
+    let id = work.strip_prefix("j:").unwrap_or(work);
+    let mut body: Map<String, Value> = ["items", "skip"]
+        .into_iter()
+        .filter_map(|k| {
+            data.get(k)
+                .filter(|v| !v.is_null())
+                .map(|v| (k.to_string(), v.clone()))
+        })
+        .collect();
+    // явная сессия аргументом (как у `memory_recall`): она же стала `X-Zam-Session` вызова
+    if let Some(s) = opt_str(args, "session_id")?
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        body.insert("session_id".into(), json!(s));
+    }
+    let extra = idempotency_header(args)?;
+    let r = call_rest(
+        rest,
+        Method::POST,
+        &format!("/api/v1/works/{}/result", enc(id)),
+        Some(&Value::Object(body)),
+        &extra,
+    )
+    .await?;
+    done(f, &r, work_result_md)
+}
+
+/// Итог работы в Markdown: состояние, счёт и причины отказов.
+fn work_result_md(v: &Value) -> String {
+    let n = |k: &str| v[k].as_array().map_or(0, Vec::len);
+    let mut s = format!(
+        "Итог {} принят ({}): принято {}, отклонено {}, отказ {}, без итога {}",
+        v["work"].as_str().unwrap_or("?"),
+        v["state"].as_str().unwrap_or("?"),
+        n("accepted"),
+        n("rejected"),
+        n("skip"),
+        n("skipped"),
+    );
+    for r in v["rejected"].as_array().into_iter().flatten() {
+        s.push_str(&format!(
+            "\n- n {} {}: {}",
+            r["n"],
+            r["target"].as_str().unwrap_or(""),
+            r["reason"].as_str().unwrap_or("")
+        ));
+    }
+    // записи принятого, которые не сделаны при закрытии (кандидат в Rules: повтор, предел)
+    for w in v["warnings"].as_array().into_iter().flatten() {
+        s.push_str(&format!("\n- предупреждение: {}", w.as_str().unwrap_or("")));
+    }
+    s
 }
 
 /// Подсказка к отказу MCP-отчёта по размеру (413) или сроку чтения тела (408): большой отчёт
@@ -1830,6 +1980,7 @@ async fn recall(rest: &Rest, args: &JsonObject) -> Res {
             "source",
             "timeout_ms",
             "limit",
+            "kind",
         ],
     );
     let r = call_rest(

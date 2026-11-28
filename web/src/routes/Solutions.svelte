@@ -2,7 +2,10 @@
   // Администрирование → «Решения» (§11.6): реестр решений с владельцами, участники и запросы
   // доступа — одобрить (rw или ro), отклонить с причиной, отозвать. Решения о доступе
   // действуют на следующем же запросе участника (кэша нет). `mine` — «Мои решения»
-  // пользователя (§15.1): только свои решения, те же REST, что у CLI.
+  // пользователя (§15.1): только свои решения, те же REST, что у CLI. M7.3 (§6.14, правило Д):
+  // «Одобрить ro/rw» — сразу; «Отклонить запрос» — окно `Prompt` с причиной на общем каркасе;
+  // «Отозвать» доступ участника необратим (участник сразу теряет доступ, вернуть — только новым
+  // запросом) — окно-подтверждение `danger`, фокус на «Отмена».
   import Prompt, { type Ask } from '../components/Prompt.svelte';
   import {
     ApiError,
@@ -16,6 +19,7 @@
     type AccessEntry,
     type SolutionItem,
   } from '../lib/api';
+  import { focusSoon } from '../lib/focus';
   import { fmtTime } from '../lib/journals';
 
   let { onexpired, mine = false }: { onexpired: () => void; mine?: boolean } = $props();
@@ -35,6 +39,10 @@
   let error = $state('');
   let loading = $state(false);
   let ask = $state<Ask | null>(null);
+  /** Итог решения о доступе — строкой над реестром (живая область есть заранее). */
+  let notice = $state('');
+  /** Итог — фокус после решения: кнопки строки участника уходят вместе с прежним состоянием. */
+  const noticeEl = () => document.querySelector<HTMLElement>('[data-testid="solutions-notice"]');
 
   function fail(e: unknown) {
     if (e instanceof ApiError && e.status === 401) return onexpired();
@@ -77,24 +85,52 @@
     delete rowErrors[guid];
   }
 
-  async function run(guid: string, fn: () => Promise<unknown>) {
+  async function run(guid: string, fn: () => Promise<unknown>, done: string) {
     delete rowErrors[guid];
+    notice = '';
     try {
       await fn();
       await refresh(guid);
+      notice = done;
+      focusSoon(noticeEl);
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) return onexpired();
       rowErrors[guid] = errorText(e);
     }
   }
 
-  const approve = (guid: string, m: AccessEntry, access: Access) =>
-    run(guid, () => approveAccess(guid, m.user_id, access));
-  const revoke = (guid: string, m: AccessEntry) => run(guid, () => revokeAccess(guid, m.user_id));
-
-  function reject(guid: string, m: AccessEntry) {
+  const approve = (s: SolutionItem, m: AccessEntry, access: Access) =>
+    run(s.agent_solution_id, () => approveAccess(s.agent_solution_id, m.user_id, access), `Доступ пользователя «${m.user_name}» к решению «${s.name}» одобрен (${access}).`);
+  /** «Отозвать» доступ — подтверждение; ошибка — в окне, окно открыто. */
+  function revoke(s: SolutionItem, m: AccessEntry) {
+    const guid = s.agent_solution_id;
+    notice = '';
     ask = {
-      title: 'Отклонить запрос',
+      title: 'Отозвать доступ?',
+      message: `Пользователь «${m.user_name}» сразу потеряет доступ к решению «${s.name}» (${m.access}): следующий же его запрос получит отказ. Вернуть доступ — только новым запросом участника и одобрением.`,
+      confirm: 'Отозвать',
+      danger: true,
+      run: async () => {
+        delete rowErrors[guid];
+        try {
+          await revokeAccess(guid, m.user_id);
+          await refresh(guid);
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 401) return onexpired();
+          throw new Error(errorText(e));
+        }
+        notice = `Доступ пользователя «${m.user_name}» к решению «${s.name}» отозван.`;
+      },
+      // кнопка «Отозвать» ушла вместе с отзывом — фокус на итог
+      refocus: noticeEl,
+    };
+  }
+
+  function reject(s: SolutionItem, m: AccessEntry) {
+    const guid = s.agent_solution_id;
+    notice = '';
+    ask = {
+      title: 'Отклонить запрос?',
       message: `Запрос пользователя «${m.user_name}». Причина сохраняется в запросе и в журнале аудита.`,
       label: 'Причина',
       placeholder: 'Например, решение закрытое',
@@ -108,7 +144,9 @@
           if (e instanceof ApiError && e.status === 401) onexpired();
           throw new Error(errorText(e));
         }
+        notice = `Запрос пользователя «${m.user_name}» к решению «${s.name}» отклонён.`;
       },
+      refocus: noticeEl,
     };
   }
 
@@ -130,6 +168,7 @@
     {/if}
   </p>
   {#if error}<p class="error" role="alert">{error}</p>{/if}
+  <p class="muted small notice" role="status" tabindex="-1" data-testid="solutions-notice">{notice}</p>
   {#if loading}<p class="muted">Загрузка…</p>{/if}
   {#if !loading && solutions.length === 0 && !error}<p class="muted">Решений пока нет.</p>{/if}
 
@@ -175,11 +214,11 @@
                           <td class="muted">{fmtTime(m.decided_at)}{#if m.decided_by} · {m.decided_by === 'admin' ? 'администратор' : 'владелец'}{/if}</td>
                           <td class="row acts">
                             {#if m.state === 'pending'}
-                              <button type="button" class="primary" onclick={() => approve(guid, m, 'rw')}>Одобрить rw</button>
-                              <button type="button" onclick={() => approve(guid, m, 'ro')}>Одобрить ro</button>
-                              <button type="button" class="danger" onclick={() => reject(guid, m)}>Отклонить</button>
+                              <button type="button" class="primary" onclick={() => approve(s, m, 'rw')}>Одобрить rw</button>
+                              <button type="button" onclick={() => approve(s, m, 'ro')}>Одобрить ro</button>
+                              <button type="button" class="danger" onclick={() => reject(s, m)}>Отклонить</button>
                             {:else if m.state === 'approved'}
-                              <button type="button" class="danger" onclick={() => revoke(guid, m)}>Отозвать</button>
+                              <button type="button" class="danger" onclick={() => revoke(s, m)}>Отозвать</button>
                             {/if}
                           </td>
                         </tr>
@@ -201,6 +240,9 @@
 <style>
   .small {
     font-size: 12px;
+  }
+  .notice:empty {
+    margin: 0;
   }
   .badge {
     display: inline-block;

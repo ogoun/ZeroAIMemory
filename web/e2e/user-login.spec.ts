@@ -6,6 +6,7 @@
 // ждёт `Retry-After` и повторяет отправку один раз (флейк M5.6, задача 15b M6; лимит не меняется).
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
+import { sectionNames } from './nav';
 import { ADMIN_STATE } from './session';
 
 const env = (k: string) => {
@@ -124,8 +125,12 @@ test('пользователь: вход, обязательная смена п
   await expect(tree).toBeVisible();
   await expect(tree).toContainText('Моя память');
   await expect(tree).toContainText(name);
+  // M7.3 (§6.9): «Проверка» и «Кандидаты» — у пользователя тоже (своя память); что не поместилось в
+  // шапку — в меню «Ещё» (ревью r1 задачи 8, I2): имена — полосы и меню по порядку
+  await expect
+    .poll(() => sectionNames(page))
+    .toEqual(['Заметки', 'Мои решения', 'Аккаунт', 'Подключение агента', 'Кэш выжимок', 'Сессии', 'Проверка', 'Кандидаты']);
   const nav = page.getByRole('navigation', { name: 'Разделы' });
-  await expect(nav.getByRole('link')).toHaveText(['Заметки', /Мои решения/, 'Аккаунт', /Подключение агента/, /Кэш выжимок/, 'Сессии']);
   await expect(page.getByRole('link', { name: 'Администрирование' })).toHaveCount(0);
   await expect(page.getByRole('link', { name: 'Индекс' })).toHaveCount(0);
   // прямой адрес раздела администратора — возврат к своим заметкам
@@ -139,7 +144,8 @@ test('пользователь: вход, обязательная смена п
   await table.getByRole('button', { name: 'Вывод агента пользователя' }).click();
   const card = page.getByRole('article', { name: 'Карточка insight' });
   await card.getByRole('button', { name: 'Заменить' }).click();
-  const form = card.getByRole('form', { name: 'Замена insight' });
+  // формы карточки — окна (M7.3, §6.14 правило Б)
+  const form = page.getByRole('dialog', { name: 'Заменить запись' });
   await expect(form.getByLabel('Надёжность новой записи')).toHaveValue('');
   await form.getByLabel('Заголовок').fill('Вывод человека');
   await form.getByRole('button', { name: 'Заменить' }).click();
@@ -148,7 +154,7 @@ test('пользователь: вход, обязательная смена п
 
   // смена статуса без причины: человеку причина и доказательство необязательны
   await card.getByRole('button', { name: 'Сменить статус надёжности' }).click();
-  const cf = card.getByRole('form', { name: 'Статус надёжности' });
+  const cf = page.getByRole('dialog', { name: 'Статус надёжности' });
   await cf.getByLabel('theorem').check();
   await cf.getByRole('button', { name: 'Сохранить' }).click();
   await expect(card.getByRole('status')).toHaveText('Статус надёжности изменён.');
@@ -178,7 +184,9 @@ test('пользователь: вход, обязательная смена п
   await expect(row).toContainText('ro');
   const ok = await rc.get(`${base()}api/v1/spaces`, { headers: { Authorization: `Bearer ${plain}` } });
   expect(ok.status()).toBe(200);
+  // отзыв — с подтверждением (M7.3, §6.14 правило Д)
   await row.getByRole('button', { name: 'Отозвать' }).click();
+  await page.getByRole('dialog', { name: 'Отозвать токен?' }).getByRole('button', { name: 'Отозвать', exact: true }).click();
   await expect(row).toContainText('отозван');
   await page.screenshot({ path: `${screens}user-account.png`, fullPage: true });
 

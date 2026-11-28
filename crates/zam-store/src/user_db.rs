@@ -149,6 +149,13 @@ pub static USER_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../migrations/user/0026_idea_review.sql"),
         rebuild: true,
     },
+    // M7.3: внутренние работы — только новые таблицы (пробы, прогоны проверки, очередь работ,
+    // журнал отправок, предложения, открытия подсказок) и `meta.usage_opened_since`
+    Migration {
+        version: 27,
+        sql: include_str!("../migrations/user/0027_internal_works.sql"),
+        rebuild: false,
+    },
 ];
 
 /// Вид пространства.

@@ -577,6 +577,16 @@ fn visible(h: &CacheHit, spaces: Option<&[Id]>) -> bool {
 /// свежие; не больше `limit`. Источники выбранных сверяются одним SQL ([`CacheHit::stale`]); у выданных
 /// обновляются `last_used_at` и `hits` (LRU).
 pub async fn cache_lookup(db: &Db, q: &CacheQuery) -> Result<Vec<CacheHit>, StoreError> {
+    cache_lookup_with(db, q, true).await
+}
+
+/// [`cache_lookup`]; `touch = false` — чтение без учёта обращения: `last_used_at` и `hits`
+/// выданных не меняются (ночная проверка памяти, M7.3 §6.5 п. 2: прогон не оставляет следов).
+pub async fn cache_lookup_with(
+    db: &Db,
+    q: &CacheQuery,
+    touch: bool,
+) -> Result<Vec<CacheHit>, StoreError> {
     let q = q.clone();
     let hits = db
         .read(move |c| {
@@ -637,7 +647,7 @@ pub async fn cache_lookup(db: &Db, q: &CacheQuery) -> Result<Vec<CacheHit>, Stor
             Ok(out)
         })
         .await?;
-    if !hits.is_empty() {
+    if touch && !hits.is_empty() {
         let ids: Vec<Id> = hits.iter().map(|h| h.entry.id).collect();
         // учёт обращения (LRU) — не повод терять найденное
         if let Err(e) = touch_used(db, ids).await {

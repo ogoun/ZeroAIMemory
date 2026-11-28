@@ -1560,7 +1560,7 @@ async fn acceptance_migration_0026() {
         })
         .await
         .unwrap();
-    assert_eq!(version, 26);
+    // 0026 и следом 0027 (M7.3) — последняя схема
     assert_eq!(version, USER_MIGRATIONS.len() as u32);
     assert_eq!(violations, 0, "foreign_key_check не пуст");
     assert_eq!(integrity, "ok");
@@ -1570,11 +1570,18 @@ async fn acceptance_migration_0026() {
         "строки ревизий, файлов, рёбер и пространств на месте"
     );
     let is_entries = |o: &&Obj| o.0 == "table" && o.1 == "entries";
+    // объекты 0027 (M7.3) — семь новых таблиц и их индексы — в сравнение с базой 0025 не входят
+    let new_0027 = common::objects_0027(&db).await;
+    assert_eq!(
+        new_0027.iter().filter(|o| o.0 == "table").count(),
+        7,
+        "{new_0027:?}"
+    );
     assert_eq!(
         after
             .0
             .iter()
-            .filter(|o| !is_entries(o))
+            .filter(|o| !is_entries(o) && !new_0027.iter().any(|(t, n)| *t == o.0 && *n == o.1))
             .collect::<Vec<_>>(),
         before
             .0

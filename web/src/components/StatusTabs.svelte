@@ -6,11 +6,14 @@
   // вторую строку, а не прокручиваются: переход к любому статусу — одно касание. Общий компонент
   // вкладок ARIA: прежние вкладки «Кода», документа, «Идей» и таблиц на него в волне M7.2 не
   // переводятся.
-  /** Вкладка: статус, подпись и число записей статуса (сервер; нет — без числа). */
+  /** Вкладка: статус, подпись и число записей статуса (сервер; нет — без числа); `nameExtra` —
+   * продолжение имени для чтения с экрана после числа (« и 18 шагов планов» — шаги планов доски
+   * задач, M7.3 §6.14 п. 10; видимо они — строкой в панели вкладки, не у числа). */
   export interface StatusTab {
     id: string;
     title: string;
     count?: number;
+    nameExtra?: string;
   }
 </script>
 
@@ -39,7 +42,7 @@
   /** Вкладка в порядке Tab: выбранная, а если выбранной нет — первая. */
   let focusable = $derived(tabs.some((t) => t.id === selected) ? selected : (tabs[0]?.id ?? ''));
 
-  const nameOf = (t: StatusTab) => (t.count === undefined ? t.title : `${t.title}, ${countText(t.count, noun)}`);
+  const nameOf = (t: StatusTab) => (t.count === undefined ? t.title : `${t.title}, ${countText(t.count, noun)}${t.nameExtra ?? ''}`);
 
   /** Клавиатура tablist (`lib/tabs.ts`): ←/→ по кругу, Home, End; выбор следует за фокусом. */
   const onkeydown = (e: KeyboardEvent, i: number) => onTabKey(e, i, tabs.length, els, (j) => onselect(tabs[j].id));

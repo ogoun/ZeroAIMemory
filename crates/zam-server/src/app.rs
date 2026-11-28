@@ -52,6 +52,13 @@ pub struct AppState {
     pub vault: Arc<VaultKeys>,
     /// Воркер обслуживания (срок хранения сессий); снимается с последней копией состояния.
     pub maintenance: Arc<Maintenance>,
+    /// Ночной исполнитель внутренних работ и проверки (M7.3 §6.1 п. 5,
+    /// [`crate::works::NightRunner`]): создаётся до сборки состояния, запускается после неё;
+    /// останавливается первым в [`AppState::shutdown`].
+    pub night: Arc<crate::works::NightRunner>,
+    /// Слоты обращений к подключённой модели (M7.3 §6.2 п. 7): `[works] max_parallel` на
+    /// сервер, у пользователя — одно ([`crate::works::exec::CallSlots`]).
+    pub model_calls: Arc<crate::works::exec::CallSlots>,
     /// Копия в процессе сервера (M7 §5.6): замок, общий у страницы «Копии»
     /// (`POST /admin/backups`) и автокопии воркера обслуживания (клон — в `Maintenance::start`),
     /// идущая копия, последний итог и кэш сводок описей.
@@ -111,6 +118,9 @@ pub struct AppState {
 impl AppState {
     /// Штатная остановка фоновых частей. Фоновые задачи, держащие `Db` (соединения SQLite), и как
     /// каждая останавливается (финальное ревью M4, M-5):
+    /// - ночной исполнитель ([`crate::works::NightRunner::stop`], M7.3) — **первым**: признак
+    ///   остановки, ожидание шага ночи и учтённых ручных запусков не дольше 5 с, затем снятие;
+    ///   клон состояния ночи отпускается до остановки обслуживания и закрытия баз;
     /// - воркер обслуживания ([`Maintenance::stop`]) — с ожиданием конца задачи;
     /// - конвейер документов ([`crate::docs::DocIndexer::shutdown`]) — незаконченные разборы
     ///   ждём не дольше 5 с (задания вернутся в очередь при следующем запуске);
@@ -151,7 +161,10 @@ impl AppState {
     }
 
     pub async fn shutdown(&self) {
+        self.night.stop().await;
         self.maintenance.stop().await;
+        #[cfg(feature = "test-hooks")]
+        crate::works::night::test_hooks::log_stop(self.night.serial(), "maintenance");
         self.docs.shutdown().await;
         self.previews.shutdown().await;
         self.index.shutdown(&self.system, &self.users).await;
@@ -398,8 +411,13 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         cfg.clone(),
         (*backups).clone(),
     ));
+    // ночной исполнитель — до состояния (поле), запуск — после него: ночи нужны поиск и
+    // `/recall` с `State<AppState>` (M7.3 §6.1 п. 5)
+    let night = crate::works::NightRunner::idle();
     let state = AppState {
         maintenance,
+        night,
+        model_calls: Arc::new(crate::works::exec::CallSlots::new(cfg.works.max_parallel)),
         backups,
         glossary: Arc::default(),
         user_flags: Arc::default(),
@@ -443,6 +461,11 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         #[cfg(feature = "test-hooks")]
         recall_delay_ms: Arc::default(),
     };
+    // внутренние работы (M7.3 §6.1 п. 5): шаги старта — в фоне раннера (сборку и роутер не
+    // задерживают), ночной цикл — при `[works] enabled`
+    state
+        .night
+        .start(crate::works::NightCtx::new(state.clone()));
     let router = router(state.clone());
     Ok((router, state, BootReport { initial_token }))
 }

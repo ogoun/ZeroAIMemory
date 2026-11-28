@@ -1665,18 +1665,31 @@ async fn acceptance_migration_from_m56_db() {
         ]
         .contains(&o.1.as_str())
     };
+    // и следом 0027 (M7.3): семь новых таблиц и их индексы — в базе 0023 их не было, эталон —
+    // `migrate_rebuild::objects_0027`; прежние объекты от них не меняются
+    let new_0027 = common::objects_0027(&db).await;
+    assert_eq!(
+        new_0027.iter().filter(|o| o.0 == "table").count(),
+        7,
+        "{new_0027:?}"
+    );
+    let m73 = |o: &&Obj| new_0027.iter().any(|(t, n)| *t == o.0 && *n == o.1);
+    assert!(
+        !before.0.iter().any(|o| m73(&o)),
+        "в базе 0023 объектов 0027 нет"
+    );
     assert_eq!(
         after
             .0
             .iter()
-            .filter(|o| !is_entries(o) && !m6(o))
+            .filter(|o| !is_entries(o) && !m6(o) && !m73(o))
             .collect::<Vec<_>>(),
         before
             .0
             .iter()
             .filter(|o| !is_entries(o) && !m6(o))
             .collect::<Vec<_>>(),
-        "объекты схемы, кроме entries и таблиц 0025"
+        "объекты схемы, кроме entries, таблиц 0025 и 0027"
     );
     let entries_sql = &after.0.iter().find(is_entries).unwrap().2;
     assert!(entries_sql.contains("'idea'"), "{entries_sql}");

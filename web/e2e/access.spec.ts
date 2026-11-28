@@ -111,7 +111,9 @@ test('Решения: одобрение ro, метки в дереве, отз�
   // отзыв: следующий же запрос участника — 403 solution-access revoked
   await openAdmin(page, 'Решения');
   await row.getByRole('button', { name: 'Доступ' }).click();
+  // отзыв — с подтверждением (M7.3, §6.14 правило Д)
   await m.getByRole('button', { name: 'Отозвать' }).click();
+  await page.getByRole('dialog', { name: 'Отозвать доступ?' }).getByRole('button', { name: 'Отозвать', exact: true }).click();
   await expect(m).toContainText('отозван');
   r = await member.get(entries);
   expect(r.status()).toBe(403);

@@ -96,24 +96,27 @@ test('glossary_create_alias_conflict', async ({ page }) => {
   await expect(card).toContainText('summary-wm');
   await expect(card).toContainText('digest_wm');
 
-  // новый термин с занятым псевдонимом: 409 и ссылка на занявший термин
+  // новый термин с занятым псевдонимом: 409 и ссылка на занявший термин; M7.3 (§6.14, правило Б) —
+  // «Новый термин» — окно формы с «Добавить», а не форма в карточке
   await page.getByRole('button', { name: 'Новый термин' }).click();
-  const form = page.getByRole('form', { name: 'Новый термин' });
+  const form = page.getByRole('dialog', { name: 'Новый термин' });
   await form.getByLabel('Имя').fill('Сводка WM');
   await form.getByLabel('Определение').fill('То же, но другое имя');
   await form.getByLabel(/Псевдонимы/).fill('summary-wm');
-  await form.getByRole('button', { name: 'Сохранить' }).click();
+  await form.getByRole('button', { name: 'Добавить' }).click();
   const conflict = form.getByTestId('term-conflicts');
   await expect(conflict).toContainText('summary-wm');
   await expect(conflict.getByRole('link', { name: '«Выжимка WM»' })).toBeVisible();
 
-  // другой псевдоним — сохраняется, термин появляется в алфавитном списке
+  // другой псевдоним — сохраняется, окно закрыто, открыта карточка созданного (§6.14 п. 6), термин —
+  // в алфавитном списке
   await form.getByLabel(/Псевдонимы/).fill('digest-wm-2');
-  await form.getByRole('button', { name: 'Сохранить' }).click();
+  await form.getByRole('button', { name: 'Добавить' }).click();
+  await expect(form).toHaveCount(0);
   await expect(list).toContainText('Сводка WM');
   await expect(page.getByRole('article', { name: 'Карточка термина' })).toContainText('digest-wm-2');
 
-  // правка с If-Match: определение меняется, ревизия растёт
+  // правка с If-Match (в карточке на месте, правило В): определение меняется, ревизия растёт
   await page.getByRole('button', { name: 'Править' }).click();
   const edit = page.getByRole('form', { name: 'Правка термина' });
   await edit.getByLabel('Определение').fill('Новое определение сводки');
@@ -151,9 +154,12 @@ test('tasks_board_claim_shown', async ({ page }) => {
   await card.getByLabel('Следующий шаг').fill('написать тест');
   await card.getByRole('button', { name: 'Сохранить шаг' }).click();
   await expect(col('открыт')).toContainText('Дальше: написать тест');
+  // «→ заблокирован» — окно «Что мешает» (M7.3, §6.14 решение 84), а не форма внизу карточки
   await card.getByRole('button', { name: '→ заблокирован' }).click();
-  await card.getByLabel('Что мешает').fill('ждём ответа владельца');
-  await card.getByRole('button', { name: 'Применить' }).click();
+  const blocked = page.getByRole('dialog', { name: 'Задача заблокирована' });
+  await blocked.getByLabel('Что мешает').fill('ждём ответа владельца');
+  await blocked.getByRole('button', { name: 'Заблокировать' }).click();
+  await expect(blocked).toHaveCount(0);
   await expect(col('заблокирован')).toContainText('Блокер: ждём ответа владельца');
 
   // снятие захвата человеком; карточка — панель 480 px поверх доски (M7.2, §5.2 п. 1): она
@@ -170,9 +176,12 @@ test('tasks_board_claim_shown', async ({ page }) => {
   await page.keyboard.press('Escape');
   await expect(card).toHaveCount(0);
   await col('выполнен').getByRole('button', { name: 'Задача WM выполнена' }).click();
+  // переоткрытие — окно с обязательной причиной (M7.3, §6.14)
   await card.getByRole('button', { name: 'Переоткрыть' }).click();
-  await card.getByLabel('Причина переоткрытия').fill('тесты красные');
-  await card.getByRole('button', { name: 'Применить' }).click();
+  const reopen = page.getByRole('dialog', { name: 'Переоткрыть задачу' });
+  await reopen.getByLabel('Причина переоткрытия').fill('тесты красные');
+  await reopen.getByRole('button', { name: 'Переоткрыть' }).click();
+  await expect(reopen).toHaveCount(0);
   await expect(col('открыт')).toContainText('Задача WM выполнена');
   expect(problems, problems.join('\n')).toEqual([]);
 });
@@ -292,7 +301,8 @@ test('decision_adr_fields', async ({ page }) => {
 
   // правка ADR на месте: If-Match, новая ревизия
   await card.getByRole('button', { name: 'Править ADR' }).click();
-  const form = card.getByRole('form', { name: 'Поля ADR' });
+  // поля ADR — окно (M7.3, §6.14 правило Б); запись правится на месте, новой ревизией
+  const form = page.getByRole('dialog', { name: 'Поля ADR' });
   await form.getByLabel('Выбрано').fill('PostgreSQL');
   const saved = page.waitForResponse((r) => r.request().method() === 'PATCH' && r.url().includes(`/entries/${human.id}`));
   await form.getByRole('button', { name: 'Сохранить' }).click();
