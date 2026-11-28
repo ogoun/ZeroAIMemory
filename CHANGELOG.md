@@ -12,6 +12,10 @@
   менее надёжной (гипотеза против `theorem`/`axiom`), получает балл
   `min(предыдущий, следующий + 0,0001)` — на шаг округления выше следующего элемента (до M7.5 —
   равный ему); ничья с предыдущим возможна, порядок задаёт массив `items`. Форма ответа прежняя.
+- `POST /search` и `memory_search` в режиме `notes`: порядок по `contradicts` смотрит фрагменты
+  первых `top_k` заметок и записей, а не первые `top_k` фрагментов — теорема, которой противоречит
+  гипотеза выше неё, встаёт перед гипотезой, даже если у заметок выше по несколько фрагментов
+  (`kc-21`); `brief` и `chunks` — как раньше.
 
 ### Added
 
@@ -35,7 +39,7 @@
   отсеяна по `reliable_first` наборов вида и recall@5), holdout его не подтвердил (`s-43`), а
   режим `chunks` с ним теряет 16 п. п. chunk-recall@5.
 - Тесты: `order_by_contradicts_moved_strictly_above_next`, `order_by_contradicts_tie_with_prev`,
-  `lift_moved_scores`, `eval_keeps_server_order_on_ties`,
+  `lift_moved_scores`, `contradicts_window_notes_by_targets`, `eval_keeps_server_order_on_ties`,
   `fts_query_drops_stop_words_when_others_remain`, `fts_query_keeps_stop_word_only_query`,
   `fts_stop_words_true_byte_equal_017`, `config_fts_stop_words`,
   `search_note_answer_above_stopword_insights`; эталон `always_byte_equal_m57` — с новым баллом

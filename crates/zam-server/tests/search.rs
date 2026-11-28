@@ -1168,7 +1168,10 @@ async fn search_note_answer_above_stopword_insights() {
     let note = "Тесты/Полный прогон";
     // как 0.0.17: заметка-ответ ниже insight, совпавших по служебным словам
     let (order, j) = world("search-stopwords-017", true).await;
-    let at = order.iter().position(|p| p == note).expect("заметка в выдаче");
+    let at = order
+        .iter()
+        .position(|p| p == note)
+        .expect("заметка в выдаче");
     assert!(at >= 3, "заметка на месте {at}: {j}");
     // без служебных слов — заметка первая
     let (order, j) = world("search-stopwords-drop", false).await;

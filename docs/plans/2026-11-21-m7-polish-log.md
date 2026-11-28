@@ -8369,6 +8369,23 @@ search.max_per_node=1`), параллельно (CPU), та же сборка; 1
 слова, итог сетки), §18.2 («Eval M7.5»), `eval/README.md` (строка сеток, «Равные баллы»),
 `docs/api-compat.md` (`search_m75`), `deploy/config.example.toml`, CHANGELOG `[Unreleased]`.
 
+**Решение координатора по замечанию 2 отчёта (окно порядка по `contradicts`, `kc-21`).** Исправить
+в задаче 1: в режиме `notes` окно — фрагменты первых `top_k` **целей** (узлов и записей) до свёртки
+(`api/search/mod.rs` `contradicts_window`: до первого фрагмента цели сверх `top_k`; поздние
+фрагменты первых целей — в хвосте, `group_by_node` их подбирает); в `brief` и `chunks` выдача —
+фрагменты, окно прежнее (первые `top_k` фрагментов). Тест `contradicts_window_notes_by_targets`;
+`decisions` 10, `search_rerank_boosts` 8 (эталон `always_byte_equal_m57` не изменился),
+`search_multi` 12, `search` 24; clippy `-p zam-server` и fmt — чисто. Пересчёт `reliable_first`
+(гибрид CPU int8, K = 1, только `default`, сборка `43889c5af572ca32…`; сетку ТС-1 не гоняли — у
+варианта Б связей `contradicts` нет): основной набор 1,000 (14), `kind` 1,000 (9), `kind_b` 1,000
+(9), `kind_c` 1,000 (9) — `kc-21` проходит; chunk-recall@5 0,957 — прежний (итог —
+`eval/results/2026-11-28-grid-m75-rf-window-bge-m3-int8.{json,md}`).
+
+**Перенесено (решение координатора по замечанию 1):** отдельный предел на узел для карточек
+`brief`/`notes` (`chunks` — прежние 3) — не в M7.5: по построению дал бы выигрыш Н2′ на dev без
+потерь режима `chunks`, но `s-43` holdout (нужная заметка — 7-й узел) им не снять; в следующую
+сетку ранжирования — вместе с chunk-recall@5 в правиле выбора.
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия
