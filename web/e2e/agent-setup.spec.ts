@@ -211,8 +211,10 @@ test('Подключение с переносом данных: задание 
     await page.setViewportSize(VIEWPORTS[w]);
     await expect(text).toBeVisible();
     expect(await noHorizontalScroll(page), w).toBe(true);
-    await task.scrollIntoViewIfNeeded();
     await page.screenshot({ path: `${screens}agent-setup-migrate-${w}.png`, fullPage: true });
+    // окно с блоком задания (снимок всей страницы на телефоне слишком высок для просмотра)
+    await task.evaluate((e) => e.scrollIntoView({ block: 'start' }));
+    await page.screenshot({ path: `${screens}agent-setup-migrate-${w}-view.png` });
   }
 
   // галочка снята — блока нет
@@ -282,8 +284,9 @@ test('Выпуск на «Подключении агента»: названи�
   await page.getByLabel('Имя решения').fill('Токен E2E');
   const name = `Codex · Токен E2E · ${date}`;
   await expect(field).toHaveValue(name);
-  await expect(page.getByRole('link', { name: '«Аккаунт» → «Мои токены»' })).toHaveAttribute('href', '#/account');
-  await expect(page.getByRole('link', { name: '«Администрирование» → «Пользователи»' })).toHaveAttribute('href', '#/admin');
+  await expect(page.getByRole('link', { name: '«Мои токены»' })).toHaveAttribute('href', '#/account');
+  await expect(page.getByRole('link', { name: 'токены пользователей' })).toHaveAttribute('href', '#/admin');
+  await expect(page.getByText('«Администрирование» → «Пользователи»')).toBeVisible();
 
   await page.getByRole('button', { name: 'Выпустить токен' }).click();
   const dialog = page.getByRole('dialog');
@@ -305,7 +308,7 @@ test('Выпуск на «Подключении агента»: названи�
   expect((await fetch(`${base()}api/v1/spaces`, { headers: { Authorization: `Bearer ${plain}` } })).status).toBe(401);
 
   // «Аккаунт»: токен — в свёрнутом списке отозванных
-  await page.getByRole('link', { name: '«Аккаунт» → «Мои токены»' }).click();
+  await page.getByRole('link', { name: '«Мои токены»' }).click();
   await expect(page).toHaveURL(/#\/account$/);
   const active = page.getByRole('table', { name: 'Мои токены' });
   await expect(active).toBeVisible();
