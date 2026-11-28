@@ -96,6 +96,7 @@
 | `snapshot_m76` | M7.6 §9.4 пп. 4–5 | Задача и даты снимка сессии: `PUT /sessions/{id}/snapshot` пишет в `data.task_id` задачу, захваченную этой сессией (`in_progress`/`blocked`, свежая по ревизии; `task_id` клиента отбрасывается), и принимает `data.started_at`, `data.ended_at` — моменты RFC 3339 (хранятся в UTC; иное — поле отбрасывается, снимок пишется); `GET …/snapshot` их отдаёт, показ снимка в дайджесте находит задачу и по `task_id` (раздел «Снимок сессии: задача и даты» ниже). Сервер без флага поля молча отбрасывает: дат и `task_id` в снимке нет. |
 | `agent_setup_local` | M7.6 §9.5 п. 3 | «Подключить локально»: `GET /agent-setup?local=true` — у `agent=claude` `init_cmd` с `--block-to local --exclude-local` (блок прежний, с адресом), у `agents`/`codex` — блок без строки `ZeroAIMemoryUrl=` и `init_cmd` с `--url-to home --exclude-local`; задание на перенос — с тем же однострочником. Без параметра или с `false` ответ байт в байт прежний; сервер без флага параметр пропускает (WebUI без флага галочку не показывает включённой). |
 | `idea_adopt_token` | M7.6 §9.5 п. 4 | «Принять как свою» токеном: `POST /entries/{id}/adopt {by, channel}` — `by: human` принимается (агент передаёт слова человека, как у `decide`), без `by` — 400 `/problems/by-required`, `by: agent` — 403 `/problems/idea-human-decision`; аудит `entry.idea.adopt {by, channel}`; сессия WebUI — как раньше. Сервер без флага токену отвечает 403: `zam idea adopt` — код 1 с подсказкой «сервер старше 0.0.19 — «Принять как свою» в WebUI». |
+| `admin_works_settings` | M7.6 §9.9 | Настройки сервера внутренних работ в WebUI: `GET/PATCH /admin/works/settings` (только сессия администратора) — все ключи `[works]` с действующим значением, значением файла и источником; значение из WebUI сильнее файла, `null` — вернуть к файлу, `rev` — 409 при чужой правке; применение без перезапуска; аудит `admin.works.settings`. `GET /admin/works` — ещё `ceiling`, `settings` и в строке `limits`, `limit`; `works.model.blocked` и причина `blocked` действующего режима — адрес подключения запрещён администратором (раздел «Настройки сервера внутренних работ» ниже). Сервер без флага на маршрут отвечает 404, полей нет. |
 
 Правило для разработки сервера: задача, которая вводит возможность или ключ конфигурации,
 добавляет строку в `FEATURES` (`crates/zam-server/src/api/health.rs`) и строку в эту таблицу;
@@ -1185,6 +1186,43 @@ next}`, новые первыми; фильтры — запросом к сер
   строки сводки на месте.
 - Подробности по пользователю — прежние `GET /works?user=<id>`, `GET /works/usage?user=<id>`,
   `GET /works/calls?user=<id>`, `GET /check/status` с `X-Zam-User`.
+- С 0.0.19-m7.6 (флаг `admin_works_settings`): в строке — `limits` (личный предел
+  `{daily_tokens, monthly_tokens}` или `null`) и `limit: {daily, monthly}` (действующий —
+  меньший из потолка и личного); в ответе — `ceiling: {daily, monthly}` (потолки сервера) и
+  `settings` (как `GET /admin/works/settings`).
+
+## Настройки сервера внутренних работ (`admin_works_settings`)
+
+С 0.0.19-m7.6 (M7.6 §9.9, флаг `admin_works_settings`). Только сессия администратора (токену и
+пользователю — 403).
+
+- `GET /admin/works/settings` → `{rev, fields}`: `fields` — по ключу `[works]` (`enabled`,
+  `default_mode`, `model_access`, `allow_loopback`, `max_daily_tokens`, `max_monthly_tokens`,
+  `max_parallel`, `call_timeout_s`, `batch_records`, `at`, `tz`, `window_min`, `check`,
+  `check_max_min`) объект `{value, file, source, applies, options?, min?, max?}`: действующее
+  значение, значение конфигурации (файл, окружение), `source` — `webui` (задано в WebUI) или
+  `config`, `applies` — `next_call` (со следующего обращения или запуска) или `next_night` (со
+  следующего планирования ночи: `at`, `tz`, `window_min`, `check`); перезапуск не нужен ни
+  одному ключу. `options` — значения перечисления, `min`/`max` — диапазон числа (те же, что у
+  конфигурации).
+- `PATCH /admin/works/settings {rev, values: {<ключ>: значение | null}}` — значение из WebUI
+  сильнее файла, `null` — вернуть к файлу. Проверка — та же, что у конфигурации: незнакомый
+  ключ, неверный тип, значение вне диапазона — 400 с именем ключа (`works.max_parallel: от 1 до
+  4`). `rev` не тот, что сейчас, — 409 `code: settings_changed` с нынешним `rev`. Правка без
+  изменений — 200 без записи. Ответ — как у `GET`; аудит `admin.works.settings {rev, changes:
+  {<ключ>: {from, to, source}}}`.
+- Строка хранится в `system.db` (`settings`, ключ `works.server`); после отката сервера на
+  версию без флага строка не читается — действует файл конфигурации.
+- Потолки пользователя (`works.limits` в `PATCH /auth/settings` и `PATCH
+  /admin/users/{id}/settings`) сверяются с действующими потолками; сниженный потолок ниже
+  личного предела — действует потолок (`limit` в `GET /works/usage`).
+- Запрет адреса сохранённого подключения (администратор сузил `model_access` или снял
+  `allow_loopback`): подключение не удаляется, `works.model.blocked` в `GET /auth/settings` —
+  причина (`model_access_off`, `model_access_lan`, `loopback_requires_admin`, `http_external`),
+  действующий режим видов в режиме модели — `off` с причиной `blocked`, обращений нет;
+  разрешит снова — режим модели действует без правки пользователя. Без DNS: имя — по классу,
+  сохранённому при закреплении; имя, которое теперь разрешается в запрещённый адрес, —
+  пауза `blocked` при обращении, как раньше.
 
 ## Версии компонентов (`health_components`)
 
