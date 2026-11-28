@@ -913,7 +913,7 @@
         адрес: <code class="path">{chosenAddr || 'нет адреса'}</code>{#if view}<span class="muted">{` — ${reachText(view.reach)}`}</span>{/if}
         {#if view?.problem}<span class="error-text">{view.problem}</span>{/if}
         {#if view?.reach === 'external' && !view.problem}<span class="warn note-ext">Данные памяти уйдут за пределы локальной сети: {view.host}</span>{/if}
-        {#if reqUrl}<span class="muted" data-testid="works-request-url">запрос уйдёт на <code class="path">{reqUrl}</code></span>{/if}
+        {#if reqUrl}<span class="muted req-url" data-testid="works-request-url">запрос уйдёт на <code class="path">{reqUrl}</code></span>{/if}
       </span>
       <select bind:value={fVault} data-autofocus aria-describedby="works-vault-note works-addr">
         {#each choices as v (v.id)}<option value={v.id}>{vaultChoiceLabel(v.title, vaultAddress(v.data))}</option>{/each}
@@ -1204,6 +1204,10 @@
   }
   .field-note .muted {
     display: inline;
+  }
+  /* куда уйдёт запрос — своей строкой под адресом и его классом */
+  .field-note .req-url {
+    display: block;
   }
   .error-text {
     color: var(--danger);
