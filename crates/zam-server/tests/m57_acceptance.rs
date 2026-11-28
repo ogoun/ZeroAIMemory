@@ -1050,8 +1050,21 @@ async fn acceptance_rights_and_shared() {
     ok(&r, StatusCode::OK, "append");
     let r = a.tok_rev(&a.token, Method::DELETE, &ent(&id), None).await;
     problem(&r, StatusCode::FORBIDDEN, "idea-human-owned", "удаление");
+    // adopt токеном (M7.6 §9.5 п. 4): без `by` — 400, от имени агента — 403
     let r = post_tok(&a, &id, "adopt", json!({})).await;
-    ok(&r, StatusCode::FORBIDDEN, "adopt токеном");
+    problem(
+        &r,
+        StatusCode::BAD_REQUEST,
+        "by-required",
+        "adopt токеном без by",
+    );
+    let r = post_tok(&a, &id, "adopt", json!({"by": "agent"})).await;
+    problem(
+        &r,
+        StatusCode::FORBIDDEN,
+        "idea-human-decision",
+        "adopt токеном by agent",
+    );
     let r = post_tok(&a, &id, "propose", json!({})).await;
     let qid = id_of(&r.json()["question"]);
     let r = post_tok(
