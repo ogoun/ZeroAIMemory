@@ -1,4 +1,5 @@
-// «Кандидаты в Rules» (M7.3, спецификация §6.9 п. 3, §6.7 пп. 4–5): кандидат агента (`POST
+// «Кандидаты в Rules» (M7.3, спецификация §6.9 п. 3, §6.7 пп. 4–5; с M7.5 — вкладка «Правила»
+// страницы «Предложения», §8.8 п. 1, уборка — proposals-tidy.spec.ts): кандидат агента (`POST
 // /proposals` по токену) — в списке и карточке (`JournalSplit`): путь, текст, довод, автор;
 // «Принять» — окно формы с правкой пути и текста, суммой Rules в дайджесте и приростом, после — строка
 // со ссылкой на созданную заметку Rules и «принят»; «Отклонить» — окно с причиной; метка дерева
@@ -54,7 +55,9 @@ test('proposals_rule_accept_creates_note', async ({ page }) => {
   const content = 'Заканчивая задачу, пиши итог одной строкой: что сделано и что осталось.';
   const id = await candidate(path, content);
   await page.goto(`${base()}#/proposals`);
-  await expect(page.getByRole('heading', { name: 'Кандидаты в Rules', exact: true })).toBeVisible();
+  // M7.5 (§8.8 п. 1): страница «Предложения», кандидаты в Rules — вкладка «Правила»
+  await expect(page.getByRole('heading', { name: 'Предложения', exact: true })).toBeVisible();
+  await expect(page.getByRole('tab', { name: /^Правила/ })).toHaveAttribute('aria-selected', 'true');
   // список: путь, начало текста, автор — агент
   const row = page.locator(`li[data-proposal="${id}"]`);
   await expect(row).toContainText(`rules:/${path}`);

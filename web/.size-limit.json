@@ -34,7 +34,7 @@
   { "name": "InsightNew (окно «Новый insight», по нажатию)", "path": "dist/assets/InsightNew-*.js", "gzip": true, "limit": "2.45 KB" },
   { "name": "Works (страница «Внутренние работы», M7.3; блок администратора и страница пользователя — M7.4)", "path": "dist/assets/Works-*.js", "gzip": true, "limit": "14.1 KB" },
   { "name": "Check (страница «Проверка памяти», M7.3; тренд и набор проб — M7.4)", "path": "dist/assets/Check-*.js", "gzip": true, "limit": "13.9 KB" },
-  { "name": "Proposals (страница «Кандидаты в Rules», M7.3)", "path": "dist/assets/Proposals-*.js", "gzip": true, "limit": "5.45 KB" },
+  { "name": "Proposals (страница «Предложения»: кандидаты в Rules — M7.3; вкладка «Уборка», карточка tidy с диффом и вкладки — M7.5)", "path": "dist/assets/Proposals-*.js", "gzip": true, "limit": "11.9 KB" },
   { "name": "worksText (тексты страниц M7.3, общий ленивый чанк Works и Proposals; сводка администратора — M7.4)", "path": "dist/assets/worksText-*.js", "gzip": true, "limit": "5.9 KB" },
   { "name": "pdf.worker", "path": "dist/pdfjs/pdf.worker-*.min.js", "gzip": true, "limit": "400 KB" }
 ]

@@ -10,7 +10,8 @@
   // аккаунта в шапке, разделы и дерево — в выдвижной панели; планшет — разделы в шапке короткими
   // подписями, дерево — в панели; настольный — дерево постоянное (260 px до 1279, 300 px дальше).
   // M7.3 (§6.9): разделы «Проверка» (точка при открытой регрессии ночной проверки) и «Кандидаты N»
-  // (открытые кандидаты в Rules); «Внутренние работы» — в меню аккаунта телефона и рядом с логином
+  // (открытые кандидаты в Rules; с M7.5 §8.8 п. 1 — «Предложения N»: кандидаты в Rules и уборки
+  // вместе, `proposalsOpen`); «Внутренние работы» — в меню аккаунта телефона и рядом с логином
   // на планшете и компьютере (меню аккаунта там нет, §5.1 п. 3), с точкой, пока исполнитель на
   // паузе; три страницы — ленивыми чанками. Полоса разделов шапки (ревью r1 задачи 8, I2) — без
   // прокрутки и обрезки: по замеру скрытой копии — полные подписи, если помещаются все разделы,
@@ -47,7 +48,7 @@
     type User,
   } from '../lib/api';
   import { attention, refreshAttention } from '../lib/attention.svelte';
-  import { countDescription, countHint, formatCount, openLabel } from '../lib/counts';
+  import { countDescription, countHint, formatCount, openLabel, proposalsOpen } from '../lib/counts';
   import { counts, proposalCounts } from '../lib/counts.svelte';
   import { JOURNAL_TITLE, journalsOf } from '../lib/journals';
   import { current, go, href, listen, routeUser, type Route } from '../lib/router';
@@ -272,13 +273,14 @@
       sessions: 'Сессии',
       works: 'Внутренние работы',
       check: 'Проверка памяти',
-      proposals: 'Кандидаты в Rules',
+      proposals: 'Предложения',
     };
     return titles[r.name] ?? 'Заметки';
   });
 
-  /** Открытых кандидатов в Rules своего пользователя («Кандидаты N», §6.7 п. 5). */
-  let candidates = $derived(proposalCounts.get(me.user_id, 'rules')?.rules ?? 0);
+  /** Открытых предложений своего пользователя («Предложения N»: кандидаты в Rules, §6.7 п. 5, и
+   * уборки, M7.5 §8.8 п. 1). */
+  let candidates = $derived(proposalsOpen(proposalCounts.get(me.user_id, 'rules')));
 
   // ---- разделы шапки: подписи и меню «Ещё» по замеру (ревью r1, I2) ----
 
@@ -304,7 +306,7 @@
       { key: 'cache', to: { name: 'cache' }, label: 'Кэш выжимок', short: 'Кэш', current: r.name === 'cache' },
       { key: 'sessions', to: { name: 'sessions' }, label: 'Сессии', current: r.name === 'sessions' },
       { key: 'check', to: { name: 'check' }, label: 'Проверка', current: r.name === 'check' },
-      { key: 'proposals', to: { name: 'proposals', proposal: null }, label: 'Кандидаты', current: r.name === 'proposals' },
+      { key: 'proposals', to: { name: 'proposals', proposal: null }, label: 'Предложения', current: r.name === 'proposals' },
     );
     return list;
   });
@@ -436,7 +438,7 @@
       </NavMore>
     {/if}
     {#if attention.regression}<span id="nav-check-dot" hidden>ночная проверка: ухудшение поиска</span>{/if}
-    {#if candidates}<span id="nav-candidates" hidden>кандидатов в Rules ждут решения: {formatCount(candidates)}</span>{/if}
+    {#if candidates}<span id="nav-candidates" hidden>предложений ждут решения: {formatCount(candidates)}</span>{/if}
   </nav>
   {#if !rows}
     <!-- скрытая копия для замера: все разделы полными и короткими подписями и кнопка «Ещё» в четырёх

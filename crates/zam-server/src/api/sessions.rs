@@ -46,10 +46,14 @@
 //!   `/search` и `/read` с явной сессией, не из MCP — `search`, `read` (выдача в токенах);
 //!   инструменты MCP — `mcp`, чтения `/read` из MCP — ещё `mcp_read` (вызов и `reread_calls`,
 //!   токенов 0 — их считает `mcp`); хуки с локальным
-//!   выводом — `pre_tool`, `post_tool_local`, `subagent_local`;
+//!   выводом — `pre_tool`, `post_tool_local`, `subagent_local`. С M7.5 (§8.8 п. 2, признак
+//!   `sessions_opened`) — ещё `hints_shown` и `hints_opened` ([`hints_of`]): целей, показанных
+//!   сессии подсказкой `/recall` (узлы и записи, каждая один раз во всех эпохах), и из них
+//!   открытых агентом (`usage_opened`, M7.3 §6.6);
 //! - `GET /sessions?solution=&limit=&tokens=&parent=` → `{items}` — свои, свежие первыми (50, до
-//!   500); `tokens=true` — у каждой ещё `tokens`, как в `GET /sessions/{id}` (`zam sessions
-//!   tokens --last N`, страница сессий WebUI); у сессии со снимком (M6 §8а) — `snapshot_at`
+//!   500); `tokens=true` — у каждой ещё `tokens`, `hints_shown` и `hints_opened`, как в
+//!   `GET /sessions/{id}` (`zam sessions tokens --last N`, `cargo xtask ab`, страница сессий
+//!   WebUI); у сессии со снимком (M6 §8а) — `snapshot_at`
 //!   (момент снимка; сам снимок — `GET /sessions/{id}/snapshot`, [`super::snapshot`]);
 //!   `parent=<id>` (M7 §5.8 п. 1, признак `sessions_parent`) — только сессии субагентов сессии
 //!   `<id>` и их субагентов (потомки по `parent_id`, без самой сессии — самоссылка и цикл её не
@@ -86,9 +90,9 @@ use serde_json::{Value, json};
 use zam_core::{Id, SolutionGuid};
 use zam_store::{
     Db, SessionFilter, SessionTouch, SpaceKind, TokenCount, add_memory_write, add_token_counts,
-    bump_epoch, claimed_tasks, end_session, get_session, list_sessions, list_spaces,
-    register_session, session_epoch, session_holdout, session_tokens, sessions_tokens, set_holdout,
-    snapshot_times, touch_session,
+    bump_epoch, claimed_tasks, end_session, get_session, hints_shown_many, list_sessions,
+    list_spaces, opened_by_sessions, register_session, session_epoch, session_holdout,
+    session_tokens, sessions_tokens, set_holdout, snapshot_times, touch_session,
 };
 
 use super::search::targets::{ScopeReq, resolve_targets};
@@ -114,8 +118,65 @@ pub(super) async fn requester_db(
     p: &Principal,
     headers: &HeaderMap,
 ) -> Result<Db, ApiError> {
+    Ok(requester(st, p, headers).await?.1)
+}
+
+/// Пользователь запроса (у администратора — `X-Zam-User`) и его база.
+async fn requester(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+) -> Result<(Id, Db), ApiError> {
     let user = crate::auth::target_user(st, p, headers).await?;
-    Ok(st.users.get(user.id).await?)
+    Ok((user.id, st.users.get(user.id).await?))
+}
+
+/// Подсказки сессий `ids` пользователя `user` (M7.5 §8.8 п. 2, признак `sessions_opened`):
+/// `(hints_shown, hints_opened)` — целей, показанных сессии подсказкой `/recall` (`session_seen`
+/// базы сессии), и из них открытых агентом (`usage_opened` баз целей: своей и владельцев чужих
+/// решений, чьи цели сессии показаны). Сессии нет в ответе — `(0, 0)`. База чужого владельца
+/// недоступна — её открытия не считаются (WARN без id сессий).
+async fn hints_of(
+    st: &AppState,
+    user: Id,
+    db: &Db,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, (i64, i64)>, ApiError> {
+    let shown = hints_shown_many(db, ids).await?;
+    let mut opened = opened_by_sessions(db, user, ids).await?;
+    let mut owners: std::collections::BTreeSet<Id> = shown
+        .values()
+        .flat_map(|h| h.owners.iter().copied())
+        .collect();
+    owners.remove(&user);
+    for owner in owners {
+        let with: Vec<String> = ids
+            .iter()
+            .filter(|s| shown.get(*s).is_some_and(|h| h.owners.contains(&owner)))
+            .cloned()
+            .collect();
+        let foreign = match st.users.get(owner).await {
+            Ok(fdb) => opened_by_sessions(&fdb, user, &with).await,
+            Err(e) => Err(e),
+        };
+        match foreign {
+            Ok(m) => {
+                for (s, n) in m {
+                    *opened.entry(s).or_default() += n;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "сессии: открытия подсказок чужой базы не прочитаны")
+            }
+        }
+    }
+    Ok(ids
+        .iter()
+        .map(|s| {
+            let n = shown.get(s).map_or(0, |h| h.shown);
+            (s.clone(), (n, opened.get(s).copied().unwrap_or(0)))
+        })
+        .collect())
 }
 
 /// Сессия запроса (касание по запросу) и база пользователя запроса, где она лежит.
@@ -383,10 +444,11 @@ pub async fn get(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let db = requester_db(&st, &p, &headers).await?;
+    let (user, db) = requester(&st, &p, &headers).await?;
     let s = get_session(&db, &id).await?.ok_or(ApiError::NotFound)?;
     let tasks = claimed_tasks_of(&st, &p, &headers, &db, &s).await;
     let tokens = session_tokens(&db, &s.id).await?;
+    let hints = hints_of(&st, user, &db, std::slice::from_ref(&s.id)).await?;
     let mut v = serde_json::to_value(&s).map_err(|e| ApiError::Internal(e.to_string()))?;
     // заголовки задач — в напоминание `Stop` агенту: по токену с маской секретов (задача 5 M7.1;
     // клиент маскирует ещё раз — для старого сервера)
@@ -394,6 +456,9 @@ pub async fn get(
     super::agent_view::view_json(&p, &mut tasks, &["title"]);
     v["claimed_tasks"] = tasks;
     v["tokens"] = json!(tokens);
+    let (shown, opened) = hints.get(&s.id).copied().unwrap_or_default();
+    v["hints_shown"] = json!(shown);
+    v["hints_opened"] = json!(opened);
     Ok(Json(v))
 }
 
@@ -487,7 +552,7 @@ pub async fn list(
         zam_store::check_session_id(id)
             .map_err(|_| ApiError::BadRequest("parent: id сессии родителя".into()))?;
     }
-    let db = requester_db(&st, &p, &headers).await?;
+    let (user, db) = requester(&st, &p, &headers).await?;
     let filter = SessionFilter {
         solution: solution.as_ref(),
         parent,
@@ -495,10 +560,14 @@ pub async fn list(
     let items = list_sessions(&db, filter, limit).await?;
     let ids: Vec<String> = items.iter().map(|s| s.id.clone()).collect();
     let snaps = snapshot_times(&db, &ids).await?;
-    let mut tokens = if q.tokens == Some(true) {
-        Some(sessions_tokens(&db, &ids).await?)
+    // учёт выданного и доля открытых подсказок (M7.5 §8.8 п. 2) — только с `tokens=true`
+    let (mut tokens, hints) = if q.tokens == Some(true) {
+        (
+            Some(sessions_tokens(&db, &ids).await?),
+            Some(hints_of(&st, user, &db, &ids).await?),
+        )
     } else {
-        None
+        (None, None)
     };
     let items: Vec<Value> = items
         .iter()
@@ -506,6 +575,11 @@ pub async fn list(
             let mut v = json!(s);
             if let Some(t) = tokens.as_mut() {
                 v["tokens"] = json!(t.remove(&s.id).unwrap_or_default());
+            }
+            if let Some(h) = hints.as_ref() {
+                let (shown, opened) = h.get(&s.id).copied().unwrap_or_default();
+                v["hints_shown"] = json!(shown);
+                v["hints_opened"] = json!(opened);
             }
             if let Some(at) = snaps.get(&s.id) {
                 v["snapshot_at"] = json!(zam_store::time::fmt_ts(*at));
