@@ -3,9 +3,9 @@
 //!
 //! ```text
 //! POST /recall {event, session_id?, solution?, area?, prompt?, error?, tool?, budget_tokens?,
-//!               agent_block_version?, task?, parent_id?, timeout_ms?, limit?}
+//!               agent_block_version?, task?, parent_id?, timeout_ms?, limit?, rules_in_budget?}
 //!   → 200 {text, items: [{id, kind, title, certainty, reason, age_days?}], tokens,
-//!          rules_tokens, timings, warnings, hooks?, holdout?}
+//!          rules_tokens, timings, warnings, hooks?, ideas?, holdout?}
 //! ```
 //!
 //! - `text` — готовый Markdown для `additionalContext`; пусто — тишина. Каждая подсказка — строка
@@ -31,6 +31,18 @@
 //!   строкой `rules` (M6 §8, §17 п. 3: `calls + 1`, `tokens + rules_tokens`), событие — без него;
 //!   вызов из MCP считает инструмент (`mcp`); `record: false`, нет сессии или вышел срок учёта —
 //!   без прибавки;
+//! - **Rules в бюджете** (M7.6 §9.3 п. 2, CR-22, признак `recall_m76`): `rules_in_budget: true`
+//!   у `session_start` и `recovery` (у прочих событий — 400) — раздел Rules и строка карты кода —
+//!   разделы бюджета `budget_tokens` и предела `output_limit` на своём месте в порядке разделов
+//!   (задачи, ответы, идеи — раньше); не влезают — у правил с конца приоритета L1 → L0, затем
+//!   правила снимаются с конца со строкой «не показано — правил: N» ([`pack_rules_in_budget`]);
+//!   `rules_tokens: 0`. Без поля — резерв, как ниже;
+//! - **родитель в `brief`** (M7.6 §9.3 п. 3, CR-23): `parent_id` с явной сессией запроса, не
+//!   равной ему, — родитель строки сессии, если его ещё нет (пишет касание учёта,
+//!   [`brief_parent`]); записанный другой не меняется (DEBUG), ответ прежний;
+//! - **режим идей** (M7.6 §9.3 п. 6, CR-26): ответ `session_start` (и с `record: false`) — поле
+//!   `ideas: {mode}` (`review | propose`, режим владельца базы решения запроса —
+//!   [`solution_ideas_mode`]);
 //! - **`session_start`** — дайджест: Rules — **резерв сверх бюджета** (M6 §8: все заметки до
 //!   [`RULES_MAX`], текст каждой до [`RULE_L1_TOKENS`], длиннее — с «…», не вытесняются),
 //!   остальное — не больше `budget_tokens` (по умолчанию `recall.digest_tokens` = 1500) по
@@ -561,6 +573,9 @@ pub struct RecallReq {
     /// Вид работы пакета `work` (M7.3 §6.3 п. 3): `probes | rules`; нет — любой. У прочих
     /// событий не действует.
     kind: Option<String>,
+    /// Rules — в бюджете и пределе вывода, а не резервом сверх них (M7.6 §9.3 п. 2, CR-22):
+    /// только `session_start` и `recovery` (`true` у прочих — 400); нет или `false` — резерв.
+    rules_in_budget: Option<bool>,
 }
 
 /// Единица предела вывода: символы (Claude Code) или байты UTF-8 (Codex).
@@ -639,6 +654,17 @@ impl<'c> RulesFit<'c> {
         hidden: usize,
     ) -> Option<Self> {
         let ri = packed.iter().position(|s| s.reserved)?;
+        Some(Self::at(ri, packed, picked, short, hidden))
+    }
+
+    /// Правила раздела `ri` упаковки.
+    fn at(
+        ri: usize,
+        packed: &[Section],
+        picked: &[Vec<&'c Cand>],
+        short: &HashMap<TargetRef, RuleShort>,
+        hidden: usize,
+    ) -> Self {
         let items = picked[ri]
             .iter()
             .zip(packed[ri].blocks.iter())
@@ -652,7 +678,7 @@ impl<'c> RulesFit<'c> {
                 }
             })
             .collect();
-        Some(Self { ri, items, hidden })
+        Self { ri, items, hidden }
     }
 
     /// Блоки и подсказки раздела — в упаковку.
@@ -739,6 +765,41 @@ fn l1_text(block: &str) -> &str {
 fn l0_text(line: &str) -> &str {
     let tail = line.split_once(" — ").map_or("", |(_, t)| t);
     tail.rsplit_once(" n:").map_or(tail, |(t, _)| t).trim()
+}
+
+/// Упаковка с Rules в бюджете (`rules_in_budget`, M7.6 §9.3 п. 2, CR-22): раздел Rules — раздел
+/// бюджета `cap` и предела вывода `limit` на своём месте в порядке разделов, так что задачи,
+/// ответы и идеи (раньше в порядке, а при пределе — стойкость [`KEEP_MANDATORY`] против 0 у
+/// Rules) остаются, а правила уходят первыми. Пока хоть один блок раздела Rules не вошёл: у
+/// правила с конца приоритета ([`rule_order`]) L1 → строка L0 (сначала с заметным выигрышем
+/// [`RULE_L0_GAIN_X10`], затем любым), затем правила снимаются с конца — строка
+/// [`rules_hidden_line`] называет их число (вместе со снятыми раньше, `hidden`); строки о снятом
+/// пределом у раздела Rules нет: раздел каждый раз собирается заново.
+fn pack_rules_in_budget(
+    packed: &mut [Section],
+    picked: &mut [Vec<&Cand>],
+    short: &HashMap<TargetRef, RuleShort>,
+    hidden: usize,
+    cap: usize,
+    limit: Option<OutputLimit>,
+) -> (String, Vec<(usize, usize)>) {
+    let fits = |t: &str| limit.is_none_or(|l| l.fits(t));
+    let pack = |p: &[Section]| pack_sections(p, cap, &count_tokens, &fits);
+    let Some(ri) = packed
+        .iter()
+        .position(|s| s.title.as_deref() == Some(SECTION_RULES))
+    else {
+        return pack(packed);
+    };
+    let mut f = RulesFit::at(ri, packed, picked, short, hidden);
+    loop {
+        let r = pack(packed);
+        let whole = (0..packed[ri].blocks.len()).all(|bi| r.1.contains(&(ri, bi)));
+        if whole || !(f.degrade(short, RULE_L0_GAIN_X10) || f.degrade(short, 10) || f.drop_last()) {
+            return r;
+        }
+        f.apply(packed, picked);
+    }
 }
 
 /// Упаковка в бюджет и предел вывода `limit` (ревью 8a, C1; M6 §8): Rules — первыми по
@@ -3849,6 +3910,33 @@ impl Arranged<'_> {
     }
 }
 
+/// Родитель сессии субагента из `brief` (M7.6 §9.3 п. 3, CR-23): `parent` (не пустой, по правилу
+/// id сессии, не сама сессия) пишется касанием учёта ([`record`], без лишней транзакции записи —
+/// бюджет хука `subagent-start` прежний), только если у строки сессии родителя нет (строки ещё нет
+/// — касание её создаёт). Другой записанный родитель не меняется (DEBUG), сбой чтения — тоже
+/// DEBUG: ответ прежний.
+async fn brief_parent(s: &mut RequestSession, parent: Option<&str>) {
+    let Some(parent) = parent.map(str::trim) else {
+        return;
+    };
+    if parent == s.touch.id || zam_store::check_session_id(parent).is_err() {
+        return;
+    }
+    match zam_store::get_session(&s.db, &s.touch.id).await {
+        Ok(Some(row)) if row.parent_id.as_deref().is_some_and(|p| p != parent) => {
+            tracing::debug!(
+                session = %s.touch.id,
+                parent,
+                prev = row.parent_id.as_deref().unwrap_or_default(),
+                "recall: brief — у сессии другой родитель, не меняется"
+            );
+        }
+        Ok(Some(row)) if row.parent_id.is_some() => {}
+        Ok(_) => s.touch.parent_id = Some(parent.to_string()),
+        Err(e) => tracing::debug!(error = %e, "recall: brief — родитель сессии не прочитан"),
+    }
+}
+
 /// `POST /recall`.
 pub async fn recall(
     state: State<AppState>,
@@ -3898,6 +3986,13 @@ pub(crate) async fn recall_with(
         return Err(ApiError::BadRequest(format!(
             "timeout_ms: от 1 до {max_timeout} (max(recall.max_timeout_ms, recall.timeout_ms))"
         )));
+    }
+    if req.rules_in_budget == Some(true)
+        && !matches!(req.event, Event::SessionStart | Event::Recovery)
+    {
+        return Err(ApiError::BadRequest(
+            "rules_in_budget: только у session_start и recovery".into(),
+        ));
     }
     if req.event == Event::IdeaReview
         && req
@@ -3979,6 +4074,13 @@ pub(crate) async fn recall_with(
                 }
             }
         }
+    }
+    // `brief` с явной сессией (M7.6 §9.3 п. 3, CR-23): пустой родитель строки сессии —
+    // `parent_id` тела; другой записанный не меняется, самоссылка не пишется, ответ прежний
+    if req.event == Event::Brief
+        && let Some(s) = &mut session
+    {
+        brief_parent(s, req.parent_id.as_deref()).await;
     }
     // пакет внутренней работы (M7.3 §6.3 п. 3): захват работы сессией — свой путь, без
     // подсказок, A/B и показов в `usage`; решение тела сильнее заголовка
@@ -4253,8 +4355,11 @@ pub(crate) async fn recall_with(
         .filter(|c| health.alive[c.target])
         .filter(|c| dup.insert(c.tref))
         .collect();
-    // Rules дайджеста и пакета восстановления — резерв сверх бюджета (M6 §8)
-    let rules_reserved = matches!(req.event, Event::SessionStart | Event::Recovery);
+    // Rules дайджеста и пакета восстановления — резерв сверх бюджета (M6 §8); с
+    // `rules_in_budget` — в бюджете (M7.6 §9.3 п. 2)
+    let rules_in_budget = req.rules_in_budget == Some(true);
+    let rules_reserved =
+        matches!(req.event, Event::SessionStart | Event::Recovery) && !rules_in_budget;
     let rules_short = std::mem::take(&mut lines.rules_short);
     let rules_hidden = lines.rules_hidden;
     // пакет разбора идей: длина очереди и собранные идеи — для строки «показано k из N»
@@ -4280,7 +4385,12 @@ pub(crate) async fn recall_with(
     // его размер — отдельным полем `rules_tokens` (§17 п. 3)
     // предел канала хука (ревью 8a, C1): Rules — первыми, остальное — в остатке
     let limit = output_limit(&req, origin.is_some());
-    let (text, taken) = pack_limited(
+    let pack = if rules_in_budget {
+        pack_rules_in_budget
+    } else {
+        pack_limited
+    };
+    let (text, taken) = pack(
         &mut packed,
         &mut picked,
         &rules_short,
@@ -4431,6 +4541,14 @@ pub(crate) async fn recall_with(
     if req.event == Event::SessionStart {
         // R5: настройки типов подсказок пользователя (`hooks.<тип>`, задача 13)
         out["hooks"] = hooks.to_json();
+        // режим идей владельца базы решения (M7.6 §9.3 п. 6): уже прочитан — тот же, иначе
+        // одним чтением (своё решение — без чтения)
+        let mode = if ideas_on || plan_on {
+            mode
+        } else {
+            solution_ideas_mode(&st, &targets, user, &flags).await
+        };
+        out["ideas"] = json!({ "mode": mode.as_str() });
     }
     if holdout {
         out["holdout"] = json!(true);

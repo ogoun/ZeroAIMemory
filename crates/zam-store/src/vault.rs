@@ -130,6 +130,10 @@ pub struct VaultMeta {
     pub created_at: Timestamp,
     #[serde(serialize_with = "crate::time::ser_ts")]
     pub updated_at: Timestamp,
+    /// Есть ли значение (M7.6 §9.3 п. 1): непустой шифротекст текущей ревизии — без
+    /// расшифровки, отвечает и при заблокированном Vault; `host`/`environment` без значения —
+    /// `false`.
+    pub has_value: bool,
 }
 
 impl VaultMeta {
@@ -154,7 +158,8 @@ pub struct VaultRevision {
 }
 
 const ITEM_COLS: &str = "id, scope, agent_solution_id, title, data, current_rev, author_kind, \
-     user_id, token_id, session_id, machine, created_at, updated_at";
+     user_id, token_id, session_id, machine, created_at, updated_at, \
+     coalesce(length(secret), 0) > 0";
 
 fn meta_row(r: &Row) -> rusqlite::Result<VaultMeta> {
     let scope: String = r.get(1)?;
@@ -184,6 +189,7 @@ fn meta_row(r: &Row) -> rusqlite::Result<VaultMeta> {
         },
         created_at: ts_at(r, 11)?,
         updated_at: ts_at(r, 12)?,
+        has_value: r.get(13)?,
     })
 }
 
@@ -248,7 +254,7 @@ fn load_live(c: &Connection, id: Id) -> Result<(VaultMeta, Vec<u8>), StoreError>
     c.prepare_cached(&format!(
         "SELECT {ITEM_COLS}, secret FROM vault_items WHERE id = ?1 AND deleted_at IS NULL"
     ))?
-    .query_row([id], |r| Ok((meta_row(r)?, r.get(13)?)))
+    .query_row([id], |r| Ok((meta_row(r)?, r.get(14)?)))
     .optional()?
     .ok_or(StoreError::NotFound)
 }
@@ -258,7 +264,7 @@ fn load_any(c: &Connection, id: Id) -> Result<(VaultMeta, bool), StoreError> {
     c.prepare_cached(&format!(
         "SELECT {ITEM_COLS}, deleted_at IS NOT NULL FROM vault_items WHERE id = ?1"
     ))?
-    .query_row([id], |r| Ok((meta_row(r)?, r.get(13)?)))
+    .query_row([id], |r| Ok((meta_row(r)?, r.get(14)?)))
     .optional()?
     .ok_or(StoreError::NotFound)
 }
@@ -364,6 +370,20 @@ pub async fn vault_list(
                     .and_then(serde_json::Value::as_str))
         })
         .collect())
+}
+
+/// Живые записи области с именем ровно `title` (M7.6 §9.3 п. 1): сравнение — как у
+/// уникального индекса и удаления по имени (регистр важен, M7.1 §4.5 п. 4), `title` — уже без
+/// пробелов по краям; с `q` — оба условия ([`vault_list`]).
+pub async fn vault_list_titled(
+    db: &Db,
+    scope: &VaultScope,
+    q: Option<&str>,
+    title: &str,
+) -> Result<Vec<VaultMeta>, StoreError> {
+    let mut items = vault_list(db, scope, q).await?;
+    items.retain(|m| m.title == title);
+    Ok(items)
 }
 
 async fn all_live(
@@ -732,6 +752,39 @@ mod tests {
 
     fn guid() -> SolutionGuid {
         "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e31".parse().unwrap()
+    }
+
+    /// Точное имя и `has_value` по шифротексту (M7.6 §9.3 п. 1).
+    #[tokio::test]
+    async fn list_titled_and_has_value() {
+        let db = db("titled");
+        let k = VaultScope::Knowledge;
+        let tok = serde_json::json!({"type": "token"});
+        let host = serde_json::json!({"type": "host"});
+        for (t, d, blob) in [
+            ("gh", &tok, vec![1]),
+            ("GH", &tok, vec![2]),
+            ("gh-2", &tok, vec![3]),
+            ("box", &host, vec![]),
+        ] {
+            vault_put(&db, Id::new(), &k, t, d.clone(), blob, &agent())
+                .await
+                .unwrap();
+        }
+        let titles = |v: Vec<VaultMeta>| v.into_iter().map(|m| m.title).collect::<Vec<_>>();
+        let got = vault_list_titled(&db, &k, None, "gh").await.unwrap();
+        assert_eq!(titles(got), ["gh"]);
+        let got = vault_list_titled(&db, &k, Some("gh"), "GH").await.unwrap();
+        assert_eq!(titles(got), ["GH"]);
+        assert!(
+            vault_list_titled(&db, &k, Some("box"), "gh")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let all = vault_list(&db, &k, None).await.unwrap();
+        let has = |t: &str| all.iter().find(|m| m.title == t).unwrap().has_value;
+        assert!(has("gh") && has("GH") && !has("box"));
     }
 
     #[tokio::test]

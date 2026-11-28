@@ -514,7 +514,10 @@ pub async fn create(
     Ok((status, Json(v)))
 }
 
+/// Параметры ленты; неизвестный — 400 «неизвестный параметр» (M7.6 §9.3 п. 4,
+/// `strict_list_query`).
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListQuery {
     kind: Option<String>,
     /// Через запятую.
@@ -883,7 +886,9 @@ async fn noisy_filter(db: &zam_store::Db) -> Result<(Option<Timestamp>, Vec<Id>)
     Ok((since, zam_store::noisy_ids(db, from).await?))
 }
 
+/// Параметры счётчиков; неизвестный — 400 «неизвестный параметр» (M7.6 §9.3 п. 4).
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CountsQuery {
     kind: Option<String>,
     area: Option<String>,

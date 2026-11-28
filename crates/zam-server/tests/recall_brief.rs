@@ -1148,3 +1148,118 @@ async fn brief_trigger_traps_respect_limit() {
     assert!(!t.contains(&format!("i:{search_only}")), "{t}");
     assert!(!t.contains(&format!("i:{}", ids[0])), "{t}");
 }
+
+// ---- связь потомка в `brief` (M7.6 §9.3 п. 3, CR-23, признак `recall_m76`) ----
+
+/// `parent_id` строки сессии (`GET /sessions/{id}`).
+async fn parent_of(a: &Api, id: &str) -> Value {
+    let r = a
+        .t(Method::GET, &format!("/api/v1/sessions/{id}"), None)
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    r.json()["parent_id"].clone()
+}
+
+/// `brief` с явной сессией и `parent_id`: сессия создаётся касанием, пустой родитель
+/// записывается; без явной сессии (только тело без `session_id`) — как раньше.
+#[tokio::test]
+async fn brief_parent_id_links_session() {
+    let a = api("brief-parent-link", roomy).await;
+    let before = brief(&a, &a.token, "kid-1", json!({"event": "brief"})).await;
+    assert_eq!(parent_of(&a, "kid-1").await, Value::Null);
+    let j = brief(
+        &a,
+        &a.token,
+        "kid-1",
+        json!({"event": "brief", "parent_id": "boss-1"}),
+    )
+    .await;
+    assert_eq!(parent_of(&a, "kid-1").await, "boss-1");
+    assert_eq!(j["text"], before["text"], "ответ прежний");
+    // сессия, которой ещё не было, — тоже (касание создаёт её)
+    brief(
+        &a,
+        &a.token,
+        "kid-2",
+        json!({"event": "brief", "parent_id": "boss-1"}),
+    )
+    .await;
+    assert_eq!(parent_of(&a, "kid-2").await, "boss-1");
+    // `session_id` тела — тоже явная сессия
+    let r = a
+        .t(
+            Method::POST,
+            RECALL,
+            Some(json!({"event": "brief", "session_id": "kid-3", "parent_id": "boss-1"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(parent_of(&a, "kid-3").await, "boss-1");
+    // прочие события родителя не задают
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            RECALL,
+            Some(json!({"event": "session_start", "parent_id": "boss-1"})),
+            &[("x-zam-session", "kid-4")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(parent_of(&a, "kid-4").await, Value::Null);
+}
+
+/// Другой уже записанный родитель не меняется, ответ прежний.
+#[tokio::test]
+async fn brief_parent_id_keeps_existing() {
+    let a = api("brief-parent-keep", roomy).await;
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({"id": "kid-k", "parent_id": "boss-a"})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let j = brief(
+        &a,
+        &a.token,
+        "kid-k",
+        json!({"event": "brief", "parent_id": "boss-b"}),
+    )
+    .await;
+    assert!(j["text"].is_string(), "{j}");
+    assert_eq!(parent_of(&a, "kid-k").await, "boss-a");
+    // тот же родитель — без изменений
+    brief(
+        &a,
+        &a.token,
+        "kid-k",
+        json!({"event": "brief", "parent_id": "boss-a"}),
+    )
+    .await;
+    assert_eq!(parent_of(&a, "kid-k").await, "boss-a");
+}
+
+/// Самоссылка (`parent_id` = сессия запроса) не пишется.
+#[tokio::test]
+async fn brief_parent_id_self_ignored() {
+    let a = api("brief-parent-self", roomy).await;
+    brief(
+        &a,
+        &a.token,
+        "kid-s",
+        json!({"event": "brief", "parent_id": "kid-s"}),
+    )
+    .await;
+    assert_eq!(parent_of(&a, "kid-s").await, Value::Null);
+    // после самоссылки настоящий родитель записывается
+    brief(
+        &a,
+        &a.token,
+        "kid-s",
+        json!({"event": "brief", "parent_id": "boss-s"}),
+    )
+    .await;
+    assert_eq!(parent_of(&a, "kid-s").await, "boss-s");
+}

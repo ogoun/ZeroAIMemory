@@ -8,10 +8,16 @@
 //!   заметки и записи со ссылкой на файл (путь нормализуется, ошибка — 422) в решении
 //!   (`solution` или `X-Zam-Solution`) либо в личной базе — то же, что `filters.file` поиска;
 //! - `POST /edges {src, type, dst}` → 201 ребро `explicit`: `src` — `n:<id>` | `e:<id>` (или
-//!   `node:<id>` | `entry:<id>`), `dst` — то же или `[[Имя]]` (в пространстве источника);
+//!   `node:<id>` | `entry:<id>`) или `[[<пространство>:<путь>]]`, `dst` — то же или `[[Имя]]` (в
+//!   пространстве источника); `[[<пространство>:<путь>]]` (M7.6 §9.3 п. 7, признак
+//!   `link_space_path`; и в `links` insight) — префикс по правилу CLI
+//!   ([`zam_core::space::split_space`]: `knowledge:`, `rules:`, `human:`, `solution:` — решение
+//!   `X-Zam-Solution`, GUID решения), заметка ищется в этом пространстве **базы пользователя
+//!   запроса** (недоступное или в чужой базе — 422; [`spaced_note`]);
 //!   `type` вне §8.5 или `supersedes` (его ставит замещение) — 422; такая связь уже есть —
-//!   409; цель не найдена — 404 (`[[Имя]]` — 422); отчёт-источник — 409
-//!   `/problems/report-immutable`, отчёт-цель — 422 (токену оба — 404, M5.5 §7);
+//!   409; цель не найдена — 404 (`[[…]]` — 422 с подсказкой [`NOT_FOUND_HINT`]);
+//!   отчёт-источник — 409 `/problems/report-immutable`, отчёт-цель — 422 (токену оба — 404,
+//!   M5.5 §7);
 //! - `DELETE /edges/{id}` → 204; удаляются только `explicit` (выведенные и системные — 422);
 //! - `GET /nodes/{id}/backlinks`, `GET /entries/{id}/backlinks` → `{items, nodes}`: рёбра в
 //!   цель от живых источников и узлы-источники; `GET /nodes/{id}/links`,
@@ -37,6 +43,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use zam_core::space::{SpaceSel, split_space};
 use zam_core::{Id, TargetKind, TargetRef};
 use zam_store::{
     Db, EdgeOrigin, EdgeType, EdgeView, EntryKind, GRAPH_DEPTH_MAX, GraphStore, NewEdge, Space,
@@ -44,7 +51,7 @@ use zam_store::{
 };
 
 use super::entries::unprocessable;
-use super::scope::{Mode, Role, edge_scope, entry_scope, graph_spaces, node_scope};
+use super::scope::{Mode, Role, edge_scope, entry_scope, graph_spaces, node_scope, space_scope};
 use super::{json_body, query};
 use crate::app::AppState;
 use crate::attrib::attribution;
@@ -56,6 +63,8 @@ pub const CROSS_DB: &str = "связи между базами — не в M3: �
                             (личная память и общее решение хранятся раздельно)";
 /// Предел `links` одного insight. [решение исполнителя]
 pub const LINKS_MAX: usize = 50;
+/// Подсказка к 422 «заметка не найдена» (M7.6 §9.3 п. 7).
+pub const NOT_FOUND_HINT: &str = "укажите n:<id> или [[пространство:путь]]";
 
 /// Ссылка на узел или запись: `n:<id>` | `e:<id>` | `node:<id>` | `entry:<id>`.
 pub fn parse_ref(s: &str) -> Option<TargetRef> {
@@ -74,19 +83,87 @@ pub fn parse_ref(s: &str) -> Option<TargetRef> {
 /// Цель связи из запроса.
 enum Dst {
     Ref(TargetRef),
-    /// Ключ `[[Имя]]` ([`links::wiki_key`]).
+    /// Ключ `[[Имя]]` ([`links::wiki_key`]) — в пространстве источника.
     Wiki(String),
+    /// `[[<пространство>:<путь>]]` (M7.6 §9.3 п. 7): пространство по правилу CLI, ключ пути
+    /// ([`links::wiki_key`]) и ссылка как в запросе — для текста ошибки.
+    Spaced {
+        space: SpaceSel,
+        key: String,
+        raw: String,
+    },
 }
 
-/// `[[Имя]]` или ссылка; иначе `None`.
+/// `[[<пространство>:<путь>]]`, `[[Имя]]` или ссылка; иначе `None`. Префикс — только известный
+/// правилу CLI ([`split_space`]): `[[a:b]]` — по-прежнему имя `a:b`.
 fn parse_dst(s: &str) -> Option<Dst> {
     let t = s.trim();
     if let Some(inner) = t.strip_prefix("[[").and_then(|t| t.strip_suffix("]]")) {
         let inner = inner.split('|').next().unwrap_or(inner);
         let inner = inner.split('#').next().unwrap_or(inner);
+        let (space, path) = split_space(inner.trim());
+        if space != SpaceSel::Default {
+            return links::wiki_key(path).map(|key| Dst::Spaced {
+                space,
+                key,
+                raw: t.to_string(),
+            });
+        }
         return links::wiki_key(inner).map(Dst::Wiki);
     }
     parse_ref(t).map(Dst::Ref)
+}
+
+/// Заметка `[[<пространство>:<путь>]]` (M7.6 §9.3 п. 7): пространство — из базы пользователя
+/// запроса (решение из `X-Zam-Solution` у `solution:`); недоступное, чужое (участнику — решение в
+/// базе владельца, решение координатора 156) или без решения — 422, заметки нет — 422 с
+/// подсказкой [`NOT_FOUND_HINT`]. Видимость и границу базы источника проверяет вызывающий.
+async fn spaced_note(
+    st: &AppState,
+    p: &Principal,
+    headers: &HeaderMap,
+    space: &SpaceSel,
+    key: String,
+    raw: &str,
+    field: &str,
+) -> Result<TargetRef, ApiError> {
+    let unavailable = || {
+        unprocessable(format!(
+            "{field}: пространство ссылки {raw} недоступно в вашей базе — {NOT_FOUND_HINT}"
+        ))
+    };
+    let name = match space {
+        SpaceSel::Fixed(k) => (*k).to_string(),
+        SpaceSel::Guid(g) => g.clone(),
+        SpaceSel::Solution => super::files::query_solution(None, headers)?
+            .map(|g| g.as_str().to_string())
+            .ok_or_else(|| {
+                unprocessable(format!(
+                    "{field}: {raw} — у solution: нужен X-Zam-Solution; иначе GUID решения"
+                ))
+            })?,
+        SpaceSel::Default => return Err(unavailable()),
+    };
+    let sc = match space_scope(st, p, headers, &name, Mode::Read).await {
+        Ok(sc) if sc.owner == sc.user.id => sc,
+        Ok(_) => return Err(unavailable()),
+        Err(e) if e.status().is_client_error() => return Err(unavailable()),
+        Err(e) => return Err(e),
+    };
+    let sid = sc.space.id;
+    let id = sc
+        .db
+        .read(move |c| Ok(links::resolve_key(c, sid, &key)?))
+        .await?;
+    id.map(|id| TargetRef {
+        kind: TargetKind::Node,
+        id,
+    })
+    .ok_or_else(|| {
+        unprocessable(format!(
+            "{field}: заметка {raw} не найдена — {NOT_FOUND_HINT}"
+        ))
+    })
 }
 
 /// Тип явной связи: из §8.5 и не `supersedes` (иначе 422).
@@ -205,9 +282,12 @@ async fn resolve_dst(
                     id,
                 }),
                 None => Err(unprocessable(format!(
-                    "{field}: заметка {key} не найдена в пространстве источника"
+                    "{field}: заметка {key} не найдена в пространстве источника — {NOT_FOUND_HINT}"
                 ))),
             };
+        }
+        Dst::Spaced { space, key, raw } => {
+            spaced_note(st, p, headers, &space, key, &raw, field).await?
         }
         Dst::Ref(r) => r,
     };
@@ -271,7 +351,9 @@ pub async fn insight_links(
         })?;
         let kind = explicit_type(&l.kind, &format!("{field}.type"))?;
         let dst = parse_dst(&l.target).ok_or_else(|| {
-            unprocessable(format!("{field}.target: node:<id>, entry:<id> или [[Имя]]"))
+            unprocessable(format!(
+                "{field}.target: node:<id>, entry:<id>, [[Имя]] или [[пространство:путь]]"
+            ))
         })?;
         let r = resolve_dst(st, p, headers, db, owner, space.id, &visible, dst, &field).await?;
         deny_report_dst(p, db, r, &field).await?;
@@ -390,10 +472,22 @@ pub async fn create(
     body: Result<Bytes, BytesRejection>,
 ) -> Result<(StatusCode, Json<EdgeView>), ApiError> {
     let req: NewEdgeReq = json_body(body)?;
-    let src =
-        parse_ref(&req.src).ok_or_else(|| ApiError::BadRequest("src: n:<id> или e:<id>".into()))?;
-    let dst = parse_dst(&req.dst)
-        .ok_or_else(|| ApiError::BadRequest("dst: n:<id>, e:<id> или [[Имя]]".into()))?;
+    // источник: ссылка или `[[<пространство>:<путь>]]` (M7.6 §9.3 п. 7); `[[Имя]]` без
+    // пространства у источника не бывает
+    let src = match parse_dst(&req.src) {
+        Some(Dst::Ref(r)) => r,
+        Some(Dst::Spaced { space, key, raw }) => {
+            spaced_note(&st, &p, &headers, &space, key, &raw, "src").await?
+        }
+        _ => {
+            return Err(ApiError::BadRequest(
+                "src: n:<id>, e:<id> или [[пространство:путь]]".into(),
+            ));
+        }
+    };
+    let dst = parse_dst(&req.dst).ok_or_else(|| {
+        ApiError::BadRequest("dst: n:<id>, e:<id>, [[Имя]] или [[пространство:путь]]".into())
+    })?;
     let kind = explicit_type(&req.kind, "type")?;
     let t = live_target(&st, &p, &headers, src, Mode::Write).await?;
     // отчёт-источник — его изменение: 409 человеку, токену — 404 (отчёт агенту не виден)

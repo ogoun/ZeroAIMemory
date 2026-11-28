@@ -9109,6 +9109,93 @@ warnings` и `cargo fmt -p zam-server --check` — чисто. WebUI: `npm run c
 новой ссылки с пунктом меню «Администрирование» (`admin.spec`, строгий режим) — ссылки
 переименованы («Мои токены», «токены пользователей»).
 
+### M7.6 · Задача 3 — Нативные клиенты: CR-21…26 и `[[пространство:путь]]`
+
+Спецификация §9.3 (решения координатора 146, 150–156); worktree `.tmp/m76/wt-t3`, ветка
+`m7.6-t3` от `fdd6c8b2` (слиты задачи 1 и 4). Миграций нет, блок v8 не менялся, MCP — прежние
+11 инструментов без новых полей схем (описание `memory_link` — 220 символов). Признаки
+`/health.features` — `vault_agent`, `recall_m76`, `strict_list_query`, `mcp_error_meta`,
+`link_space_path` — в конец массива после строк задачи 4 (она слита первой).
+
+**Параметры клиентов к трём маршрутам** (сверка до строгого разбора, шаг 2 плана):
+- `GET /spaces/{s}/vault`: WebUI (`api.ts` `listVault`) — без параметров; `zam vault`
+  (`cmd/vault.rs` `listing`) и MCP `memory_vault` (`vault_named`, `list`) — `q`;
+- `GET /spaces/{s}/entries`: WebUI `listEntries` — `kind`, `status`, `certainty`, `area`, `tag`,
+  `data_kind`, `decided_by`, `origin`, `priority`, `from_idea`, `top_level`, `parent`,
+  `deleted`, `noisy`, `cursor`, `limit`; `listReports` — `kind`, `tag`, `area`, `cursor`,
+  `deleted`, `limit`; `zam` (`cmd/mod.rs` `list_entries` из `insight|task|question|idea|release
+  list`) — `kind`, `status`, `origin`, `top_level`, `parent`, `limit`, `cursor`;
+- `GET /spaces/{s}/entries/counts`: WebUI `entryCounts` — `kind`, `area`, `tag`, `origin`,
+  `priority`, `from_idea`, `top_level`; `zam` — не зовёт.
+Все они уже были в `ListQuery`/`CountsQuery`; новых полей, кроме `title` у Vault, нет. Прочие
+`.svelte` ходят только через `api.ts`; пользователь администратора — заголовок `X-Zam-User`, не
+параметр.
+
+**Сделано.**
+- **Vault** (`api/vault.rs`, `zam-store/src/vault.rs`): `has_value` — поле `VaultMeta` из
+  выборки `coalesce(length(secret), 0) > 0` (столбец 13 `ITEM_COLS`, шифротекст не читается и не
+  расшифровывается); `vault_list_titled` — точное имя поверх `vault_list` (оба условия с `q`);
+  `ListQuery` — `deny_unknown_fields` и `title` (через `check_vault_title`, иное — 400);
+  `GetQuery.purpose` — `check_purpose` (1..=64 байта ASCII `[A-Za-z0-9._:/-]`), в аудит
+  `vault.reveal` — полем `purpose`.
+- **Строгий query** (`api/mod.rs` `query`, `api/entries.rs`): `ListQuery` и `CountsQuery` —
+  `deny_unknown_fields`; общий `query` у ошибки serde «unknown field `x`» отвечает 400
+  «неизвестный параметр: x» (`unknown_param`).
+- **`/recall`** (`api/recall/mod.rs`): `RecallReq.rules_in_budget` (у событий, кроме
+  `session_start` и `recovery`, `true` — 400); с ним `rules_reserved = false` и упаковка
+  `pack_rules_in_budget` (раздел Rules на своём месте в бюджете; пока блок раздела не вошёл —
+  `RulesFit::degrade` с выигрышем, затем любым, затем `drop_last`; `RulesFit::at` — конструктор
+  по индексу раздела); `brief_parent` — родитель строки сессии у `brief`; `ideas: {mode}` в ответе
+  `session_start` (`solution_ideas_mode`, если ещё не прочитан).
+- **MCP** (`mcp/tools.rs`): `Output.problem` и `ProblemMeta` (`of(&Fail)`, `blank(status)`,
+  `meta()`), `into_result` кладёт `_meta` у `isError: true`; `problem()` (отказ до REST) — тоже.
+  Описание `memory_link` и `link_line` — оба конца `[[…]]` с найденной заметкой.
+- **Связи** (`api/graph.rs`, `error.rs`): `Dst::Spaced {space, key, raw}` в `parse_dst`
+  (префикс — только известный `split_space`), `spaced_note` (`space_scope` чтения, база
+  пользователя запроса, `links::resolve_key`), `src` у `POST /edges` — ссылка или `Spaced`;
+  подсказка `NOT_FOUND_HINT` у обоих 422 «не найдена»; `ApiError::status()` — статус problem
+  (4xx `space_scope` → 422).
+- **Документы**: ТЗ §7.6, §10.3, §12, §13.1; `docs/api-compat.md` (пять строк признаков, абзац о
+  строгом query в «Правиле совместимости», разделы «Vault для рантайма агента», «Строгий query
+  списков», «Предел ответа для нативных клиентов», «Родитель в `brief` и режим идей», «Код ошибки
+  MCP», «`[[пространство:путь]]` в связях»); протокол `guide.{ru,en}.md` (строка «Связи»);
+  CHANGELOG. Задание на перенос (`migrate.{ru,en}.md`) не менялось: команды, которые оно называет,
+  прежние.
+
+**Решения исполнителя.**
+- [решение исполнителя, задача 3 M7.6] Родитель сессии из `brief` пишет то же касание учёта
+  (`record` → `touch_session`/`mark_seen_with_tokens`, `SessionTouch.parent_id`), а «пуст ли
+  родитель» — чтение строки (`get_session`) до него: лишней транзакции записи (fsync на HDD) в
+  хуке `subagent-start` нет, бюджет прежний. Общий `upsert` (`parent_id = coalesce(excluded, …)`)
+  не менялся — `POST /sessions` по-прежнему перезаписывает родителя. Цена: два одновременных
+  `brief` с разными родителями у сессии без родителя — выигрывает последний; с `record: false`
+  касания нет — родитель не пишется (как и сама сессия). `parent_id` не по правилу id сессии —
+  молча не пишется (иначе касание упало бы целиком).
+- [решение исполнителя, задача 3 M7.6] Текст «неизвестный параметр: <имя>» — в общем
+  `api::query`, поэтому и у `/sessions`, `/cache` (раньше — «некорректный запрос: Failed to
+  deserialize query string: unknown field …»); статус и тип прежние, текст `detail` контрактом не
+  является (`docs/api-compat.md`). Остальные ошибки разбора query — прежний текст.
+- [решение исполнителя, задача 3 M7.6] `purpose` проверяется и без `reveal=1` (400 у неверной),
+  верная без раскрытия — ничего не делает; пустое или неверное `title` — 400 (а не пустой
+  список).
+- [решение исполнителя, задача 3 M7.6] `[[пространство:путь]]` — и в `links[].target` insight
+  (общий `parse_dst`/`resolve_dst`); `human:` — тоже (по токену Human недоступен — 422);
+  `[[Имя]]` у `src` — 400, как раньше (у источника нет «своего» пространства). После поиска
+  заметки граница базы и видимость — прежней проверкой `n:<id>` (`CROSS_DB` и т. п.).
+- [решение исполнителя, задача 3 M7.6] С `rules_in_budget` раздел Rules — стойкость 0 под
+  пределом вывода (как прочие разделы без своей стойкости): снимается раньше задач, ответов,
+  идей и ловушек, но позже разделов после него (корни, revisit, changelog); `rules_tokens: 0` —
+  резерва нет, учёт выданного — одной строкой события.
+
+**Проверки** (Windows 11, HDD). Сервер: `--test vault` — 37 (новые 6), `--test strict_query` —
+2 (новый набор), `--test recall` — 66 (новые 4; 1 ignored), `--test recall_brief` — 17 (новые 3),
+`--test recall_recovery` — 6, `--test recall_frozen` — 5, `--test ideas_recall` — 34 (новые 2;
+2 ignored), `--test mcp` — 89 (новые 4; `mcp_descriptions_under_300`, `mcp_tool_count_11`),
+`--test graph` — 8 (новые 2), `--test boot` — 16 (`health_features_documented`), `--test
+agent_setup` — 26 (`guide_sections_in_sync`, бюджет задания на перенос); `zam-store --lib` — 148
+(1 ignored; новый `list_titled_and_has_value`). `cargo clippy -p zam-server -p zam-store
+--all-targets -- -D warnings` и `cargo fmt --all --check` — чисто.
+
 ### M7.6 · Задача 4 — Снимок сессии, подключение без следа, CLI идей
 
 Спецификация §9.4, §9.5 (решения координатора 157–162); worktree `.tmp/m76/wt-t4`, ветка

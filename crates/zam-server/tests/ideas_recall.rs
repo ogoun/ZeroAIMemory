@@ -1908,3 +1908,83 @@ async fn inner_search_ideas_median() {
         );
     }
 }
+
+// ---- режим идей в ответе `session_start` (M7.6 §9.3 п. 6, CR-26, признак `recall_m76`) ----
+
+/// `ideas.mode` пользователя `user` администратором.
+async fn set_mode(a: &Api, user: &str, mode: &str) {
+    let r = a
+        .adm(
+            Method::PATCH,
+            &format!("/api/v1/admin/users/{user}/settings"),
+            Some(json!({"ideas": {"mode": mode}})),
+            None,
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+}
+
+/// Ответ `session_start` — `ideas: {mode}` рядом с `hooks`: своё решение — режим пользователя
+/// (и при выключенных идеях), общее — режим владельца базы решения; у прочих событий поля нет.
+#[tokio::test]
+async fn session_start_ideas_mode() {
+    let a = server("mode-field", |_| {}).await;
+    let j = start(&a, "im-1").await;
+    assert_eq!(j["ideas"], json!({"mode": "propose"}), "{j}");
+    assert!(j["hooks"].is_object(), "{j}");
+    set_mode(&a, &a.admin_id(), "review").await;
+    assert_eq!(start(&a, "im-2").await["ideas"]["mode"], "review");
+    // идеи выключены у пользователя — режим всё равно в ответе
+    set_user_proactive(&a, false).await;
+    assert_eq!(start(&a, "im-3").await["ideas"]["mode"], "review");
+    let j = prompt(&a, "im-3", "экспорт отчётов").await;
+    assert!(j.get("ideas").is_none(), "{j}");
+    // общее решение: режим владельца, а не участника
+    let (o_id, o_tok) = a.new_user("Анна").await;
+    let (m_id, m_tok) = a.new_user("Борис").await;
+    const S: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e6b";
+    for (tok, want) in [
+        (&o_tok, StatusCode::CREATED),
+        (&m_tok, StatusCode::ACCEPTED),
+    ] {
+        let r = a
+            .tok(
+                tok,
+                Method::POST,
+                "/api/v1/solutions",
+                Some(json!({"agent_solution_id": S, "name": "Общее"})),
+            )
+            .await;
+        assert_eq!(r.status, want, "{}", r.text());
+    }
+    let r = a
+        .tok(
+            &o_tok,
+            Method::POST,
+            &format!("/api/v1/solutions/{S}/access/{m_id}/approve"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    set_mode(&a, &o_id, "review").await;
+    set_mode(&a, &m_id, "propose").await;
+    let body = json!({"event": "session_start", "solution": S});
+    let j = ok_as(&a, &m_tok, Some("im-m"), body.clone()).await;
+    assert_eq!(j["ideas"]["mode"], "review", "{j}");
+    set_mode(&a, &o_id, "propose").await;
+    let j = ok_as(&a, &m_tok, Some("im-m2"), body).await;
+    assert_eq!(j["ideas"]["mode"], "propose", "{j}");
+}
+
+/// `record: false` (хук с выключенным дайджестом) — поле тоже есть; текст дайджеста прежний.
+#[tokio::test]
+async fn session_start_ideas_mode_record_false() {
+    let a = server("mode-record-false", |_| {}).await;
+    idea(&a, &sol(), "Экспорт отчётов в PDF", json!({})).await;
+    let body = json!({"event": "session_start", "solution": G, "record": false});
+    let j = ok(&a, Some("imr-1"), body.clone()).await;
+    assert_eq!(j["ideas"], json!({"mode": "propose"}), "{j}");
+    let again = ok(&a, Some("imr-1"), body).await;
+    assert_eq!(again["text"], j["text"], "без учёта — тот же текст");
+    assert_eq!(again["ideas"]["mode"], "propose");
+}

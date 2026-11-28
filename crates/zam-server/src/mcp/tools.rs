@@ -8,7 +8,10 @@
 //!   подсказкой: 409 — текущая ревизия, дифф (у заметок) и что перечитать; 428 — какую ревизию
 //!   передать; 409 `possible-duplicate` — кандидаты и выбор (append, supersede, force).
 //!   Неизвестный инструмент — ошибка JSON-RPC (`invalid_params`), неверные аргументы —
-//!   `isError: true`.
+//!   `isError: true`. У каждого результата `isError: true` — `_meta: {"zeroaimemory/problem":
+//!   {status, type, code?}}` (M7.6 §9.3 п. 5, CR-25, признак `mcp_error_meta`; [`ProblemMeta`]):
+//!   у ответа REST — его статус, `type` problem и `code` расширения, у отказа инструмента — его
+//!   статус и `about:blank`, у неверных аргументов — 400, у сбоя — 500; текст ошибки прежний.
 //! - **Пространство по умолчанию** (`memory_tree`, `memory_write`, `memory_log`,
 //!   `memory_vault`) **[решение исполнителя]** — решение из `X-Zam-Solution`, без него —
 //!   `knowledge`. Префикс пространства в `path` у `memory_tree` и `memory_write` — по правилу CLI
@@ -22,7 +25,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use axum::http::{HeaderName, Method, StatusCode, header};
-use rmcp::model::{CallToolResult, ContentBlock, JsonObject, Tool, ToolAnnotations};
+use rmcp::model::{CallToolResult, ContentBlock, JsonObject, MetaObject, Tool, ToolAnnotations};
 use serde_json::{Map, Value, json};
 use zam_store::count_tokens;
 
@@ -128,9 +131,9 @@ impl ToolName {
                  status obsolete; review — разбор идеи (outcome, summary)."
             }
             ToolName::Link => {
-                "Связь графа: src, type, dst (n:<id>, i:<id>; dst также [[Имя]]) — создать явную \
-                 связь; type contradicts — запись возражает axiom/theorem dst; remove: <edge_id> — \
-                 удалить связь."
+                "Связь графа: src, type, dst (n:<id>, i:<id>, [[пространство:путь]]; dst также \
+                 [[Имя]] — в пространстве src) — создать явную связь; type contradicts — запись \
+                 возражает axiom/theorem dst; remove: <edge_id> — удалить связь."
             }
             ToolName::Recall => {
                 "Подсказки памяти к событию: session_start — дайджест, prompt — к запросу, \
@@ -553,6 +556,59 @@ pub fn definitions() -> &'static [Tool] {
 pub struct Output {
     pub text: String,
     pub is_error: bool,
+    /// Код ошибки для `_meta` результата (`is_error`; M7.6 §9.3 п. 5).
+    pub problem: Option<ProblemMeta>,
+}
+
+/// Ключ `_meta` результата-ошибки с кодом (M7.6 §9.3 п. 5, CR-25).
+pub const PROBLEM_META_KEY: &str = "zeroaimemory/problem";
+
+/// Код ошибки инструмента: статус HTTP, `type` problem (RFC 9457; без своего типа —
+/// `about:blank`) и `code` расширения problem, если он есть.
+pub struct ProblemMeta {
+    pub status: u16,
+    pub kind: String,
+    pub code: Option<String>,
+}
+
+impl ProblemMeta {
+    /// Только статус: `about:blank`.
+    fn blank(status: StatusCode) -> Self {
+        Self {
+            status: status.as_u16(),
+            kind: "about:blank".into(),
+            code: None,
+        }
+    }
+
+    /// Код неуспеха инструмента: ответ REST — его статус, `type` и `code`; отказ инструмента — его
+    /// статус; неверные аргументы — 400; сбой — 500.
+    fn of(f: &Fail) -> Self {
+        match f {
+            Fail::Rest { reply, .. } => {
+                let p = reply.json();
+                Self {
+                    status: reply.status.as_u16(),
+                    kind: p["type"].as_str().unwrap_or("about:blank").to_string(),
+                    code: p["code"].as_str().map(str::to_string),
+                }
+            }
+            Fail::Problem { status, .. } => Self::blank(*status),
+            Fail::Invalid(_) => Self::blank(StatusCode::BAD_REQUEST),
+            Fail::Internal(_) => Self::blank(StatusCode::INTERNAL_SERVER_ERROR),
+        }
+    }
+
+    /// `_meta` результата: `{"zeroaimemory/problem": {status, type, code?}}`.
+    fn meta(&self) -> MetaObject {
+        let mut v = json!({ "status": self.status, "type": self.kind });
+        if let Some(c) = &self.code {
+            v["code"] = json!(c);
+        }
+        let mut m = JsonObject::new();
+        m.insert(PROBLEM_META_KEY.into(), v);
+        MetaObject(m)
+    }
 }
 
 impl Output {
@@ -571,7 +627,9 @@ impl Output {
     pub fn into_result(self) -> CallToolResult {
         let content = vec![ContentBlock::text(self.text)];
         if self.is_error {
-            CallToolResult::error(content)
+            let mut r = CallToolResult::error(content);
+            r.meta = self.problem.map(|p| p.meta());
+            r
         } else {
             CallToolResult::success(content)
         }
@@ -633,14 +691,17 @@ pub async fn call(tool: ToolName, rest: &Rest, mut args: JsonObject) -> Output {
         Ok(Done::Md(s)) => Output {
             text: with_tokens(s),
             is_error: false,
+            problem: None,
         },
         Ok(Done::Json(v)) => Output {
             text: with_tokens(v.to_string()),
             is_error: false,
+            problem: None,
         },
         Err(f) => Output {
             text: with_tokens(fail_text(&f)),
             is_error: true,
+            problem: Some(ProblemMeta::of(&f)),
         },
     }
 }
@@ -673,6 +734,7 @@ pub fn problem(status: StatusCode, detail: String) -> Output {
     Output {
         text: with_tokens(fail_text(&Fail::Problem { status, detail })),
         is_error: true,
+        problem: Some(ProblemMeta::blank(status)),
     }
 }
 
@@ -1954,19 +2016,19 @@ async fn link(rest: &Rest, args: &JsonObject) -> Res {
 }
 
 /// Строка созданной связи: концы — так, как их передал агент (`i:`, `k:`, `n:` …; M6.6 §8,
-/// замечание 29), а не `e:<id>` маршрута `/edges` — такой буквы в протоколе нет. У `[[Имя]]` —
-/// ещё найденная заметка (`dst` ребра, `n:<id>`).
+/// замечание 29), а не `e:<id>` маршрута `/edges` — такой буквы в протоколе нет. У `[[Имя]]` и
+/// `[[пространство:путь]]` (M7.6 §9.3 п. 7) — ещё найденная заметка (`n:<id>` ребра).
 fn link_line(v: &Value, src: &str, kind: &str, dst: &str) -> String {
-    let mut s = format!(
-        "Связь {}: {src} —{kind}→ {dst}",
-        v["id"].as_str().unwrap_or("?")
-    );
-    if dst.starts_with("[[")
-        && let Some(n) = v["dst"].as_str().filter(|d| d.starts_with("n:"))
-    {
-        s.push_str(&format!(" ({n})"));
-    }
-    s
+    let end = |raw: &str, key: &str| match v[key].as_str().filter(|n| n.starts_with("n:")) {
+        Some(n) if raw.starts_with("[[") => format!("{raw} ({n})"),
+        _ => raw.to_string(),
+    };
+    format!(
+        "Связь {}: {} —{kind}→ {}",
+        v["id"].as_str().unwrap_or("?"),
+        end(src, "src"),
+        end(dst, "dst")
+    )
 }
 
 async fn recall(rest: &Rest, args: &JsonObject) -> Res {

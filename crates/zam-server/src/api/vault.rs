@@ -3,12 +3,15 @@
 //! - `GET /spaces/{space}/vault?q=` — метаданные (без значений), `q` — поиск `vault_fts` по
 //!   имени и открытым полям (слова от 3 символов — префиксом, порядок `bm25`); запасной путь
 //!   для `q` короче 3 символов — подстрока имени, `data.url`, `data.description`;
+//!   `?title=` — точное имя (регистр важен), с `q` — оба условия (M7.6 §9.3 п. 1); у элементов
+//!   и метаданных — `has_value` (по шифротексту, без расшифровки); неизвестный параметр — 400;
 //! - `POST /spaces/{space}/vault {title, data: {type, username?, url?, description?, purpose?,
 //!   address?, limits?, notes?}, secret?}` → 201 (имя занято в области → 409). `secret`
 //!   обязателен, кроме типов `host` и `environment` (окружение, M4.5 §8): у них без значения
 //!   в базе пустой блоб, раскрытие отдаёт `secret: null`;
 //! - `GET /vault/{id}` — метаданные; `?reveal=1` — и значение (`Cache-Control: no-store`,
-//!   аудит `vault.reveal` с `{item, session, machine}`, `actor` — id токена);
+//!   аудит `vault.reveal` с `{item, session, machine}` и `purpose` при `&purpose=<цель>` —
+//!   1..=64 символа `[A-Za-z0-9._:/-]`, иначе 400; `actor` — id токена);
 //! - `PATCH /vault/{id} {title?, data?, secret?}` (`If-Match: <rev>` необязателен) — новая
 //!   ревизия (занятое имя — 409 «имя занято»); `DELETE /vault/{id}` — мягко, аудит
 //!   `vault.delete`;
@@ -48,8 +51,8 @@ use serde_json::{Map, Value, json};
 use zam_core::{Id, SolutionGuid};
 use zam_store::{
     Db, Space, SpaceKind, User, VaultMeta, VaultScope, check_vault_title, vault_delete, vault_get,
-    vault_get_any, vault_list, vault_move, vault_put, vault_revision_secret, vault_revisions,
-    vault_update,
+    vault_get_any, vault_list, vault_list_titled, vault_move, vault_put, vault_revision_secret,
+    vault_revisions, vault_update,
 };
 use zeroize::Zeroizing;
 
@@ -391,12 +394,18 @@ fn flag(v: Option<&str>) -> Result<bool, ApiError> {
     }
 }
 
+/// Параметры списка; неизвестный — 400 «неизвестный параметр» (M7.6 §9.3 п. 4,
+/// `strict_list_query`).
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListQuery {
     q: Option<String>,
+    /// Точное имя (M7.6 §9.3 п. 1, `vault_agent`).
+    title: Option<String>,
 }
 
-/// `GET /spaces/{space}/vault?q=` → `{items}` (без значений).
+/// `GET /spaces/{space}/vault?q=&title=` → `{items}` (без значений; `has_value` — есть ли
+/// значение). `title` — точное имя ([`vault_list_titled`]), с `q` — оба условия.
 pub async fn list(
     State(st): State<AppState>,
     p: Principal,
@@ -405,9 +414,17 @@ pub async fn list(
     q: Result<Query<ListQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let q = query(q)?;
+    let title = q
+        .title
+        .as_deref()
+        .map(|t| check_vault_title(t).map_err(|e| ApiError::BadRequest(format!("title: {e}"))))
+        .transpose()?;
     let scope = parse_scope(&space)?;
     let a = area(&st, &p, &headers, &scope, false).await?;
-    let items = vault_list(&a.db, &scope, q.q.as_deref()).await?;
+    let items = match &title {
+        Some(t) => vault_list_titled(&a.db, &scope, q.q.as_deref(), t).await?,
+        None => vault_list(&a.db, &scope, q.q.as_deref()).await?,
+    };
     let mut v = json!({ "items": items.iter().map(meta_json).collect::<Vec<_>>() });
     if let Value::Object(o) = &mut v {
         put_lock(&st, o);
@@ -486,9 +503,30 @@ pub async fn create(
 #[derive(Deserialize)]
 pub struct GetQuery {
     reveal: Option<String>,
+    /// Цель раскрытия для аудита (M7.6 §9.3 п. 1, `vault_agent`): [`check_purpose`].
+    purpose: Option<String>,
 }
 
-/// `GET /vault/{id}` → метаданные; `?reveal=1` — со значением и аудитом.
+/// Предел цели раскрытия, символов.
+const PURPOSE_PARAM_MAX: usize = 64;
+
+/// Цель раскрытия: 1..=[`PURPOSE_PARAM_MAX`] символов `[A-Za-z0-9._:/-]`, иначе 400 (формат
+/// закрыт: цель попадает в аудит как есть).
+fn check_purpose(p: &str) -> Result<(), ApiError> {
+    let ok = (1..=PURPOSE_PARAM_MAX).contains(&p.len())
+        && p.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'/' | b'-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(format!(
+            "purpose: 1–{PURPOSE_PARAM_MAX} символов A-Za-z0-9._:/-"
+        )))
+    }
+}
+
+/// `GET /vault/{id}` → метаданные (`has_value` — есть ли значение); `?reveal=1` — со значением и
+/// аудитом `vault.reveal` (`&purpose=<цель>` — цель в аудите).
 pub async fn get(
     State(st): State<AppState>,
     p: Principal,
@@ -499,6 +537,9 @@ pub async fn get(
 ) -> Result<Response, ApiError> {
     let q = query(q)?;
     let reveal = flag(q.reveal.as_deref())?;
+    if let Some(purpose) = &q.purpose {
+        check_purpose(purpose)?;
+    }
     let (a, m, blob) = item(&st, &p, &headers, &id, false, reveal).await?;
     let mut v = meta_json(&m);
     if !reveal {
@@ -517,7 +558,10 @@ pub async fn get(
         a.user.id,
         "vault.reveal",
         m.id,
-        json!({}),
+        match &q.purpose {
+            Some(purpose) => json!({ "purpose": purpose }),
+            None => json!({}),
+        },
     )
     .await?;
     if let Value::Object(o) = &mut v {

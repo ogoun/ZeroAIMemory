@@ -6015,3 +6015,192 @@ async fn mcp_write_candidate() {
         );
     }
 }
+
+// ---- код ошибки в `_meta` (M7.6 §9.3 п. 5, CR-25, признак `mcp_error_meta`) ----
+
+/// Полный результат `tools/call`.
+async fn call_result(a: &Api, name: &str, args: Value) -> Value {
+    rpc(
+        a,
+        &a.token,
+        &sess(),
+        "tools/call",
+        json!({"name": name, "arguments": args}),
+    )
+    .await
+}
+
+/// `_meta.zeroaimemory/problem` результата-ошибки.
+fn problem_meta(r: &Value) -> Value {
+    assert_eq!(r["isError"], true, "{r}");
+    r["_meta"]["zeroaimemory/problem"].clone()
+}
+
+/// Ответ REST с ошибкой: статус, `type` problem и `code` расширения; без своего типа —
+/// `about:blank`; успешный результат — без `_meta`.
+#[tokio::test]
+async fn mcp_error_meta_rest_problem() {
+    let a = api("mcp-error-meta-rest", |_| {}).await;
+    // 422 /problems/certainty с кодом
+    let r = call_result(
+        &a,
+        "memory_log",
+        json!({"kind": "insight", "title": "Теорема без доказательства", "certainty": "theorem",
+               "data": {"kind": "discovery"}}),
+    )
+    .await;
+    assert_eq!(
+        problem_meta(&r),
+        json!({"status": 422, "type": "/problems/certainty", "code": "evidence-required"}),
+        "{r}"
+    );
+    // 404 без своего типа
+    let r = call_result(
+        &a,
+        "memory_update_entry",
+        json!({"id": format!("k:{}", zam_core::Id::new()), "action": "claim"}),
+    )
+    .await;
+    assert_eq!(
+        problem_meta(&r),
+        json!({"status": 404, "type": "about:blank"}),
+        "{r}"
+    );
+    // отказ самого инструмента (секрета нет) — его статус и about:blank
+    let r = call_result(
+        &a,
+        "memory_vault",
+        json!({"action": "get", "name": "нет-такого"}),
+    )
+    .await;
+    assert_eq!(
+        problem_meta(&r),
+        json!({"status": 404, "type": "about:blank"}),
+        "{r}"
+    );
+    // успех — без `_meta`
+    let r = call_result(&a, "memory_search", json!({"query": "что угодно"})).await;
+    assert_ne!(r["isError"], true, "{r}");
+    assert!(r.get("_meta").is_none(), "{r}");
+}
+
+/// Неверные аргументы — 400 `about:blank`; отказ до вызова REST (`session_id` против заголовка)
+/// — тоже 400.
+#[tokio::test]
+async fn mcp_error_meta_invalid_args() {
+    let a = api("mcp-error-meta-args", |_| {}).await;
+    let r = call_result(&a, "memory_link", json!({"src": "n:x"})).await;
+    assert_eq!(
+        problem_meta(&r),
+        json!({"status": 400, "type": "about:blank"}),
+        "{r}"
+    );
+    let r = call_result(
+        &a,
+        "memory_search",
+        json!({"query": "x", "session_id": "другая-сессия"}),
+    )
+    .await;
+    assert_eq!(
+        problem_meta(&r),
+        json!({"status": 400, "type": "about:blank"}),
+        "{r}"
+    );
+}
+
+/// Текст ошибки — прежний: `_meta` не меняет `content` (тот же текст, что строит problem REST).
+#[tokio::test]
+async fn mcp_error_text_unchanged() {
+    let a = api("mcp-error-text", |_| {}).await;
+    let r = call_result(
+        &a,
+        "memory_log",
+        json!({"kind": "insight", "title": "Теорема без доказательства", "certainty": "theorem",
+               "data": {"kind": "discovery"}}),
+    )
+    .await;
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("Ошибка 422 Unprocessable Content: ")
+            && text.contains("(код evidence-required)"),
+        "{text}"
+    );
+    assert_eq!(r["content"].as_array().unwrap().len(), 1, "{r}");
+    assert!(r.get("structuredContent").is_none(), "{r}");
+    let r = call_result(&a, "memory_link", json!({"src": "n:x"})).await;
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("Ошибка аргументов: "), "{text}");
+}
+
+// ---- `[[пространство:путь]]` в `memory_link` (M7.6 §9.3 п. 7) ----
+
+/// `memory_link` принимает `[[пространство:путь]]` у `src` и `dst`; ответ называет концы, как их
+/// передал агент, с найденной заметкой; описание — ≤ 300 символов и называет форму.
+#[tokio::test]
+async fn mcp_link_space_path() {
+    let a = api("mcp-link-space-path", |_| {}).await;
+    let n = a
+        .note("knowledge", "Инструменты/Ripgrep", "# Ripgrep\n")
+        .await;
+    let nid = n["id"].as_str().unwrap().to_string();
+    let m = a.note("knowledge", "Инструменты/Fd", "# Fd\n").await;
+    let mid = m["id"].as_str().unwrap().to_string();
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_link",
+        json!({"src": format!("n:{mid}"), "type": "relates_to",
+               "dst": "[[knowledge:Инструменты/Ripgrep]]"}),
+    )
+    .await;
+    let line = &body_lines(&o)[0];
+    assert!(
+        line.ends_with(&format!(
+            "n:{mid} —relates_to→ [[knowledge:Инструменты/Ripgrep]] (n:{nid})"
+        )),
+        "{line}"
+    );
+    let o = ok(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_link",
+        json!({"src": "[[knowledge:Инструменты/Fd]]", "type": "depends_on",
+               "dst": "[[Ripgrep]]"}),
+    )
+    .await;
+    let line = &body_lines(&o)[0];
+    assert!(
+        line.ends_with(&format!(
+            "[[knowledge:Инструменты/Fd]] (n:{mid}) —depends_on→ [[Ripgrep]] (n:{nid})"
+        )),
+        "{line}"
+    );
+    // не найдено — ошибка с подсказкой
+    let o = tool(
+        &a,
+        &a.token,
+        &sess(),
+        "memory_link",
+        json!({"src": format!("n:{mid}"), "type": "mentions", "dst": "[[knowledge:нет/такой]]"}),
+    )
+    .await;
+    assert!(o.is_error, "{}", o.text);
+    assert!(
+        o.text.contains("укажите n:<id> или [[пространство:путь]]"),
+        "{}",
+        o.text
+    );
+    let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
+    let d = list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "memory_link")
+        .and_then(|t| t["description"].as_str())
+        .unwrap()
+        .to_string();
+    assert!(d.contains("[[пространство:путь]]"), "{d}");
+    assert!(d.chars().count() <= 300, "{}", d.chars().count());
+}
