@@ -8,7 +8,9 @@
 //!   `max(AGENT_BLOCK_VERSION, agent_setup.version)`; каждое сохранение шаблона, которое меняет
 //!   его текст, увеличивает её на 1 ([`save_templates`]). Её отдаёт `GET /agent-setup`
 //!   (`version`), с ней сравнивают `/recall(session_start)` и `zam status`.
-//! - Токен не попадает ни в блок, ни в `.mcp.json` (stdio `zam mcp` берёт его сам).
+//! - Токен не попадает ни в блок, ни в `.mcp.json` (stdio `zam mcp` берёт его сам), ни в задание
+//!   на перенос проекта ([`migrate`], M7.6 §9.1).
+pub mod migrate;
 pub mod templates;
 
 use serde_json::{Value, json};
@@ -411,6 +413,13 @@ fn init_line(c: &InitCmd<'_>, quote: fn(&str) -> String) -> String {
     s
 }
 
+/// Однострочник `zam init` без токена в POSIX-кавычках — для задания на перенос ([`migrate`]):
+/// `c.token` не берётся.
+pub fn init_sh(c: &InitCmd<'_>) -> String {
+    let plain = InitCmd { token: None, ..*c };
+    init_line(&plain, sh_quote)
+}
+
 /// Однострочники `zam init` для Linux (POSIX shell) и Windows (PowerShell).
 pub fn init_cmd(c: &InitCmd<'_>) -> Value {
     json!({"linux": init_line(c, sh_quote), "windows": init_line(c, ps_quote)})
@@ -515,6 +524,30 @@ mod tests {
                 .unwrap()
                 .contains(" --name 'Trading X' --yes"),
             "{c}"
+        );
+    }
+
+    /// Однострочник задания на перенос — без токена, даже если он передан (§15.5).
+    #[test]
+    fn init_sh_never_has_token() {
+        let s = SolutionRef {
+            name: "Trading X".into(),
+            ..sol()
+        };
+        let c = init_sh(&InitCmd {
+            url: "http://h:1",
+            token: Some("zam_abc"),
+            agent: AgentKind::Codex,
+            solution: Some(&s),
+            registered: false,
+            hooks: true,
+            mcp: true,
+            lang: Lang::Ru,
+        });
+        assert_eq!(
+            c,
+            "zam init --url 'http://h:1' --agent codex --id 0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e11 \
+             --name 'Trading X' --yes"
         );
     }
 

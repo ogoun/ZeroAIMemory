@@ -1892,3 +1892,190 @@ async fn guide_sections_in_sync() {
         assert!(sec_en.contains(want), "{want}: {sec_en}");
     }
 }
+
+/// Решение примера задания на перенос (в реестре его нет — имя из `name=`).
+const MIGRATE_GUID: &str = "0192f1c4-7a1e-7c3b-9a55-2b1f6f0d9e11";
+
+/// Задание агенту на перенос проекта (M7.6 §9.1, решение координатора 137): без `migrate` и с
+/// `migrate=false` ответ прежний (эталон ключей, тот же JSON); `migrate=true` — тот же ответ и
+/// `migration_prompt` с именем и GUID решения, адресом и однострочником `zam init` без токена —
+/// ни заглушки `<токен>`, ни открытого токена сессии WebUI; агент и язык меняют текст; признак
+/// `agent_setup_migrate` в `/health`.
+#[tokio::test]
+async fn agent_setup_migration_prompt() {
+    let a = api("agent-setup-migrate", |_| {}).await;
+    let q = format!("agent=claude&solution={MIGRATE_GUID}&name=Proj%20M");
+    let base = setup(&a, &a.token, &q).await;
+    let mut keys: Vec<&str> = base
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "agent",
+            "block",
+            "claude_settings",
+            "init_cmd",
+            "install",
+            "lang",
+            "mcp_json",
+            "solution",
+            "solution_toml",
+            "template_custom",
+            "tokens",
+            "tokens_exact",
+            "url",
+            "version",
+            "warnings"
+        ],
+        "эталон ключей ответа без migrate"
+    );
+    assert_eq!(
+        setup(&a, &a.token, &format!("{q}&migrate=false")).await,
+        base
+    );
+
+    let mut j = setup(&a, &a.token, &format!("{q}&migrate=true")).await;
+    let prompt = j
+        .as_object_mut()
+        .unwrap()
+        .remove("migration_prompt")
+        .expect("migration_prompt");
+    assert_eq!(j, base, "остальной ответ — прежний");
+    let p = prompt.as_str().unwrap();
+    let init = base["init_cmd"]["linux"].as_str().unwrap();
+    for want in [
+        "«Proj M»",
+        MIGRATE_GUID,
+        "`http://memory.lan:7700`",
+        init,
+        "zam guide",
+        "~/.claude/projects/",
+        "`CLAUDE.md`",
+        "zam sessions snapshot",
+        "zam code sync",
+        "zam report",
+        "reject_secrets",
+    ] {
+        assert!(p.contains(want), "нет «{want}»:\n{p}");
+    }
+    assert!(!p.contains("{?") && !p.contains("{solution}"), "{p}");
+
+    // заглушка токена — только в init_cmd
+    let j = setup(
+        &a,
+        &a.token,
+        &format!("{q}&migrate=true&token_placeholder=true"),
+    )
+    .await;
+    assert!(
+        j["init_cmd"]["linux"]
+            .as_str()
+            .unwrap()
+            .contains("'<токен>'")
+    );
+    let p = j["migration_prompt"].as_str().unwrap();
+    assert!(!p.contains("<токен>") && !p.contains("--token"), "{p}");
+
+    // сессия WebUI с открытым токеном: токен — в командах, не в задании
+    let r = a
+        .send(
+            Request::get(format!(
+                "/api/v1/agent-setup?{q}&migrate=true&token={}",
+                a.token
+            ))
+            .header("host", "memory.lan:7700")
+            .header("cookie", &a.cookie)
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert!(j["init_cmd"]["linux"].as_str().unwrap().contains(&a.token));
+    let p = j["migration_prompt"].as_str().unwrap();
+    assert!(!p.contains(&a.token) && !p.contains("--token"), "{p}");
+
+    // агент и язык меняют текст
+    let j = setup(
+        &a,
+        &a.token,
+        &format!("agent=codex&solution={MIGRATE_GUID}&name=Proj&migrate=true&lang=en"),
+    )
+    .await;
+    let p = j["migration_prompt"].as_str().unwrap();
+    for want in [
+        "# Task: move the project into ZeroAIMemory memory",
+        "\"Proj\"",
+        "~/.codex/sessions/",
+        "`AGENTS.md`",
+        "--agent codex",
+        "--lang en",
+    ] {
+        assert!(p.contains(want), "нет «{want}»:\n{p}");
+    }
+    assert!(!p.contains("~/.claude/projects/"), "{p}");
+    // без решения — указание на zam init
+    let j = setup(&a, &a.token, "agent=agents&migrate=true").await;
+    let p = j["migration_prompt"].as_str().unwrap();
+    assert!(p.contains("новое — его создаст `zam init`"), "{p}");
+    assert!(
+        p.contains(".cursor/rules/") && p.contains("--no-hooks"),
+        "{p}"
+    );
+
+    let r = a.tok(&a.token, Method::GET, "/api/v1/health", None).await;
+    let f = r.json()["features"].clone();
+    assert!(
+        f.as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == "agent_setup_migrate"),
+        "{f}"
+    );
+}
+
+/// Размер задания на перенос по bge-m3 (M7.6 §9.1: ориентир 1,5–3 тыс. токенов на язык) —
+/// худший случай: длинный адрес и имя решения из 128 символов, все агенты.
+#[tokio::test]
+async fn migration_prompt_token_budget() {
+    let Some(counter) = common::ml::bge_counter() else {
+        return;
+    };
+    let a = api("agent-setup-migrate-tokens", |c| {
+        c.server.public_url = Some(VERY_LONG_URL.into());
+    })
+    .await;
+    let name: String = "Платформа алгоритмической торговли "
+        .repeat(5)
+        .chars()
+        .take(128)
+        .collect();
+    for lang in ["ru", "en"] {
+        for agent in ["claude", "agents", "codex"] {
+            let j = setup(
+                &a,
+                &a.token,
+                &format!(
+                    "agent={agent}&lang={lang}&solution={WORST_GUID}&name={}&migrate=true",
+                    enc(&name)
+                ),
+            )
+            .await;
+            let n = counter.count(j["migration_prompt"].as_str().unwrap());
+            eprintln!("migration_prompt {lang} {agent}: {n} токенов");
+            assert!(
+                (1500..=MIGRATION_TOKENS_MAX).contains(&n),
+                "{lang} {agent}: {n}"
+            );
+        }
+    }
+}
+
+/// Предел задания на перенос в худшем случае теста, токенов bge-m3 (обычный адрес и имя — около
+/// 2,8 тыс.).
+const MIGRATION_TOKENS_MAX: usize = 3200;

@@ -4,6 +4,7 @@
 import { expect, test, type Page } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 import { ADMIN_STATE } from './session';
+import { VIEWPORTS, noHorizontalScroll } from './viewports';
 
 const env = (k: string) => {
   const v = process.env[k];
@@ -158,6 +159,87 @@ test('Подключение агента: опции меняют фрагме�
     .poll(async () => (await (await page.request.get(`${base()}api/v1/auth/settings`)).json()).hooks.prompt)
     .toBe(true);
 
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+// M7.6 §9.1: «Подключить с переносом данных» — задание агенту на перенос проекта от сервера
+test('Подключение с переносом данных: задание с сервера, смена агента и языка, копирование, три ширины', async ({ page, context }) => {
+  const problems = watch(page);
+  await page.goto(`${base()}#/agent-setup`);
+  const opt = page.getByLabel('Подключить с переносом данных');
+  await expect(opt).toBeEnabled();
+  await expect(opt).not.toBeChecked();
+  const task = frag(page, 'Задание агенту на перенос');
+  await expect(task).toHaveCount(0);
+
+  await page.getByLabel('Новое (GUID выдаст сервер)').check();
+  await page.getByLabel('Имя решения').fill('Перенос E2E');
+  await opt.check();
+  const text = task.getByLabel('Текст задания на перенос');
+  await expect(text).toHaveValue(/Решение: «Перенос E2E» \(`[0-9a-f-]{36}`\)/);
+  await expect(text).toHaveValue(/~\/\.claude\/projects\//);
+  await expect(text).toHaveAttribute('readonly', '');
+  // блок — сразу под текстом для CLAUDE.md; токена в задании нет
+  const order = await page.locator('section.frag').evaluateAll((els) => els.map((e) => e.getAttribute('aria-label')));
+  expect(order.slice(0, 2)).toEqual(['Текст для CLAUDE.md', 'Задание агенту на перенос']);
+  await expect(text).not.toHaveValue(/zam_|<токен>/);
+
+  // агент Codex и язык — текст обновляется
+  await page.getByLabel('Codex (AGENTS.md и хуки Codex)').check();
+  await expect(text).toHaveValue(/~\/\.codex\/sessions\//);
+  await expect(text).not.toHaveValue(/~\/\.claude\/projects\//);
+  await page.getByLabel('Язык инструкции').selectOption('en');
+  await expect(text).toHaveValue(/^# Task: move the project into ZeroAIMemory memory/);
+  await page.getByLabel('Язык инструкции').selectOption('ru');
+  await page.getByLabel('Claude Code (CLAUDE.md)').check();
+  await expect(text).toHaveValue(/~\/\.claude\/projects\//);
+
+  // «Копировать» — в буфере текст задания
+  await task.getByRole('button', { name: 'Копировать' }).click();
+  await expect(task.getByRole('button', { name: 'Скопировано' })).toBeVisible();
+  await expect(task.getByRole('status')).toHaveText('Скопировано в буфер обмена.');
+  const value = await text.inputValue();
+  const port = new URL(base()).port;
+  await context.grantPermissions(['clipboard-read'], { origin: `http://localhost:${port}` });
+  const probe = await context.newPage();
+  await probe.goto(`http://localhost:${port}/`);
+  expect((await probe.evaluate(() => navigator.clipboard.readText())).replace(/\r\n/g, '\n')).toBe(value);
+  await probe.close();
+
+  // три ширины: без горизонтальной прокрутки; снимки — в .tmp/e2e/screens
+  for (const w of ['phone', 'tablet', 'desktop'] as const) {
+    await page.setViewportSize(VIEWPORTS[w]);
+    await expect(text).toBeVisible();
+    expect(await noHorizontalScroll(page), w).toBe(true);
+    await task.scrollIntoViewIfNeeded();
+    await page.screenshot({ path: `${screens}agent-setup-migrate-${w}.png`, fullPage: true });
+  }
+
+  // галочка снята — блока нет
+  await opt.uncheck();
+  await expect(task).toHaveCount(0);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('Сервер без признака agent_setup_migrate — галочка выключена с пояснением', async ({ page }) => {
+  const problems = watch(page);
+  await page.route('**/api/v1/health', async (route) => {
+    const r = await route.fetch();
+    const j = await r.json();
+    j.features = (j.features ?? []).filter((f: string) => f !== 'agent_setup_migrate');
+    await route.fulfill({ response: r, json: j });
+  });
+  const setupUrls: string[] = [];
+  page.on('request', (r) => {
+    if (r.url().includes('/api/v1/agent-setup')) setupUrls.push(r.url());
+  });
+  await page.goto(`${base()}#/agent-setup`);
+  const opt = page.getByLabel('Подключить с переносом данных');
+  await expect(opt).toBeDisabled();
+  await expect(page.getByText('Сервер старше 0.0.19: задания на перенос нет — обновите сервер.')).toBeVisible();
+  await expect(frag(page, 'Текст для CLAUDE.md')).toBeVisible();
+  await expect(frag(page, 'Задание агенту на перенос')).toHaveCount(0);
+  expect(setupUrls.some((u) => u.includes('migrate='))).toBe(false);
   expect(problems, problems.join('\n')).toEqual([]);
 });
 

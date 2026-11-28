@@ -7,7 +7,9 @@
   // сразу после создания пользователя или выпуска токена (lib/agentSetup.ts). Здесь же —
   // типы подсказок хуков пользователя на сервере (`hooks.<тип>`, §10.3, R5), проактивность идей
   // (`ideas.proactive`, M5.7 §8: раздел дайджеста об идеях и подсказки идей) и режим идей
-  // (`ideas.mode`, M6.5 §7: «Идеи: разбирать сам / предлагать мне»).
+  // (`ideas.mode`, M6.5 §7: «Идеи: разбирать сам / предлагать мне»). Галочка «Подключить с
+  // переносом данных» (M7.6 §9.1) — задание агенту на перенос проекта от сервера
+  // (`migration_prompt`); сервер без признака `agent_setup_migrate` — галочка выключена с пояснением.
   import { onMount } from 'svelte';
   import TokenShown from '../components/TokenShown.svelte';
   import {
@@ -21,6 +23,7 @@
     issueOwnToken,
     issueToken,
     listSolutions,
+    serverFeatures,
     setUserHooks,
     setUserIdeas,
     type Access,
@@ -80,6 +83,10 @@
   let hooks = $state(true);
   let rulesMode = $state<'server' | 'on' | 'off'>('server');
   let lang = $state<Lang>('ru');
+  /** «Подключить с переносом данных»: задание агенту на перенос проекта. */
+  let migrate = $state(false);
+  /** Сервер умеет задание на перенос (`agent_setup_migrate`); `null` — ещё не узнали. */
+  let migrateOk = $state<boolean | null>(null);
 
   let setup = $state<AgentSetup | null>(null);
   let error = $state('');
@@ -130,6 +137,7 @@
           rulesWrite: rulesMode === 'server' ? undefined : rulesMode === 'on',
           lang,
           tokenPlaceholder: issued !== null,
+          migrate: migrate && migrateOk === true,
         },
         asUser(),
       );
@@ -144,7 +152,7 @@
 
   // любые опции — новый фрагмент (с небольшой задержкой при наборе имени)
   $effect(() => {
-    void [agent, solMode, existing, name, mcp, hooks, rulesMode, lang, userId, issued];
+    void [agent, solMode, existing, name, mcp, hooks, rulesMode, lang, userId, issued, migrate, migrateOk];
     const t = setTimeout(load, 150);
     return () => clearTimeout(t);
   });
@@ -274,8 +282,14 @@
     return out;
   });
 
+  /** Текст задания на перенос (только при выбранной галочке и ответе сервера с полем). */
+  let migration = $derived(migrate && migrateOk ? (setup?.migration_prompt ?? '') : '');
+
   onMount(() => {
     loadSolutions();
+    serverFeatures()
+      .then((f) => (migrateOk = f.includes('agent_setup_migrate')))
+      .catch(() => (migrateOk = false));
   });
 </script>
 
@@ -329,6 +343,20 @@
         <input placeholder={solMode === 'new' ? 'Имя решения' : 'Имя (по умолчанию — из реестра)'} bind:value={name} maxlength="128" aria-label="Имя решения" />
       {/if}
     </fieldset>
+
+    <div class="migrate-opt">
+      <label class="opt">
+        <input type="checkbox" bind:checked={migrate} disabled={migrateOk !== true} aria-describedby="migrate-note" />
+        Подключить с переносом данных
+      </label>
+      <p class="muted small" id="migrate-note">
+        {#if migrateOk === false}
+          Сервер старше 0.0.19: задания на перенос нет — обновите сервер.
+        {:else}
+          Агенту — ещё задание перенести в память всё, что уже наработано по проекту.
+        {/if}
+      </p>
+    </div>
 
     <fieldset>
       <legend>Опции</legend>
@@ -387,7 +415,7 @@
       {#if setup.solution} · решение <code>{setup.solution.agent_solution_id}</code>{/if}
     </p>
     {#each setup.warnings as w (w)}<p class="warn" role="alert">{w}</p>{/each}
-    {#each blocks as b (b.key)}
+    {#each blocks as b, i (b.key)}
       <section class="frag" aria-label={b.title}>
         <header class="row">
           <h3>{b.title}</h3>
@@ -398,6 +426,23 @@
         {#if copied === b.key}<p class="muted small" role="status">Скопировано в буфер обмена.</p>{/if}
         {#if copyHint === b.key}<p class="error small" role="alert">Не удалось скопировать автоматически: выделите текст и нажмите Ctrl+C.</p>{/if}
       </section>
+      {#if i === 0 && migration}
+        <!-- M7.6 §9.1: задание на перенос — сразу под текстом подключения -->
+        <section class="frag migrate" aria-label="Задание агенту на перенос">
+          <header class="row">
+            <h3>Задание агенту на перенос</h3>
+            <button type="button" class="copy" onclick={() => copy('migrate', migration)}>{copied === 'migrate' ? 'Скопировано' : 'Копировать'}</button>
+          </header>
+          <p class="muted small">
+            Дайте агенту в проекте: он подключит проект и перенесёт в память свою память и историю сессий, карту
+            кода, решения, ловушки, задачи и термины. Это займёт время и токены; секреты — только в Vault;
+            кандидатов в Rules и аксиомы принимаете вы.
+          </p>
+          <textarea readonly rows="14" spellcheck="false" aria-label="Текст задания на перенос" value={migration}></textarea>
+          {#if copied === 'migrate'}<p class="muted small" role="status">Скопировано в буфер обмена.</p>{/if}
+          {#if copyHint === 'migrate'}<p class="error small" role="alert">Не удалось скопировать автоматически: выделите текст и нажмите Ctrl+C.</p>{/if}
+        </section>
+      {/if}
     {/each}
     <p class="small">
       Бинарники <code>zam</code> раздаёт сервер:
@@ -535,6 +580,35 @@
   .copy {
     margin-left: auto;
     padding: 2px 10px;
+  }
+  .migrate-opt {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+  }
+  .migrate-opt p {
+    margin: 0;
+  }
+  .migrate p {
+    margin: 0 0 6px;
+  }
+  .migrate textarea {
+    display: block;
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 100%;
+    max-height: 420px;
+    margin: 0;
+    padding: 10px 12px;
+    overflow: auto;
+    resize: vertical;
+    background: var(--code-bg, var(--hover));
+    color: inherit;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font: 12.5px/1.45 ui-monospace, Consolas, monospace;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
   pre {
     margin: 0;

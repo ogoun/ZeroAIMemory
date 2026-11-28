@@ -2,10 +2,10 @@
 //!
 //! ```text
 //! GET /agent-setup?agent=claude|agents|codex&solution=<guid|new|auto>&name=&mcp=&hooks=
-//!                  &rules_write=&lang=ru|en&token=&token_placeholder=
+//!                  &rules_write=&lang=ru|en&token=&token_placeholder=&migrate=
 //!   → 200 {version, agent, lang, url, block, tokens, tokens_exact, warnings, template_custom,
 //!          solution_toml?, solution?, mcp_json?, claude_settings?, codex_hooks?,
-//!          install: {windows, linux}, init_cmd: {linux, windows}}
+//!          install: {windows, linux}, init_cmd: {linux, windows}, migration_prompt?}
 //! GET /agent-guide?lang=ru|en → 200 text/markdown (полный протокол §9.3, §14)
 //! POST /admin/agent-setup/preview {agent, lang, template}
 //!   → 200 {block, tokens, warnings, version, version_next}
@@ -30,6 +30,9 @@
 //! - `mcp`, `hooks` — по умолчанию `true`; `rules_write` — по умолчанию настройка сервера
 //!   `rules.agent_write`. Хуков у `agents` нет (AGENTS.md без хуков Codex).
 //! - `version` — текущая версия блока сервера ([`agent_setup::current_version`]).
+//! - `migrate=true` (M7.6 §9.1, признак `agent_setup_migrate`) — ещё `migration_prompt`: задание
+//!   агенту на перенос проекта в память ([`agent_setup::migrate`]) для того же агента, решения и
+//!   языка; токена в нём нет никогда (и с `token=`). Без параметра или с `false` ответ прежний.
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
@@ -41,6 +44,7 @@ use zam_core::{SolutionGuid, looks_like_token};
 
 use super::query;
 use super::scope::RULES_AGENT_WRITE;
+use crate::agent_setup::migrate::MigrateCtx;
 use crate::agent_setup::{self, AgentKind, BlockCtx, InitCmd, Lang, SolutionRef};
 use crate::app::AppState;
 use crate::auth::{AdminOnly, Client, Principal, target_user_id};
@@ -67,6 +71,8 @@ pub struct SetupQuery {
     token: Option<String>,
     /// Без `token=`: в `init_cmd` — `--token '<токен>'` (заглушку подставляет WebUI).
     token_placeholder: Option<bool>,
+    /// Задание агенту на перенос проекта (`migration_prompt`).
+    migrate: Option<bool>,
 }
 
 fn parse_agent(raw: Option<&str>) -> Result<AgentKind, ApiError> {
@@ -248,6 +254,26 @@ pub async fn setup(
             lang,
         }),
     });
+    if q.migrate.unwrap_or(false) {
+        // однострочник — тот же, что `init_cmd`, но без токена (§15.5)
+        let init = agent_setup::init_sh(&InitCmd {
+            url: &url,
+            token: None,
+            agent,
+            solution: sol.as_ref(),
+            registered,
+            hooks,
+            mcp,
+            lang,
+        });
+        out["migration_prompt"] = json!(agent_setup::migrate::render(&MigrateCtx {
+            url: &url,
+            solution: sol.as_ref(),
+            agent,
+            lang,
+            init: &init,
+        }));
+    }
     if let Some(s) = &sol {
         out["solution"] = json!({"agent_solution_id": s.guid, "name": s.name});
         out["solution_toml"] = json!(agent_setup::solution_toml(s));

@@ -1695,6 +1695,8 @@ export interface AgentSetupQuery {
   /** `--token '<токен>'` в `init_cmd`: заглушку подставляет браузер (`withToken`). Открытый
    * текст токена WebUI серверу в адресе не передаёт (журналы прокси). */
   tokenPlaceholder?: boolean;
+  /** Задание агенту на перенос проекта (`migration_prompt`, признак `agent_setup_migrate`). */
+  migrate?: boolean;
 }
 
 export interface AgentSetup {
@@ -1714,6 +1716,8 @@ export interface AgentSetup {
   codex_hooks?: unknown;
   install: { windows: string; linux: string };
   init_cmd: { linux: string; windows: string };
+  /** С `migrate=true` (M7.6 §9.1): задание агенту на перенос проекта; токена в нём нет. */
+  migration_prompt?: string;
 }
 
 /** `GET /agent-setup`; администратор — для пользователя `user` (`X-Zam-User`). */
@@ -1728,7 +1732,14 @@ export function agentSetup(f: AgentSetupQuery, user?: string) {
   if (f.name) p.set('name', f.name);
   if (f.rulesWrite !== undefined) p.set('rules_write', String(f.rulesWrite));
   if (f.tokenPlaceholder) p.set('token_placeholder', 'true');
+  if (f.migrate) p.set('migrate', 'true');
   return call<AgentSetup>('GET', `agent-setup?${p}`, undefined, user);
+}
+
+/** Признак `/health.features` (без аутентификации): что умеет сервер (`docs/api-compat.md`). */
+export async function serverFeatures(): Promise<string[]> {
+  const h = await call<{ features?: string[] }>('GET', 'health');
+  return h.features ?? [];
 }
 
 /** Заглушка токена сервера в кавычках оболочки (`'<токен>'`, POSIX shell и PowerShell). */
