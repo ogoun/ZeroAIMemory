@@ -759,7 +759,11 @@
         {#await import('./Works.svelte')}
           <p class="muted">Загрузка…</p>
         {:then { default: Works }}
-          <Works {me} {onexpired} />
+          <!-- пользователь страницы (администратор, `?user=`, M7.4 §7.7 п. 2) сменился — страница
+               заново: ответы прежнего пользователя не смешиваются с новым -->
+          {#key route.user ?? ''}
+            <Works {me} {users} user={route.user ?? null} {onexpired} />
+          {/key}
         {:catch e}
           <LazyFail error={e} />
         {/await}

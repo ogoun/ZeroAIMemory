@@ -13,11 +13,17 @@
   // причиной, если сервер её не проводит — `usage.check`); очередь работ и
   // «Запустить сейчас» (окно-подтверждение; у модели — опрос очереди, пока работа идёт); журнал
   // отправок (метаданные, без текста); токены суток и месяца к пределам. Таблицы — `.table-wrap`,
-  // на телефоне — карточки (§5.1). Свой пользователь (блок администратора — M7.4, §6.13).
+  // на телефоне — карточки (§5.1).
+  // M7.4 (§7.7 п. 2): у администратора — блок «Все пользователи» (сводка `GET /admin/works`,
+  // `WorksAdmin.svelte`); имя пользователя ведёт на его вид страницы (`#/works?user=<id>`): та же
+  // страница по его настройкам (`/admin/users/{id}/settings`), очереди, токенам, журналу и
+  // Vault, правки — от имени администратора (аудит). Точку паузы в шапке ставит только своя
+  // страница. Смену пользователя страница не переживает — оболочка монтирует её заново (`{#key}`).
   import { onMount } from 'svelte';
   import FormDialog from '../components/FormDialog.svelte';
   import Notice from '../components/Notice.svelte';
-  import { ApiError, errorText, listVault, type Me, type VaultItem } from '../lib/api';
+  import WorksAdmin from '../components/WorksAdmin.svelte';
+  import { ApiError, errorText, isAdminSession, listVault, type Me, type User, type VaultItem } from '../lib/api';
   import { attention } from '../lib/attention.svelte';
   import { isDirty } from '../lib/formDraft';
   import { localTime } from '../lib/time';
@@ -72,7 +78,24 @@
     type WorksMode,
   } from '../lib/worksText';
 
-  let { me, onexpired }: { me: Me; onexpired: () => void } = $props();
+  let {
+    me,
+    users = [],
+    user = null,
+    onexpired,
+  }: {
+    me: Me;
+    /** Пользователи сервера (администратор): имя пользователя страницы. */
+    users?: User[];
+    /** Пользователь страницы из адреса (`?user=`); `null` — свой. */
+    user?: string | null;
+    onexpired: () => void;
+  } = $props();
+
+  let admin = $derived(isAdminSession(me));
+  /** Чужой пользователь страницы — только у администратора (сервер чужое иначе не отдаст: 403). */
+  let target = $derived<string | null>(admin && user && user !== me.user_id ? user : null);
+  let targetName = $derived(target ? (users.find((u) => u.id === target)?.name ?? target) : '');
 
   let settings = $state<WorksSettings | null>(null);
   let usage = $state<WorksUsage | null>(null);
@@ -105,14 +128,19 @@
     return false;
   }
 
+  /** Точка паузы в шапке — по своему исполнителю: чужая страница её не трогает. */
+  function markPause(s: WorksSettings) {
+    if (!target) attention.pause = s.pause?.class ?? null;
+  }
+
   async function loadSettings() {
-    const s = await worksSettings();
+    const s = await worksSettings(target);
     settings = s.works;
-    attention.pause = s.works.pause?.class ?? null;
+    markPause(s.works);
   }
 
   async function loadQueue() {
-    const [l, u] = await Promise.all([listWorks(), worksUsage()]);
+    const [l, u] = await Promise.all([listWorks(30, target), worksUsage(target)]);
     list = l;
     usage = u;
     now = Date.now();
@@ -121,7 +149,7 @@
   async function loadCalls() {
     callsError = '';
     try {
-      calls = (await workCalls(days)).calls;
+      calls = (await workCalls(days, target)).calls;
     } catch (e) {
       if (expired(e)) return;
       callsError = errorText(e);
@@ -130,7 +158,7 @@
 
   async function loadVault() {
     try {
-      const v = await listVault(me.user_id, 'knowledge');
+      const v = await listVault(target ?? me.user_id, 'knowledge');
       vault = v.items;
       vaultLocked = v.locked ? (v.reason ?? 'Vault заблокирован') : '';
     } catch (e) {
@@ -190,9 +218,9 @@
 
   /** Правка настроек: ответ — все настройки (у подключения — `external` и `host` для плашки). */
   async function save(patch: WorksPatch) {
-    const r = await patchWorks(patch);
+    const r = await patchWorks(patch, target);
     settings = r.works;
-    attention.pause = r.works.pause?.class ?? null;
+    markPause(r.works);
     return r;
   }
 
@@ -243,7 +271,8 @@
     nightError = '';
     try {
       await save({ check: on ? 'on' : 'off' });
-      nightNotice = on ? 'Ночная проверка вашей памяти включена.' : 'Ночная проверка вашей памяти выключена (ручной прогон — на странице «Проверка памяти»).';
+      const whose = target ? `памяти пользователя ${targetName}` : 'вашей памяти';
+      nightNotice = on ? `Ночная проверка ${whose} включена.` : `Ночная проверка ${whose} выключена (ручной прогон — на странице «Проверка памяти»).`;
     } catch (e) {
       if (expired(e)) return;
       nightError = errorText(e);
@@ -352,7 +381,7 @@
    * показывает «был → стал». */
   async function runTest(): Promise<{ text: string; ok: boolean }> {
     try {
-      const r = await testModel();
+      const r = await testModel(target);
       await loadSettings();
       void loadCalls();
       return { text: testText(r), ok: r.ok };
@@ -439,7 +468,7 @@
     runNotice = '';
     let r;
     try {
-      r = await runWorks(k);
+      r = await runWorks(k, target);
     } catch (e) {
       if (expired(e)) return;
       throw new Error(errorText(e));
@@ -499,7 +528,13 @@
 </script>
 
 <section class="panel works-page" aria-labelledby="works-h">
-  <h2 id="works-h">Внутренние работы</h2>
+  <h2 id="works-h">Внутренние работы{#if target}: {targetName}{/if}</h2>
+  {#if target}
+    <p class="viewing" data-testid="works-viewing">
+      Страница пользователя <b>{targetName}</b> глазами администратора: настройки, очередь и журнал — его; правки
+      записываются в аудит от имени администратора. <a href="#/works">Свои внутренние работы</a>
+    </p>
+  {/if}
   <p class="muted small">
     Работы памяти над собственными записями: пробные вопросы ночной проверки и кандидаты в Rules. Знания по их итогу не
     меняются — пробы идут в проверку, кандидатов принимает человек («Кандидаты в Rules»).
@@ -542,6 +577,11 @@
     </div>
   {/if}
 </section>
+
+{#if admin}
+  <!-- блок администратора (M7.4 §7.7 п. 2): сводка всех пользователей, имя — вид страницы -->
+  <WorksAdmin current={target ?? me.user_id} self={me.user_id} {onexpired} />
+{/if}
 
 {#if settings}
   {@const s = settings}
@@ -648,7 +688,7 @@
           aria-describedby={serverOff ? 'works-check-off' : undefined}
           onchange={(e) => setCheck(e.currentTarget.checked)}
         />
-        Ночная проверка моей памяти
+        {target ? `Ночная проверка памяти пользователя ${targetName}` : 'Ночная проверка моей памяти'}
       </label>
       {#if serverOff}
         <p class="muted small" id="works-check-off" data-testid="works-check-off">{checkOffText(u.check.reason)}</p>
@@ -783,7 +823,9 @@
 <FormDialog
   open={connOpen}
   title="Подключение модели"
-  description="OpenAI-совместимый Chat Completions. Адрес (поле url записи, с /v1, как у поставщика) и ключ — запись вашего личного Vault."
+  description="OpenAI-совместимый Chat Completions. Адрес (поле url записи, с /v1, как у поставщика) и ключ — запись {target
+    ? `личного Vault пользователя ${targetName}`
+    : 'вашего личного Vault'}."
   submit="Сохранить"
   wide
   busy={dlgTesting}
@@ -910,6 +952,15 @@
   }
   .small {
     font-size: 13px;
+  }
+  /* страница чужого пользователя (администратор): чья она — заметно, ссылка на свою */
+  .viewing {
+    margin: 8px 0;
+    padding: 8px 10px;
+    border-left: 4px solid var(--accent);
+    border-radius: 4px;
+    background: var(--selected);
+    overflow-wrap: anywhere;
   }
   .alert {
     margin: 12px 0 0;

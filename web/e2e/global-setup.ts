@@ -162,6 +162,7 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
     process.env.E2E_ADMIN_TOKEN = token;
     process.env.E2E_INSIGHT_OLD = journals.oldInsight;
     process.env.E2E_INSIGHT_HYP = journals.hypothesis;
+    process.env.E2E_CHANGELOG_DOCS = journals.changelogDocs;
     process.env.E2E_MEMBER_ID = journals.memberId;
     process.env.E2E_MEMBER_TOKEN = journals.memberToken;
     process.env.E2E_GUEST_TOKEN = journals.guestToken;

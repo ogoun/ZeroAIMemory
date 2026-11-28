@@ -911,14 +911,28 @@ export interface AuditRow {
   details: unknown;
 }
 
+/** Фильтры журнала аудита — на сервере (M7.4 §7.6 п. 1, признак `audit_filters`): `action` —
+ * точно (`user.password.set`) или префиксом (`user.*`), `user` — id пользователя события,
+ * `since`/`until` — RFC 3339 (`until` исключительно); пустое — без фильтра. */
+export interface AuditFilter {
+  action?: string;
+  user?: string;
+  since?: string;
+  until?: string;
+}
+
 /** Страница аудита: события новые первыми, по 100 (сервер по умолчанию отдаёт 50); `before` —
- * `next` прошлой страницы, `next` — `null` на последней. */
+ * `next` прошлой страницы (с теми же фильтрами), `next` — `null` на последней. */
 export const AUDIT_PAGE = 100;
-export const listAudit = (before?: number) =>
-  call<{ items: AuditRow[]; next: number | null }>(
-    'GET',
-    `admin/audit?limit=${AUDIT_PAGE}` + (before !== undefined ? `&before=${before}` : ''),
-  );
+export const listAudit = (f: AuditFilter = {}, before?: number) => {
+  const p = new URLSearchParams({ limit: String(AUDIT_PAGE) });
+  if (before !== undefined) p.set('before', String(before));
+  for (const k of ['action', 'user', 'since', 'until'] as const) {
+    const v = f[k]?.trim();
+    if (v) p.set(k, v);
+  }
+  return call<{ items: AuditRow[]; next: number | null }>('GET', `admin/audit?${p}`);
+};
 
 // ---- журналы решения: Changelog, Releases, Insights (§7.2–7.5) ----
 

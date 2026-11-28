@@ -4,7 +4,10 @@
 // «Принять», «Отклонить»). Модуль раздела, как `code.ts`: импортируют только ленивые страницы, в
 // стартовую загрузку он не идёт (оболочке нужны лишь число кандидатов — `api.ts` — и точки шапки —
 // `attention.svelte.ts`). Страницы — своего пользователя: сессия пользователя — он сам,
-// администратор — его пользователь (блок администратора — M7.4, §6.13).
+// администратор — его пользователь. M7.4 (§7.6 пп. 2–3, §7.7 пп. 1–2): сводка работ всех
+// пользователей (`GET /admin/works`), «Внутренние работы» пользователя глазами администратора
+// (`user` у функций очереди и настроек: чтение — `?user=`, запуск — `X-Zam-User`, настройки —
+// `/admin/users/{id}/settings`), набор проб — список, ручная проба и снятие.
 import { call, getEntry, getNode, listSpaces, spaceRef, type Space, type UserSettings } from './api';
 import type { CheckRun, CheckStatus } from './checkVerdict';
 import { JOURNAL_OF_KIND } from './journals';
@@ -112,11 +115,18 @@ export interface WorksPatch {
 /** Ответ `PATCH`: все настройки и предупреждения (`works_model_external: <хост>`). */
 export type SettingsSaved = UserSettings & { works: WorksSettings; warnings?: string[] };
 
-/** Свои настройки (`GET /auth/settings`). */
-export const worksSettings = () => call<UserSettings & { works: WorksSettings }>('GET', 'auth/settings');
+/** Настройки пользователя: свои — `GET /auth/settings`; чужие (администратор, `user`) —
+ * `GET /admin/users/{id}/settings` (та же форма ответа). */
+const settingsPath = (user?: string | null) => (user ? `admin/users/${encodeURIComponent(user)}/settings` : 'auth/settings');
+/** `?user=` чужого пользователя (администратор) у чтения очереди, токенов и журнала. */
+const userQ = (user: string | null | undefined, sep: '?' | '&') => (user ? `${sep}user=${encodeURIComponent(user)}` : '');
 
-/** Правка настроек исполнителя. */
-export const patchWorks = (works: WorksPatch) => call<SettingsSaved>('PATCH', 'auth/settings', { works });
+/** Настройки исполнителя (`user` — чужой пользователь администратора). */
+export const worksSettings = (user?: string | null) => call<UserSettings & { works: WorksSettings }>('GET', settingsPath(user));
+
+/** Правка настроек исполнителя (`user` — чужой пользователь администратора; аудит — от имени
+ * администратора). */
+export const patchWorks = (works: WorksPatch, user?: string | null) => call<SettingsSaved>('PATCH', settingsPath(user), { works });
 
 /** Проверка подключения (§6.2 п. 9): фиксированный запрос без данных памяти. На паузе
  * `vault_changed` — 409 `{code: vault_changed, was, now}` без обращения. */
@@ -127,7 +137,7 @@ export interface ModelTest {
   hint?: string;
   thinking?: boolean;
 }
-export const testModel = () => call<ModelTest>('POST', 'works/model/test');
+export const testModel = (user?: string | null) => call<ModelTest>('POST', `works/model/test${userQ(user, '?')}`);
 
 // ---- очередь, токены, журнал (§6.2 пп. 7–8, §6.3) ----
 
@@ -165,7 +175,7 @@ export interface WorksList {
   modes: Record<string, { mode: WorksMode; reason: string | null }>;
   paused?: WorksPause;
 }
-export const listWorks = (limit = 30) => call<WorksList>('GET', `works?limit=${limit}`);
+export const listWorks = (limit = 30, user?: string | null) => call<WorksList>('GET', `works?limit=${limit}${userQ(user, '&')}`);
 
 /** `GET /works/usage`: токены суток и месяца UTC к пределам, ночь сервера. */
 export interface WorksUsage {
@@ -181,15 +191,16 @@ export interface WorksUsage {
   check: { server: 'nightly' | 'off'; user: 'on' | 'off'; reason: string | null };
   paused?: WorksPause;
 }
-export const worksUsage = () => call<WorksUsage>('GET', 'works/usage');
+export const worksUsage = (user?: string | null) => call<WorksUsage>('GET', `works/usage${userQ(user, '?')}`);
 
-/** Ручной запуск вида (§6.3 п. 2): агент — работы в очереди, модель — сразу (202). */
+/** Ручной запуск вида (§6.3 п. 2): агент — работы в очереди, модель — сразу (202). Чужой
+ * пользователь администратора — заголовком `X-Zam-User` (у `POST /works/run` нет `?user=`). */
 export interface WorksRun {
   mode: 'agent' | 'model';
   run: string | null;
   queued: string[];
 }
-export const runWorks = (kind: WorkKind) => call<WorksRun>('POST', 'works/run', { kind });
+export const runWorks = (kind: WorkKind, user?: string | null) => call<WorksRun>('POST', 'works/run', { kind }, user ?? undefined);
 
 /** Строка журнала отправок — метаданные, без текста пакета и ответа. */
 export interface WorkCall {
@@ -210,7 +221,29 @@ export interface WorkCall {
   items: number | null;
   run: string | null;
 }
-export const workCalls = (days: number) => call<{ days: number; calls: WorkCall[] }>('GET', `works/calls?days=${days}`);
+export const workCalls = (days: number, user?: string | null) =>
+  call<{ days: number; calls: WorkCall[] }>('GET', `works/calls?days=${days}${userQ(user, '&')}`);
+
+// ---- сводка администратора (M7.4 §7.6 п. 2, признак `admin_works`) ----
+
+/** Строка сводки `GET /admin/works`: режимы видов, пауза, очередь, упавшие за 7 суток, последняя
+ * ночь, токены суток и месяца, последний законченный прогон проверки. База пользователя не
+ * открылась — только `{user, login, error}`. */
+export interface AdminWorksRow {
+  user: string;
+  login: string;
+  error?: string;
+  modes?: Record<string, { mode: WorksMode; reason: string | null }>;
+  paused?: WorksPause;
+  queued?: number;
+  running?: number;
+  failed_7d?: number;
+  last_night?: string | null;
+  tokens?: { day: number; month: number };
+  check?: { status: string | null; verdict: string | null };
+}
+/** Сводка работ всех пользователей — только администратор. */
+export const adminWorks = () => call<{ users: AdminWorksRow[] }>('GET', 'admin/works');
 
 // ---- проверка памяти (§6.5) ----
 
@@ -230,6 +263,51 @@ export const lastNightlyRun = async (): Promise<CheckRun | null> =>
 export const runCheck = () => call<{ run: string; status: string }>('POST', 'check/run');
 /** «Принять как норму» — последний законченный ночной прогон эпизода. */
 export const acceptCheck = (run: string) => call<CheckRun>('POST', 'check/accept', { run });
+
+// ---- набор проб (M7.4 §7.6 п. 3, признак `check_probes_manage`) ----
+
+export type ProbeKind = 'probe' | 'cache' | 'negative' | 'manual';
+
+/** Проба ночной проверки (`GET /check/probes`): цели — ссылки с ревизией при создании. */
+export interface Probe {
+  id: string;
+  space: string | null;
+  question: string;
+  kind: ProbeKind;
+  targets: { ref: string; rev: number }[];
+  split: 'dev' | 'test';
+  overlap: number | null;
+  author_kind: 'agent' | 'model' | 'human' | 'system';
+  author: string | null;
+  work: string | null;
+  status: 'active' | 'retired';
+  retired_reason: string | null;
+  created_at: string;
+  retired_at: string | null;
+}
+
+/** Фильтры списка проб (сервер): пустое — без фильтра. */
+export interface ProbeFilter {
+  kind?: ProbeKind | '';
+  status?: 'active' | 'retired' | '';
+  split?: 'dev' | 'test' | '';
+}
+
+/** Сколько проб показывает список (сервер — до 1000, по умолчанию 200). */
+export const PROBES_PAGE = 200;
+
+export const listProbes = (f: ProbeFilter) => {
+  const q = new URLSearchParams({ limit: String(PROBES_PAGE) });
+  if (f.kind) q.set('kind', f.kind);
+  if (f.status) q.set('status', f.status);
+  if (f.split) q.set('split', f.split);
+  return call<{ items: Probe[] }>('GET', `check/probes?${q}`);
+};
+/** Ручная проба (201 `{id: "x:<id>"}`): повтор вопроса — 409 `/problems/probe-duplicate`, предел
+ * проб у цели — 409 `/problems/probes-limit`, цель не найдена или из другого пространства — 422. */
+export const addProbe = (question: string, targets: string[]) => call<{ id: string }>('POST', 'check/probes', { question, targets });
+/** Снять пробу (204) — только человек; причина 3..=500 символов, аудит `check.probe.retire`. */
+export const retireProbe = (id: string, reason: string) => call<void>('DELETE', `check/probes/${encodeURIComponent(id)}`, { reason });
 
 // ---- кандидаты в Rules (§6.7) ----
 

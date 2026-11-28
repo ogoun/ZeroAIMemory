@@ -1036,3 +1036,136 @@ test('insights_noisy_filter', async ({ page }) => {
   await expect(table.locator(`tr[data-entry="${opened.id}"]`)).toBeVisible();
   expect(problems, problems.join('\n')).toEqual([]);
 });
+
+// ---- M7.4 (спецификация §7.7 п. 4): ленты Changelog, Releases и «Вопросы» без перечитывания ----
+// Лента и фильтры сбрасываются и перечитываются только при смене пользователя или пространства
+// (образец — «Словарь»): переход к записи (адрес, поиск, выбор) ленту не запрашивает заново.
+
+/** Запросы ленты журнала `kind` решения `guid` (`GET /spaces/{guid}/entries?kind=…`) — счётчик. */
+function feedRequests(page: Page, guid: string, kind: string): string[] {
+  const seen: string[] = [];
+  page.on('request', (r) => {
+    const u = new URL(r.url());
+    // корзина журнала (`deleted=only`) — не лента
+    const feed = u.searchParams.get('kind') === kind && !u.searchParams.has('deleted');
+    if (r.method() === 'GET' && u.pathname.endsWith(`/spaces/${guid}/entries`) && feed) seen.push(u.search);
+  });
+  return seen;
+}
+
+test('changelog_keeps_filters_on_nav', async ({ page }) => {
+  const problems = watch(page);
+  const guid = await newSolution('лента changelog без перечитывания');
+  const post = (title: string, kind: string) =>
+    agentApi<Rec>('POST', `spaces/${guid}/entries`, { kind: 'changelog', title, body: '', area: 'web', data: { kind } });
+  const a = await post('Исправление A', 'fix');
+  const b = await post('Исправление B', 'fix');
+  await post('Возможность C', 'feat');
+  // второе пространство — до загрузки страницы (список пространств оболочка читает при входе)
+  const other = await newSolution('лента changelog: другое пространство');
+  await agentApi('POST', `spaces/${other}/entries`, { kind: 'changelog', title: 'Чужая запись', body: '', data: { kind: 'docs' } });
+  const c = await pageCtx(page);
+  const at = (id = '') => `#/u/${c.user}/s/${guid}/j/changelog${id ? `/${id}` : ''}`;
+  const go = (h: string) => page.evaluate((hash) => (location.hash = hash), h);
+  const feed = page.getByRole('feed', { name: 'Лента changelog' });
+  const asked = feedRequests(page, guid, 'changelog');
+  await page.goto(`${base()}${at()}`);
+  await expect(feed.locator('article')).toHaveCount(3);
+  // фильтр по виду — запрос сервера
+  await page.getByLabel('Вид записи').selectOption('fix');
+  await expect(feed.locator('article')).toHaveCount(2);
+  await expect.poll(() => asked.length).toBe(2);
+  expect(asked[1]).toContain('data_kind=fix');
+  // переход к записи: открыта сверху, в фокусе; фильтр тот же, ленту не запрашивали
+  await go(at(a.id));
+  const opened = page.locator('.focused');
+  await expect(opened.getByRole('heading')).toHaveText('Исправление A');
+  await expect(opened.getByRole('heading')).toBeFocused();
+  await expect(page.getByLabel('Вид записи')).toHaveValue('fix');
+  await expect(feed.locator('article')).toHaveCount(2);
+  // к другой записи и обратно к ленте — по-прежнему без запросов ленты
+  await go(at(b.id));
+  await expect(opened.getByRole('heading')).toHaveText('Исправление B');
+  await go(at());
+  await expect(page.locator('.focused')).toHaveCount(0);
+  await expect(page.getByLabel('Вид записи')).toHaveValue('fix');
+  expect(asked.length).toBe(2);
+  // другое пространство — фильтры сброшены, лента своя
+  await go(`#/u/${c.user}/s/${other}/j/changelog`);
+  await expect(feed.locator('article')).toHaveCount(1);
+  await expect(page.getByLabel('Вид записи')).toHaveValue('');
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('releases_keeps_feed_on_nav', async ({ page }) => {
+  const problems = watch(page);
+  const guid = await newSolution('релизы без перечитывания');
+  const release = (v: string, date: string) =>
+    agentApi<Rec>('POST', `spaces/${guid}/entries`, { kind: 'release', title: `Релиз ${v}`, body: `Релиз ${v}.`, data: { version: v, date } });
+  const r1 = await release('1.0.0', '2026-10-01');
+  const r2 = await release('1.1.0', '2026-11-01');
+  const c = await pageCtx(page);
+  const at = (id = '') => `#/u/${c.user}/s/${guid}/j/releases${id ? `/${id}` : ''}`;
+  const go = (h: string) => page.evaluate((hash) => (location.hash = hash), h);
+  const asked = feedRequests(page, guid, 'release');
+  await page.goto(`${base()}${at()}`);
+  const list = page.getByRole('list', { name: 'Релизы' });
+  await expect(list.getByRole('button')).toHaveCount(2);
+  await expect(page.getByRole('heading', { name: 'Релиз 1.1.0' })).toBeVisible();
+  await expect.poll(() => asked.length).toBe(1);
+  // выбор релиза в списке и переход по адресу — сравнение другого релиза без запроса списка
+  await list.getByRole('button', { name: /1\.0\.0/ }).click();
+  await expect(page.getByRole('heading', { name: 'Релиз 1.0.0' })).toBeVisible();
+  await go(at(r2.id));
+  await expect(page.getByRole('heading', { name: 'Релиз 1.1.0' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Релиз 1.1.0' })).toBeFocused();
+  await go(at(r1.id));
+  await expect(page.getByRole('heading', { name: 'Релиз 1.0.0' })).toBeVisible();
+  expect(asked.length).toBe(1);
+  // релиз, записанный после загрузки, по адресу — список перечитан, он в списке
+  const r3 = await release('1.2.0', '2026-11-20');
+  await go(at(r3.id));
+  await expect(page.getByRole('heading', { name: 'Релиз 1.2.0' })).toBeVisible();
+  await expect(list.getByRole('button')).toHaveCount(3);
+  expect(asked.length).toBe(2);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('questions_keeps_filters_on_nav', async ({ page }) => {
+  // у «Вопросов» фильтров нет: сохраняются лента (загруженное) и набранное; переход к вопросу
+  // показывает его из загруженного — на виду и в фокусе заголовка
+  const problems = watch(page);
+  const guid = await newSolution('вопросы без перечитывания');
+  const ask = (title: string) => agentApi<Rec>('POST', `spaces/${guid}/entries`, { kind: 'question', title, body: 'Нужен ответ человека.' });
+  const q1 = await ask('Вопрос первый: где хранить снимки?');
+  const q2 = await ask('Вопрос второй: как назвать каталог?');
+  const c = await pageCtx(page);
+  const at = (id = '') => `#/u/${c.user}/s/${guid}/j/questions${id ? `/${id}` : ''}`;
+  const go = (h: string) => page.evaluate((hash) => (location.hash = hash), h);
+  const asked = feedRequests(page, guid, 'question');
+  await page.goto(`${base()}${at()}`);
+  const feed = page.getByRole('feed', { name: 'Вопросы' });
+  await expect(feed.locator('article')).toHaveCount(2);
+  await expect.poll(() => asked.length).toBe(1);
+  // переход к вопросу по адресу (поиск, связи): заголовок в фокусе, ленту не запрашивали
+  await go(at(q1.id));
+  const h1 = feed.locator(`[data-question="${q1.id}"] h2`);
+  await expect(h1).toBeFocused();
+  await go(at(q2.id));
+  await expect(feed.locator(`[data-question="${q2.id}"] h2`)).toBeFocused();
+  await expect(feed.locator('article')).toHaveCount(2);
+  expect(asked.length).toBe(1);
+  // «Корзина», выключенная переходом, — лента перечитывается (могли восстановить вопрос)
+  await trashToggle(page).click();
+  await expect(trashRegion(page)).toBeVisible();
+  await go(at(q1.id));
+  await expect(trashToggle(page)).toHaveAttribute('aria-pressed', 'false');
+  await expect(h1).toBeFocused();
+  expect(asked.length).toBe(2);
+  // вопрос, заданный после загрузки, по адресу — лента перечитана, вопрос на виду
+  const q3 = await ask('Вопрос третий: нужен ли индекс?');
+  await go(at(q3.id));
+  await expect(feed.locator(`[data-question="${q3.id}"] h2`)).toBeFocused();
+  expect(asked.length).toBe(3);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
