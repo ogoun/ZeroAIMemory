@@ -14,10 +14,11 @@
 //! подгоняются).
 //!
 //! M6 §12а: карта — с умолчаниями клиента M6 (`**/tests/fixtures/**` исключены); развилка — та
-//! же карта с `exclude_defaults = false`. **Абляция** (справочно, выбор из неё не делается):
+//! же карта с `exclude_defaults = false`. **Абляция** M6 (справочно, выбор из неё не делается):
 //! входы ранжирования читаются из базы прогона, ранги считает `zam_code::rank_with` по вариантам
-//! «как M5.7», «только fixtures», «только получатель», «только веса вида», «все три»; «все три»
-//! сверяется с ответом сервера.
+//! «как M5.7», «только fixtures», «только получатель», «только веса вида», «все три». M7.5 §8.6:
+//! точки связывания M6 (A/A), В1, В2, В1 + В2 на тех же входах и выбор по правилу п. 3
+//! ([`bind_choice`]); с ответом сервера сверяются точки связывания (`server_points`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -958,9 +959,35 @@ fn print_table(r: &Value) {
             v["top15_hits"]
         );
     }
+    let b = &r["ablation"]["bind"];
+    for p in b["points"].as_array().into_iter().flatten() {
+        println!(
+            "| связывание M7.5: {} — ключевые типы в первых 15 (сумма мест {}) | {}/10 | ≥ {} |",
+            p["variant"].as_str().unwrap_or(""),
+            p["key_places_sum"],
+            p["top15_hits"],
+            b["accept_min"]
+        );
+    }
     println!(
-        "| абляция «все три» = ответ сервера (первые 15) | {} | да |",
-        r["ablation"]["matches_server"]
+        "| связывание M7.5: лучшая точка (правило §8.6 п. 3) | {} ({}/10), принять по числу: {} | — |",
+        b["best"].as_str().unwrap_or(""),
+        b["best_hits"],
+        b["accepted_by_hits"]
+    );
+    let server_points: Vec<&str> = r["ablation"]["server_points"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    println!(
+        "| абляция = ответ сервера (первые 15): точки | {} | правила сервера |",
+        if server_points.is_empty() {
+            "нет".to_string()
+        } else {
+            server_points.join(", ")
+        }
     );
     let v = &r["zam_version"];
     println!(
@@ -1132,17 +1159,97 @@ fn offline_top(
     (top, places, top_only)
 }
 
-/// Абляция M6 §12а (справочно): каждое из трёх изменений отдельно и вместе на входах прогона —
-/// карта без эталонов (`nf`) и с ними (`fx`); места и первые 15 — среди всех символов карты (у
-/// сервера — только символы JSON-карты в бюджете 20000, её состав зависит от рангов). Сверка:
-/// «все три» среди символов JSON-карты сервера `in_json` = первые 15 сервера.
+/// Порог правила M7.5 §8.6 п. 3: ключевых типов в первых 15, чтобы принять связывание.
+const BIND_ACCEPT_MIN: usize = 5;
+
+/// Точки связывания M7.5 §8.6 п. 3 (правило записано в журнал этапа до прогона): первая — M6
+/// (A/A), затем В1, В2, В1 + В2 на тех же входах.
+fn bind_points() -> [(&'static str, RankWeights); 4] {
+    let bind = |bind_kind: bool, bind_export: bool| RankWeights {
+        bind_kind,
+        bind_export,
+        ..RankWeights::M6
+    };
+    [
+        ("M6 (A/A)", RankWeights::M6),
+        ("В1 «по виду»", bind(true, false)),
+        ("В2 «экспорт»", bind(false, true)),
+        ("В1 + В2", bind(true, true)),
+    ]
+}
+
+/// Одна точка абляции: число и список первых 15, места ключевых типов; `top_json` — первые 15
+/// среди символов JSON-карты сервера (сверка с ответом сервера).
+struct Point {
+    report: Value,
+    hits: usize,
+    places_sum: usize,
+    top_json: Top,
+}
+
+fn ablation_point(
+    name: &str,
+    inp: &Inputs,
+    w: RankWeights,
+    in_json: &std::collections::HashSet<(String, String)>,
+) -> Point {
+    let key = |q: &str, p: &str| KEY_TYPES.iter().any(|(kq, kp)| *kq == q && *kp == p);
+    let (top, places, top_json) = offline_top(inp, w, in_json);
+    let hits = top.iter().filter(|(q, p)| key(q, p)).count();
+    let symbols: usize = inp.files.iter().map(|f| f.defs.len()).sum();
+    // нет в карте — место «за последним символом»
+    let places_sum = places.iter().map(|p| p.unwrap_or(symbols + 1)).sum();
+    let report = json!({
+        "variant": name,
+        "files": inp.files.len(),
+        "top15_hits": hits,
+        "key_places_sum": places_sum,
+        "top15": top.iter().map(|(q, p)| json!({"qual": q, "path": p, "key": key(q, p)}))
+            .collect::<Vec<_>>(),
+        "key_type_places": KEY_TYPES.iter().zip(&places)
+            .map(|((q, _), pl)| json!({"qual": q, "place": pl})).collect::<Vec<_>>(),
+    });
+    Point {
+        report,
+        hits,
+        places_sum,
+        top_json,
+    }
+}
+
+/// Выбор связывания по правилу M7.5 §8.6 п. 3 среди `points` (первая — M6): наибольшее число
+/// ключевых типов в первых 15; при равенстве — меньше изменённых ключей, затем меньшая сумма мест
+/// ключевых типов, затем порядок точек ([решение исполнителя, задача 4]). Принять — лучшая точка
+/// не M6 и у неё не меньше [`BIND_ACCEPT_MIN`]; пункт «остальные пункты `code-bench` не хуже
+/// M6» проверяет второй прогон с выбранными правилами на сервере (журнал этапа).
+fn bind_choice(points: &[(&str, RankWeights, &Point)]) -> (usize, bool) {
+    let changed = |w: RankWeights| usize::from(w.bind_kind) + usize::from(w.bind_export);
+    let best = (0..points.len())
+        .min_by_key(|&i| {
+            let (_, w, p) = points[i];
+            (std::cmp::Reverse(p.hits), changed(w), p.places_sum, i)
+        })
+        .unwrap_or(0);
+    let accepted = best != 0 && points[best].2.hits >= BIND_ACCEPT_MIN;
+    (best, accepted)
+}
+
+/// Абляция на входах прогона — карта без эталонов (`nf`) и с ними (`fx`); места и первые 15 —
+/// среди всех символов карты (у сервера — только символы JSON-карты в бюджете 20000, её состав
+/// зависит от рангов). M6 §12а (справочно): каждое из трёх изменений M6 отдельно и вместе.
+/// M7.5 §8.6 (`bind`): точки связывания [`bind_points`] на `nf` и выбор [`bind_choice`]. Сверка:
+/// какие точки среди символов JSON-карты сервера `in_json` дают первые 15 сервера.
 fn ablation_report(
     nf: &Inputs,
     fx: &Inputs,
     server: &Value,
     in_json: &std::collections::HashSet<(String, String)>,
 ) -> Value {
-    let only = |kind_table: bool, recv: bool| RankWeights { kind_table, recv };
+    let only = |kind_table: bool, recv: bool| RankWeights {
+        kind_table,
+        recv,
+        ..RankWeights::M57
+    };
     let variants: [(&str, &Inputs, RankWeights); 5] = [
         (
             "как M5.7 (с fixtures, виды равны, без получателя)",
@@ -1154,26 +1261,7 @@ fn ablation_report(
         ("только веса вида", fx, only(true, false)),
         ("все три (M6)", nf, RankWeights::M6),
     ];
-    let key = |q: &str, p: &str| KEY_TYPES.iter().any(|(kq, kp)| *kq == q && *kp == p);
-    let mut out = Vec::new();
-    let mut all_three = Vec::new();
-    for (name, inp, w) in variants {
-        let (top, places, top_json) = offline_top(inp, w, in_json);
-        let hits = top.iter().filter(|(q, p)| key(q, p)).count();
-        if w == RankWeights::M6 {
-            all_three = top_json;
-        }
-        out.push(json!({
-            "variant": name,
-            "files": inp.files.len(),
-            "top15_hits": hits,
-            "top15": top.iter().map(|(q, p)| json!({"qual": q, "path": p, "key": key(q, p)}))
-                .collect::<Vec<_>>(),
-            "key_type_places": KEY_TYPES.iter().zip(&places)
-                .map(|((q, _), pl)| json!({"qual": q, "place": pl})).collect::<Vec<_>>(),
-        }));
-    }
-    let server_top: Vec<(String, String)> = server["top15"]
+    let server_top: Top = server["top15"]
         .as_array()
         .into_iter()
         .flatten()
@@ -1184,14 +1272,69 @@ fn ablation_report(
             )
         })
         .collect();
-    json!({"variants": out, "matches_server": all_three == server_top,
-           "note": "справочно (M6 §12а): выбор из абляции не делается; первые 15 и места — \
-                    среди всех символов карты, у сервера — среди символов JSON-карты"})
+    let out: Vec<Value> = variants
+        .iter()
+        .map(|(name, inp, w)| ablation_point(name, inp, *w, in_json).report)
+        .collect();
+    let bind: Vec<(&str, RankWeights, Point)> = bind_points()
+        .into_iter()
+        .map(|(name, w)| (name, w, ablation_point(name, nf, w, in_json)))
+        .collect();
+    let refs: Vec<(&str, RankWeights, &Point)> = bind.iter().map(|(n, w, p)| (*n, *w, p)).collect();
+    let (best, accepted) = bind_choice(&refs);
+    let server_points: Vec<&str> = bind
+        .iter()
+        .filter(|(_, _, p)| p.top_json == server_top)
+        .map(|(n, _, _)| *n)
+        .collect();
+    json!({
+        "variants": out,
+        "matches_server": !server_points.is_empty(),
+        "server_points": server_points,
+        "bind": {
+            "points": bind.iter().map(|(_, _, p)| p.report.clone()).collect::<Vec<_>>(),
+            "best": bind[best].0,
+            "best_hits": bind[best].2.hits,
+            "accept_min": BIND_ACCEPT_MIN,
+            "accepted_by_hits": accepted,
+            "rule": "M7.5 §8.6 п. 3: наибольшее число ключевых типов в первых 15 (равенство — \
+                     меньше изменённых ключей, меньшая сумма мест); принять, если не M6, ≥ 5 из \
+                     10 и остальные пункты code-bench не хуже M6 (второй прогон)",
+        },
+        "note": "M6 §12а — справочно; первые 15 и места — среди всех символов карты, у сервера \
+                 — среди символов JSON-карты",
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Правило M7.5 §8.6 п. 3: больше ключевых типов; равенство — меньше изменённых ключей, затем
+    /// меньшая сумма мест; принять — не M6 и не меньше 5 из 10.
+    #[test]
+    fn bind_choice_rule() {
+        let p = |hits: usize, places_sum: usize| Point {
+            report: Value::Null,
+            hits,
+            places_sum,
+            top_json: Vec::new(),
+        };
+        let pts = bind_points();
+        let run = |v: [Point; 4]| {
+            let refs: Vec<(&str, RankWeights, &Point)> =
+                pts.iter().zip(&v).map(|((n, w), p)| (*n, *w, p)).collect();
+            bind_choice(&refs)
+        };
+        // В1 + В2 больше всех, но меньше порога: не принять
+        assert_eq!(run([p(3, 90), p(3, 80), p(2, 70), p(4, 60)]), (3, false));
+        // равенство В1 и В1 + В2 — меньше ключей (В1), даже при худшей сумме мест
+        assert_eq!(run([p(3, 90), p(6, 80), p(2, 70), p(6, 60)]), (1, true));
+        // равенство В1 и В2 — меньшая сумма мест
+        assert_eq!(run([p(3, 90), p(5, 80), p(5, 70), p(4, 60)]), (2, true));
+        // M6 не хуже всех — M6 (A/A), не принять
+        assert_eq!(run([p(6, 90), p(6, 80), p(5, 70), p(4, 60)]), (0, false));
+    }
 
     #[test]
     fn pct_nearest_rank() {

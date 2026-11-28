@@ -19,6 +19,17 @@
 //! **Веса ссылок (M6 §12а)** — [`RankWeights::M6`]: вид ссылки по таблице `ref_kind_weight`
 //! (тип и реализация ×2), вызов по получателю ×0,25. Входы старого клиента (`recv_count = 0`)
 //! дают те же ранги, что M5.7 с той же таблицей видов; [`RankWeights::M57`] — ранги M5.7 целиком.
+//!
+//! **Связывание ссылки с определением (M7.5 §8.6)** — вместо «ко всем одноимённым»: ссылка идёт к
+//! **группе** подходящих определений имени. В1 ([`RankWeights::bind_kind`]): `type`/`impl` — к
+//! типам, `call` — к функциям и методам (конструктор Java/C# — метод), прочие виды и имя без
+//! определения нужного вида — ко всем. В2 ([`RankWeights::bind_export`]): ссылка из другого
+//! файла не идёт к определению с `exported = Some(false)`; своё закрытое определение файла —
+//! среди подходящих (`d`), но ребра к себе нет. `d(n)` — число подходящих файлов, множитель
+//! общего имени (больше 5 файлов) — по файлам группы. Поток группы, пришедший в файл, делится
+//! поровну между его определениями, которые группа принимает. Без связывания группа — все
+//! определения имени, номер группы — номер имени: правила M6 считаются теми же операциями в том
+//! же порядке (тест `rank_m6_unchanged`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -109,27 +120,61 @@ fn ref_kind_weight(kind: RefKind) -> f64 {
 /// немногим файлам, где имя определено методом (`is_empty`, `len`).
 const RECV_CALL_WEIGHT: f64 = 0.25;
 
-/// Правила весов ссылок. Продукт — только [`RankWeights::M6`]; прочие — для справочной абляции
-/// замера (`cargo xtask code-bench`, M6 §12а): выбор из абляции не делается.
+/// Правила весов и связывания ссылок. Продукт — правила сервера (`zam-server` `api/code.rs`,
+/// с M7.5 — [`RankWeights::M75`]); [`rank`], [`Graph::new`] и [`edges_among`] — M6; прочие — для
+/// абляции замера (`cargo xtask code-bench`: M6 §12а — справочно, M7.5 §8.6 — выбор связывания по
+/// правилу, записанному до прогона).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RankWeights {
     /// Таблица весов вида [`ref_kind_weight`]; `false` — все виды 1,0 (как M5.7).
     pub kind_table: bool,
     /// Вызов по получателю с весом [`RECV_CALL_WEIGHT`]; `false` — как прямой (как M5.7).
     pub recv: bool,
+    /// В1 «по виду» (M7.5 §8.6 п. 1): `type`/`impl` — к типам, `call` — к функциям и методам;
+    /// `false` — ко всем одноимённым (M6).
+    pub bind_kind: bool,
+    /// В2 «экспорт» (M7.5 §8.6 п. 2): ссылка из другого файла не идёт к определению с
+    /// `exported = Some(false)`; `false` — идёт (M6).
+    pub bind_export: bool,
 }
 
 impl RankWeights {
-    /// Правила M6 (§12а).
+    /// Правила M6 (§12а): связывания нет.
     pub const M6: RankWeights = RankWeights {
         kind_table: true,
         recv: true,
+        bind_kind: false,
+        bind_export: false,
     };
     /// Правила M5.7: виды равны, получатель не различается.
     pub const M57: RankWeights = RankWeights {
         kind_table: false,
         recv: false,
+        bind_kind: false,
+        bind_export: false,
     };
+    /// Правила M7.5 (§8.6 п. 3): M6 и В2 «экспорт» — точка, выбранная `cargo xtask code-bench` по
+    /// правилу, записанному до прогона (журнал этапа, «M7.5 · Задача 4»: 5/10 против 4/10 у M6,
+    /// В1 и В1 + В2 — тоже 5/10, но больше сумма мест или изменённых ключей).
+    pub const M75: RankWeights = RankWeights {
+        kind_table: true,
+        recv: true,
+        bind_kind: false,
+        bind_export: true,
+    };
+
+    /// Отпечаток правил (`rank:` и четыре флага `0`/`1` по порядку полей): им сервер помечает,
+    /// какими правилами посчитаны сохранённые ранги карты (`zam_store::code_rank_rules`).
+    pub fn rules_id(self) -> String {
+        let b = |x: bool| if x { '1' } else { '0' };
+        format!(
+            "rank:{}{}{}{}",
+            b(self.kind_table),
+            b(self.recv),
+            b(self.bind_kind),
+            b(self.bind_export)
+        )
+    }
 
     /// Вклад ссылки в счётчик `c`: `count` с весом вида; у `call` —
     /// `(count − recv) × 1,0 + recv × 0,25` (`recv` не больше `count`).
@@ -148,51 +193,135 @@ impl RankWeights {
     }
 }
 
-/// Ссылки файла по имени: `(name, c)`, где `c` — сумма вкладов по видам
-/// ([`RankWeights::contribution`]); по имени.
-fn agg_refs(file: &RankFile, w: RankWeights) -> Vec<(&str, f64)> {
-    let mut by_name: HashMap<&str, f64> = HashMap::new();
-    for (name, kind, count, recv) in &file.refs {
-        if *count > 0 {
-            *by_name.entry(name.as_str()).or_default() += w.contribution(*kind, *count, *recv);
-        }
+/// Класс группы связывания В1: определения-типы (struct, enum, trait, class, interface,
+/// псевдоним типа).
+const CLASS_TYPE: usize = 0;
+/// Класс группы связывания В1: функции и методы (конструктор Java/C# — метод).
+const CLASS_CALL: usize = 1;
+/// Нет группы класса у имени.
+const NO_GROUP: usize = usize::MAX;
+
+/// Класс ссылки при В1: `type`/`impl` — типы, `call` — функции и методы; прочие — все виды
+/// (`None`).
+fn ref_class(kind: RefKind) -> Option<usize> {
+    match kind {
+        RefKind::Type | RefKind::Impl => Some(CLASS_TYPE),
+        RefKind::Call => Some(CLASS_CALL),
+        RefKind::Import | RefKind::Other => None,
     }
-    let mut out: Vec<_> = by_name.into_iter().collect();
-    out.sort_by(|a, b| a.0.cmp(b.0));
-    out
 }
 
-/// Вес ссылки файла на имя: `√c × ident_mult(name, d) / d`.
-fn ref_weight(name: &str, c: f64, d: usize) -> f64 {
-    c.sqrt() * ident_mult(name, d) / d as f64
+/// Класс определения при В1 ([`ref_class`]); прочие виды (константа, модуль, макрос) — `None`.
+fn def_class(kind: SymbolKind) -> Option<usize> {
+    match kind {
+        SymbolKind::Class
+        | SymbolKind::Struct
+        | SymbolKind::Enum
+        | SymbolKind::Interface
+        | SymbolKind::Trait
+        | SymbolKind::Type => Some(CLASS_TYPE),
+        SymbolKind::Function | SymbolKind::Method => Some(CLASS_CALL),
+        SymbolKind::Const | SymbolKind::Module | SymbolKind::Macro => None,
+    }
 }
 
-/// Ссылка графа: файл, id имени, `w_An / out[A]` (доля исходящего веса файла).
+/// Определение видно ссылке из другого файла при В2: всё, кроме `exported = Some(false)` (`None`
+/// — язык без признака, Python).
+fn visible(exported: Option<bool>) -> bool {
+    exported != Some(false)
+}
+
+/// Группы, к которым относится определение имени `id` вида `kind`: все определения имени (номер
+/// группы = номер имени) и, при В1, группа его класса ([`NO_GROUP`] — нет).
+fn member_groups(id: usize, kind: SymbolKind, class_groups: &[[usize; 2]]) -> [usize; 2] {
+    let class = class_groups
+        .get(id)
+        .zip(def_class(kind))
+        .map_or(NO_GROUP, |(g, c)| g[c]);
+    [id, class]
+}
+
+/// Файлы каждой группы по возрастанию (`files[start[g]..start[g + 1]]`): определения, которые
+/// `keep(exported)` оставляет; повтор файла в группе — один раз.
+fn group_files(
+    files: &[RankFile],
+    def_ids: &[Vec<usize>],
+    class_groups: &[[usize; 2]],
+    groups: usize,
+    keep: impl Fn(Option<bool>) -> bool,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut count = vec![0usize; groups];
+    let mut last = vec![usize::MAX; groups];
+    let each = |f: &mut dyn FnMut(usize, usize)| {
+        for (i, (file, own)) in files.iter().zip(def_ids).enumerate() {
+            for ((_, kind, e), &id) in file.defs.iter().zip(own) {
+                if keep(*e) {
+                    for g in member_groups(id, *kind, class_groups) {
+                        if g != NO_GROUP {
+                            f(i, g);
+                        }
+                    }
+                }
+            }
+        }
+    };
+    each(&mut |i, g| {
+        if last[g] != i {
+            last[g] = i;
+            count[g] += 1;
+        }
+    });
+    let mut start = Vec::with_capacity(groups + 1);
+    start.push(0);
+    for c in &count {
+        start.push(start.last().copied().unwrap_or(0) + c);
+    }
+    let mut fill = start.clone();
+    let mut out = vec![0; fill.last().copied().unwrap_or(0)];
+    last.iter_mut().for_each(|x| *x = usize::MAX);
+    each(&mut |i, g| {
+        if last[g] != i {
+            last[g] = i;
+            out[fill[g]] = i;
+            fill[g] += 1;
+        }
+    });
+    (start, out)
+}
+
+/// Ссылка графа: файл, группа связывания, `w_Ag / out[A]` (доля исходящего веса файла).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct GraphRef {
     src: usize,
-    name: usize,
+    group: usize,
     wq: f64,
 }
 
-/// Граф файлов в факторизованном виде: интернированные имена, определители, ссылки по id имени,
-/// исходящий вес файла. Строится за O(ссылок + определений), по одному поиску имени на ссылку;
-/// заимствует имена у входного среза.
+/// Граф файлов в факторизованном виде: интернированные имена, группы связывания с их файлами,
+/// ссылки по группе, исходящий вес файла. Строится за O(ссылок + определений), по одному поиску
+/// имени на ссылку; заимствует имена у входного среза.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Graph<'a> {
     n: usize,
     /// Интернирование имён: `std` `HashMap` (SipHash со случайным ключом) — имена приходят
     /// от клиентов, детерминированный хэш позволил бы подобрать коллизии (HashDoS).
     ids: HashMap<&'a str, usize>,
-    /// Определители имени `id`: `def_files[def_start[id]..def_start[id + 1]]`, по возрастанию.
+    /// Файлы группы `g`: `def_files[def_start[g]..def_start[g + 1]]`, по возрастанию. Группы
+    /// `0..имён` — все определения имени (номер группы = номер имени, как M6), дальше — классы В1.
     def_start: Vec<usize>,
     def_files: Vec<usize>,
+    /// Группы классов имени `[типы, функции]` при В1 ([`NO_GROUP`] — нет); без В1 — пусто.
+    class_groups: Vec<[usize; 2]>,
+    /// При В2 — принимающие файлы группы (с открытым определением), как `def_start`/`def_files`;
+    /// `None` — все файлы группы.
+    open: Option<(Vec<usize>, Vec<usize>)>,
     /// id имени каждого определения файла (параллельно `RankFile::defs`).
     def_ids: Vec<Vec<usize>>,
     refs: Vec<GraphRef>,
-    /// Ссылки файла на имена, которые он сам определяет (ребра A → A нет — их часть вычитается).
+    /// Ссылки файла на группы, куда он сам принимает поток (ребра A → A нет — часть вычитается).
     self_refs: Vec<GraphRef>,
     out: Vec<f64>,
+    w: RankWeights,
 }
 
 impl<'a> Graph<'a> {
@@ -202,91 +331,97 @@ impl<'a> Graph<'a> {
         Graph::with_weights(files, RankWeights::M6)
     }
 
-    /// Граф с правилами весов `w` (абляция замера; продукт — [`Graph::new`]).
+    /// Граф с правилами весов и связывания `w` (сервер — со своими правилами, абляция замера).
     pub fn with_weights(files: &'a [RankFile], w: RankWeights) -> Graph<'a> {
         let total_defs: usize = files.iter().map(|f| f.defs.len()).sum();
         let mut ids: HashMap<&'a str, usize> = HashMap::new();
         ids.reserve(total_defs);
         let mut def_ids = Vec::with_capacity(files.len());
-        // число определителей имени; `last` — последний учтённый файл (повтор имени в файле)
-        let mut count: Vec<usize> = Vec::new();
-        let mut last: Vec<usize> = Vec::new();
-        for (i, f) in files.iter().enumerate() {
+        for f in files {
             let mut own = Vec::with_capacity(f.defs.len());
             for (name, _, _) in &f.defs {
-                let next = count.len();
-                let id = *ids.entry(name.as_str()).or_insert(next);
-                if id == next {
-                    count.push(0);
-                    last.push(usize::MAX);
-                }
-                if last[id] != i {
-                    last[id] = i;
-                    count[id] += 1;
-                }
-                own.push(id);
+                let next = ids.len();
+                own.push(*ids.entry(name.as_str()).or_insert(next));
             }
             def_ids.push(own);
         }
-        let mut def_start = Vec::with_capacity(count.len() + 1);
-        def_start.push(0);
-        for c in &count {
-            def_start.push(def_start.last().copied().unwrap_or(0) + c);
+        let names = ids.len();
+        let mut name_of = vec![""; names];
+        for (name, &id) in &ids {
+            name_of[id] = name;
         }
-        let mut fill = def_start.clone();
-        let mut def_files = vec![0; fill.last().copied().unwrap_or(0)];
-        last.iter_mut().for_each(|x| *x = usize::MAX);
-        for (i, own) in def_ids.iter().enumerate() {
-            for &id in own {
-                if last[id] != i {
-                    last[id] = i;
-                    def_files[fill[id]] = i;
-                    fill[id] += 1;
+        // группы классов В1: номер — по первому определению класса в порядке файлов
+        let mut group_name: Vec<usize> = (0..names).collect();
+        let mut class_groups = Vec::new();
+        if w.bind_kind {
+            class_groups = vec![[NO_GROUP; 2]; names];
+            for (f, own) in files.iter().zip(&def_ids) {
+                for ((_, kind, _), &id) in f.defs.iter().zip(own) {
+                    if let Some(c) = def_class(*kind)
+                        && class_groups[id][c] == NO_GROUP
+                    {
+                        class_groups[id][c] = group_name.len();
+                        group_name.push(id);
+                    }
                 }
             }
         }
-        let mut mult = vec![0.0; count.len()];
-        for (name, &id) in &ids {
-            mult[id] = ident_mult(name, count[id]);
-        }
+        let groups = group_name.len();
+        let (def_start, def_files) = group_files(files, &def_ids, &class_groups, groups, |_| true);
+        let open = w
+            .bind_export
+            .then(|| group_files(files, &def_ids, &class_groups, groups, visible));
+        let mult: Vec<f64> = (0..groups)
+            .map(|g| ident_mult(name_of[group_name[g]], def_start[g + 1] - def_start[g]))
+            .collect();
         let mut refs = Vec::new();
         let mut self_refs = Vec::new();
         let mut out = vec![0.0; files.len()];
-        let mut by_id: Vec<(usize, f64)> = Vec::new();
+        let mut by_group: Vec<(usize, f64)> = Vec::new();
         for (a, f) in files.iter().enumerate() {
-            by_id.clear();
+            by_group.clear();
             for (name, kind, count, recv) in &f.refs {
                 if *count > 0
                     && let Some(&id) = ids.get(name.as_str())
                 {
-                    by_id.push((id, w.contribution(*kind, *count, *recv)));
+                    let g = group_of(id, *kind, w, &class_groups);
+                    by_group.push((g, w.contribution(*kind, *count, *recv)));
                 }
             }
-            by_id.sort_unstable_by_key(|x| x.0);
+            by_group.sort_unstable_by_key(|x| x.0);
             let first = refs.len();
             let mut k = 0;
-            while k < by_id.len() {
-                let id = by_id[k].0;
+            while k < by_group.len() {
+                let g = by_group[k].0;
                 let mut c = 0.0;
-                while k < by_id.len() && by_id[k].0 == id {
-                    c += by_id[k].1;
+                while k < by_group.len() && by_group[k].0 == g {
+                    c += by_group[k].1;
                     k += 1;
                 }
-                let defs = &def_files[def_start[id]..def_start[id + 1]];
+                let defs = &def_files[def_start[g]..def_start[g + 1]];
                 let self_def = defs.binary_search(&a).is_ok();
-                let targets = defs.len() - usize::from(self_def);
+                let (rcv, self_rcv) = match &open {
+                    Some((s, o)) => {
+                        let rcv = &o[s[g]..s[g + 1]];
+                        (rcv, rcv.binary_search(&a).is_ok())
+                    }
+                    None => (defs, self_def),
+                };
+                // своё закрытое определение — среди подходящих, но потока не принимает
+                let d = rcv.len() + usize::from(self_def && !self_rcv);
+                let targets = rcv.len() - usize::from(self_rcv);
                 if targets == 0 {
                     continue;
                 }
-                let w = c.sqrt() * mult[id] / defs.len() as f64;
+                let w = c.sqrt() * mult[g] / d as f64;
                 out[a] += w * targets as f64;
                 let e = GraphRef {
                     src: a,
-                    name: id,
+                    group: g,
                     wq: w,
                 };
                 refs.push(e);
-                if self_def {
+                if self_rcv {
                     self_refs.push(e);
                 }
             }
@@ -302,10 +437,13 @@ impl<'a> Graph<'a> {
             ids,
             def_start,
             def_files,
+            class_groups,
+            open,
             def_ids,
             refs,
             self_refs,
             out,
+            w,
         }
     }
 
@@ -319,25 +457,59 @@ impl<'a> Graph<'a> {
         self.n == 0
     }
 
-    /// Число файлов, где имя определено.
+    /// Число файлов, где имя определено (любого вида).
     pub fn definers_count(&self, name: &str) -> usize {
         self.ids
             .get(name)
             .map_or(0, |&id| self.def_start[id + 1] - self.def_start[id])
     }
 
-    /// Число интернированных (определённых) имён.
-    fn names(&self) -> usize {
+    /// Число групп связывания (без связывания — определённых имён).
+    fn groups(&self) -> usize {
         self.def_start.len() - 1
     }
 
-    /// Поток каждого имени `F_n = Σ_A r[A] × w_An / out[A]` (без затухания).
+    /// Файлы, принимающие поток группы `g`.
+    fn receivers(&self, g: usize) -> &[usize] {
+        match &self.open {
+            Some((s, o)) => &o[s[g]..s[g + 1]],
+            None => &self.def_files[self.def_start[g]..self.def_start[g + 1]],
+        }
+    }
+
+    /// Группы, чей поток принимает определение имени `id` вида `kind` ([`NO_GROUP`] — нет):
+    /// при В2 закрытое (`Some(false)`) не принимает ничего.
+    fn takers(&self, id: usize, kind: SymbolKind, exported: Option<bool>) -> [usize; 2] {
+        if self.w.bind_export && !visible(exported) {
+            return [NO_GROUP; 2];
+        }
+        member_groups(id, kind, &self.class_groups)
+    }
+
+    /// Поток каждой группы `F_g = Σ_A r[A] × w_Ag / out[A]` (без затухания).
     fn flows(&self, r: &[f64], flow: &mut [f64]) {
         flow.iter_mut().for_each(|x| *x = 0.0);
         for e in &self.refs {
-            flow[e.name] += r[e.src] * e.wq;
+            flow[e.group] += r[e.src] * e.wq;
         }
     }
+}
+
+/// Группы из `[usize; 2]` ([`Graph::takers`], [`member_groups`]) без [`NO_GROUP`].
+fn each(t: &[usize; 2]) -> impl Iterator<Item = usize> + '_ {
+    t.iter().copied().filter(|&x| x != NO_GROUP)
+}
+
+/// Группа ссылки вида `kind` на имя `id`: при В1 — группа класса, если у имени есть определения
+/// этого класса; иначе — все определения имени (номер группы = номер имени).
+fn group_of(id: usize, kind: RefKind, w: RankWeights, class_groups: &[[usize; 2]]) -> usize {
+    if !w.bind_kind {
+        return id;
+    }
+    ref_class(kind)
+        .map(|c| class_groups[id][c])
+        .filter(|&g| g != NO_GROUP)
+        .unwrap_or(id)
 }
 
 /// Вектор перезапуска: нормированный `restart` или равномерный, если его нет, длина не `n`,
@@ -410,7 +582,7 @@ pub fn pagerank(n: usize, edges: &[(usize, usize, f64)], restart: Option<&[f64]>
 /// PageRank по факторизованному графу (персонализация на сервере: `restart` из
 /// [`focus_restart`]). Совпадает с [`pagerank`] по плотным рёбрам того же графа.
 pub fn rank_on_graph(g: &Graph<'_>, restart: Option<&[f64]>) -> Vec<f64> {
-    let mut flow = vec![0.0; g.names()];
+    let mut flow = vec![0.0; g.groups()];
     power_iteration(g.n, restart, &g.out, |r, next| {
         g.flows(r, &mut flow);
         for e in &g.self_refs {
@@ -419,7 +591,7 @@ pub fn rank_on_graph(g: &Graph<'_>, restart: Option<&[f64]>) -> Vec<f64> {
         for (id, f) in flow.iter().enumerate() {
             if *f != 0.0 {
                 let add = DAMPING * f;
-                for &b in &g.def_files[g.def_start[id]..g.def_start[id + 1]] {
+                for &b in g.receivers(id) {
                     next[b] += add;
                 }
             }
@@ -427,21 +599,41 @@ pub fn rank_on_graph(g: &Graph<'_>, restart: Option<&[f64]>) -> Vec<f64> {
     })
 }
 
-/// Рёбра графа только между файлами `shown` (обзор WebUI, `format=json`): `(src, dst, weight)`
-/// с индексами входного среза, по убыванию веса, при равенстве — по `(src, dst)`. `d(name)` —
-/// по всем файлам. Стоимость — O(ссылок показанных × определителей).
+/// Файлы группы связывания для [`edges_among_with`]: все с определением группы и (В2) с
+/// открытым — по возрастанию.
+#[derive(Default)]
+struct GroupFiles {
+    files: Vec<usize>,
+    open: Vec<usize>,
+}
+
+/// [`edges_among_with`] по правилам M6.
 pub fn edges_among(files: &[RankFile], shown: &[usize]) -> Vec<(usize, usize, f64)> {
-    let w = RankWeights::M6;
+    edges_among_with(files, shown, RankWeights::M6)
+}
+
+/// Рёбра графа только между файлами `shown` (обзор WebUI, `format=json`) по правилам `w`:
+/// `(src, dst, weight)` с индексами входного среза, по убыванию веса, при равенстве — по
+/// `(src, dst)`. `d` и множитель имени — по всем файлам. Стоимость — O(определений + ссылок
+/// показанных × файлов группы).
+pub fn edges_among_with(
+    files: &[RankFile],
+    shown: &[usize],
+    w: RankWeights,
+) -> Vec<(usize, usize, f64)> {
     let in_shown: HashSet<usize> = shown.iter().copied().filter(|&i| i < files.len()).collect();
-    let mut d: HashMap<&str, usize> = HashMap::new();
-    let mut shown_definers: HashMap<&str, Vec<usize>> = HashMap::new();
+    // группа — (имя, класс В1); `None` — все определения имени
+    let mut groups: HashMap<(&str, Option<usize>), GroupFiles> = HashMap::new();
     for (i, f) in files.iter().enumerate() {
-        let mut seen = HashSet::new();
-        for (name, _, _) in &f.defs {
-            if seen.insert(name.as_str()) {
-                *d.entry(name.as_str()).or_default() += 1;
-                if in_shown.contains(&i) {
-                    shown_definers.entry(name.as_str()).or_default().push(i);
+        for (name, kind, e) in &f.defs {
+            let class = def_class(*kind).filter(|_| w.bind_kind);
+            for key in [Some(None), class.map(Some)].into_iter().flatten() {
+                let g = groups.entry((name.as_str(), key)).or_default();
+                if g.files.last() != Some(&i) {
+                    g.files.push(i);
+                }
+                if visible(*e) && g.open.last() != Some(&i) {
+                    g.open.push(i);
                 }
             }
         }
@@ -450,13 +642,32 @@ pub fn edges_among(files: &[RankFile], shown: &[usize]) -> Vec<(usize, usize, f6
     let mut src: Vec<usize> = in_shown.iter().copied().collect();
     src.sort_unstable();
     for a in src {
-        for (name, c) in agg_refs(&files[a], w) {
-            let Some(defs) = shown_definers.get(name) else {
+        let mut by_group: HashMap<(&str, Option<usize>), f64> = HashMap::new();
+        for (name, kind, count, recv) in &files[a].refs {
+            if *count == 0 {
+                continue;
+            }
+            let class = ref_class(*kind)
+                .filter(|c| w.bind_kind && groups.contains_key(&(name.as_str(), Some(*c))));
+            *by_group.entry((name.as_str(), class)).or_default() +=
+                w.contribution(*kind, *count, *recv);
+        }
+        let mut by_group: Vec<_> = by_group.into_iter().collect();
+        by_group.sort_by(|x, y| x.0.cmp(&y.0));
+        for (key, c) in by_group {
+            let Some(g) = groups.get(&key) else {
                 continue;
             };
-            let w = ref_weight(name, c, d[name]);
-            for &b in defs.iter().filter(|&&b| b != a) {
-                *sum.entry((a, b)).or_default() += w;
+            let rcv = if w.bind_export { &g.open } else { &g.files };
+            let self_def = g.files.binary_search(&a).is_ok();
+            let self_rcv = rcv.binary_search(&a).is_ok();
+            let d = rcv.len() + usize::from(self_def && !self_rcv);
+            if rcv.len() == usize::from(self_rcv) {
+                continue;
+            }
+            let wt = c.sqrt() * ident_mult(key.0, g.files.len()) / d as f64;
+            for &b in rcv.iter().filter(|&&b| b != a && in_shown.contains(&b)) {
+                *sum.entry((a, b)).or_default() += wt;
             }
         }
     }
@@ -542,8 +753,8 @@ fn kind_weight(kind: SymbolKind, exported: Option<bool>) -> f64 {
     if exported == Some(true) { k * 2.0 } else { k }
 }
 
-/// Доли символов файла по входящему потоку `inflow[j]` каждого определения (поток имени делится
-/// поровну между `same[j]` одноимёнными определениями); символам без входящих ссылок —
+/// Доли символов файла по входящему потоку `inflow[j]` каждого определения (поток группы делится
+/// поровну между `same[j]` принимающими его определениями файла); символам без входящих ссылок —
 /// [`UNREFERENCED_SHARE`] по весу вида, или всё, если входящих ссылок у файла нет.
 fn shares(file: &RankFile, inflow: &[f64], same: &[f64]) -> Vec<f64> {
     let ref_total: f64 = inflow.iter().zip(same).map(|(f, s)| f / s).sum();
@@ -584,35 +795,55 @@ pub fn rank(files: &[RankFile], focus: Option<&Focus>) -> Ranked {
     rank_with(files, focus, RankWeights::M6)
 }
 
-/// [`rank`] с правилами весов `w` — справочная абляция замера (M6 §12а); продукт — [`rank`].
+/// [`rank`] с правилами весов и связывания `w` (сервер — со своими правилами, абляция замера).
+///
+/// Доли: поток группы, пришедший в файл (без своей части), делится поровну между определениями
+/// файла, которые группа принимает (`same`). Определение, принимающее поток нескольких групп
+/// (тип при В1: группа типов и группа всех определений имени), получает сумму частей.
 pub fn rank_with(files: &[RankFile], focus: Option<&Focus>, w: RankWeights) -> Ranked {
     let g = Graph::with_weights(files, w);
     let restart = focus.and_then(|f| focus_restart(files, f));
     let file_rank = rank_on_graph(&g, restart.as_deref());
-    let mut flow = vec![0.0; g.names()];
+    let mut flow = vec![0.0; g.groups()];
     g.flows(&file_rank, &mut flow);
     let own: HashMap<(usize, usize), f64> = g
         .self_refs
         .iter()
-        .map(|e| ((e.src, e.name), file_rank[e.src] * e.wq))
+        .map(|e| ((e.src, e.group), file_rank[e.src] * e.wq))
         .collect();
-    let mut count = vec![0.0f64; g.names()];
+    let mut count = vec![0.0f64; g.groups()];
     let symbol_share = files
         .iter()
         .zip(&g.def_ids)
         .enumerate()
         .map(|(i, (f, ids))| {
-            ids.iter().for_each(|&id| count[id] += 1.0);
-            let inflow: Vec<f64> = ids
+            let takers: Vec<[usize; 2]> = f
+                .defs
                 .iter()
-                .map(|&id| {
-                    let total = flow[id];
-                    let x = total - own.get(&(i, id)).copied().unwrap_or(0.0);
-                    if x > total * FLOW_EPS { x } else { 0.0 }
-                })
+                .zip(ids)
+                .map(|((_, kind, e), &id)| g.takers(id, *kind, *e))
                 .collect();
-            let same: Vec<f64> = ids.iter().map(|&id| count[id]).collect();
-            ids.iter().for_each(|&id| count[id] = 0.0);
+            takers.iter().flat_map(each).for_each(|x| count[x] += 1.0);
+            // одна группа — (поток, число принимающих), как M6; несколько — сумма частей
+            let (inflow, same): (Vec<f64>, Vec<f64>) = takers
+                .iter()
+                .map(|t| {
+                    let mut parts = 0;
+                    let mut one = (0.0, 1.0);
+                    let mut sum = 0.0;
+                    for x in each(t) {
+                        let total = flow[x];
+                        let v = total - own.get(&(i, x)).copied().unwrap_or(0.0);
+                        if v > total * FLOW_EPS {
+                            parts += 1;
+                            one = (v, count[x]);
+                            sum += v / count[x];
+                        }
+                    }
+                    if parts > 1 { (sum, 1.0) } else { one }
+                })
+                .unzip();
+            takers.iter().flat_map(each).for_each(|x| count[x] = 0.0);
             shares(f, &inflow, &same)
         })
         .collect();

@@ -44,8 +44,11 @@
 //! **Удаление коллекции** (M7.1, задача 7): `delete_collection` повторяется при сбое
 //! переименования её каталога на Windows ([`QdrantIndex::delete_collection_retry`]). Частично
 //! удалённая коллекция — [`IndexError::Corrupt`] с советом по режиму ([`QdrantIndex::with_managed`]:
-//! `zam-server qdrant reset` или удалить коллекцию на своём Qdrant): и когда повторы не помогли, и
-//! когда `create_collection` упирается в оставшийся каталог ([`create_err`]).
+//! `zam-server qdrant reset` или удалить коллекцию на своём Qdrant), когда повторы не помогли.
+//! **Самовосстановление** (M7.5 §8.5): `create_collection` упирается в оставшийся каталог
+//! ([`create_err`]) — `ensure` один раз удаляет остаток и создаёт коллекцию снова
+//! ([`QdrantIndex::heal`], [`IndexMeta::healed`]: вызывающий ставит пересборку из кэша); не вышло
+//! — тот же `Corrupt` с советом.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -317,31 +320,33 @@ impl QdrantIndex {
         self
     }
 
-    async fn ensure_impl(&self, model_id: &str, dim: usize) -> Result<IndexMeta, IndexError> {
-        let exists = self
-            .client
+    async fn collection_exists(&self) -> Result<bool, IndexError> {
+        self.client
             .collection_exists(COLLECTION)
             .await
-            .map_err(|e| map_err("collection_exists", e))?;
+            .map_err(|e| map_err("collection_exists", e))
+    }
+
+    async fn ensure_impl(&self, model_id: &str, dim: usize) -> Result<IndexMeta, IndexError> {
+        let exists = self.collection_exists().await?;
         let mut created = false;
+        let mut healed = false;
         if !exists {
             match self.create_collection(model_id, dim).await {
                 Ok(()) => created = true,
-                Err(e) => {
-                    // Гонка с параллельным ensure: коллекцию успел создать другой вызов.
-                    let now = self
-                        .client
-                        .collection_exists(COLLECTION)
-                        .await
-                        .map_err(|e| map_err("collection_exists", e))?;
-                    if !now {
-                        return Err(e);
-                    }
+                // Гонка с параллельным ensure: коллекцию успел создать другой вызов.
+                Err(_) if self.collection_exists().await? => {}
+                Err(CreateFail::Leftover(corrupt)) => {
+                    self.heal(model_id, dim, corrupt).await?;
+                    created = true;
+                    healed = true;
                 }
+                Err(CreateFail::Other(e)) => return Err(e),
             }
         }
         let (mut meta, schema, current) = self.read_meta().await?;
         meta.created = created;
+        meta.healed = healed;
         // Недостающие payload-индексы (обрыв между созданием коллекции и индексов, коллекция
         // M2 без индексов полей записей) досоздаём только в «своей» коллекции: чужую модель
         // не трогаем. Создание индекса на существующей коллекции точки не трогает.
@@ -396,7 +401,52 @@ impl QdrantIndex {
         Ok(())
     }
 
-    async fn create_collection(&self, model_id: &str, dim: usize) -> Result<(), IndexError> {
+    /// Самовосстановление частично удалённой коллекции (M7.5 §8.5, решение координатора 122):
+    /// коллекции нет в списке Qdrant, а её каталог остался, и создать поверх нельзя. Остаток
+    /// удаляется одним `delete_collection` (с повторами Windows M7.1,
+    /// [`QdrantIndex::delete_collection_retry`]: Qdrant сам удаляет каталог коллекции, которой
+    /// нет в списке), коллекция создаётся снова; пересборку индекса из кэша эмбеддингов ставит
+    /// вызывающий по [`IndexMeta::healed`] (данные остатка без коллекции в списке недоступны,
+    /// источник истины — SQLite и кэш). Так и у внешнего Qdrant: имя коллекции принадлежит
+    /// серверу памяти. Не вышло — прежний `corrupt` с советом по режиму; Qdrant недоступен —
+    /// его ошибка (воркер повторит `ensure`).
+    async fn heal(
+        &self,
+        model_id: &str,
+        dim: usize,
+        corrupt: IndexError,
+    ) -> Result<(), IndexError> {
+        tracing::warn!(
+            collection = COLLECTION,
+            error = %corrupt,
+            "коллекция удалена частично: удаление остатка и повторное создание"
+        );
+        if let Err(e) = self.delete_collection_retry().await {
+            tracing::warn!(collection = COLLECTION, error = %e, "остаток коллекции не удалён");
+            return Err(match e {
+                IndexError::Unavailable(_) | IndexError::Auth => e,
+                _ => corrupt,
+            });
+        }
+        // у новой коллекции нумерация WAL с начала (как после `drop_all`)
+        self.writes.reset_ops();
+        if let Err(f) = self.create_collection(model_id, dim).await {
+            let e = f.into_err();
+            tracing::warn!(
+                collection = COLLECTION,
+                error = %e,
+                "коллекция после удаления остатка не создана"
+            );
+            return Err(e);
+        }
+        tracing::warn!(
+            collection = COLLECTION,
+            "коллекция удалена частично — остаток убран, индекс пересоберётся"
+        );
+        Ok(())
+    }
+
+    async fn create_collection(&self, model_id: &str, dim: usize) -> Result<(), CreateFail> {
         let mut vectors = VectorsConfigBuilder::default();
         vectors.add_named_vector_params(
             DENSE,
@@ -521,6 +571,7 @@ impl QdrantIndex {
                 dim,
                 points,
                 created: false,
+                healed: false,
             },
             schema,
             current,
@@ -1281,25 +1332,48 @@ fn delete_pause(attempt: u32) -> Duration {
         .min(DELETE_PAUSE_MAX)
 }
 
+/// Отказ `create_collection`.
+#[derive(Debug)]
+enum CreateFail {
+    /// Остаток частично удалённой коллекции ([`create_err`]): [`IndexError::Corrupt`] с советом —
+    /// `ensure` пробует самовосстановление ([`QdrantIndex::heal`]).
+    Leftover(IndexError),
+    Other(IndexError),
+}
+
+impl CreateFail {
+    fn into_err(self) -> IndexError {
+        match self {
+            CreateFail::Leftover(e) | CreateFail::Other(e) => e,
+        }
+    }
+}
+
+impl From<IndexError> for CreateFail {
+    fn from(e: IndexError) -> Self {
+        CreateFail::Other(e)
+    }
+}
+
 /// Ошибка `create_collection`. Перед созданием `ensure` проверяет, что коллекции нет
 /// (`collection_exists`), но частично удалённой коллекции нет только в списке Qdrant: её каталог
 /// с конфигурацией остался в хранилище, и Qdrant 1.19 создавать поверх отказывается («Collection
-/// data already exists»). Это [`IndexError::Corrupt`] с советом `advice` (по режиму Qdrant,
-/// [`QdrantIndex::with_managed`]); прочее — [`map_err`].
-fn create_err(e: QdrantError, advice: &str) -> IndexError {
+/// data already exists»). Это [`CreateFail::Leftover`] — [`IndexError::Corrupt`] с советом
+/// `advice` (по режиму Qdrant, [`QdrantIndex::with_managed`]); прочее — [`map_err`].
+fn create_err(e: QdrantError, advice: &str) -> CreateFail {
     if let QdrantError::ResponseError { status } = &e
         && status
             .message()
             .to_lowercase()
             .contains("data already exists")
     {
-        return IndexError::Corrupt(format!(
+        return CreateFail::Leftover(IndexError::Corrupt(format!(
             "create_collection: коллекция {COLLECTION} удалена частично — её каталог остался в \
              хранилище Qdrant ({}); {advice}",
             truncate(status.message())
-        ));
+        )));
     }
-    map_err("create_collection", e)
+    CreateFail::Other(map_err("create_collection", e))
 }
 
 fn is_transport_failure(msg: &str) -> bool {
@@ -1429,9 +1503,9 @@ mod tests {
         assert_eq!(delete_pause(u32::MAX), DELETE_PAUSE_MAX);
     }
 
-    /// Создание поверх остатка каталога — частично удалённая коллекция с советом по режиму:
-    /// управляемый Qdrant — `zam-server qdrant reset`, внешний — удалить коллекцию на своём
-    /// Qdrant, без команды сброса.
+    /// Создание поверх остатка каталога — частично удалённая коллекция (`Leftover`: `ensure`
+    /// пробует самовосстановление) с советом по режиму: управляемый Qdrant — `zam-server qdrant
+    /// reset`, внешний — удалить коллекцию на своём Qdrant, без команды сброса.
     #[test]
     fn data_left_on_create_is_partial_collection() {
         let st = |c: Code, m: &str| QdrantError::ResponseError {
@@ -1446,22 +1520,29 @@ mod tests {
         };
         let e = create_err(left(), RESET_ADVICE_MANAGED);
         assert!(
-            matches!(&e, IndexError::Corrupt(m) if m.contains("zam-server qdrant reset")),
+            matches!(&e, CreateFail::Leftover(IndexError::Corrupt(m))
+                if m.contains("zam-server qdrant reset")),
             "{e:?}"
         );
         let e = create_err(left(), RESET_ADVICE_EXTERNAL);
         assert!(
-            matches!(&e, IndexError::Corrupt(m)
+            matches!(&e, CreateFail::Leftover(IndexError::Corrupt(m))
                 if m.contains("DELETE /collections/zam_chunks") && !m.contains("qdrant reset")),
             "{e:?}"
         );
-        assert!(matches!(
-            create_err(
-                st(Code::InvalidArgument, "Wrong input: bad vector size"),
-                RESET_ADVICE_MANAGED
-            ),
-            IndexError::Other(_)
-        ));
+        // коллекция уже есть (гонка `ensure`) — не остаток
+        for m in [
+            "Wrong input: bad vector size",
+            "Wrong input: Collection `zam_chunks` already exists!",
+        ] {
+            assert!(
+                matches!(
+                    create_err(st(Code::InvalidArgument, m), RESET_ADVICE_MANAGED),
+                    CreateFail::Other(IndexError::Other(_))
+                ),
+                "{m}"
+            );
+        }
     }
 
     /// Совет — по режиму клиента: по умолчанию внешний Qdrant, `with_managed(true)` —

@@ -10,9 +10,10 @@
 //!   ([`crate::file_refs::apply_changes`] — та же функция, что у `POST /files/changed`, но
 //!   только для ссылок на символы: файловые ссылки судят хуки рабочей копии). Удаление файла
 //!   синхронизацией — `symbol_removed` у ссылок на его символы.
-//! - **Ранги** считаются лениво ([`code_rank_inputs`] → `zam_code::rank` → [`code_store_ranks`]);
-//!   любое изменение карты увеличивает `gen` снимка и ставит `rank_state = pending`, ранги по
-//!   устаревшим входам не сохраняются. Хранятся ранг файла и доли его символов
+//! - **Ранги** считаются лениво ([`code_rank_inputs`] → `zam_code::rank_with` правилами сервера →
+//!   [`code_store_ranks`]); любое изменение карты увеличивает `gen` снимка и ставит
+//!   `rank_state = pending`, ранги по устаревшим входам не сохраняются; другие правила сервера
+//!   (M7.5) — тоже `pending` ([`code_rank_rules`]). Хранятся ранг файла и доли его символов
 //!   (`code_files.shares`, f32); ранг символа = ранг файла × доля — при чтении.
 //! - **Невидимость:** функции модуля не трогают `chunks`, `index_jobs` и Qdrant; поиск памяти
 //!   (`search.rs`) таблиц карты не читает.
@@ -56,7 +57,8 @@ const CENTRAL_PER_FILE: usize = 3;
 /// Изменение доли символа, ниже которого доли файла не переписываются.
 const SHARE_EPS: f32 = 1e-4;
 
-/// Атрибуция загрузки: коммит, ветка и машина клиента, пользователь запроса, момент.
+/// Атрибуция загрузки: коммит, ветка и машина клиента, пользователь запроса, момент; предел
+/// файлов карты.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadMeta {
     pub commit: Option<String>,
@@ -64,6 +66,9 @@ pub struct UploadMeta {
     pub machine: Option<String>,
     pub user_id: Id,
     pub now: Timestamp,
+    /// Карта решения после загрузки — не больше стольких файлов (`code.max_files`): проверка в
+    /// транзакции записи ([`code_put_files`], M7.5 §8.6 п. 5); `None` — без предела.
+    pub max_files: Option<u32>,
 }
 
 /// Итог `POST /code/sync`.
@@ -589,12 +594,52 @@ fn put_file(
     Ok(id)
 }
 
-/// Загрузка разобранных файлов (одна транзакция на вызов, до 500 файлов): строки файлов,
-/// символы, ссылки, атрибуция; затем правило устарелости ссылок памяти на символы пространств
-/// `ref_spaces` этой базы по загруженным символам. Файловые ссылки и хэш файла у ссылок не
-/// меняются (их судят хуки рабочей копии: у другой машины другой перевод строк); пропущенный
-/// файл (`skipped`) и не найденный символ неполного (`partial`) — ссылку не судят. Снимок:
-/// счётчики, преобладающий коммит/ветка/машина, `rank_state = pending`.
+/// Карта решения после загрузки `files` — не больше `max` файлов: текущие файлы и новые пути
+/// загрузки; иначе [`StoreError::BadInput`] с пределом (сервер — 422). Новые пути считаются,
+/// только если быстрая оценка «файлы + загрузка» предел превышает. В транзакции записи
+/// ([`code_put_files`]): две параллельные загрузки вместе предел не превысят (M7.5 §8.6 п. 5; до
+/// M7.5 сервер проверял до транзакции).
+fn check_map_size(
+    tx: &Connection,
+    solution: &str,
+    files: &[FileUpload],
+    max: u32,
+) -> Result<(), StoreError> {
+    let have: i64 = tx
+        .prepare_cached("SELECT count(*) FROM code_files WHERE solution_guid = ?1")?
+        .query_row([solution], |r| r.get(0))?;
+    let have = u64::try_from(have).unwrap_or(0);
+    if have + files.len() as u64 <= u64::from(max) {
+        return Ok(());
+    }
+    let mut known = tx.prepare_cached(
+        "SELECT EXISTS (SELECT 1 FROM code_files WHERE solution_guid = ?1 AND path = ?2)",
+    )?;
+    let mut new: HashSet<&str> = HashSet::new();
+    for f in files {
+        if !new.contains(f.path.as_str())
+            && !known.query_row(params![solution, f.path], |r| r.get::<_, bool>(0))?
+        {
+            new.insert(&f.path);
+        }
+    }
+    if have + new.len() as u64 > u64::from(max) {
+        return Err(StoreError::BadInput(format!(
+            "files: в карте решения не больше {max} файлов (code.max_files): сейчас {have}, \
+             новых {}",
+            new.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Загрузка разобранных файлов (одна транзакция на вызов, до 500 файлов): предел файлов карты
+/// (`meta.max_files`, [`check_map_size`]), строки файлов, символы, ссылки, атрибуция; затем
+/// правило устарелости ссылок памяти на символы пространств `ref_spaces` этой базы по
+/// загруженным символам. Файловые ссылки и хэш файла у ссылок не меняются (их судят хуки рабочей
+/// копии: у другой машины другой перевод строк); пропущенный файл (`skipped`) и не найденный
+/// символ неполного (`partial`) — ссылку не судят. Снимок: счётчики, преобладающий
+/// коммит/ветка/машина, `rank_state = pending`.
 pub async fn code_put_files(
     db: &Db,
     solution: &str,
@@ -606,6 +651,9 @@ pub async fn code_put_files(
     let meta = meta.clone();
     let spaces = (!ref_spaces.is_empty()).then(|| crate::file_refs::ids_json(ref_spaces));
     db.write(move |tx| {
+        if let Some(max) = meta.max_files {
+            check_map_size(tx, &solution, &files, max)?;
+        }
         let now = fmt_ts(meta.now);
         ensure_snapshot(tx, &solution, &now)?;
         for f in &files {
@@ -814,6 +862,40 @@ pub async fn code_rank_inputs(db: &Db, solution: &str) -> Result<RankInputs, Sto
             }
         }
         Ok(RankInputs { files, generation })
+    })
+    .await
+}
+
+/// Ключ `meta`: правила ранжирования, которыми посчитаны сохранённые ранги карт базы
+/// ([`code_rank_rules`], M7.5).
+const RANK_RULES_KEY: &str = "code.rank_rules";
+
+/// Правила ранжирования сервера `rules` (отпечаток `zam_code::RankWeights::rules_id`, M7.5 §8.6):
+/// сохранённые ранги карт базы посчитаны другими (ключа `meta` `code.rank_rules` нет — база до
+/// M7.5) — все снимки карты базы `pending` (ранги пересчитает следующий запрос карты, поколение
+/// снимка прежнее), ключ — `rules`; одна транзакция. Число отмеченных снимков.
+pub async fn code_rank_rules(db: &Db, rules: &str) -> Result<usize, StoreError> {
+    let rules = rules.to_string();
+    db.write(move |tx| {
+        let cur: Option<String> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [RANK_RULES_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if cur.as_deref() == Some(rules.as_str()) {
+            return Ok(0);
+        }
+        let n = tx.execute(
+            "UPDATE code_snapshots SET rank_state = 'pending' WHERE rank_state <> 'pending'",
+            [],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            params![RANK_RULES_KEY, rules],
+        )?;
+        Ok(n)
     })
     .await
 }
@@ -1064,25 +1146,6 @@ pub async fn code_map_symbols(
         Ok(out)
     })
     .await
-}
-
-/// Файлы карты с символами ([`code_map_files`] + [`code_map_symbols`] всех файлов) — для
-/// небольших областей; полную карту сервер собирает в две фазы.
-pub async fn code_map_rows(
-    db: &Db,
-    solution: &str,
-    area: Option<&str>,
-) -> Result<Vec<MapFileRow>, StoreError> {
-    let mut files = code_map_files(db, solution, area).await?;
-    let ids: Vec<i64> = files.iter().map(|f| f.id).collect();
-    let mut syms: HashMap<i64, Vec<MapSymRow>> = code_map_symbols(db, solution, &ids)
-        .await?
-        .into_iter()
-        .collect();
-    for f in &mut files {
-        f.symbols = syms.remove(&f.id).unwrap_or_default();
-    }
-    Ok(files)
 }
 
 /// Центральные символы решения (§7) без чтения всей карты: первые `n` по рангу символа

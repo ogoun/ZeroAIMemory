@@ -68,6 +68,8 @@ pub struct MaskedSig {
 pub struct SyncReport {
     /// Файлов в манифесте.
     pub files: usize,
+    /// Файлов кода, исключённых по `.gitattributes` (M7.5 §8.6 п. 4).
+    pub excluded_gitattributes: usize,
     /// Путей в `need` (с `--full` — все).
     pub need: usize,
     /// Принято сервером.
@@ -102,6 +104,12 @@ impl SyncReport {
         }
         if self.stale_refs > 0 {
             s.push_str(&format!(", устаревших ссылок {}", self.stale_refs));
+        }
+        if self.excluded_gitattributes > 0 {
+            s.push_str(&format!(
+                ", исключено по .gitattributes {}",
+                self.excluded_gitattributes
+            ));
         }
         s.push_str(&format!(" ({} мс)", self.ms));
         s
@@ -715,7 +723,10 @@ pub fn sync(
     let mut state = CodeState::load(root);
     let crash = CrashLog::new(root);
     absorb_crash(root, &crash, &mut state)?;
-    let fps = scan::fingerprints(root, cfg)?;
+    let scan::Scan {
+        files: fps,
+        gitattributes: by_attrs,
+    } = scan::scan(root, cfg)?;
     let mut hashes: HashMap<String, String> = HashMap::with_capacity(fps.len());
     let mut manifest: Vec<Value> = Vec::with_capacity(fps.len());
     let mut live: Vec<&Fingerprint> = Vec::with_capacity(fps.len());
@@ -727,14 +738,17 @@ pub fn sync(
         hashes.insert(fp.path.clone(), h);
         live.push(fp);
     }
-    // пути под исключениями по умолчанию (M6 §12а) не считаются: их уход из карты — смена
-    // умолчания (`code.exclude_defaults`), а не потерянный корень (ревью задачи 14, M1)
+    // пути под исключениями по умолчанию (M6 §12а) и по `.gitattributes` (M7.5 §8.6) не
+    // считаются: их уход из карты — смена умолчания (`code.exclude_defaults`,
+    // `code.exclude_gitattributes`), а не потерянный корень (ревью задачи 14, M1)
     let defaults = cfg.default_exclude_set();
+    let attr_set: HashSet<&str> = by_attrs.iter().map(String::as_str).collect();
     let known = if state.solution == guid && !state.files.is_empty() {
         state
             .files
             .keys()
             .filter(|p| !defaults.as_ref().is_some_and(|g| g.is_match(p.as_str())))
+            .filter(|p| !attr_set.contains(p.as_str()))
             .count()
     } else if opts.prune {
         0
@@ -776,6 +790,7 @@ pub fn sync(
         .map_err(|e| e.context("синхронизация карты"))?;
     let mut report = SyncReport {
         files: live.len(),
+        excluded_gitattributes: by_attrs.len(),
         removed: resp["removed"].as_u64().unwrap_or(0),
         stale_refs: resp["stale_refs"].as_u64().unwrap_or(0) as u32,
         warnings,
@@ -912,6 +927,7 @@ pub fn sync(
         solution: guid.to_string(),
         last_ok_at: now,
         head: meta.commit.clone(),
+        excluded_gitattributes: by_attrs.len(),
     }
     .save(root)
     .map_err(io)?;

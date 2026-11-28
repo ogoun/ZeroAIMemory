@@ -738,6 +738,7 @@ fn ensure_blocking(inner: &Inner, model_id: &str, dim: usize) -> Result<IndexMet
         dim: dim_now,
         points,
         created,
+        healed: false,
     })
 }
 

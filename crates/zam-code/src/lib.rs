@@ -22,8 +22,8 @@ pub use proto::{
     SymbolHash, SymbolKind, UPLOAD_FILES_MAX, body_hash, lang_of, sig_line,
 };
 pub use rank::{
-    Focus, Graph, RankFile, RankWeights, Ranked, central, edges_among, focus_idents, focus_restart,
-    ident_mult, pagerank, rank, rank_on_graph, rank_with,
+    Focus, Graph, RankFile, RankWeights, Ranked, central, edges_among, edges_among_with,
+    focus_idents, focus_restart, ident_mult, pagerank, rank, rank_on_graph, rank_with,
 };
 
 #[cfg(feature = "parse")]
