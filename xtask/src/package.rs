@@ -995,15 +995,45 @@ fn clarify_failures(stderr: &str) -> Vec<&str> {
         .collect()
 }
 
-/// `cargo about generate`: сводка лицензий Rust-зависимостей в `out` — пакета `manifest` или,
-/// без него, всего workspace; с проверкой, что уточнения `about` применены.
-fn cargo_about(
+/// Цель сборки (`--target` cargo) платформы упаковки: сервер Linux — gnu, клиент `zam` Linux —
+/// musl (статический, как `cargo build --release -p zam-cli --target x86_64-unknown-linux-musl`
+/// в `package.yml`).
+fn triple(platform: &str, cli: bool) -> &'static str {
+    match (is_windows(platform), cli) {
+        (true, _) => "x86_64-pc-windows-msvc",
+        (false, false) => "x86_64-unknown-linux-gnu",
+        (false, true) => "x86_64-unknown-linux-musl",
+    }
+}
+
+/// Цели сводок лицензий платформы `platform` (M7.4 §7.6 п. 8): комплект сервера — цели всего, что
+/// в нём собрано из Rust: `zam-server`, `zam` своей платформы и `zam` другой (комплект раздаёт его,
+/// `--cli-other`, `GET /downloads/zam/<платформа>`); архив клиента — только цель `zam` этой
+/// платформы. Без `--target` действовали все цели `about.toml` разом, и сводки клиента обеих
+/// платформ были одинаковы — с крейтами чужой ОС **[решение исполнителя, задача 2 M7.4]**.
+pub fn license_targets(platform: &str) -> (Vec<&'static str>, Vec<&'static str>) {
+    let mut server = Vec::new();
+    for t in [
+        triple(platform, false),
+        triple(platform, true),
+        triple(other_platform(platform), true),
+    ] {
+        if !server.contains(&t) {
+            server.push(t);
+        }
+    }
+    (server, vec![triple(platform, true)])
+}
+
+/// Команда `cargo about generate` в `root`: конфигурация `config`, пакет `manifest` (без него —
+/// весь workspace), цели `targets` (по флагу `--target` на каждую), вывод `out`.
+fn cargo_about_cmd(
     root: &Path,
-    about: &AboutConfig,
     config: &Path,
     manifest: Option<&Path>,
+    targets: &[&str],
     out: &Path,
-) -> Result<()> {
+) -> Command {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut cmd = Command::new(cargo);
     cmd.current_dir(root)
@@ -1012,7 +1042,24 @@ fn cargo_about(
     if let Some(m) = manifest {
         cmd.arg("--manifest-path").arg(m);
     }
+    for t in targets {
+        cmd.args(["--target", t]);
+    }
     cmd.arg("about.hbs").arg("-o").arg(out);
+    cmd
+}
+
+/// `cargo about generate`: сводка лицензий Rust-зависимостей в `out` — пакета `manifest` или,
+/// без него, всего workspace, по целям `targets`; с проверкой, что уточнения `about` применены.
+fn cargo_about(
+    root: &Path,
+    about: &AboutConfig,
+    config: &Path,
+    manifest: Option<&Path>,
+    targets: &[&str],
+    out: &Path,
+) -> Result<()> {
+    let mut cmd = cargo_about_cmd(root, config, manifest, targets, out);
     let o = run(
         &mut cmd,
         &format!("cargo about (установка: {})", cargo_about_install()),
@@ -1031,12 +1078,13 @@ fn cargo_about(
     check_clarified_notices(&html, &about.clarified, &out.display().to_string())
 }
 
-/// Генерирует в `work` лицензии поставки. Комплект сервера (`work/server/`):
+/// Генерирует в `work` лицензии поставки платформы `platform`. Комплект сервера (`work/server/`):
 /// THIRD-PARTY-RUST.html (cargo-about по всему workspace), THIRD-PARTY-WEB.json
 /// (license-checker) и THIRD-PARTY-WEB-NOTICES.txt (тексты лицензий бандла WebUI). Архив клиента
-/// (`work/cli/`): THIRD-PARTY-RUST.html только по зависимостям `zam` ([`CLI_MANIFEST`]). Сети
-/// cargo-about не требует: тексты `clarify` — в репозитории ([`resolve_about_config`]).
-pub fn generate_licenses(root: &Path, work: &Path) -> Result<GeneratedLicenses> {
+/// (`work/cli/`): THIRD-PARTY-RUST.html только по зависимостям `zam` ([`CLI_MANIFEST`]). Сводки
+/// Rust — по целям упаковки ([`license_targets`]). Сети cargo-about не требует: тексты `clarify` —
+/// в репозитории ([`resolve_about_config`]).
+pub fn generate_licenses(root: &Path, work: &Path, platform: &str) -> Result<GeneratedLicenses> {
     if work.exists() {
         fs::remove_dir_all(work)?;
     }
@@ -1062,13 +1110,22 @@ pub fn generate_licenses(root: &Path, work: &Path) -> Result<GeneratedLicenses> 
     check_cargo_about_version(&String::from_utf8_lossy(&v.stdout))?;
     let config = work.join("about.toml");
     fs::write(&config, &about.text)?;
-    cargo_about(root, &about, &config, None, &out.join(RUST_LICENSES))?;
+    let (server_targets, cli_targets) = license_targets(platform);
+    cargo_about(
+        root,
+        &about,
+        &config,
+        None,
+        &server_targets,
+        &out.join(RUST_LICENSES),
+    )?;
     let cli_rust = cli.join(RUST_LICENSES);
     cargo_about(
         root,
         &about,
         &config,
         Some(&root.join(CLI_MANIFEST)),
+        &cli_targets,
         &cli_rust,
     )?;
     // В бандл WebUI входят пакеты из devDependencies (сборка vite), поэтому проверяем всё дерево.
@@ -2041,6 +2098,67 @@ pub(crate) mod tests {
         let out = format!("{other}\n{warn}\n");
         assert_eq!(clarify_failures(&out), [warn]);
         assert!(clarify_failures(other).is_empty());
+    }
+
+    /// M7.4 §7.6 п. 8: сводка лицензий — по целям упаковки (`cargo about generate --target`):
+    /// комплект сервера — цели `zam-server`, своего `zam` и `zam` другой платформы
+    /// (`--cli-other`, раздача `GET /downloads/zam/…`), архив клиента — только цель его `zam`
+    /// (Linux — musl, как сборка в CI).
+    #[test]
+    fn cargo_about_uses_package_target() {
+        let (server, cli) = license_targets("windows-x64");
+        assert_eq!(
+            server,
+            ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-musl"]
+        );
+        assert_eq!(cli, ["x86_64-pc-windows-msvc"]);
+        let (server, cli) = license_targets("linux-x64");
+        assert_eq!(
+            server,
+            [
+                "x86_64-unknown-linux-gnu",
+                "x86_64-unknown-linux-musl",
+                "x86_64-pc-windows-msvc"
+            ]
+        );
+        assert_eq!(cli, ["x86_64-unknown-linux-musl"]);
+        let args = |c: &Command| -> Vec<String> {
+            c.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let c = cargo_about_cmd(
+            Path::new("."),
+            Path::new("about.toml"),
+            Some(Path::new(CLI_MANIFEST)),
+            &cli,
+            Path::new("out.html"),
+        );
+        let a = args(&c);
+        let at = |i: usize| a.get(i).map(String::as_str);
+        let t = a.iter().position(|x| x == "--target").expect("--target");
+        assert_eq!(at(t + 1), Some("x86_64-unknown-linux-musl"), "{a:?}");
+        assert_eq!(a.iter().filter(|x| *x == "--target").count(), 1, "{a:?}");
+        let m = a
+            .iter()
+            .position(|x| x == "--manifest-path")
+            .expect("манифест");
+        assert_eq!(at(m + 1), Some(CLI_MANIFEST), "{a:?}");
+        // комплект сервера — обе цели, каждая своим флагом
+        let a = args(&cargo_about_cmd(
+            Path::new("."),
+            Path::new("about.toml"),
+            None,
+            &server,
+            Path::new("out.html"),
+        ));
+        let targets: Vec<&str> = a
+            .windows(2)
+            .filter(|w| w[0] == "--target")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(targets, server, "{a:?}");
+        assert!(!a.iter().any(|x| x == "--manifest-path"), "{a:?}");
     }
 
     /// Пакет выпускаемого клиента `zam`.

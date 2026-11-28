@@ -617,6 +617,11 @@ fn symbol_hashes_match_extract_and_none_when_skipped() {
 
 /// Ревью C1: подъём к корню через `Node::parent()` был O(глубины²) — 80 КБ вложенных блоков
 /// разбирались 14 с при отсечке 200 мс. Теперь один обход; отсечка соблюдается.
+///
+/// Предел времени — [`DEEP_BLOCKS_LIMIT`] (1 с; до M7.4 — 150 мс): тест ловит квадратичный
+/// обход (14 с), а 150 мс давали ложные падения на занятой машине (параллельная сборка,
+/// HDD) — флейк M7.3; замедление в 2–6 раз этот тест больше не ловит (решение координатора
+/// 110, спецификация M7 §7.6 п. 9).
 #[test]
 fn deep_blocks_definition_respects_timeout() {
     let n = 20_000;
@@ -657,16 +662,20 @@ fn deep_blocks_definition_respects_timeout() {
             out.state,
             out.skip
         );
-        assert!(el < Duration::from_millis(150), "{lang:?}: {el:?}");
+        assert!(el < DEEP_BLOCKS_LIMIT, "{lang:?}: {el:?}");
         let t = Instant::now();
         let _ = symbol_hashes(lang, src.as_bytes(), &l);
         assert!(
-            t.elapsed() < Duration::from_millis(150),
+            t.elapsed() < DEEP_BLOCKS_LIMIT,
             "{lang:?} hashes: {:?}",
             t.elapsed()
         );
     }
 }
+
+/// Предел времени [`deep_blocks_definition_respects_timeout`]: квадратичный обход — 14 с, на
+/// занятой машине нормальный — до сотен мс.
+const DEEP_BLOCKS_LIMIT: Duration = Duration::from_secs(1);
 
 /// Ревью C2: рекурсивный разбор типа `impl` переполнял стек (catch_unwind его не ловит).
 #[test]

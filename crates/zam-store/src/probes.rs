@@ -666,6 +666,57 @@ fn target_alive(c: &Connection, t: &ProbeTarget) -> Result<bool, StoreError> {
     Ok(live.is_some())
 }
 
+/// Цель ручной пробы (M7.4 §7.6 п. 3): ссылка `<буква>:<id>` живой записи — заметка `n:` (не
+/// удалена, не папка) или запись журнала той буквы, что у её вида (`EntryKind::ref_letter`; не
+/// удалена, не замещена и не отозвана — как [`target_alive`]). Итог — цель с текущей ревизией и
+/// пространство записи; иначе (нет записи, не действует, буква не того вида, ссылка не той
+/// формы) — `None`.
+pub async fn live_target(
+    db: &Db,
+    reference: &str,
+) -> Result<Option<(ProbeTarget, Id)>, StoreError> {
+    let reference = reference.trim().to_string();
+    db.read(move |c| {
+        let Some((letter, raw)) = reference.split_once(':') else {
+            return Ok(None);
+        };
+        let Ok(id) = raw.parse::<Id>() else {
+            return Ok(None);
+        };
+        let row: Option<(Id, i64)> = if letter == "n" {
+            c.query_row(
+                "SELECT space_id, current_rev FROM nodes
+                 WHERE id = ?1 AND kind = 'note' AND deleted_at IS NULL",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+        } else {
+            let row: Option<(Id, i64, String)> = c
+                .query_row(
+                    "SELECT space_id, current_rev, kind FROM entries
+                     WHERE id = ?1 AND deleted_at IS NULL
+                       AND (status IS NULL OR status NOT IN ('superseded', 'retracted'))",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            row.filter(|(_, _, k)| EntryKind::parse(k).map(EntryKind::ref_letter) == Some(letter))
+                .map(|(space, rev, _)| (space, rev))
+        };
+        Ok(row.map(|(space, rev)| {
+            (
+                ProbeTarget {
+                    target: format!("{letter}:{id}"),
+                    rev,
+                },
+                space,
+            )
+        }))
+    })
+    .await
+}
+
 /// Снимает активные пробы с целью, у которых не осталось ни одной живой цели
 /// ([`RETIRED_TARGET_GONE`]); id снятых.
 pub async fn retire_gone(db: &Db) -> Result<Vec<Id>, StoreError> {

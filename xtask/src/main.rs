@@ -443,7 +443,7 @@ fn package_cmd(a: PackageArgs) -> Result<()> {
                 package::other_platform(&platform)
             );
         }
-        let licenses = package::generate_licenses(&root, &target.join("licenses"))?;
+        let licenses = package::generate_licenses(&root, &target.join("licenses"), &platform)?;
         let crt = if platform.starts_with("windows") {
             Some(package::find_crt_dir(a.flavor)?)
         } else {

@@ -353,6 +353,302 @@ async fn probes_not_in_search_export_digest() {
     }
 }
 
+const PROBES: &str = "/api/v1/check/probes";
+
+/// Insight пространства `space` первым токеном; id.
+async fn insight_id(a: &Api, space: &str, title: &str) -> String {
+    let r = a
+        .t(
+            Method::POST,
+            &format!("/api/v1/spaces/{space}/entries"),
+            Some(json!({"kind": "insight", "title": title, "body": "текст",
+                        "data": {"kind": "gotcha"}})),
+        )
+        .await;
+    ok(&r, StatusCode::CREATED);
+    id(&r.json())
+}
+
+/// M7.4 §7.6 п. 3: ручная проба `POST /check/probes {question, targets, space?}` — 201 `{id}`;
+/// вид `manual`, автор по принципалу (токен — `agent`, сессия WebUI — `human`), часть — общим
+/// правилом по первой цели, ревизия цели — текущая, пространство — цели или явное; цели из
+/// другого пространства — 422.
+#[tokio::test]
+async fn check_probes_add_manual() {
+    let _serial = SERIAL.lock().await;
+    let a = api("probes-add-manual", |_| {}).await;
+    let kn = space_id(&a, SpaceKind::Knowledge).await;
+    let n = id(&a
+        .note("knowledge", "kb/ручная.md", "# Ручная\n\nalphamike.\n")
+        .await);
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::PUT,
+            &format!("/api/v1/nodes/{n}"),
+            Some(json!({"content": "# Ручная\n\nalphamike, правлено.\n"})),
+            &[("if-match", "1")],
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    let ins = insight_id(&a, "knowledge", "Ловушка bravonovember").await;
+    let t = format!("n:{n}");
+    let r = a
+        .t(
+            Method::POST,
+            PROBES,
+            Some(json!({"question": "где alphamike", "targets": [t, format!("i:{ins}")]})),
+        )
+        .await;
+    ok(&r, StatusCode::CREATED);
+    let pid = r.json()["id"].as_str().unwrap().to_string();
+    assert!(pid.starts_with("x:"), "{pid}");
+    let items = probes(&a, "?kind=manual").await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    let p = &items[0];
+    assert_eq!(p["id"], pid);
+    assert_eq!(p["question"], "где alphamike");
+    assert_eq!(p["author_kind"], "agent");
+    assert_eq!(p["status"], "active");
+    assert_eq!(p["space"], kn.to_string());
+    assert_eq!(p["split"], zam_search::eval::probe_split(&t).as_str());
+    assert_eq!(
+        p["targets"],
+        json!([{"ref": t, "rev": 2}, {"ref": format!("i:{ins}"), "rev": 1}])
+    );
+    // сессия WebUI — автор `human`; пространство явно
+    let r = a
+        .adm(
+            Method::POST,
+            PROBES,
+            Some(
+                json!({"question": "что за bravonovember", "targets": [format!("i:{ins}")],
+                        "space": "knowledge"}),
+            ),
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::CREATED);
+    let items = probes(&a, "?kind=manual").await;
+    assert_eq!(items[0]["author_kind"], "human", "{items:?}");
+    assert_eq!(items[0]["author"], "admin");
+    // цель не из пространства пробы — 422
+    let r = a
+        .t(
+            Method::POST,
+            PROBES,
+            Some(
+                json!({"question": "в rules alphamike", "targets": [format!("n:{n}")],
+                        "space": "rules"}),
+            ),
+        )
+        .await;
+    ok(&r, StatusCode::UNPROCESSABLE_ENTITY);
+    // ручная проба — не запись памяти: в поиске её нет
+    let r = a
+        .t(
+            Method::POST,
+            "/api/v1/search",
+            Some(json!({"query": "что за bravonovember", "format": "json"})),
+        )
+        .await;
+    ok(&r, StatusCode::OK);
+    assert!(!r.text().contains(&pid), "{}", r.text());
+}
+
+/// M7.4 §7.6 п. 3: повтор вопроса (та же нормализованная строка у активной пробы пространства) —
+/// 409 `/problems/probe-duplicate`; предел активных проб с целью — 409 `/problems/probes-limit`.
+#[tokio::test]
+async fn check_probes_add_duplicate_409() {
+    let _serial = SERIAL.lock().await;
+    let a = api("probes-add-dup", |_| {}).await;
+    let n = id(&a
+        .note("knowledge", "kb/d.md", "# D\n\ncharlieoscar.\n")
+        .await);
+    let body = |q: &str| json!({"question": q, "targets": [format!("n:{n}")]});
+    ok(
+        &a.t(Method::POST, PROBES, Some(body("где charlieoscar")))
+            .await,
+        StatusCode::CREATED,
+    );
+    let r = a
+        .t(Method::POST, PROBES, Some(body("  Где   CHARLIEOSCAR ")))
+        .await;
+    common::api::problem(&r, StatusCode::CONFLICT, "probe-duplicate");
+    assert_eq!(probes(&a, "?kind=manual").await.len(), 1);
+    // предел: активных проб с целью — PROBES_MAX
+    let kn = space_id(&a, SpaceKind::Knowledge).await;
+    let db = a.st.users.get(a.st.admin_id).await.unwrap();
+    let target = json!([{"ref": format!("n:{n}"), "rev": 1}]).to_string();
+    let now = zam_store::time::fmt_ts(zam_store::time::now());
+    db.write(move |t| {
+        for i in 1..PROBES_MAX {
+            t.execute(
+                "INSERT INTO probes (id, space_id, question, kind, targets, split, author_kind,
+                                     status, created_at)
+                 VALUES (?1, ?2, ?3, 'probe', ?4, 'dev', 'agent', 'active', ?5)",
+                rusqlite::params![
+                    Id::new(),
+                    kn.to_string(),
+                    format!("вопрос предела {i}"),
+                    target,
+                    now
+                ],
+            )?;
+        }
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let r = a
+        .t(
+            Method::POST,
+            PROBES,
+            Some(body("сверх предела charlieoscar")),
+        )
+        .await;
+    common::api::problem(&r, StatusCode::CONFLICT, "probes-limit");
+}
+
+/// M7.4 §7.6 п. 3: цель не найдена или не действует (нет записи, удалена, отозвана, буква не того
+/// вида) — 422; ссылка не `<буква>:<id>`, без целей, пустой вопрос — 400. Ничего не записано.
+#[tokio::test]
+async fn check_probes_add_bad_target_422() {
+    let _serial = SERIAL.lock().await;
+    let a = api("probes-add-bad", |_| {}).await;
+    let gone = id(&a.note("knowledge", "kb/g.md", "# G\n\ndeltaecho.\n").await);
+    ok(
+        &a.t(Method::DELETE, &format!("/api/v1/nodes/{gone}"), None)
+            .await,
+        StatusCode::NO_CONTENT,
+    );
+    let ins = insight_id(&a, "knowledge", "Отозванный foxtrotgolf").await;
+    ok(
+        &a.t(
+            Method::POST,
+            &format!("/api/v1/entries/{ins}/retract"),
+            Some(json!({"reason": "опровергнуто"})),
+        )
+        .await,
+        StatusCode::OK,
+    );
+    let live = insight_id(&a, "knowledge", "Живой hotelindia").await;
+    for t in [
+        format!("n:{}", Id::new()),
+        format!("n:{gone}"),
+        format!("i:{ins}"),
+        // insight по букве заметки
+        format!("n:{live}"),
+    ] {
+        let r = a
+            .t(
+                Method::POST,
+                PROBES,
+                Some(json!({"question": "где deltaecho", "targets": [t]})),
+            )
+            .await;
+        common::api::problem(&r, StatusCode::UNPROCESSABLE_ENTITY, "unprocessable");
+        assert!(r.text().contains(&t), "{t}: {}", r.text());
+    }
+    for body in [
+        json!({"question": "где deltaecho", "targets": ["deltaecho"]}),
+        json!({"question": "где deltaecho", "targets": []}),
+        json!({"question": "   ", "targets": [format!("i:{live}")]}),
+        json!({"question": "где deltaecho", "targets": [format!("i:{live}")], "kind": "probe"}),
+    ] {
+        let r = a.t(Method::POST, PROBES, Some(body.clone())).await;
+        ok(&r, StatusCode::BAD_REQUEST);
+    }
+    assert!(probes(&a, "?kind=manual").await.is_empty());
+}
+
+/// M7.4 §7.6 п. 3, Review Focus 4: снять пробу (`DELETE /check/probes/{id} {reason}`) может только
+/// человек — агентский токен 403, проба остаётся; сессия WebUI — 204, аудит `check.probe.retire
+/// {probe, reason}`; снятая, чужая и несуществующая — 404; причина 3..=500 символов.
+#[tokio::test]
+async fn check_probes_retire_human_only() {
+    let _serial = SERIAL.lock().await;
+    let a = api("probes-retire-human", |_| {}).await;
+    let n = id(&a.note("knowledge", "kb/r.md", "# R\n\njulietkilo.\n").await);
+    let r = a
+        .t(
+            Method::POST,
+            PROBES,
+            Some(json!({"question": "где julietkilo", "targets": [format!("n:{n}")]})),
+        )
+        .await;
+    ok(&r, StatusCode::CREATED);
+    let pid = r.json()["id"].as_str().unwrap().to_string();
+    let uri = format!("{PROBES}/{pid}");
+    let reason = json!({"reason": "вопрос сформулирован неверно"});
+    let r = a.t(Method::DELETE, &uri, Some(reason.clone())).await;
+    ok(&r, StatusCode::FORBIDDEN);
+    assert!(r.text().contains("человек"), "{}", r.text());
+    assert_eq!(probes(&a, "?status=active&kind=manual").await.len(), 1);
+    // чужая: сессия другого пользователя — 404 (в его базе пробы нет)
+    let u = common::reports::ready_user(&a, "olga", "192.0.2.41").await;
+    let r = common::reports::web(&a, &u.web, Method::DELETE, &uri, Some(reason.clone())).await;
+    ok(&r, StatusCode::NOT_FOUND);
+    // причина короче 3 символов — 422
+    let r = a
+        .adm(Method::DELETE, &uri, Some(json!({"reason": " x "})), None)
+        .await;
+    common::api::problem(&r, StatusCode::UNPROCESSABLE_ENTITY, "reason-required");
+    let r = a
+        .adm(Method::DELETE, &uri, Some(reason.clone()), None)
+        .await;
+    ok(&r, StatusCode::NO_CONTENT);
+    let retired = probes(&a, "?status=retired&kind=manual").await;
+    assert_eq!(retired.len(), 1);
+    assert_eq!(retired[0]["retired_reason"], "вопрос сформулирован неверно");
+    let audit = a.st.system.list_audit(50, None).await.unwrap();
+    let row = audit
+        .iter()
+        .find(|r| r.action == "check.probe.retire")
+        .expect("аудит check.probe.retire");
+    assert_eq!(row.actor, "admin");
+    assert_eq!(row.user_id, Some(a.st.admin_id));
+    assert_eq!(
+        row.details,
+        json!({"probe": pid, "reason": "вопрос сформулирован неверно"})
+    );
+    // снятая и несуществующая — 404
+    let r = a
+        .adm(Method::DELETE, &uri, Some(reason.clone()), None)
+        .await;
+    ok(&r, StatusCode::NOT_FOUND);
+    let r = a
+        .adm(
+            Method::DELETE,
+            &format!("{PROBES}/x:{}", Id::new()),
+            Some(reason),
+            None,
+        )
+        .await;
+    ok(&r, StatusCode::NOT_FOUND);
+}
+
+/// M7.4 §7.6 п. 3: ввод пробы — `rw`: токен `ro` — 403 (список ему по-прежнему доступен).
+#[tokio::test]
+async fn check_probes_ro_403() {
+    let _serial = SERIAL.lock().await;
+    let a = api("probes-ro", |_| {}).await;
+    let n = id(&a.note("knowledge", "kb/ro.md", "# RO\n\nlimamike.\n").await);
+    let ro = a.issue(&a.admin_id(), "ro").await;
+    let r = a
+        .tok(
+            &ro,
+            Method::POST,
+            PROBES,
+            Some(json!({"question": "где limamike", "targets": [format!("n:{n}")]})),
+        )
+        .await;
+    ok(&r, StatusCode::FORBIDDEN);
+    let r = a.tok(&ro, Method::GET, PROBES, None).await;
+    ok(&r, StatusCode::OK);
+    assert!(probes(&a, "?kind=manual").await.is_empty());
+}
+
 /// §6 «Общее»: пробы — в копии сервера (база целиком): копия снята с работающего сервера, в её
 /// базе пользователя пробы на месте.
 #[tokio::test]

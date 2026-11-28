@@ -1317,6 +1317,30 @@ async fn mcp_tool_count_11() {
     }
 }
 
+/// M7.4 §7.6 п. 5: `include_history` — в схемах `memory_search` и `memory_cache_put` (булево с
+/// описанием до 300 символов); инструментов по-прежнему 11.
+#[tokio::test]
+async fn mcp_schema_include_history() {
+    let a = api("mcp-include-history", |_| {}).await;
+    let list = rpc(&a, &a.token, &[], "tools/list", json!({})).await;
+    let tools = list["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 11, "{list}");
+    for name in ["memory_search", "memory_cache_put"] {
+        let t = tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("нет {name}"));
+        let f = &t["inputSchema"]["properties"]["include_history"];
+        assert_eq!(f["type"], "boolean", "{name}: {t}");
+        let d = f["description"].as_str().unwrap_or_default();
+        assert!(
+            !d.is_empty() && d.chars().count() <= 300,
+            "{name}: {} символов",
+            d.chars().count()
+        );
+    }
+}
+
 /// Описания инструментов — до 300 символов и перечисляют новые виды и действия M4.5.
 #[tokio::test]
 async fn mcp_descriptions_under_300() {

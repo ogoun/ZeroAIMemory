@@ -7622,6 +7622,107 @@ LAN»: её адрес, ключ и значения Vault в журнал, от
 `k:01M7GAQQGBERPTY57K706BBTBS`, `k:01M85AS1C0EZVV95FQZ2ZEQCET`, `k:01M86MDJHXEMHTBNDEXFS73NGN`),
 перенесённое (§6.13) — задачами с причиной; ловушки и решения волны — в память.
 
+## Волна M7.4 «Администрирование сервера»
+
+Ветка `m7.4-admin` от `main` `c9f462c7`; спецификация §7, план `docs/plans/2026-11-28-m7.4-admin.md`.
+
+### M7.4 · Задача 2 — API и CLI администратора, мелкие долги
+
+Спецификация §7.6 пп. 1–9, решения 108–110. Worktree `.tmp/m74/wt-t2`, ветка `m7.4-t2` от
+`897a86d1`; параллельно с задачей 1 (общие файлы — своими блоками).
+
+**Сделано.**
+- **Фильтры аудита** (п. 1, `audit_filters`): `zam_store::system::{AuditFilter, AuditAction}`,
+  `SystemStore::list_audit_filtered`; `GET /admin/audit` — `action`, `user`, `since`, `until`
+  вместе с `limit` и `before`.
+- **`GET /admin/works`** (п. 2, `admin_works`): `api::works::admin_summary` — строка на
+  пользователя (`admin_row`): режимы и пауза (`modes_json`, `pause_json`), очередь —
+  `zam_store::works::state_counts`, токены — `tokens_used` (общая с `GET /works/usage`),
+  последняя ночь, последний прогон — `api::check::last_brief` (тот же `last`, что у `GET
+  /check/status`).
+- **Ручные пробы** (п. 3, `check_probes_manage`): `POST /check/probes` (`create_probe`) и
+  `DELETE /check/probes/{id}` (`retire_probe`, только `Principal::is_human`); цель —
+  `zam_store::probes::live_target`; запись — прежняя `insert_probe` (повтор, предел); ошибки
+  `ApiError::ProbeDuplicate`, `ProbesLimit`. CLI — `zam check probes list|add|retire`
+  (`cmd::check::probes_*`, `Client::delete_json`); протокол `guide.{ru,en}.md`, «Проверка
+  памяти» — строка п. 3.
+- **`/health.components`** (п. 4, `health_components`): `api::health::Components`,
+  `probe_external_qdrant` (фоном при старте), `zam_ml::ort_version`,
+  `zam_index::QdrantIndex::server_version`, `crate::qdrant::external_version`.
+- **MCP `include_history`** (п. 5) — в схемах `memory_search` и `memory_cache_put`.
+- **`limits.big_body_permits`** (п. 6): `LimitsSection::big_body_permits` (2, 1..=8,
+  `validate`), `BigBodies::new(cfg.limits.big_body_permits, …)`; константа
+  `BIG_BODY_PERMITS` снята.
+- **Сторож `ZAM_`** (п. 7): `crates/zam-cli/tests/env_literals.rs`; `RESERVED_ENV` сервера —
+  `pub`.
+- **Лицензии по цели** (п. 8): `package::license_targets`, `cargo_about_cmd` (`--target` на
+  каждую цель), `generate_licenses(root, work, platform)`.
+- **Флейк** (п. 9): `deep_blocks_definition_respects_timeout` — предел `DEEP_BLOCKS_LIMIT` = 1 с
+  с комментарием о причине.
+
+**Решения исполнителя.**
+- [решение исполнителя, задача 2] `list_audit(limit, before)` оставлен обёрткой над новым
+  `list_audit_filtered(AuditFilter)`: у прежней сигнатуры полсотни вызовов в тестах.
+- [решение исполнителя, задача 2] Префикс действия — `substr(action, 1, length(?)) = ?`, а не
+  `LIKE`: `_` в именах действий (`user_create`) — не шаблон. Пустой параметр — без фильтра (форма
+  WebUI со сброшенным полем), один `*` — 400.
+- [решение исполнителя, задача 2] `GET /admin/works`: база пользователя не открылась — строка
+  `{user, login, error}` и WARN, а не 500 всей сводки; `check` — последний **законченный**
+  прогон (`status`, вид `verdict`), идущий прогон в сводку не входит.
+- [решение исполнителя, задача 2] Ручная проба: цели — живые записи **одного** пространства
+  (явное `space` или пространство первой цели), Human — 422 (агент его не видит); целей до 5 (как
+  у пробы из кэша), вопрос до 512 символов (как запрос поиска); `overlap` — `null` (метрика
+  `hard` её не считает); автор — `Principal::actor()` (id токена, `admin`, `user`).
+- [решение исполнителя, задача 2] Снятие: `id` — `x:<id>` или id; причина — в `retired_reason`
+  пробы и в аудите; посторонний вопрос набора сервера — 409 `code: negative_probe` (набор вернул
+  бы его следующим прогоном).
+- [решение исполнителя, задача 2] Подсказка CLI на 403 снятия — «снимает человек: WebUI
+  «Проверка памяти» …» без «или человеческий токен» спецификации: токен всегда агентский
+  (`Principal::is_human` — только сессии WebUI).
+- [решение исполнителя, задача 2] Версия внешнего Qdrant — gRPC `HealthCheck` (`title`,
+  `version` — то же, что `GET /` REST): у внешнего настроен только gRPC-адрес `qdrant.url`;
+  спрашивается фоном после сборки состояния, ждёт не дольше 5 с, ответ `/health` его не ждёт.
+- [решение исполнителя, задача 2] Сводка лицензий комплекта сервера — по целям всего Rust в нём:
+  `zam-server`, свой `zam` (Linux — musl) и раздаваемый `zam` другой платформы; архив клиента —
+  только цель его `zam`.
+
+**Лицензии по цели** (`cargo about generate --format json --target …`, dev, 2026-11-28; число
+крейтов в сводке):
+
+| Сводка | До (все цели `about.toml`) | Windows | Linux |
+|---|---|---|---|
+| Комплект сервера | 426 | 426 (msvc + musl) | 426 (gnu + musl + msvc) |
+| — без раздаваемого `zam` другой платформы | — | 419 (msvc) | 407 (gnu + musl) |
+| Архив клиента `zam` | 119 | 118 (msvc) | 104 (musl) |
+
+Разница архивов клиента: только у Windows — 15 крейтов (`windows*`, `anstyle-wincon`,
+`once_cell_polyfill`, `syn` — proc-macro `windows-implement`), только у Linux — `libc`.
+
+**RED → GREEN.** RED (до кода сервера): `audit_filters_action_user_period` — фильтр не действует
+(9 записей вместо 2); `health_features_documented` — нет `audit_filters`;
+`health_components_present` — `components` нет; пять `check_probes_*` — 405 у `POST`;
+`mcp_schema_include_history` — поля нет; `admin_works_*` — 404; `big_body_permits_one_busy_503`
+и `big_body_permits_range` — нет поля `limits.big_body_permits`; `cli_env_literals_registered` —
+`RESERVED_ENV` закрыт; `check_probes_cli` — сервер без признака, код 1. Код CLI и xtask написан
+раньше прогона RED их тестов: `check_probes_old_server_code_1` зелёный с первого прогона,
+`cargo_about_uses_package_target` не запускался до кода.
+
+**Прогоны** (Windows, dev, `CARGO_TARGET_DIR=target\m74-t2`, `-j 2`). `cargo test -p zam-server
+--test admin --test works --test check_probes --test boot --test mcp --test reports` — 11 + 36 +
+12 + 16 + 85 + 27 = **187/187** за 5 мин 51 с; `--lib config::` — 50/50
+(`big_body_permits_range`, `example_config_parses_to_defaults`); `boot` повторно после
+расширения `health_components_present` настоящим внешним Qdrant (`target/deps`, копия из
+основного каталога) — 16/16; `cargo test -p zam-cli --test check --test env_literals` — 4 + 1;
+`cargo test -p xtask` — 245 + 6 + 5; `cargo test -p zam-code --features parse --test extract` —
+31/31 (без фичи файл пуст — 0 тестов); `cargo test -p zam-store --lib` — 132/132 (1 ignored).
+Первый прогон `check_probes_cli` упал на моём ожидании кода 2 у ошибки разбора аргументов: `zam`
+отвечает на неё кодом ввода 6 (как прочие команды) — ожидание исправлено. Clippy `-D warnings`
+(`zam-store`, `zam-ml`, `zam-index`, `zam-server`, `zam-cli`, `xtask`, `zam-code --features
+parse`, `--all-targets`) и `cargo fmt --all --check` — чисто. `cargo xtask package` не
+запускался (нужны release-сборки, `web/dist` и `license-checker`): числа сводок — прямым `cargo
+about generate --target` для обеих платформ (таблица выше). `git diff main -- Cargo.lock` — без
+изменений (новых крейтов нет).
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

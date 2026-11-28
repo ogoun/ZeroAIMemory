@@ -34,7 +34,8 @@
 ## Как узнать возможности
 
 `GET /api/v1/health` (без аутентификации) →
-`{status, version, git, features, token_counter, tokenizer_id, uptime_s}`.
+`{status, version, git, features, token_counter, tokenizer_id, uptime_s, components}`
+(`components` — с флагом `health_components`, раздел «Версии компонентов»).
 
 - `features` — массив строк: каждая строка — возможность этой сборки. Поля нет у выпусков до
   M6 (`v0.0.10-m5.7` и раньше отдают только `status, version, git, uptime_s`): у них нет ни
@@ -82,6 +83,10 @@
 | `proposals` | M7.3 §6.7 | Кандидаты в Rules (предложения человеку, ссылка `o:`): `POST /proposals {type: "rule", path, content, reason, basis?}` (токен `rw`; 201 `{proposal: "o:<id>"}`, тот же путь и текст — 200 `existing: true`; открытых 50 — 409 `/problems/proposals-full`), `GET /proposals?type=&status=&author=me`, `GET /proposals/counts` → `{rules}`, `GET /proposals/{id}` (с `rules_tokens {now, after}`), `POST /proposals/{id}/accept {path?, content?}` и `/decline {note?}` (только сессия WebUI, токен — 403), `/withdraw` (автор-агент); поле `candidate` у MCP `memory_write`; `detail` 403 записи агента в Rules — с подсказкой `candidate`; вид работы `rules`; `zam rules`. Раздел «Кандидаты в Rules» ниже. Сервер без флага — 404 на `/proposals*`, поле `candidate` MCP не знает (запись в Rules — 403). |
 | `usage_opened` | M7.3 §6.6 | «Агент открыл подсказку»: чтение узла или записи по токену явной сессией (`POST /read` — любой уровень, секция, фокус; `GET /entries/{id}`; `GET /nodes/{id}` и `GET /nodes/by-path`) после показа этой цели подсказкой `/recall` той же сессии в той же эпохе — одно открытие на сессию и цель; поле `opened` в `usage {shown, opened, useful, useless}` у `GET /entries/{id}` и insight ленты; «шумные» — `GET /spaces/{space}/entries?kind=insight&noisy=1` с полем ответа `opened_since`; `zam insight show` — «показы · открыто · полезно · бесполезно» (раздел «Открытие подсказок» ниже). Сервер без флага отдаёт `usage` без `opened`, а параметр `noisy` молча пропускает (лента целиком) — клиент шлёт его только с флагом. |
 | `space_counts_steps` | M7.3 §6.14 п. 10 | Поле `task_steps` ответа `GET /spaces/{space}/counts` — число шагов планов (подзадач `part_of`) среди `journals.tasks`, по правилу фильтра `top_level=1` (задача на цикле `part_of` — верхнего уровня): задачи верхнего уровня — `journals.tasks − task_steps` (раздел «Число записей разделов» ниже). Сервер без флага поля не отдаёт. |
+| `audit_filters` | M7.4 §7.6 п. 1 | Фильтры `GET /admin/audit`: `action` (точно или префиксом `user.*`), `user` (id), `since`/`until` (RFC 3339, `until` исключительно) — вместе с прежними `limit` и `before` (раздел «Фильтры аудита» ниже). Сервер без флага неизвестные параметры молча пропускает и отдаёт весь журнал — клиент шлёт их только с флагом. |
+| `admin_works` | M7.4 §7.6 п. 2 | `GET /admin/works` — сводка внутренних работ и проверки по всем пользователям, только сессия администратора (раздел «Сводка внутренних работ» ниже). Сервер без флага на маршрут отвечает 404. |
+| `check_probes_manage` | M7.4 §7.6 п. 3 | Ручные пробы: `POST /check/probes {question, targets, space?}` (токен `rw` или сессия WebUI) и снятие `DELETE /check/probes/{id} {reason}` (только сессия WebUI, токен — 403); `zam check probes add|retire` (раздел «Ночная проверка памяти» ниже). Сервер без флага: `POST` — 405, `DELETE` — 404. |
+| `health_components` | M7.4 §7.6 п. 4 | Поле `components` ответа `GET /health`: `{qdrant: {mode, version}, onnxruntime: {version, device}}` (раздел «Версии компонентов» ниже). Сервер без флага поля не отдаёт. |
 
 Правило для разработки сервера: задача, которая вводит возможность или ключ конфигурации,
 добавляет строку в `FEATURES` (`crates/zam-server/src/api/health.rs`) и строку в эту таблицу;
@@ -390,6 +395,23 @@ recall.timeout_ms)` (`recall.max_timeout_ms` по умолчанию — 2000), 
 - **`GET /check/probes`** → `{items: [{id: "x:…", space, question, kind: probe|cache|negative|
   manual, targets: [{ref, rev}], split: dev|test, overlap, author_kind, author, work, status:
   active|retired, retired_reason, created_at, retired_at}]}`; `limit` 1..=1000 (200).
+- **`POST /check/probes {question, targets: ["<буква>:<id>"], space?}`** (с 0.0.17-m7.4, флаг
+  `check_probes_manage`; токен `rw` или сессия WebUI, `ro` — 403) → 201 `{id: "x:<id>"}` —
+  ручная проба вида `manual`: `author_kind` — `agent` у токена, `human` у сессии WebUI, `author`
+  — id токена или `admin`/`user`; часть — общим правилом по первой цели, ревизии целей —
+  текущие, `overlap` — `null`. Цель — живая заметка `n:` или запись журнала своей буквы (`i:`
+  insight, `t:` термин …): нет её, удалена, замещена, отозвана, буква не того вида или запись не
+  из пространства пробы — 422 `/problems/unprocessable`; пространство — `space` (`knowledge`,
+  `rules`, GUID решения, id) или целей, Human — 422. Тот же вопрос (без учёта регистра и
+  пробелов) у активной пробы пространства — 409 `/problems/probe-duplicate`, активных проб с
+  целью 500 — 409 `/problems/probes-limit`; ссылка не `<буква>:<id>`, без целей или больше 5,
+  вопрос пустой или длиннее 512 символов, лишнее поле — 400.
+- **`DELETE /check/probes/{id} {reason}`** (флаг `check_probes_manage`; `id` — `x:<id>` или id)
+  → 204 — снять пробу может **только человек** (сессия WebUI; агентский токен — 403: агент не
+  прячет регрессию); `reason` — 3..=500 символов (иначе 422 `/problems/reason-required`), он же
+  — `retired_reason` пробы; аудит `check.probe.retire {probe, reason}`. Проба снята, чужая или её
+  нет — 404; посторонний вопрос набора сервера — 409 `/problems/conflict`, `code:
+  negative_probe`.
 - **Строка дайджеста** первого `session_start` сессии (не после `compact`, `resume`, `clear`):
   «Ночная проверка памяти: ухудшение поиска (hit −12 п. п.) — zam check report» (у эпизода после
   обновления — «… ухудшение поиска после обновления до <версия> — zam check report», без флага),
@@ -945,3 +967,54 @@ CLI `zam`, свой клиент) получает значения, похож�
   флага (`usage` без `opened`) — прежняя строка «показы · полезно · бесполезно». `zam insight show`
   в сессии агента (`ZAM_SESSION`, сессия хуков) после подсказки — тоже открытие.
 - Открытия — в копии сервера; в экспорт пространства и архив — нет; уборка сессий их не трогает.
+
+## Фильтры аудита (`audit_filters`)
+
+С 0.0.17-m7.4 (M7.4 §7.6 п. 1, флаг `audit_filters`). `GET /admin/audit` — только сессия
+администратора, ответ прежний `{items: [{id, ts, actor, user_id, action, target, ip, details}],
+next}`, новые первыми; фильтры — запросом к серверу:
+
+- **`action`** — точное действие (`user.password.set`) или префикс со звёздочкой в конце
+  (`user.*` — все действия, начинающиеся с `user.`; `check.*`); `_` и `%` — обычные знаки, не
+  шаблон (`user_*` — `user_create`, `user_update` …); один `*` — 400.
+- **`user`** — id пользователя записи (`user_id`); неверный id — 400.
+- **`since`**, **`until`** — время RFC 3339 (`2026-11-28T10:00:00Z`, `2026-11-28T13:00:00+03:00`;
+  `+` в адресе — `%2B`): `since` включительно, `until` исключительно; неверное — 400.
+- **`limit`** (1..=500, по умолчанию 50) и курсор **`before`** — как были: `next` — id последней
+  записи страницы, если записей ровно `limit`; со следующей страницей передавайте те же фильтры.
+- Пустой параметр (`action=`) — без фильтра. Сервер без флага фильтры молча пропускает и отдаёт
+  весь журнал.
+
+## Сводка внутренних работ (`admin_works`)
+
+С 0.0.17-m7.4 (M7.4 §7.6 п. 2, флаг `admin_works`). `GET /admin/works` — только сессия
+администратора (токену и пользователю — 403) → `{users: [строка]}`, строка на каждого
+пользователя сервера (порядок — по id):
+
+- `{user, login, modes, paused?, queued, running, failed_7d, last_night, tokens: {day, month},
+  check: {status, verdict}}`: `modes` — действующие режимы видов `{<вид>: {mode, reason}}`, как
+  у `GET /works`; `paused` — пауза исполнителя `{class, since, from, to}` (нет паузы — поля нет);
+  `queued`, `running` — работы очереди (истёкшие сроки сняты перед счётом, как у `GET /works`),
+  `failed_7d` — упавшие за 7 суток (по `finished_at`); `last_night` — последняя ночь с ночной
+  постановкой (`YYYY-MM-DD` или `null`); `tokens` — расход модели суток и месяца UTC, как
+  `day.tokens` и `month.tokens` `GET /works/usage`; `check` — последний законченный прогон
+  проверки, как `last` `GET /check/status`: `status` (`done|skipped|timeout|failed`) и `verdict`
+  (вид вердикта: `baseline|ok|regression|changed|degraded`) или `null`.
+- База пользователя не открылась — строка `{user, login, error}` (текст ошибки), остальные
+  строки сводки на месте.
+- Подробности по пользователю — прежние `GET /works?user=<id>`, `GET /works/usage?user=<id>`,
+  `GET /works/calls?user=<id>`, `GET /check/status` с `X-Zam-User`.
+
+## Версии компонентов (`health_components`)
+
+С 0.0.17-m7.4 (M7.4 §7.6 п. 4, флаг `health_components`). `GET /health` (без аутентификации) —
+ещё поле `components`:
+
+- **`qdrant`** — `{mode: managed|external|edge, version}`: у `managed` — версия, под которую
+  собран сервер (манифест `deploy/qdrant.toml`; другой версии супервизор не запускает), у
+  `external` — ответ внешнего Qdrant при старте сервера (gRPC `HealthCheck` — те же `title` и
+  `version`, что `GET /` REST; до ответа и если Qdrant недоступен — `null`), у `edge` — `null`.
+- **`onnxruntime`** — `{version, device}`: версия загруженной библиотеки `1.<minor>` (например
+  `1.23`) и устройство эмбеддера (`cpu`, `cuda:0`); не загружены (нет библиотеки или модели) —
+  `null`.
+- Подробное состояние Qdrant и модели — по-прежнему `GET /index/status` (с аутентификацией).

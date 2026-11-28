@@ -1,4 +1,5 @@
-//! Команды `zam-server qdrant fetch|status|reset` (§4.3).
+//! Команды `zam-server qdrant fetch|status|reset` (§4.3) и версия внешнего Qdrant для
+//! `/health.components` ([`external_version`], M7.4).
 //!
 //! Супервизор работает в составе сервера (`index_state::IndexRuntime`); здесь — только
 //! обслуживание установки: загрузка бинарника по манифесту, диагностика и стирание хранилища.
@@ -100,6 +101,37 @@ pub fn fetch(manifest: &DepManifest, binary: &Path) -> anyhow::Result<String> {
         );
     }
     Ok(out)
+}
+
+/// Сколько ждать ответа внешнего Qdrant о версии.
+const EXTERNAL_VERSION_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Версия внешнего Qdrant для `/health.components` (M7.4 §7.6 п. 4): ответ gRPC `HealthCheck` —
+/// те же `title` и `version`, что `GET /` REST. У внешнего Qdrant настроен только gRPC-адрес
+/// (`qdrant.url`), REST-адреса в конфигурации нет **[решение исполнителя, задача 2 M7.4]**. Нет
+/// ответа за [`EXTERNAL_VERSION_WAIT`] или ошибка — `None` (WARN без ключа).
+pub async fn external_version(url: &str, api_key: Option<&str>) -> Option<String> {
+    let idx = match QdrantIndex::connect(url, api_key) {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!(error = %e, "внешний Qdrant: версия не узнана (клиент)");
+            return None;
+        }
+    };
+    match tokio::time::timeout(EXTERNAL_VERSION_WAIT, idx.server_version()).await {
+        Ok(Ok(v)) => Some(v),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "внешний Qdrant: версия не узнана");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                wait_s = EXTERNAL_VERSION_WAIT.as_secs(),
+                "внешний Qdrant: версия не узнана — нет ответа"
+            );
+            None
+        }
+    }
 }
 
 /// `qdrant status`: режим, бинарник, порты, pid, лок, метка, ответ процесса.

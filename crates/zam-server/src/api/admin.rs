@@ -8,6 +8,7 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use zam_core::{Id, mask_token};
+use zam_store::system::{AuditAction, AuditFilter};
 use zam_store::time::fmt_ts;
 use zam_store::{Access, AuditRow, TokenInfo, User};
 
@@ -437,10 +438,46 @@ pub async fn clear_password(
 
 // ---- аудит ----
 
+/// `GET /admin/audit?action=&user=&since=&until=&before=&limit=` (фильтры — M7.4 §7.6 п. 1,
+/// признак `audit_filters`): `action` — точно или префиксом (`user.*` — действия с `user.`),
+/// `user` — id пользователя записи, `since`/`until` — RFC 3339 (`until` исключительно); пустой
+/// параметр — без фильтра (форма WebUI со сброшенным полем).
 #[derive(Deserialize)]
 pub struct AuditQuery {
     limit: Option<u32>,
     before: Option<i64>,
+    action: Option<String>,
+    user: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+}
+
+/// Непустое значение параметра (пробелы по краям сняты).
+fn param(v: &Option<String>) -> Option<&str> {
+    v.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Действие фильтра: `префикс*` — префикс, иначе точное; один `*` — 400.
+fn audit_action(raw: &str) -> Result<AuditAction, ApiError> {
+    match raw.strip_suffix('*') {
+        Some("") => Err(ApiError::BadRequest(
+            "action: действие (user.password.set) или префикс (user.*)".into(),
+        )),
+        Some(prefix) => Ok(AuditAction::Prefix(prefix.to_string())),
+        None => Ok(AuditAction::Exact(raw.to_string())),
+    }
+}
+
+/// Граница периода: RFC 3339 (`2026-11-28T10:00:00Z`, `…+03:00`); иначе 400.
+fn audit_time(key: &str, raw: Option<&str>) -> Result<Option<jiff::Timestamp>, ApiError> {
+    raw.map(|s| {
+        s.parse().map_err(|e| {
+            ApiError::BadRequest(format!(
+                "{key}: время RFC 3339, например 2026-11-28T10:00:00Z ({e})"
+            ))
+        })
+    })
+    .transpose()
 }
 
 pub async fn list_audit(
@@ -454,7 +491,15 @@ pub async fn list_audit(
         Some(0) => return Err(ApiError::BadRequest("limit должен быть ≥ 1".into())),
         Some(n) => n.min(AUDIT_MAX_LIMIT),
     };
-    let rows = st.system.list_audit(limit, q.before).await?;
+    let filter = AuditFilter {
+        limit,
+        before: q.before,
+        action: param(&q.action).map(audit_action).transpose()?,
+        user: param(&q.user).map(parse_id).transpose()?,
+        since: audit_time("since", param(&q.since))?,
+        until: audit_time("until", param(&q.until))?,
+    };
+    let rows = st.system.list_audit_filtered(filter).await?;
     // Ровно limit записей — возможно, есть продолжение.
     let next = (rows.len() == limit as usize)
         .then(|| rows.last().map(|r| r.id))

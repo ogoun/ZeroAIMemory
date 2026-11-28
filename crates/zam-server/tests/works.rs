@@ -1673,6 +1673,98 @@ async fn usage_check_state_and_limits() {
     assert_eq!(v["ceiling"], json!({"daily": 1000, "monthly": 5000}), "{v}");
 }
 
+/// M7.4 §7.6 п. 2: `GET /admin/works` — сводка по всем пользователям тем же кодом, что
+/// `GET /works/usage` и `GET /check/status`: режимы, очередь, упавшие за 7 суток, последняя ночь,
+/// токены суток и месяца, последний прогон проверки.
+#[tokio::test]
+async fn admin_works_all_users() {
+    let _g = SERIAL.lock().await;
+    let a = server("admin-works", |_| {}).await;
+    let (olga, _) = a.new_user("olga").await;
+    set_mode(&a, "agent").await;
+    insight(&a, "knowledge", "Сводка администратора", "текст").await;
+    night(&a).await;
+    let row = |v: &Value, id: &str| -> Value {
+        v["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["user"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("нет {id}: {v}"))
+    };
+    let r = a.adm(Method::GET, "/api/v1/admin/works", None, None).await;
+    ok(&r, StatusCode::OK);
+    let v = r.json();
+    assert_eq!(v["users"].as_array().unwrap().len(), 2, "{v}");
+    let adm = row(&v, &a.admin_id());
+    assert_eq!(adm["login"], "admin", "{adm}");
+    assert_eq!(adm["modes"]["echo"]["mode"], "agent", "{adm}");
+    assert_eq!(
+        (adm["queued"].as_u64(), adm["running"].as_u64()),
+        (Some(1), Some(0))
+    );
+    assert_eq!(adm["failed_7d"], 0);
+    assert_eq!(
+        adm["last_night"],
+        zam_store::time::utc_today().to_string(),
+        "{adm}"
+    );
+    assert_eq!(adm["tokens"], json!({"day": 0, "month": 0}), "{adm}");
+    assert_eq!(
+        adm["check"],
+        json!({"status": null, "verdict": null}),
+        "{adm}"
+    );
+    assert!(adm.get("paused").is_none(), "{adm}");
+    // те же режимы, что у `GET /works/usage` пользователя
+    let usage = a.adm(Method::GET, "/api/v1/works/usage", None, None).await;
+    assert_eq!(adm["modes"], usage.json()["modes"]);
+    let o = row(&v, &olga);
+    assert_eq!(o["login"], "olga");
+    assert_eq!(
+        (o["queued"].as_u64(), o["failed_7d"].as_u64()),
+        (Some(0), Some(0))
+    );
+    assert!(o["last_night"].is_null(), "{o}");
+    // упавшая работа — в `failed_7d`, из очереди ушла
+    let w = echo_works(&a).await.remove(0);
+    store::finish(
+        &db(&a).await,
+        w.id,
+        WorkState::Failed,
+        Value::Null,
+        Some("x"),
+    )
+    .await
+    .unwrap();
+    let v = a
+        .adm(Method::GET, "/api/v1/admin/works", None, None)
+        .await
+        .json();
+    let adm = row(&v, &a.admin_id());
+    assert_eq!(
+        (adm["queued"].as_u64(), adm["failed_7d"].as_u64()),
+        (Some(0), Some(1))
+    );
+}
+
+/// M7.4 §7.6 п. 2: `GET /admin/works` — только администратор: токену и сессии пользователя — 403.
+#[tokio::test]
+async fn admin_works_non_admin_403() {
+    let _g = SERIAL.lock().await;
+    let a = server("admin-works-403", |_| {}).await;
+    let r = a.t(Method::GET, "/api/v1/admin/works", None).await;
+    ok(&r, StatusCode::FORBIDDEN);
+    let u = common::reports::ready_user(&a, "olga", "192.0.2.31").await;
+    let r = common::reports::web(&a, &u.web, Method::GET, "/api/v1/admin/works", None).await;
+    ok(&r, StatusCode::FORBIDDEN);
+    let r = a
+        .tok(&u.tok, Method::GET, "/api/v1/admin/works", None)
+        .await;
+    ok(&r, StatusCode::FORBIDDEN);
+}
+
 /// §6.3 п. 2: ручной запуск — только человек: токену 403 и ни одного запроса к модели.
 #[tokio::test]
 async fn works_run_token_403() {

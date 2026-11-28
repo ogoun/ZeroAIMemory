@@ -127,6 +127,11 @@ fn health_features_documented() {
         "usage_opened",
         // шаги планов `task_steps` в `GET /spaces/{space}/counts` (задача 10c M7.3)
         "space_counts_steps",
+        // фильтры аудита, сводка работ, ручные пробы, версии компонентов (задача 2 M7.4)
+        "audit_filters",
+        "admin_works",
+        "check_probes_manage",
+        "health_components",
     ] {
         assert!(built.contains(f), "{f}");
     }
@@ -138,6 +143,96 @@ fn health_features_documented() {
             "{l}"
         );
     }
+}
+
+/// M7.4 §7.6 п. 4: `/health.components` — `{qdrant: {mode, version}, onnxruntime: {version,
+/// device}}`: управляемый Qdrant — версия манифеста сборки; внешний недоступный и `edge` —
+/// `null`; ONNX Runtime — версия загруженной библиотеки `1.<minor>` и устройство эмбеддера
+/// (не загружены — `null`).
+#[tokio::test]
+async fn health_components_present() {
+    let (app, st, _) = build(cfg_in(tmp("b-components")), Some("pw".into()))
+        .await
+        .unwrap();
+    let j = json(app.oneshot(get("/api/v1/health")).await.unwrap()).await;
+    let c = &j["components"];
+    assert_eq!(c["qdrant"]["mode"], "managed", "{j}");
+    assert_eq!(
+        c["qdrant"]["version"],
+        zam_index::supervisor::QDRANT_VERSION,
+        "{j}"
+    );
+    let ort = &c["onnxruntime"];
+    assert!(
+        ort.as_object()
+            .is_some_and(|o| o.contains_key("version") && o.contains_key("device")),
+        "{j}"
+    );
+    match ort["version"].as_str() {
+        // версия загруженной библиотеки: 1.<minor>
+        Some(v) => assert!(
+            v.strip_prefix("1.")
+                .is_some_and(|m| !m.is_empty() && m.bytes().all(|b| b.is_ascii_digit())),
+            "{j}"
+        ),
+        None => assert!(ort["version"].is_null(), "{j}"),
+    }
+    assert_eq!(
+        ort["device"].as_str().map(str::to_string),
+        st.index.device.as_ref().map(|d| d.device.to_string()),
+        "{j}"
+    );
+    st.shutdown().await;
+    // внешний Qdrant недоступен — версии нет; `edge` — тоже
+    for (name, mode, url) in [
+        ("b-components-ext", "external", Some("http://127.0.0.1:1")),
+        ("b-components-edge", "edge", None),
+    ] {
+        let mut cfg = cfg_in(tmp(name));
+        cfg.qdrant.mode = match mode {
+            "external" => zam_server::config::QdrantMode::External,
+            _ => zam_server::config::QdrantMode::Edge,
+        };
+        cfg.qdrant.url = url.map(str::to_string);
+        let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();
+        let j = json(app.oneshot(get("/api/v1/health")).await.unwrap()).await;
+        assert_eq!(j["components"]["qdrant"]["mode"], mode, "{j}");
+        assert!(j["components"]["qdrant"]["version"].is_null(), "{j}");
+        st.shutdown().await;
+    }
+    // внешний Qdrant отвечает — версия из его ответа при старте (настоящий Qdrant из
+    // `target/deps`; без бинарника — SKIP, с `ZAM_REQUIRE_ML` — ошибка)
+    let bin = common::qdrant::qdrant_bin();
+    if !bin.is_file() && std::env::var_os("ZAM_REQUIRE_ML").is_none() {
+        eprintln!(
+            "SKIP health_components_present (внешний Qdrant): нет {}",
+            bin.display()
+        );
+        return;
+    }
+    let q = tokio::task::spawn_blocking(|| common::qdrant::TestQdrant::start("components"))
+        .await
+        .unwrap();
+    let mut cfg = cfg_in(tmp("b-components-ext-live"));
+    cfg.qdrant.mode = zam_server::config::QdrantMode::External;
+    cfg.qdrant.url = Some(q.grpc_url());
+    cfg.qdrant.api_key = Some(q.api_key.clone());
+    let (app, st, _) = build(cfg, Some("pw".into())).await.unwrap();
+    let t0 = std::time::Instant::now();
+    loop {
+        let j = json(app.clone().oneshot(get("/api/v1/health")).await.unwrap()).await;
+        assert_eq!(j["components"]["qdrant"]["mode"], "external", "{j}");
+        if j["components"]["qdrant"]["version"] == zam_index::supervisor::QDRANT_VERSION {
+            break;
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(15),
+            "версия внешнего Qdrant не пришла: {j}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    st.shutdown().await;
+    drop(q);
 }
 
 #[tokio::test]

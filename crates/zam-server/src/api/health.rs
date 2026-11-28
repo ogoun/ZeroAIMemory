@@ -1,9 +1,19 @@
 //! `/health` (жив ли процесс) и `/ready` (доступна ли `system.db`); без аутентификации.
+//!
+//! С M7.4 (§7.6 п. 4, признак `health_components`) `/health` несёт `components: {qdrant: {mode,
+//! version}, onnxruntime: {version, device}}`: версия управляемого Qdrant — из манифеста сборки
+//! (`deploy/qdrant.toml`, ей же обязан отвечать процесс — иначе супервизор его не примет), внешнего
+//! — его ответ при старте ([`probe_external_qdrant`]; недоступен — `null`), у `edge` — `null`;
+//! ONNX Runtime — версия загруженной библиотеки `1.<minor>` и устройство эмбеддера (не загружены —
+//! `null`).
+use std::sync::OnceLock;
+
 use axum::Json;
 use axum::extract::State;
 use serde_json::{Value, json};
 
 use crate::app::{AppState, GIT_SHA};
+use crate::config::QdrantMode;
 use crate::error::ApiError;
 
 /// Возможности сборки в `/health` (`features`) для загрузчика замера M6 (`xtask eval`, модуль
@@ -53,7 +63,52 @@ pub const FEATURES: &[&str] = &[
     "proposals",
     "usage_opened",
     "space_counts_steps",
+    "audit_filters",
+    "admin_works",
+    "check_probes_manage",
+    "health_components",
 ];
+
+/// Версии компонентов, которые узнаются один раз при старте (`AppState::components`).
+#[derive(Debug, Default)]
+pub struct Components {
+    /// Версия внешнего Qdrant (`[qdrant] mode = "external"`); не узнана — пусто.
+    qdrant_external: OnceLock<String>,
+}
+
+/// Внешний Qdrant (`[qdrant] mode = "external"`): версия — фоном, ответ `/health` её не ждёт;
+/// недоступен — версии нет (`null`), строка WARN в журнале. Задача держит только
+/// [`Components`], не состояние сервера: остановка её не ждёт.
+pub(crate) fn probe_external_qdrant(st: &AppState) {
+    let q = &st.cfg.qdrant;
+    let Some(url) = q.url.clone().filter(|_| q.mode == QdrantMode::External) else {
+        return;
+    };
+    let key = q.api_key.clone().filter(|k| !k.is_empty());
+    let comps = st.components.clone();
+    tokio::spawn(async move {
+        if let Some(v) = crate::qdrant::external_version(&url, key.as_deref()).await {
+            let _ = comps.qdrant_external.set(v);
+        }
+    });
+}
+
+/// `components` ответа `/health`.
+fn components_json(st: &AppState) -> Value {
+    let mode = st.cfg.qdrant.mode;
+    let qdrant = match mode {
+        QdrantMode::Managed => Some(zam_index::supervisor::QDRANT_VERSION.to_string()),
+        QdrantMode::External => st.components.qdrant_external.get().cloned(),
+        QdrantMode::Edge => None,
+    };
+    json!({
+        "qdrant": {"mode": mode, "version": qdrant},
+        "onnxruntime": {
+            "version": zam_ml::ort_version(),
+            "device": st.index.device.as_ref().map(|d| d.device.to_string()),
+        },
+    })
+}
 
 pub async fn health(State(st): State<AppState>) -> Json<Value> {
     Json(json!({
@@ -64,6 +119,7 @@ pub async fn health(State(st): State<AppState>) -> Json<Value> {
         "token_counter": zam_store::budget_counter_kind().as_str(),
         "tokenizer_id": zam_store::budget_tokenizer_id(),
         "uptime_s": st.started_at.elapsed().as_secs(),
+        "components": components_json(&st),
     }))
 }
 
