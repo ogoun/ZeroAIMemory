@@ -120,9 +120,10 @@ fn ref_kind_weight(kind: RefKind) -> f64 {
 /// немногим файлам, где имя определено методом (`is_empty`, `len`).
 const RECV_CALL_WEIGHT: f64 = 0.25;
 
-/// Правила весов и связывания ссылок. Продукт — правила сервера (`zam-server` `api/code.rs`);
-/// прочие — для абляции замера (`cargo xtask code-bench`: M6 §12а — справочно, M7.5 §8.6 —
-/// выбор связывания по правилу, записанному до прогона).
+/// Правила весов и связывания ссылок. Продукт — правила сервера (`zam-server` `api/code.rs`,
+/// с M7.5 — [`RankWeights::M75`]); [`rank`], [`Graph::new`] и [`edges_among`] — M6; прочие — для
+/// абляции замера (`cargo xtask code-bench`: M6 §12а — справочно, M7.5 §8.6 — выбор связывания по
+/// правилу, записанному до прогона).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RankWeights {
     /// Таблица весов вида [`ref_kind_weight`]; `false` — все виды 1,0 (как M5.7).
@@ -152,6 +153,28 @@ impl RankWeights {
         bind_kind: false,
         bind_export: false,
     };
+    /// Правила M7.5 (§8.6 п. 3): M6 и В2 «экспорт» — точка, выбранная `cargo xtask code-bench` по
+    /// правилу, записанному до прогона (журнал этапа, «M7.5 · Задача 4»: 5/10 против 4/10 у M6,
+    /// В1 и В1 + В2 — тоже 5/10, но больше сумма мест или изменённых ключей).
+    pub const M75: RankWeights = RankWeights {
+        kind_table: true,
+        recv: true,
+        bind_kind: false,
+        bind_export: true,
+    };
+
+    /// Отпечаток правил (`rank:` и четыре флага `0`/`1` по порядку полей): им сервер помечает,
+    /// какими правилами посчитаны сохранённые ранги карты (`zam_store::code_rank_rules`).
+    pub fn rules_id(self) -> String {
+        let b = |x: bool| if x { '1' } else { '0' };
+        format!(
+            "rank:{}{}{}{}",
+            b(self.kind_table),
+            b(self.recv),
+            b(self.bind_kind),
+            b(self.bind_export)
+        )
+    }
 
     /// Вклад ссылки в счётчик `c`: `count` с весом вида; у `call` —
     /// `(count − recv) × 1,0 + recv × 0,25` (`recv` не больше `count`).

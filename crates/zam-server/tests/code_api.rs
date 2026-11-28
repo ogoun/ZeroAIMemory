@@ -468,6 +468,47 @@ async fn map_json_format_edges_between_shown_max_120() {
     }
 }
 
+/// M7.5 §8.6 п. 3: сервер ранжирует правилами `RANK_WEIGHTS` = `RankWeights::M75` (В2 «экспорт»):
+/// вызов `helper` из `a.rs` идёт к открытому определению в `c.rs`, а не к закрытому
+/// (`exported: false`) в `b.rs` — ранг символа в `c.rs` выше, ребра `a → b` в обзоре нет (у M6 — к
+/// обоим поровну).
+#[tokio::test]
+async fn map_ranks_by_server_rules_m75() {
+    assert_eq!(
+        zam_server::api::code::RANK_WEIGHTS,
+        zam_code::RankWeights::M75
+    );
+    let a = world("rules-m75", |_| {}).await;
+    let mut closed = func("helper", 1);
+    closed["exported"] = json!(false);
+    put(
+        &a,
+        vec![
+            file(
+                "src/a.rs",
+                1,
+                vec![func("caller_fn", 1)],
+                &[("helper", "call", 9)],
+            ),
+            file("src/b.rs", 2, vec![closed], &[]),
+            file("src/c.rs", 3, vec![func("helper", 1)], &[]),
+        ],
+    )
+    .await;
+    wait_ranked(&a).await;
+    let m = map_json(&a, "&budget_tokens=20000").await;
+    let files = m["files"].as_array().unwrap();
+    let by_path = |p: &str| files.iter().find(|f| f["path"] == p).unwrap().clone();
+    let (b, c) = (by_path("src/b.rs"), by_path("src/c.rs"));
+    let rank = |f: &Value| f["symbols"][0]["rank"].as_f64().unwrap();
+    assert!(rank(&c) > rank(&b) * 1.5, "открытое выше закрытого: {m}");
+    let ids = |f: &Value| f["id"].as_i64().unwrap();
+    let a_id = ids(&by_path("src/a.rs"));
+    let edges = m["edges"].as_array().unwrap();
+    let edge = |d: i64| edges.iter().any(|e| e["src"] == a_id && e["dst"] == d);
+    assert!(edge(ids(&c)) && !edge(ids(&b)), "{m}");
+}
+
 #[tokio::test]
 async fn map_focus_paths_in_top5() {
     let a = world("focus", |_| {}).await;

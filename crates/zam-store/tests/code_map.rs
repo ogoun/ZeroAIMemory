@@ -14,8 +14,8 @@ use zam_core::Id;
 use zam_core::{TargetKind, TargetRef};
 use zam_store::code::{
     MapFileRow, RankState, UploadMeta, code_clear, code_impact, code_put_files, code_rank_inputs,
-    code_status, code_store_ranks, code_symbol, code_symbols_named, code_symbols_search,
-    code_sync_manifest,
+    code_rank_rules, code_status, code_store_ranks, code_symbol, code_symbols_named,
+    code_symbols_search, code_sync_manifest,
 };
 use zam_store::code::{
     code_central, code_files_page, code_map_files, code_map_symbols, code_snapshot,
@@ -459,6 +459,50 @@ async fn check_map_size_in_tx() {
     assert!(matches!(a.err().or(b.err()), Some(StoreError::BadInput(_))));
     let st = code_status(&db2, G).await.unwrap().unwrap();
     assert_eq!(st.snapshot.files, 2);
+}
+
+/// M7.5 §8.6: другие правила ранжирования сервера (`meta` `code.rank_rules`; ключа нет — база
+/// до M7.5) — снимки карты `pending` один раз, поколение прежнее (ранги, посчитанные после,
+/// сохраняются); те же правила — без изменений.
+#[tokio::test]
+async fn code_rank_rules_marks_pending_once() {
+    let (db, _) = setup("rank-rules").await;
+    code_put_files(
+        &db,
+        G,
+        &meta("m"),
+        vec![upload("a.rs", &h('a'), vec![], vec![])],
+        &[],
+    )
+    .await
+    .unwrap();
+    let inputs = code_rank_inputs(&db, G).await.unwrap();
+    let ranked = zam_code::rank(&inputs.files, None);
+    code_store_ranks(&db, G, &inputs, &ranked, Timestamp::now())
+        .await
+        .unwrap()
+        .unwrap();
+    let dbr = &db;
+    let state = move || async move { code_snapshot(dbr, G).await.unwrap().unwrap() };
+    assert_eq!(state().await.rank_state, RankState::Ok);
+    let before = state().await.etag;
+    // база до M7.5: ключа нет — пересчёт
+    assert_eq!(code_rank_rules(&db, "rank:1101").await.unwrap(), 1);
+    let s = state().await;
+    assert_eq!((s.rank_state, s.etag), (RankState::Pending, before));
+    assert_eq!(code_rank_rules(&db, "rank:1101").await.unwrap(), 0);
+    let inputs = code_rank_inputs(&db, G).await.unwrap();
+    assert!(
+        code_store_ranks(&db, G, &inputs, &ranked, Timestamp::now())
+            .await
+            .unwrap()
+            .is_some(),
+        "поколение прежнее — ранги сохраняются"
+    );
+    assert_eq!(code_rank_rules(&db, "rank:1101").await.unwrap(), 0);
+    assert_eq!(state().await.rank_state, RankState::Ok);
+    // другие правила — снова пересчёт
+    assert_eq!(code_rank_rules(&db, "rank:1100").await.unwrap(), 1);
 }
 
 /// Повторная загрузка файла заменяет символы, ссылки и строки FTS, `id` файла сохраняется.

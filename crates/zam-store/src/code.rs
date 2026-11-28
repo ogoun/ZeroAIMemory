@@ -10,9 +10,10 @@
 //!   ([`crate::file_refs::apply_changes`] — та же функция, что у `POST /files/changed`, но
 //!   только для ссылок на символы: файловые ссылки судят хуки рабочей копии). Удаление файла
 //!   синхронизацией — `symbol_removed` у ссылок на его символы.
-//! - **Ранги** считаются лениво ([`code_rank_inputs`] → `zam_code::rank` → [`code_store_ranks`]);
-//!   любое изменение карты увеличивает `gen` снимка и ставит `rank_state = pending`, ранги по
-//!   устаревшим входам не сохраняются. Хранятся ранг файла и доли его символов
+//! - **Ранги** считаются лениво ([`code_rank_inputs`] → `zam_code::rank_with` правилами сервера →
+//!   [`code_store_ranks`]); любое изменение карты увеличивает `gen` снимка и ставит
+//!   `rank_state = pending`, ранги по устаревшим входам не сохраняются; другие правила сервера
+//!   (M7.5) — тоже `pending` ([`code_rank_rules`]). Хранятся ранг файла и доли его символов
 //!   (`code_files.shares`, f32); ранг символа = ранг файла × доля — при чтении.
 //! - **Невидимость:** функции модуля не трогают `chunks`, `index_jobs` и Qdrant; поиск памяти
 //!   (`search.rs`) таблиц карты не читает.
@@ -861,6 +862,40 @@ pub async fn code_rank_inputs(db: &Db, solution: &str) -> Result<RankInputs, Sto
             }
         }
         Ok(RankInputs { files, generation })
+    })
+    .await
+}
+
+/// Ключ `meta`: правила ранжирования, которыми посчитаны сохранённые ранги карт базы
+/// ([`code_rank_rules`], M7.5).
+const RANK_RULES_KEY: &str = "code.rank_rules";
+
+/// Правила ранжирования сервера `rules` (отпечаток `zam_code::RankWeights::rules_id`, M7.5 §8.6):
+/// сохранённые ранги карт базы посчитаны другими (ключа `meta` `code.rank_rules` нет — база до
+/// M7.5) — все снимки карты базы `pending` (ранги пересчитает следующий запрос карты, поколение
+/// снимка прежнее), ключ — `rules`; одна транзакция. Число отмеченных снимков.
+pub async fn code_rank_rules(db: &Db, rules: &str) -> Result<usize, StoreError> {
+    let rules = rules.to_string();
+    db.write(move |tx| {
+        let cur: Option<String> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [RANK_RULES_KEY],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if cur.as_deref() == Some(rules.as_str()) {
+            return Ok(0);
+        }
+        let n = tx.execute(
+            "UPDATE code_snapshots SET rank_state = 'pending' WHERE rank_state <> 'pending'",
+            [],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+            params![RANK_RULES_KEY, rules],
+        )?;
+        Ok(n)
     })
     .await
 }

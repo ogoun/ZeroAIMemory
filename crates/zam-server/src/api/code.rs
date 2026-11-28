@@ -55,16 +55,16 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 use zam_code::{
     FileUpload, Focus, Graph, ManifestItem, MapFile, MapSym, NAME_MAX_CHARS, Packed, ParseState,
-    QUAL_MAX_CHARS, RefKind, SIG_MAX_CHARS, SymbolHash, SymbolKind, UPLOAD_FILES_MAX, edges_among,
-    focus_restart, rank_on_graph, render_map_rest, split_ref,
+    QUAL_MAX_CHARS, RankWeights, RefKind, SIG_MAX_CHARS, SymbolHash, SymbolKind, UPLOAD_FILES_MAX,
+    edges_among_with, focus_restart, rank_on_graph, rank_with, render_map_rest, split_ref,
 };
 use zam_core::Id;
 use zam_core::text::plural_ru;
 use zam_store::code::{
     CodeSnapshot, CodeStatus, MapFileRow, MapSymRow, RankInputs, RankState, SymbolHit, UploadMeta,
     code_central, code_clear, code_files_page, code_impact, code_map_files, code_map_symbols,
-    code_put_files, code_rank_inputs, code_snapshot, code_status, code_store_ranks, code_symbol,
-    code_symbols_search, code_sync_manifest,
+    code_put_files, code_rank_inputs, code_rank_rules, code_snapshot, code_status,
+    code_store_ranks, code_symbol, code_symbols_search, code_sync_manifest,
 };
 use zam_store::file_refs::PATH_MAX_CHARS;
 use zam_store::{
@@ -83,6 +83,11 @@ use crate::error::ApiError;
 
 /// Предупреждение: ранги ещё считаются, карта — по старым рангам.
 pub const RANK_PENDING: &str = "rank pending";
+/// Правила ранжирования карты сервера — ранги, фокус и рёбра обзора по одним правилам: M7.5 —
+/// [`RankWeights::M75`] (M6 и связывание В2 «экспорт»; выбор `cargo xtask code-bench` по правилу
+/// спецификации M7 §8.6 п. 3, журнал этапа «M7.5 · Задача 4»). Ранги, посчитанные другими
+/// правилами (база до M7.5), пересчитываются при первом запросе карты ([`check_rank_rules`]).
+pub const RANK_WEIGHTS: RankWeights = RankWeights::M75;
 /// Рёбер в `format=json` не больше (обзор WebUI, §11).
 const EDGES_MAX: usize = 120;
 /// Наибольший бюджет карты, токенов (§7).
@@ -140,6 +145,9 @@ type SolutionKey = (Id, String);
 pub struct CodeRuntime {
     /// Решения, ранги которых сейчас пересчитываются.
     ranking: Mutex<HashSet<SolutionKey>>,
+    /// Базы (владельцы), у которых правила сохранённых рангов уже сверены с [`RANK_WEIGHTS`]
+    /// ([`check_rank_rules`]) — раз за жизнь процесса.
+    rules_checked: Mutex<HashSet<Id>>,
     /// Слоты ранжирования с фокусом ([`FOCUS_SLOTS`]).
     focus_slots: Arc<tokio::sync::Semaphore>,
     /// Слоты тяжёлых операций на весь сервер ([`HEAVY_SLOTS`], [`heavy_slot`]): слот держит
@@ -163,6 +171,7 @@ impl Default for CodeRuntime {
     fn default() -> Self {
         Self {
             ranking: Mutex::default(),
+            rules_checked: Mutex::default(),
             focus_slots: Arc::new(tokio::sync::Semaphore::new(FOCUS_SLOTS)),
             heavy_slots: Arc::new(tokio::sync::Semaphore::new(HEAVY_SLOTS)),
             inputs: Mutex::default(),
@@ -625,7 +634,7 @@ async fn store_rank(rt: Arc<CodeRuntime>, owner: Id, db: Db, guid: String) -> Re
         }
     }
     let ranked = tokio::task::spawn_blocking(move || {
-        let r = zam_code::rank(&inputs.files, None);
+        let r = rank_with(&inputs.files, None, RANK_WEIGHTS);
         (inputs, r)
     })
     .await;
@@ -664,6 +673,7 @@ impl Drop for RankingGuard {
 /// уже идёт, карта изменилась во время счёта или сбой — `["rank pending"]` (карта отдаётся по
 /// старым рангам).
 pub async fn ensure_ranked(st: &AppState, sc: &MemScope, guid: &str) -> Vec<String> {
+    check_rank_rules(st, sc).await;
     match code_snapshot(&sc.db, guid).await {
         Ok(Some(s)) if s.rank_state == RankState::Pending => rank_now(st, sc, guid).await,
         Ok(_) => Vec::new(),
@@ -671,6 +681,40 @@ pub async fn ensure_ranked(st: &AppState, sc: &MemScope, guid: &str) -> Vec<Stri
             tracing::warn!(error = %e, "состояние карты кода не прочитано");
             vec![RANK_PENDING.into()]
         }
+    }
+}
+
+/// Сохранённые ранги карт базы посчитаны правилами [`RANK_WEIGHTS`] (`meta` `code.rank_rules`,
+/// `zam_store::code::code_rank_rules`): иначе (база до M7.5) все её снимки карты — `pending`, ранги
+/// пересчитает этот же запрос. Раз на базу за жизнь процесса; сбой — WARN и повтор следующим
+/// запросом (карта — по прежним рангам).
+async fn check_rank_rules(st: &AppState, sc: &MemScope) {
+    let done = |s: &Mutex<HashSet<Id>>| {
+        s.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&sc.owner)
+    };
+    if done(&st.code.rules_checked) {
+        return;
+    }
+    let rules = RANK_WEIGHTS.rules_id();
+    match code_rank_rules(&sc.db, &rules).await {
+        Ok(n) => {
+            if n > 0 {
+                tracing::info!(
+                    owner = %sc.owner,
+                    snapshots = n,
+                    rules,
+                    "правила рангов карты кода сменились: ранги пересчитаются"
+                );
+            }
+            st.code
+                .rules_checked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(sc.owner);
+        }
+        Err(e) => tracing::warn!(error = %e, "правила рангов карты кода не сверены"),
     }
 }
 
@@ -718,6 +762,7 @@ async fn ranked_status(
     sc: &MemScope,
     guid: &str,
 ) -> Result<(Option<CodeStatus>, Vec<String>), ApiError> {
+    check_rank_rules(st, sc).await;
     let pending = store_snapshot(sc, guid)
         .await?
         .is_some_and(|s| s.rank_state == RankState::Pending);
@@ -1433,7 +1478,10 @@ fn pack_input(rows: &[MapFileRow], loaded: usize) -> Vec<MapFile> {
 /// Ранги файлов по фокусу (`None` — совпадений нет, глобальный ранг).
 fn focus_ranks(inputs: &RankInputs, f: &Focus) -> Option<HashMap<i64, f64>> {
     let restart = focus_restart(&inputs.files, f)?;
-    let r = rank_on_graph(&Graph::new(&inputs.files), Some(&restart));
+    let r = rank_on_graph(
+        &Graph::with_weights(&inputs.files, RANK_WEIGHTS),
+        Some(&restart),
+    );
     Some(inputs.files.iter().map(|x| x.id).zip(r).collect())
 }
 
@@ -1770,7 +1818,7 @@ async fn build_map(
                 .map(|(i, f)| (f.id, i))
                 .collect();
             let idx: Vec<usize> = shown.iter().filter_map(|id| at.get(id).copied()).collect();
-            edges_among(&inp.files, &idx)
+            edges_among_with(&inp.files, &idx, RANK_WEIGHTS)
                 .into_iter()
                 .take(EDGES_MAX)
                 .map(|(a, b, w)| (inp.files[a].id, inp.files[b].id, w))

@@ -1187,6 +1187,15 @@ fn rank_m6_unchanged() {
     }
 }
 
+/// Правила сервера M7.5 — M6 и В2 (выбор `code-bench`, журнал этапа); отпечатки правил различны.
+#[test]
+fn m75_is_m6_with_export_binding() {
+    assert_eq!(RankWeights::M75, W2);
+    assert_eq!(RankWeights::M75.rules_id(), "rank:1101");
+    assert_eq!(RankWeights::M6.rules_id(), "rank:1100");
+    assert_eq!(RankWeights::M57.rules_id(), "rank:0000");
+}
+
 fn r_m6(files: &[RankFile]) -> Vec<f64> {
     rank(files, None).file_rank
 }
