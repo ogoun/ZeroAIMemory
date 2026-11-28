@@ -1,10 +1,149 @@
 //! Версионные миграции на `PRAGMA user_version` с копией файла перед обновлением.
+//!
+//! **Контрольные суммы (M7.4 §7.1).** Служебная таблица мигратора [`TABLE`] (`version`,
+//! `sha256`, `recorded_at`, `origin`) — в каждой базе; её DDL — здесь, а не номерной миграцией
+//! (решение 98). Сумма — SHA-256 текста SQL после замены `\r\n` на `\n` ([`checksum`]).
+//! Применённая миграция пишет строку `applied` в той же транзакции, что её SQL и `user_version`;
+//! версии `≤ user_version` без строки (база до 0.0.17) получают строки `adopted` текущих файлов
+//! одной транзакцией после применения (решение 99). Записанные суммы сверяются с программой при
+//! каждом открытии — **до** применения новых миграций и до копии `bak-v<N>` **[решение
+//! исполнителя, задача 1]**: база с изменённой выпущенной миграцией не получает ни копии, ни
+//! следующих миграций, открытие — [`StoreError::MigrationChanged`] (решение 100). Сверка схемы с
+//! эталоном и открытие без изменений — [`crate::inspect`].
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 
 use crate::StoreError;
+
+/// Служебная таблица мигратора: суммы применённых и принятых миграций.
+pub const TABLE: &str = "zam_migrations";
+
+/// DDL таблицы сумм (`IF NOT EXISTS`: выполняется в каждой транзакции записи сумм).
+const TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS zam_migrations (
+  version INTEGER PRIMARY KEY,
+  sha256 TEXT NOT NULL,
+  recorded_at TEXT NOT NULL,
+  origin TEXT NOT NULL CHECK (origin IN ('applied', 'adopted')))";
+
+/// SHA-256 текста миграции (нижний регистр hex) после замены `\r\n` на `\n`: файл, полученный
+/// с CRLF (Windows без `.gitattributes`), даёт ту же сумму.
+pub fn checksum(sql: &str) -> String {
+    use sha2::Digest;
+    let norm = sql.replace("\r\n", "\n");
+    sha2::Sha256::digest(norm.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Есть ли таблица сумм в базе.
+pub(crate) fn has_table(conn: &Connection) -> Result<bool, StoreError> {
+    Ok(conn.query_row(
+        "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [TABLE],
+        |r| r.get(0),
+    )?)
+}
+
+/// Записанные суммы `(версия, сумма)` по возрастанию версии; таблицы нет — пусто.
+pub(crate) fn recorded(conn: &Connection) -> Result<Vec<(u32, String)>, StoreError> {
+    if !has_table(conn)? {
+        return Ok(Vec::new());
+    }
+    let mut st = conn.prepare("SELECT version, sha256 FROM zam_migrations ORDER BY version")?;
+    let rows = st.query_map([], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?)))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Версии `≤ applied`, у которых записанная сумма расходится с суммой миграции программы:
+/// `(версия, записанная, программы)` по возрастанию. Версий вне списка программы не сверяет.
+pub(crate) fn changed(
+    rows: &[(u32, String)],
+    migrations: &[Migration],
+    applied: u32,
+) -> Vec<(u32, String, String)> {
+    rows.iter()
+        .filter(|(v, _)| *v <= applied)
+        .filter_map(|(v, sha)| {
+            let m = migrations.iter().find(|m| m.version == *v)?;
+            let compiled = checksum(m.sql);
+            (compiled != *sha).then(|| (*v, sha.clone(), compiled))
+        })
+        .collect()
+}
+
+/// Сверка записанных сумм применённых версий (`≤ applied`, обычно `user_version`) с
+/// программой: первое расхождение — [`StoreError::MigrationChanged`]. Только чтение.
+pub(crate) fn verify(
+    conn: &Connection,
+    migrations: &[Migration],
+    applied: u32,
+) -> Result<(), StoreError> {
+    let rows = recorded(conn)?;
+    match changed(&rows, migrations, applied).into_iter().next() {
+        Some((version, recorded, compiled)) => Err(StoreError::MigrationChanged {
+            version,
+            recorded,
+            compiled,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Строка `applied` миграции `m` в транзакции её SQL (таблица создаётся при необходимости).
+fn record_applied(tx: &Connection, m: &Migration) -> Result<(), StoreError> {
+    tx.execute_batch(TABLE_DDL)?;
+    // строка той же версии без применения (аномалия: `user_version` меньше записанного) —
+    // заменяется: сумма теперь у только что применённого SQL
+    tx.execute(
+        "INSERT OR REPLACE INTO zam_migrations (version, sha256, recorded_at, origin)
+         VALUES (?1, ?2, ?3, 'applied')",
+        rusqlite::params![
+            m.version,
+            checksum(m.sql),
+            crate::time::fmt_ts(crate::time::now())
+        ],
+    )?;
+    Ok(())
+}
+
+/// Строки `adopted` для версий `1..=upto` без строки — одной транзакцией; ничего не нужно —
+/// без записи.
+fn adopt_missing(
+    conn: &mut Connection,
+    migrations: &[Migration],
+    upto: u32,
+) -> Result<(), StoreError> {
+    if upto == 0 {
+        return Ok(());
+    }
+    if has_table(conn)? {
+        let have: u32 = conn.query_row(
+            "SELECT count(*) FROM zam_migrations WHERE version BETWEEN 1 AND ?1",
+            [upto],
+            |r| r.get(0),
+        )?;
+        if have >= upto {
+            return Ok(());
+        }
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    tx.execute_batch(TABLE_DDL)?;
+    let now = crate::time::fmt_ts(crate::time::now());
+    {
+        let mut st = tx.prepare(
+            "INSERT OR IGNORE INTO zam_migrations (version, sha256, recorded_at, origin)
+             VALUES (?1, ?2, ?3, 'adopted')",
+        )?;
+        for m in migrations.iter().take(upto as usize) {
+            st.execute(rusqlite::params![m.version, checksum(m.sql), now])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
 
 /// Одна миграция: целевая версия схемы и SQL (может содержать несколько операторов).
 ///
@@ -33,7 +172,9 @@ fn user_version(conn: &Connection) -> Result<u32, StoreError> {
     Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
 }
 
-/// Применяет недостающие миграции, возвращает итоговую версию.
+/// Применяет недостающие миграции, возвращает итоговую версию. Записанные суммы сверяются до
+/// любых изменений; применённые миграции пишут строки `applied`, версии без строки получают
+/// `adopted` (см. документацию модуля).
 pub fn apply(
     conn: &mut Connection,
     path: &Path,
@@ -58,7 +199,10 @@ pub fn apply(
             supported: latest,
         });
     }
+    // база с изменённой выпущенной миграцией не получает ни копии, ни следующих миграций
+    verify(conn, migrations, current)?;
     if current == latest {
+        adopt_missing(conn, migrations, latest)?;
         return Ok(current);
     }
 
@@ -83,10 +227,13 @@ pub fn apply(
         } else {
             let tx = conn.transaction()?;
             tx.execute_batch(m.sql)?;
+            record_applied(&tx, m)?;
             tx.pragma_update(None, "user_version", m.version)?;
             tx.commit()?;
         }
     }
+    // версии до `current` у базы до 0.0.17 — без строк: суммы текущих файлов принимаются
+    adopt_missing(conn, migrations, latest)?;
     Ok(latest)
 }
 
@@ -137,6 +284,7 @@ fn rebuild_tx(conn: &mut Connection, m: &Migration) -> Result<(), StoreError> {
             violations.join("; ")
         )));
     }
+    record_applied(&tx, m)?;
     tx.pragma_update(None, "user_version", m.version)?;
     tx.commit()?;
     Ok(())

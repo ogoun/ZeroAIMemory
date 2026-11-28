@@ -341,6 +341,19 @@ pub(crate) fn prepare(cfg: ServerConfig, env_password: Option<&str>) -> anyhow::
     })
 }
 
+/// `system.db` при старте; изменённая выпущенная миграция — отказ старта текстом для человека
+/// (M7.4 §7.1 п. 3).
+fn open_system(dd: &DataDir) -> anyhow::Result<SystemStore> {
+    SystemStore::open(dd).map_err(|e| match e {
+        zam_store::StoreError::MigrationChanged { version, .. } => anyhow::anyhow!(
+            "миграция {version} system.db изменилась после применения к этой базе: верните \
+             выпуск, которым база обновлялась, или восстановите копию; подробности — zam-server \
+             doctor"
+        ),
+        e => e.into(),
+    })
+}
+
 /// Фаза 2: система, администратор, роутер.
 pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, BootReport)> {
     let Prepared {
@@ -370,10 +383,8 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     // без эмбеддера — токенизатор установленной модели (если есть): чанки сразу точные
     ml::setup_chunker(&cfg, ml.embedder.as_deref());
     // срок годности признака копии `.zam-backup` для потоков контрольных точек баз (§12б.2)
-    zam_store::set_backup_flag_max_age(std::time::Duration::from_secs(
-        u64::from(cfg.backup.flag_max_hours) * 3600,
-    ));
-    let system = SystemStore::open(&data_dir)?;
+    zam_store::set_backup_flag_max_age(cfg.backup.flag_max_age());
+    let system = open_system(&data_dir)?;
     let initial_token = bootstrap::ensure_admin_user(&system, &cfg.admin.login).await?;
     bootstrap::warn_legacy_human_tokens(&system).await;
     let admin_id = system

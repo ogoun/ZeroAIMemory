@@ -7622,6 +7622,121 @@ LAN»: её адрес, ключ и значения Vault в журнал, от
 `k:01M7GAQQGBERPTY57K706BBTBS`, `k:01M85AS1C0EZVV95FQZ2ZEQCET`, `k:01M86MDJHXEMHTBNDEXFS73NGN`),
 перенесённое (§6.13) — задачами с причиной; ловушки и решения волны — в память.
 
+## Волна M7.4 «Администрирование сервера»
+
+Проект — спецификация этапа §7 (решения координатора 97–113 — §12), план —
+`docs/plans/2026-11-28-m7.4-admin.md`. Ветка `m7.4-admin` от `main` `c9f462c7`.
+
+### M7.4 · Задача 1 — Миграции: суммы, сверка схемы, `rollback`, `restore`
+
+Спецификация §7.1–§7.3; worktree `.tmp/m74/wt-t1`, ветка `m7.4-t1` от `897a86d1`.
+
+**Суммы (§7.1 пп. 1–4).** `migrate.rs`: таблица `zam_migrations` (DDL `TABLE_DDL`, `CREATE TABLE IF
+NOT EXISTS` в каждой транзакции записи сумм), `checksum` (SHA-256 после `\r\n` → `\n`), строка
+`applied` — в транзакции миграции и в `rebuild_tx`, `adopt_missing` (одна транзакция `IMMEDIATE`,
+`INSERT OR IGNORE`; ничего не нужно — без записи), `verify` → `StoreError::MigrationChanged
+{version, recorded, compiled}` (`is_permanent`). `migrations/SHA256SUMS` — 34 строки (system
+0001–0007, user 0001–0027), файлы — LF без BOM (проверено при генерации). `system.db` при старте —
+`app::open_system`: текст спецификации «миграция N system.db изменилась после применения к этой
+базе: …; подробности — zam-server doctor».
+
+**`inspect` (§7.1 пп. 5–6).** `open_ro` (закрытая база — `immutable=1`; есть `-wal`/`-shm` —
+`READ_ONLY`, видит WAL; `query_only`; файла нет — ошибка без создания), `RoDb::{user_version,
+checksum_status, schema_diff, quick_check, integrity_check, fts_check, path}`, `ChecksumStatus {Ok,
+AdoptedPending, Changed(Vec<u32>)}`, `DIFF_MAX` = 20 (последняя строка — «… и ещё N различий»).
+Эталон — `:memory:` с `migrate::apply` миграций `1..=user_version`.
+
+**`rollback` (§7.2).** `backup/rollback.rs`: `RollbackOpts`, `parse_version` (`v<N>` | `N`),
+`RollbackPlan {items, skipped, resume}`, `PlanItem {db, from, to, copy, copy_time, copy_bytes,
+current_bytes, step: Move | Place | Done}`, `RollbackReport {to, system, dry_run, plan, applied,
+moved_to}` (`text`, `needs_yes`). `Cmd::Rollback {to, system, dry_run, yes, json}` в `main.rs`: без
+`--yes` — план и код 1 («ничего не изменено: проверьте план и повторите команду с --yes»).
+`zam-store`: `LockMark::Rollback`, `DataDir::open_for_rollback`, `rollback_incomplete`,
+`StoreError::RollbackIncomplete`, `jobs::set_reindex_pending_closed`, `system::audit_closed`.
+Общие переносы — `backup/mod.rs`: `side`, `ts_name`, `new_pre_dir`, `move_into`, `mark_incomplete`
+(`kind` — `restore` | `rollback`), `incomplete_moved_to` (по префиксу). Тестовые точки сбоя —
+`rollback_moved` (после переноса всех баз), `rollback_placed` (после первой положенной копии).
+
+**`restore` и долги (§7.3).** `vault::keys::{key_state, VaultKeyState, KEY_MISMATCH_WARNING}`
+(`restored_key_fits` удалён), `VaultKeyState::warning(cfg)`; `RestoreReport` — `vault`,
+`vault_warning` (и прежний `vault_ok`); `move_old` переносит `first-admin-token.txt`;
+`restore::QDRANT_KEPT_NOTE` при `--replace --no-reindex` и управляемом Qdrant;
+`BackupSection::flag_max_age()` — `app.rs`, `backup()`, `restore()`, `rollback()`;
+`restore::Source` (публичный) и `with_reader(rel, size, f)` — `Oversize` до чтения, поток
+ограничен `size + 1`.
+
+- [решение исполнителя, задача 1] **Суммы сверяются до применения, а не после.** Спецификация
+  (§7.1 п. 3) — «при каждом открытии, после применения». Сверка записанных строк идёт первой —
+  в `Db::open_with` до досборки 0025 и в `migrate::apply` до копии `bak-v<N>` и миграций: база с
+  изменённой выпущенной миграцией не меняется вовсе (ни досборки, ни копии, ни 0026–0027; тест
+  `checksum_changed_rejected`). Новые строки пишет сам мигратор — их сверять незачем.
+- [решение исполнителя, задача 1] **Тесты промежуточной 0025** (`migrate_rebuild::
+  reopen_historic_0025_versions_repaired`, `repair_runs_before_next_migration`) открывают базу
+  изменённым списком — теперь с суммами она итоговой сборкой не открылась бы (это и есть повод
+  §7.1, тест `checksum_changed_rejected`, ветка `966cb85`). Настоящие базы промежуточной M6 были
+  без таблицы сумм: тесты снимают её (`as_m6_build`) — ожидания прежние. `table_counts` не
+  считает `zam_migrations` (в ней строка на миграцию, число растёт с миграциями).
+- [решение исполнителя, задача 1] **`checksum_status` и `schema_diff` — `Result<…>`** (в плане —
+  без `Result`): ошибка чтения повреждённой базы не прячется за «Ok» или пустым списком.
+- [решение исполнителя, задача 1] **Сверка схемы:** автоиндексы (`sqlite_autoindex_*`) — под
+  правилом «`sqlite_%` не сравниваются»; у явных индексов, кроме `pragma_index_list` и
+  `pragma_index_xinfo`, сравнивается SQL без пробельных различий (меняется предикат частичного
+  индекса — видно); виртуальные таблицы — ещё и SQL (токенизатор FTS5 в столбцах не виден);
+  порядок общих столбцов — отдельной строкой.
+- [решение исполнителя, задача 1] **`fts_check`** — `PRAGMA integrity_check(<таблица FTS5>)`
+  (`xIntegrity`, SQLite ≥ 3.44, только чтение; команда FTS5 `'integrity-check'` — запись и на
+  `READ_ONLY` не идёт). Тест `fts_check_detects_damage`: удалённые листы `vault_fts_data` видят и
+  `fts_check`, и общий `integrity_check`.
+- [решение исполнителя, задача 1] **`open_ro` на запущенном сервере** читает закрытую (ещё не
+  открытую сервером) базу `immutable=1`: если сервер откроет её посреди чтения, картина может быть
+  несогласованной — для `doctor` (задача 3) это ложная тревога, не порча (запись — только у
+  сервера). Базы, которые сервер уже держит (`-wal`/`-shm`), читаются `READ_ONLY` с WAL.
+- [решение исполнителя, задача 1] **Откаченные базы пишутся без мигратора этой сборки:** отметка
+  пересборки — `jobs::set_reindex_pending_closed` (схема без `meta`, до 0004, — без отметки),
+  аудит — `system::audit_closed` (`audit` — с 0001). `Db::open`/`SystemStore::open` снова обновили бы
+  схему откаченной базы.
+- [решение исполнителя, задача 1] **Отказ `rollback` — все причины сразу** (`RollbackRefused`,
+  строки по базам), плюс проверка места под копии (`with_margin`, +10 %) до признака. Откатывать
+  нечего (все базы на N, не продолжение) — код 0, без признака, переноса и аудита.
+- [решение исполнителя, задача 1] **Продолжение после сбоя — по состоянию файлов** (`Step`):
+  база на месте выше N — `Move`; на месте её нет, а в `pre-rollback-…` есть — `Place`; на месте —
+  N, а в `pre-rollback-…` — прежняя — `Done` (не переносится второй раз: иначе копия легла бы
+  поверх прежней базы в каталоге прежних данных; тест `rollback_resume_after_crash` сверяет
+  `probe = v27` в нём). Остатки `-wal`/`-shm` у `Place` переносятся до копии (чужой WAL испортил
+  бы её); занятое имя — в `rollback-remnants-<время>/`.
+- [решение исполнителя, задача 1] **Признак отката — тот же файл с текстом `rollback …`**, а
+  сервер отвечает новым `StoreError::RollbackIncomplete` («повторите ту же команду zam-server
+  rollback»), а не советом `restore --replace`, который потерял бы смысл отката. Метка лока —
+  тот же дубль `.zam-restore` с текстом `rollback <pid>` (`lock_mark` различает по тексту);
+  `backup` и `restore` во время отката — `RollbackInProgress`.
+- [решение исполнителя, задача 1] **`key_state`:** файл ключа не читается по любой причине —
+  `Missing`; ключ не декодируется, не проходит `vault.key_check` или ключи Vault базы повреждены —
+  `Mismatch` (раньше все три — один `false`).
+- [решение исполнителя, задача 1] **`Source` публичен** (`restore::Source::{open, with_reader}`):
+  тест `restore_oversize_stream_early` проверяет, что замыкание чтения не вызывается, если
+  источник длиннее описи (у каталога и у архива); иначе «раньше чтения» не наблюдаемо.
+- [решение исполнителя, задача 1] **Сверх списка спецификации:** `serve_refuses_changed_system_
+  migration` (текст отказа старта, §7.1 п. 3), `fts_check_detects_damage`, ручной замер
+  `migrate_checksum::dev_db_first_open_measure` (`#[ignore]`, `ZAM_DEV_DB=<копия базы>`).
+
+**Прогоны** (Windows, `CARGO_TARGET_DIR=target/m74-t1`, `-j 2`). RED: `migrate_checksum` — 11 из
+11 падают (нет таблицы, `inspect` — заглушка, нет `SHA256SUMS`); `rollback` — 12 из 12, новые
+restore-тесты `backup` — 5 из 5 (заглушки). GREEN: `zam-store --test migrate_checksum` — 12 passed,
+1 ignored; `migrate_rebuild` 11, `user_db` 11, `system` 17, `db` 24, `--lib` 132 (1 ignored);
+`zam-server --test rollback` 13, `backup` 58, `boot` 15 — все passed. Первая попытка
+`rollback_bad_copy_changes_nothing` не прошла по вине теста: 2 КиБ мусора с 16-го байта страницы 2
+легли в её свободное место, `integrity_check` был `ok`; тест портит страницу 3 целиком. clippy
+`-D warnings` (`zam-store`, `zam-server`, `--all-targets`) и `cargo fmt --all --check` — чисто.
+`Cargo.lock` не менялся.
+
+**Замер на копиях баз разработчика** (`.tmp/` основного каталога → `.tmp/devdb/` worktree; HDD;
+`dev_db_first_open_measure`): база v25 из `.tmp/m56/bench` (9,9 МБ) — первое открытие v25 → v27
+(копия `bak-v25`, 0026–0027, принятие сумм 1–25) — 8,9 с, `schema_diff` — 79 мс, пусто, суммы `Ok`;
+база v14 из `.tmp/m4/task-15/bench` (406 МБ) — v14 → v27 с пересборками — 18,8 с, `schema_diff` —
+61 мс, пусто. Только принятие сумм (`migrate::apply` на v27 без таблицы, одна транзакция) — 357 мс
+(406 МБ) и 148 мс (9,9 МБ); повторное открытие с суммами — 4–9 мс. Рабочей базы сервера памяти в
+`.tmp/` нет — она на сервере в LAN; замер `doctor` при развёртывании — решение 111.
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

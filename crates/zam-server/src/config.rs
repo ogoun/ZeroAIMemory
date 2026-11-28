@@ -1339,6 +1339,13 @@ impl BackupSection {
         crate::schedule::parse_tz(&self.tz).unwrap_or(jiff::tz::TimeZone::UTC)
     }
 
+    /// Срок годности признака копии `.zam-backup` и брошенных сборок `*.partial`
+    /// (`flag_max_hours`) — один источник для `serve`, `backup`, `restore`, `rollback` и
+    /// `doctor` (M7.4 §7.3 п. 3).
+    pub fn flag_max_age(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.flag_max_hours) * 3600)
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         let bad = |key: &str, message: &str| ConfigError::Invalid {
             key: format!("backup.{key}"),
