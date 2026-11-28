@@ -299,12 +299,18 @@ async fn token_cannot_adopt_rewrite_or_delete_human_idea() {
     let e = get(&a, &i).await;
     assert_eq!(e["rev"], 1, "ревизия прежняя");
     assert!(e["deleted_at"].is_null());
-    // adopt токену — 403 и для идеи агента
+    // adopt токену без `by` — 400, от имени агента — 403 (M7.6 §9.5 п. 4), и для идеи агента
     let ag = idea_tok(&a, &sol(), "Идея агента", "agent").await;
     for x in [&i, &ag] {
-        ok(
+        problem(
             &post_tok(&a, x, "adopt", json!({})).await,
+            StatusCode::BAD_REQUEST,
+            "by-required",
+        );
+        problem(
+            &post_tok(&a, x, "adopt", json!({"by": "agent"})).await,
             StatusCode::FORBIDDEN,
+            "idea-human-decision",
         );
     }
     assert_eq!(get(&a, &ag).await["data"]["origin"], "agent");
@@ -1146,10 +1152,10 @@ async fn shared_solution_rights_matrix() {
             &m_tok,
             Method::POST,
             &format!("{}/adopt", ent(&agent)),
-            None,
+            Some(json!({"by": "agent"})),
         )
         .await;
-    ok(&r, StatusCode::FORBIDDEN);
+    problem(&r, StatusCode::FORBIDDEN, "idea-human-decision");
     let r = a
         .tok(
             &m_tok,
@@ -1533,4 +1539,114 @@ async fn propose_task_revived_409_and_answer_decide_audit() {
     ok(&r, StatusCode::OK);
     let rows = audit(&a).await;
     assert_eq!(actions(&rows, "entry.idea.decide"), before + 1);
+}
+
+// ---- M7.6 §9.5 п. 4: «Принять как свою» токеном (`idea_adopt_token`) ----
+
+/// Токен с `by: human` (агент передаёт слова человека) делает идею агента идеей человека, как
+/// WebUI; аудит `entry.idea.adopt {by, channel}`; повтор — 409; признак в `/health`.
+#[tokio::test]
+async fn idea_adopt_token_by_human() {
+    let a = setup("adopt-token").await;
+    let ag = idea_tok(&a, &sol(), "Идея агента", "agent").await;
+    let r = post_tok(&a, &ag, "adopt", json!({"by": "human", "channel": "cli"})).await;
+    ok(&r, StatusCode::OK);
+    let e = r.json();
+    assert_eq!(e["data"]["origin"], "human", "{e}");
+    assert!(e["data"]["adopted_by"].is_string(), "{e}");
+    let rows = audit(&a).await;
+    let row = rows
+        .iter()
+        .find(|r| r.action == "entry.idea.adopt")
+        .expect("аудит");
+    assert_eq!(row.details["by"], "human", "{:?}", row.details);
+    assert_eq!(row.details["channel"], "cli", "{:?}", row.details);
+    problem(
+        &post_tok(&a, &ag, "adopt", json!({"by": "human"})).await,
+        StatusCode::CONFLICT,
+        "already-adopted",
+    );
+    let r = a.t(Method::GET, "/api/v1/health", None).await;
+    assert!(
+        r.json()["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x == "idea_adopt_token"),
+        "{}",
+        r.text()
+    );
+}
+
+/// Токен без `by` (тело `{}` или без тела) — 400 `by-required`; `channel: webui` — 422; идея не
+/// меняется.
+#[tokio::test]
+async fn idea_adopt_token_without_by_400() {
+    let a = setup("adopt-no-by").await;
+    let ag = idea_tok(&a, &sol(), "Идея агента", "agent").await;
+    problem(
+        &post_tok(&a, &ag, "adopt", json!({})).await,
+        StatusCode::BAD_REQUEST,
+        "by-required",
+    );
+    let r = a
+        .t(Method::POST, &format!("{}/adopt", ent(&ag)), None)
+        .await;
+    problem(&r, StatusCode::BAD_REQUEST, "by-required");
+    let r = post_tok(&a, &ag, "adopt", json!({"by": "human", "channel": "webui"})).await;
+    ok(&r, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(get(&a, &ag).await["data"]["origin"], "agent");
+    assert_eq!(actions(&audit(&a).await, "entry.idea.adopt"), 0);
+}
+
+/// Токен с `by: agent` — 403 `idea-human-decision`: своей идею делает только человек.
+#[tokio::test]
+async fn idea_adopt_token_by_agent_403() {
+    let a = setup("adopt-agent").await;
+    let ag = idea_tok(&a, &sol(), "Идея агента", "agent").await;
+    problem(
+        &post_tok(&a, &ag, "adopt", json!({"by": "agent", "channel": "chat"})).await,
+        StatusCode::FORBIDDEN,
+        "idea-human-decision",
+    );
+    let e = get(&a, &ag).await;
+    assert_eq!(e["data"]["origin"], "agent", "{e}");
+    assert!(e["data"].get("adopted_by").is_none(), "{e}");
+    assert_eq!(actions(&audit(&a).await, "entry.idea.adopt"), 0);
+}
+
+/// Сессия WebUI — как раньше: тело не нужно и не читается (`by: agent` в нём не мешает), идея
+/// становится идеей человека; аудит — `by: human`, `channel: webui`.
+#[tokio::test]
+async fn idea_adopt_session_unchanged() {
+    let a = setup("adopt-session").await;
+    for body in [None, Some(json!({"by": "agent"}))] {
+        let ag = idea_tok(&a, &sol(), "Идея агента", "agent").await;
+        let r = a
+            .adm(
+                Method::POST,
+                &format!("{}/adopt", ent(&ag)),
+                body.clone(),
+                None,
+            )
+            .await;
+        ok(&r, StatusCode::OK);
+        let e = r.json();
+        assert_eq!(e["data"]["origin"], "human", "{body:?}: {e}");
+        assert_eq!(e["data"]["adopted_by"], a.admin_id().as_str(), "{e}");
+        assert_eq!(e["id"], ag.as_str());
+    }
+    let rows = audit(&a).await;
+    let adopts: Vec<_> = rows
+        .iter()
+        .filter(|r| r.action == "entry.idea.adopt")
+        .collect();
+    assert_eq!(adopts.len(), 2);
+    assert!(
+        adopts
+            .iter()
+            .all(|r| r.details["by"] == "human" && r.details["channel"] == "webui"),
+        "{:?}",
+        adopts.iter().map(|r| &r.details).collect::<Vec<_>>()
+    );
 }

@@ -1659,3 +1659,247 @@ async fn tiny_budget_without_note_hides() {
     let text = digest(&a, "B").await;
     assert!(section(&text).is_none(), "{text}");
 }
+
+// ---- задача и даты снимка (M7.6 §9.4 пп. 4–5, признак `snapshot_m76`) ----
+
+/// `data.task_id` снимка сессии `id` из `GET …/snapshot` (нет — `None`).
+async fn snap_task_id(a: &Api, id: &str) -> Option<String> {
+    let g = a.t(Method::GET, &snap_uri(id), None).await;
+    assert_eq!(g.status, StatusCode::OK, "{}", g.text());
+    g.json()["data"]["task_id"].as_str().map(str::to_string)
+}
+
+/// Задача решения без сессии (ревизии без сессии): создаётся и переводится в `in_progress`; id.
+async fn task_without_session(a: &Api, title: &str) -> String {
+    let r = a
+        .t(
+            Method::POST,
+            &entries(),
+            Some(json!({"kind": "task", "title": title, "data": {"next_step": "дальше"}})),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+    let id = r.json()["id"].as_str().unwrap().to_string();
+    let uri = format!("/api/v1/entries/{id}");
+    let rev = a.t(Method::GET, &uri, None).await.json()["rev"].to_string();
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::PATCH,
+            &uri,
+            Some(json!({"status": "in_progress"})),
+            &[("if-match", rev.as_str())],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    id
+}
+
+/// Захват или его снятие (`op` — `claim` | `release`) задачи `task` сессией `session`.
+async fn claim_op(a: &Api, session: &str, task: &str, op: &str) {
+    let r = a
+        .tok_h(
+            &a.token,
+            Method::POST,
+            &format!("/api/v1/entries/{task}/{op}"),
+            Some(json!({})),
+            &[("x-zam-session", session)],
+        )
+        .await;
+    assert!(r.status.is_success(), "{op}: {}", r.text());
+}
+
+/// §9.4 п. 4: `PUT` пишет в `data.task_id` задачу, захваченную сессией (`in_progress`/`blocked`),
+/// свежую по ревизии; захваченная задача `open` не берётся; без захвата — поля нет.
+#[tokio::test]
+async fn snapshot_put_fills_task_id() {
+    let a = world("task-id", |_| {}).await;
+    {
+        let _c = at("08:00");
+        register(&a, "A", true, None).await;
+        put_ok(&a, "A", "08:00", data_files()).await;
+    }
+    assert_eq!(snap_task_id(&a, "A").await, None);
+    let older = {
+        let _c = at("08:10");
+        task_of(&a, "A", "Первая").await
+    };
+    let newer = {
+        let _c = at("08:20");
+        task_of(&a, "A", "Вторая").await
+    };
+    {
+        // захваченная, но не начатая задача (`open`) — не задача снимка
+        let _c = at("08:30");
+        let r = a
+            .tok_h(
+                &a.token,
+                Method::POST,
+                &entries(),
+                Some(json!({"kind": "task", "title": "Открытая"})),
+                &[("x-zam-session", "A")],
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::CREATED, "{}", r.text());
+        let open = r.json()["id"].as_str().unwrap().to_string();
+        claim_op(&a, "A", &open, "claim").await;
+    }
+    {
+        let _c = at("08:40");
+        put_ok(&a, "A", "08:40", data_files()).await;
+    }
+    assert_eq!(snap_task_id(&a, "A").await.as_deref(), Some(newer.as_str()));
+    // `blocked` с более свежей ревизией — она
+    {
+        let _c = at("08:50");
+        patch_task(
+            &a,
+            "A",
+            &older,
+            json!({"status": "blocked", "blocked_by": "ждём ревью"}),
+        )
+        .await;
+    }
+    {
+        let _c = at("09:00");
+        put_ok(&a, "A", "09:00", data_files()).await;
+    }
+    assert_eq!(snap_task_id(&a, "A").await.as_deref(), Some(older.as_str()));
+    // сессия без решения — задачи нет
+    {
+        let _c = at("09:10");
+        register(&a, "N", false, None).await;
+        put_ok(&a, "N", "09:10", data_files()).await;
+    }
+    assert_eq!(snap_task_id(&a, "N").await, None);
+}
+
+/// §9.4 п. 4: `task_id` клиента отбрасывается — и выдуманный, и не id вовсе (снимок пишется).
+#[tokio::test]
+async fn snapshot_put_ignores_client_task_id() {
+    let a = world("task-id-client", |_| {}).await;
+    let _c = at("08:00");
+    register(&a, "A", true, None).await;
+    let fake = zam_core::Id::new().to_string();
+    for t in [json!(fake), json!("не id"), json!(42)] {
+        let mut d = data_files();
+        d["task_id"] = t.clone();
+        put_ok(&a, "A", "08:00", d).await;
+        assert_eq!(snap_task_id(&a, "A").await, None, "{t}");
+    }
+    // захваченная задача сессии — её id, а не присланный
+    let task = task_of(&a, "A", "Своя").await;
+    let mut d = data_files();
+    d["task_id"] = json!(fake);
+    put_ok(&a, "A", "08:00", d).await;
+    assert_eq!(snap_task_id(&a, "A").await.as_deref(), Some(task.as_str()));
+}
+
+/// §9.4 п. 4: задачу снимка без ревизий сессии, захват которой сессия сняла, поиск по сессии не
+/// находит — показ берёт её по `task_id` (строка задачи; без неё раздела не было бы: файлов
+/// нет).
+#[tokio::test]
+async fn snapshot_show_finds_task_by_id() {
+    let a = world("task-by-id", |_| {}).await;
+    let task = {
+        let _c = at("08:00");
+        register(&a, "A", true, None).await;
+        let task = task_without_session(&a, "Задача из WebUI").await;
+        claim_op(&a, "A", &task, "claim").await;
+        task
+    };
+    {
+        let _c = at("09:00");
+        put_ok(&a, "A", "09:00", json!({"prompts": ["продолжай"]})).await;
+        assert_eq!(snap_task_id(&a, "A").await.as_deref(), Some(task.as_str()));
+        claim_op(&a, "A", &task, "release").await;
+    }
+    let _c = at("10:00");
+    let text = digest(&a, "B").await;
+    let sec = section(&text).unwrap_or_else(|| panic!("нет раздела: {text}"));
+    assert!(
+        sec.contains(&format!(
+            "задача k:{task} не обновлялась с 2026-11-10 08:00:00"
+        )),
+        "{sec}"
+    );
+    // в тексте агенту дат сессии нет (квота строки)
+    assert!(!sec.contains("сессия:"), "{sec}");
+}
+
+/// §9.4 п. 4: задача по `task_id` — с прежними правилами скрытия: действующий чужой захват
+/// раздел скрывает (до захвата раздел есть).
+#[tokio::test]
+async fn snapshot_show_task_by_id_foreign_claim_hidden() {
+    let a = world("task-by-id-claim", |_| {}).await;
+    let task = {
+        let _c = at("08:00");
+        register(&a, "A", true, None).await;
+        let task = task_without_session(&a, "Задача из WebUI").await;
+        claim_op(&a, "A", &task, "claim").await;
+        task
+    };
+    {
+        let _c = at("09:00");
+        put_ok(&a, "A", "09:00", json!({"prompts": ["продолжай"]})).await;
+        claim_op(&a, "A", &task, "release").await;
+    }
+    {
+        let _c = at("10:00");
+        assert!(section(&digest(&a, "B").await).is_some());
+        // сессия без решения: признак «писала в память другая сессия» не срабатывает
+        register(&a, "C", false, None).await;
+        claim_op(&a, "C", &task, "claim").await;
+    }
+    let _c = at("10:05");
+    let text = digest(&a, "B").await;
+    assert!(section(&text).is_none(), "чужой захват: {text}");
+}
+
+/// §9.4 п. 5: даты сессии — моменты RFC 3339, хранятся в UTC и отдаются `GET`; без них снимок —
+/// как раньше (полей нет).
+#[tokio::test]
+async fn snapshot_dates_round_trip() {
+    let a = world("dates", |_| {}).await;
+    let _c = at("10:00");
+    register(&a, "A", true, None).await;
+    let mut d = data_files();
+    d["started_at"] = json!("2026-11-10T08:00:00Z");
+    d["ended_at"] = json!("2026-11-10T12:30:15.5+03:00");
+    put_ok(&a, "A", "10:00", d).await;
+    let g = a.t(Method::GET, &snap_uri("A"), None).await.json();
+    assert_eq!(g["data"]["started_at"], "2026-11-10T08:00:00Z", "{g}");
+    assert_eq!(g["data"]["ended_at"], "2026-11-10T09:30:15.5Z", "{g}");
+    put_ok(&a, "A", "10:00", data_files()).await;
+    let g = a.t(Method::GET, &snap_uri("A"), None).await.json();
+    let data = g["data"].as_object().unwrap();
+    assert!(
+        !data.contains_key("started_at") && !data.contains_key("ended_at"),
+        "{g}"
+    );
+}
+
+/// §9.4 п. 5: дата не RFC 3339 (или не строка) отбрасывается, снимок пишется (204), вторая дата
+/// остаётся.
+#[tokio::test]
+async fn snapshot_bad_date_dropped() {
+    let a = world("bad-date", |_| {}).await;
+    let _c = at("10:00");
+    register(&a, "A", true, None).await;
+    for bad in [
+        json!("вчера"),
+        json!(1_700_000_000),
+        json!("2026-13-01T00:00:00Z"),
+    ] {
+        let mut d = data_files();
+        d["started_at"] = bad.clone();
+        d["ended_at"] = json!("2026-11-10T09:00:00Z");
+        let b = body(&t("10:00").to_string(), d);
+        let r = put_as(&a, &a.token, "A", Some("A"), b).await;
+        assert_eq!(r.status, StatusCode::NO_CONTENT, "{bad}: {}", r.text());
+        let g = a.t(Method::GET, &snap_uri("A"), None).await.json();
+        assert!(g["data"].get("started_at").is_none(), "{bad}: {g}");
+        assert_eq!(g["data"]["ended_at"], "2026-11-10T09:00:00Z", "{bad}: {g}");
+        assert_eq!(g["data"]["files"], json!(["src/lib.rs"]), "{bad}: {g}");
+    }
+}

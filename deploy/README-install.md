@@ -406,6 +406,33 @@ zam init --url http://<хост>:7700 --token <токен> --url-to local   # а
 токена — их можно коммитить, тогда они есть и в worktree, и у коллег. Коллеге на другой машине
 адрес задаёт его `zam init --url-to home` (или переменная `ZAM_URL`).
 
+**Подключение без следа в репозитории (с 0.0.19).** Если `CLAUDE.md` общий для команды и
+отслеживается git, а подключение нужно только вам:
+
+```
+zam init --url http://<хост>:7700 --token <токен> --block-to local --exclude-local --yes
+```
+
+- `--block-to local` — блок Claude Code (с адресом сервера) пишется в `CLAUDE.local.md` корня
+  проекта, `CLAUDE.md` не меняется; `CLAUDE.local.md` вносится в `.git/info/exclude` (вопрос или
+  `--yes`), а если он уже в индексе git — отказ (код 1): `git rm --cached CLAUDE.local.md` или
+  `--block-to agent`. Блок, который уже был в `CLAUDE.md`, переносится: вырезается (остальной
+  текст, BOM и переводы строк не меняются), `zam init` пишет «блок перенесён из CLAUDE.md —
+  проверьте git diff» — отслеживаемый `CLAUDE.md` вернётся к закоммиченному виду. `--url-to home`
+  убирает и строку адреса (адрес — в `~/.zeroaimemory/config.toml`). Повтор без флага держит
+  режим. Codex `CLAUDE.local.md` не читает: с `--agent codex|both` — код 1, Codex подключайте
+  `--url-to home --exclude-local` (блок без адреса — в `AGENTS.md`).
+- `--exclude-local` — файлы подключения, которые не отслеживаются git (`.mcp.json`,
+  `.claude/settings.json`, `.zeroaimemory/` целиком, `CLAUDE.local.md`, `AGENTS.md`,
+  `.codex/hooks.json`), вносятся в `.git/info/exclude`; о файле, который git уже отслеживает, а
+  `zam init` правит, — предупреждение «… отслеживается git — правка попадёт в репозиторий» (такой
+  файл не коммитьте или верните `git checkout -- <файл>`). С исключённым `.zeroaimemory/` GUID
+  решения не попадает в репозиторий: в другом клоне — `zam init --id <guid>` (его печатает
+  `zam init`). Вне git — «не git — исключать нечего».
+- На странице «Подключение агента» то же даёт галочка «Подключить локально» (сервер 0.0.19 и
+  новее): у Claude Code — команда с этими флагами и «Текст для CLAUDE.local.md», у Codex и прочих
+  — блок без адреса и команда с `--url-to home --exclude-local`.
+
 Повторный запуск ничего не ломает: так же обновляется устаревший блок (о нём напоминают
 `zam status` и дайджест в начале сессии агента). Битый JSON в `.claude/settings.json` или
 `.mcp.json` `zam init` не перезаписывает — исправьте файл и повторите.
@@ -445,7 +472,8 @@ zam init --url http://<хост>:7700 --token <токен> --url-to local   # а
 долго и расходует токены; секреты агент кладёт только в Vault; кандидатов в Rules принимаете вы
 («Предложения»), аксиом агент не ставит. Текст зависит от выбранных агента, решения и языка; тот
 же текст — `GET /api/v1/agent-setup?migrate=true` (поле `migration_prompt`). Сервер старше 0.0.19
-задания не отдаёт — галочка выключена.
+задания не отдаёт — галочка выключена. Если `CLAUDE.md` отслеживается git, задание велит агенту
+подключать с `--block-to local --exclude-local` (вместе с «Подключить локально» — уже в команде).
 
 **Codex.** Хуки — `.codex/hooks.json` (Codex попросит подтвердить их в `/hooks`). MCP Codex
 читает из `config.toml`, `zam init` его не пишет. Рекомендуемый вариант (M6) — stdio-прокси
@@ -1027,6 +1055,8 @@ zam idea propose w:<id> [--text "почему сейчас"] [--space <guid>]   
 zam idea accept w:<id> [--by human] [--channel chat|cli] [--space <guid>]   # начать → задача k:<id>
 zam idea defer w:<id> [--until ГГГГ-ММ-ДД]                      # отложить (дата — UTC)
 zam idea decline w:<id> [--reason R]
+zam idea reopen w:<id> --reason "почему" [--by human] [--channel chat|cli]   # вернуть на разбор
+zam idea adopt w:<id> [--by human] [--channel chat|cli]   # идею агента — своей (сервер 0.0.19)
 ```
 
 - **Разбор** (`zam idea review`, MCP `memory_update_entry action=review`): разбор
@@ -1058,6 +1088,11 @@ zam idea decline w:<id> [--reason R]
   решений обязательны (код 6): идея со слов человека — `--origin human`, своя — `--origin agent`
   (такую не предлагают, пока человек не примет её как свою в WebUI); решение человека из чата —
   `--by human --channel chat`. Коды: 403 — 3, повторный `accept` — 4 (с задачей), 422 — 6.
+- «Вернуть на разбор» и «Принять как свою» есть и в CLI (с 0.0.19): `zam idea reopen w:<id>
+  --reason …` и `zam idea adopt w:<id>` — агент выполняет их только по вашим словам (`--by human
+  --channel chat`); от своего имени (`--by agent`) сервер «принять как свою» не даёт (403). Сервер
+  старше 0.0.19 `adopt` по токену не принимает — `zam` выходит с кодом 1 «сервер старше 0.0.19 —
+  «Принять как свою» в WebUI»; `reopen` работает и с ним.
 - Задачу из идеи сняли (`dropped`) или удалили — идея остаётся «начатой»; агент видит её с
   пометкой «задача снята, можно предложить вернуть» и может спросить человека «Вернуть идею?»
   (`zam idea propose w:<id> --text "почему пора"`, печатает `Предложено вернуть w:<id> → вопрос

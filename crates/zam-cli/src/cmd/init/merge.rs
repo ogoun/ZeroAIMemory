@@ -71,6 +71,30 @@ fn block_span(text: &str) -> Result<Option<(usize, usize)>, String> {
     Ok(Some((b, end)))
 }
 
+/// Текст без блока ZeroAIMemory (`--block-to local`, перенос блока из `CLAUDE.md`, M7.6 §9.5
+/// п. 1): остальной текст — байт в байт, BOM и CRLF сохраняются; пустая строка, через которую
+/// [`upsert_block`] дописал блок в конец файла, уходит вместе с ним. Блока нет — `None`, начало
+/// без конца — ошибка.
+pub fn remove_block(text: &str) -> Result<Option<String>, String> {
+    let (bom, body) = match text.strip_prefix(BOM) {
+        Some(rest) => (BOM, rest),
+        None => ("", text),
+    };
+    let Some((b, e)) = block_span(body)? else {
+        return Ok(None);
+    };
+    let (mut before, after) = (&body[..b], &body[e..]);
+    if after.is_empty() {
+        for blank in ["\r\n\r\n", "\n\n"] {
+            if before.ends_with(blank) {
+                before = &before[..before.len() - blank.len() / 2];
+                break;
+            }
+        }
+    }
+    Ok(Some(format!("{bom}{before}{after}")))
+}
+
 /// Блок ZeroAIMemory в тексте файла (с маркерами; BOM в начале файла пропускается, как у
 /// [`upsert_block`]); нет блока — `None`, начало без конца — ошибка.
 pub fn find_block(text: &str) -> Result<Option<&str>, String> {
@@ -289,6 +313,25 @@ mod tests {
         let out = upsert_block(Some(old), B2).unwrap();
         assert_eq!(out, format!("# Проект\n\nтекст\n{B2}хвост\n"));
         assert_eq!(upsert_block(Some(&out), B2).unwrap(), out);
+    }
+
+    /// M7.6 §9.5 п. 1: вырезание блока — обратная операция дописывания: текст, BOM и CRLF
+    /// возвращаются байт в байт; блок посередине — только его строки; блока нет — `None`.
+    #[test]
+    fn block_removed_text_restored() {
+        for own in ["a\n", "\u{feff}# П\r\n\r\nтекст\r\n", "a\n\n\nb\n"] {
+            let with = upsert_block(Some(own), B2).unwrap();
+            assert_eq!(
+                remove_block(&with).unwrap().as_deref(),
+                Some(own),
+                "{own:?}"
+            );
+        }
+        let mid = format!("x\n{B2}y\n");
+        assert_eq!(remove_block(&mid).unwrap().as_deref(), Some("x\ny\n"));
+        assert_eq!(remove_block(B2).unwrap().as_deref(), Some(""));
+        assert_eq!(remove_block("нет блока\n").unwrap(), None);
+        assert!(remove_block("<!-- zeroaimemory:begin v1 -->\nбез конца\n").is_err());
     }
 
     #[test]

@@ -1697,6 +1697,9 @@ export interface AgentSetupQuery {
   tokenPlaceholder?: boolean;
   /** Задание агенту на перенос проекта (`migration_prompt`, признак `agent_setup_migrate`). */
   migrate?: boolean;
+  /** «Подключить локально» (признак `agent_setup_local`): флаги `zam init` без следа в
+   * репозитории, у AGENTS.md и Codex — блок без адреса. */
+  local?: boolean;
 }
 
 export interface AgentSetup {
@@ -1733,6 +1736,7 @@ export function agentSetup(f: AgentSetupQuery, user?: string) {
   if (f.rulesWrite !== undefined) p.set('rules_write', String(f.rulesWrite));
   if (f.tokenPlaceholder) p.set('token_placeholder', 'true');
   if (f.migrate) p.set('migrate', 'true');
+  if (f.local) p.set('local', 'true');
   return call<AgentSetup>('GET', `agent-setup?${p}`, undefined, user);
 }
 

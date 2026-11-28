@@ -380,6 +380,34 @@ pub struct InitCmd<'a> {
     pub hooks: bool,
     pub mcp: bool,
     pub lang: Lang,
+    /// «Подключить локально» (M7.6 §9.5 п. 3): у Claude Code — `--block-to local
+    /// --exclude-local`, у прочих — `--url-to home --exclude-local`.
+    pub local: bool,
+}
+
+/// Флаги «Подключить локально» в `zam init` агента (M7.6 §9.5 п. 3).
+fn local_flags(agent: AgentKind) -> &'static str {
+    match agent {
+        AgentKind::Claude => " --block-to local --exclude-local",
+        AgentKind::Agents | AgentKind::Codex => " --url-to home --exclude-local",
+    }
+}
+
+/// Блок без строк адреса `ZeroAIMemoryUrl=` (M7.6 §9.5 п. 3, «Подключить локально» у `agents`
+/// и `codex`: адрес — в `~/.zeroaimemory/config.toml`); строка адреса — по правилу клиента
+/// (`locate::md_setting`: пробелы, маркеры списка и обратные кавычки по краям).
+pub fn block_without_url(block: &str) -> String {
+    block
+        .split_inclusive('\n')
+        .filter(|l| {
+            let k = l
+                .trim()
+                .trim_start_matches(['-', '*', ' '])
+                .trim_matches('`');
+            !k.split_once('=')
+                .is_some_and(|(k, _)| k.trim() == "ZeroAIMemoryUrl")
+        })
+        .collect()
 }
 
 /// Однострочник `zam init …` (§15.5, п. 6) для оболочки с правилом кавычек `quote`.
@@ -408,6 +436,9 @@ fn init_line(c: &InitCmd<'_>, quote: fn(&str) -> String) -> String {
     }
     if c.lang != Lang::Ru {
         s.push_str(&format!(" --lang {}", c.lang.as_str()));
+    }
+    if c.local {
+        s.push_str(local_flags(c.agent));
     }
     s.push_str(" --yes");
     s
@@ -497,6 +528,7 @@ mod tests {
             hooks: true,
             mcp: false,
             lang: Lang::En,
+            local: false,
         });
         assert_eq!(
             c["linux"],
@@ -517,6 +549,7 @@ mod tests {
             hooks: true,
             mcp: true,
             lang: Lang::Ru,
+            local: false,
         });
         assert!(
             c["windows"]
@@ -543,6 +576,7 @@ mod tests {
             hooks: true,
             mcp: true,
             lang: Lang::Ru,
+            local: false,
         });
         assert_eq!(
             c,

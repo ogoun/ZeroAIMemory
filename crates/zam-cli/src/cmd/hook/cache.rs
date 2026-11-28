@@ -31,10 +31,12 @@
 //!   дольше [`SPAWN_FILE_TTL`] удаляет [`gc_cache`];
 //! - `snapst-<сессия>.json` и `snapq-<сессия>.json` — состояние и очередь снимка сессии (M6 §8а,
 //!   [`super::snapshot_queue`]);
+//! - `endq-<сессия>.json` — метка отложенного конца сессии (M7.6 §9.4 п. 2,
+//!   [`super::snapshot_queue::end_session`]);
 //! - `<сессия>` в именах — очищенный id, `-` и 8 hex blake3 исходного id (fix round 1, m-9);
 //!   `shown-*`/`edits-*`/`holdout-*`/`events-*`/`changed-*`/`tokens-*`/`snapst-*`/`snapq-*`/
-//!   `agent-*` старше
-//!   [`SHOWN_TTL`] и `.*.tmp` старше [`TMP_TTL`] удаляет `session-start` ([`gc_cache`]);
+//!   `endq-*`/`agent-*` старше [`SHOWN_TTL`] и `.*.tmp` старше [`TMP_TTL`] удаляет
+//!   `session-start` ([`gc_cache`]) — порцией с курсором `.gc-cursor` (M7.6 §9.4 п. 3);
 //! - `session.json` — `{id, agent}`: текущая сессия агента в проекте; команды `zam` берут из
 //!   него `X-Zam-Session` (не старше [`SESSION_TTL`]), чтобы запись в память через CLI попала
 //!   в `memory_writes` сессии хуков **[решение исполнителя]**.
@@ -1401,49 +1403,102 @@ pub fn prune_spawns(env: &Env, session: &str) {
     }
 }
 
+/// Файлов кэша, которые уборка проверяет за один старт (M7.6 §9.4 п. 3).
+pub const GC_BATCH: usize = 256;
+/// Срок уборки кэша за один старт, мс (M7.6 §9.4 п. 3): остальное — следующим стартом.
+pub const GC_MS: u64 = 30;
+/// Курсор уборки кэша: имя последнего проверенного файла (M7.6 §9.4 п. 3).
+pub const GC_CURSOR: &str = ".gc-cursor";
+
+/// Срок хранения файла кэша по имени для [`gc_cache`]; не убираемый файл — `None`.
+fn gc_ttl(n: &str) -> Option<Duration> {
+    let session_file = (n.starts_with("shown-") && n.ends_with(".json"))
+        || n.starts_with("edits-")
+        || n.starts_with("holdout-")
+        || (n.starts_with("events-") && n.ends_with(".jsonl"))
+        || (n.starts_with("changed-") && n.ends_with(".jsonl"))
+        || (n.starts_with("tokens-") && n.ends_with(".jsonl"))
+        // снимок сессии (M6 §8а): состояние и очередь; метка отложенного конца (M7.6 §9.4)
+        || (n.starts_with("snapst-") && n.ends_with(".json"))
+        || (n.starts_with("snapq-") && n.ends_with(".json"))
+        || (n.starts_with(super::snapshot_queue::END_MARK_PREFIX) && n.ends_with(".json"))
+        // привязка `zam mcp` к сессии (M6 §7.1): pid агента, перезаписывается каждым стартом
+        || (n.starts_with(super::binding::BINDING_PREFIX) && n.ends_with(".json"));
+    if session_file {
+        Some(SHOWN_TTL)
+    } else if n.starts_with("spawn-") && n.ends_with(".json") {
+        Some(SPAWN_FILE_TTL)
+    } else if n.starts_with('.')
+        && (n.ends_with(".tmp") || n.ends_with(".lock") || n.ends_with(".trimfail"))
+    {
+        Some(TMP_TTL)
+    } else {
+        None
+    }
+}
+
 /// Удаляет файлы сессий (`shown-*.json`, `edits-*`, `events-*.jsonl`, `changed-*.jsonl`,
-/// `tokens-*.jsonl`, снимок сессии `snapst-*.json` и `snapq-*.json`) и привязки `agent-*.json` (M6 §7.1) старше [`SHOWN_TTL`], очереди `spawn-*.json` старше [`SPAWN_FILE_TTL`] и
-/// временные `.*.tmp` и замки старше [`TMP_TTL`].
+/// `tokens-*.jsonl`, снимок сессии `snapst-*.json` и `snapq-*.json`, метки отложенного конца
+/// `endq-*.json`) и привязки `agent-*.json` (M6 §7.1) старше [`SHOWN_TTL`], очереди `spawn-*.json`
+/// старше [`SPAWN_FILE_TTL`] и временные `.*.tmp` и замки старше [`TMP_TTL`].
+///
+/// **Порцией** (M7.6 §9.4 п. 3, решение координатора): имена каталога (без `metadata`)
+/// сортируются, проверяются следующие за курсором [`GC_CURSOR`] — не больше [`GC_BATCH`] файлов
+/// и не дольше [`GC_MS`]; курсор — имя последнего проверенного; дошли до конца — курсор сброшен
+/// (следующий старт начнёт сначала). Большой кэш чистится за несколько стартов.
 pub fn gc_cache(env: &Env) {
     gc_stall();
-    let Ok(rd) = std::fs::read_dir(env.cache_dir()) else {
-        return;
+    gc_cache_batch(env, GC_BATCH, Duration::from_millis(GC_MS));
+}
+
+/// [`gc_cache`] с пределами порции `batch` и `limit` (тесты задают свои: срок на занятом диске
+/// непредсказуем). Проверено файлов.
+pub fn gc_cache_batch(env: &Env, batch: usize, limit: Duration) -> usize {
+    let dir = env.cache_dir();
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return 0;
     };
-    for e in rd.flatten() {
-        let name = e.file_name();
-        let Some(n) = name.to_str() else { continue };
-        let session_file = (n.starts_with("shown-") && n.ends_with(".json"))
-            || n.starts_with("edits-")
-            || n.starts_with("holdout-")
-            || (n.starts_with("events-") && n.ends_with(".jsonl"))
-            || (n.starts_with("changed-") && n.ends_with(".jsonl"))
-            || (n.starts_with("tokens-") && n.ends_with(".jsonl"))
-            // снимок сессии (M6 §8а): состояние и очередь
-            || (n.starts_with("snapst-") && n.ends_with(".json"))
-            || (n.starts_with("snapq-") && n.ends_with(".json"))
-            // привязка `zam mcp` к сессии (M6 §7.1): pid агента, перезаписывается каждым стартом
-            || (n.starts_with(super::binding::BINDING_PREFIX) && n.ends_with(".json"));
-        let ttl = if session_file {
-            SHOWN_TTL
-        } else if n.starts_with("spawn-") && n.ends_with(".json") {
-            SPAWN_FILE_TTL
-        } else if n.starts_with('.')
-            && (n.ends_with(".tmp") || n.ends_with(".lock") || n.ends_with(".trimfail"))
-        {
-            TMP_TTL
-        } else {
-            continue;
-        };
-        let old = e
-            .metadata()
+    let t0 = std::time::Instant::now();
+    let mut names: Vec<String> = rd
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| gc_ttl(n).is_some())
+        .collect();
+    names.sort_unstable();
+    let cursor_path = dir.join(GC_CURSOR);
+    let cursor = std::fs::read_to_string(&cursor_path).unwrap_or_default();
+    let cursor = cursor.trim();
+    let from = if cursor.is_empty() {
+        0
+    } else {
+        names.partition_point(|n| n.as_str() <= cursor)
+    };
+    let mut checked = 0;
+    for n in &names[from..] {
+        if checked >= batch || t0.elapsed() >= limit {
+            break;
+        }
+        checked += 1;
+        let Some(ttl) = gc_ttl(n) else { continue };
+        let path = dir.join(n);
+        let old = std::fs::metadata(&path)
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age > ttl);
         if old {
-            let _ = std::fs::remove_file(e.path());
+            let _ = std::fs::remove_file(&path);
         }
     }
+    if from + checked >= names.len() {
+        // дошли до конца — следующая порция с начала
+        if !cursor.is_empty() {
+            let _ = std::fs::remove_file(&cursor_path);
+        }
+    } else if checked > 0 {
+        let _ = write_atomic(&cursor_path, names[from + checked - 1].as_bytes());
+    }
+    checked
 }
 
 /// Точка подмены для тестов (только отладочная сборка и фича `test-hooks`, как
@@ -1816,5 +1871,110 @@ mod tests {
         // одинаковая очистка — разные имена
         assert_ne!(session_file_part("a/b"), session_file_part("a:b"));
         assert_eq!(session_file_part(&"x".repeat(300)).len(), 64 + 1 + 8);
+    }
+
+    /// Окружение `session-start` в пустом проекте `target/tmp/zam-cli-<name>` с каталогом кэша.
+    fn gc_env(name: &str) -> Env {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../target/tmp/zam-cli-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".zeroaimemory/cache")).unwrap();
+        Env::new(
+            super::super::Kind::SessionStart,
+            super::super::Agent::Claude,
+            std::time::Instant::now(),
+            dir.clone(),
+            dir.join("home"),
+        )
+    }
+
+    /// Файл кэша `name`; `old` — время изменения 30 суток назад (старше [`SHOWN_TTL`]).
+    fn cache_file(env: &Env, name: &str, old: bool) {
+        let p = env.cache_dir().join(name);
+        std::fs::write(&p, b"{}").unwrap();
+        if old {
+            std::fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(SystemTime::now() - Duration::from_secs(30 * 24 * 3600))
+                .unwrap();
+        }
+    }
+
+    /// Имена убираемых файлов кэша по порядку.
+    fn gc_names(env: &Env) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(env.cache_dir())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| gc_ttl(n).is_some())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// M7.6 §9.4 п. 3: уборка за старт проверяет не больше порции файлов — следующие за курсором
+    /// по имени; курсор — имя последнего проверенного, следующий старт продолжает с него; файлы
+    /// не уборки (`triggers.json`) в порцию не входят; метка `endq-*` — файл сессии.
+    #[test]
+    fn gc_cache_batch_and_cursor() {
+        let env = gc_env("gc-batch");
+        for i in 0..300 {
+            cache_file(&env, &format!("shown-s{i:03}-0000000{}.json", i % 10), true);
+        }
+        cache_file(&env, "endq-s-00000000.json", true);
+        cache_file(&env, "triggers.json", true);
+        let all = gc_names(&env);
+        assert_eq!(all.len(), 301);
+        let cursor = env.cache_dir().join(GC_CURSOR);
+        assert_eq!(
+            gc_cache_batch(&env, GC_BATCH, Duration::from_secs(600)),
+            GC_BATCH
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cursor).unwrap(),
+            all[GC_BATCH - 1],
+            "курсор — последний проверенный"
+        );
+        assert_eq!(
+            gc_names(&env),
+            all[GC_BATCH..].to_vec(),
+            "убраны первые по имени"
+        );
+        assert_eq!(gc_cache_batch(&env, GC_BATCH, Duration::from_secs(600)), 45);
+        assert!(gc_names(&env).is_empty());
+        assert!(!cursor.exists(), "дошли до конца — курсор сброшен");
+        assert!(env.cache_dir().join("triggers.json").is_file());
+        // срок порции вышел сразу — ничего не проверено, курсор на месте
+        cache_file(&env, "shown-a-00000000.json", true);
+        std::fs::write(&cursor, "shown-").unwrap();
+        assert_eq!(gc_cache_batch(&env, GC_BATCH, Duration::ZERO), 0);
+        assert_eq!(std::fs::read_to_string(&cursor).unwrap(), "shown-");
+    }
+
+    /// M7.6 §9.4 п. 3: проход до конца сбрасывает курсор, следующий начинает сначала; курсор за
+    /// последним именем (файлы удалены) — тоже сброс; свежие файлы остаются.
+    #[test]
+    fn gc_cache_cursor_resets_at_end() {
+        let env = gc_env("gc-cursor");
+        for i in 0..10 {
+            cache_file(&env, &format!("events-s{i}-00000000.jsonl"), false);
+        }
+        let cursor = env.cache_dir().join(GC_CURSOR);
+        assert_eq!(gc_cache_batch(&env, 4, Duration::from_secs(600)), 4);
+        assert!(cursor.exists());
+        assert_eq!(gc_cache_batch(&env, 4, Duration::from_secs(600)), 4);
+        assert_eq!(gc_cache_batch(&env, 4, Duration::from_secs(600)), 2);
+        assert!(!cursor.exists(), "конец — курсор сброшен");
+        assert_eq!(
+            gc_cache_batch(&env, 4, Duration::from_secs(600)),
+            4,
+            "снова сначала"
+        );
+        std::fs::write(&cursor, "zzz").unwrap();
+        assert_eq!(gc_cache_batch(&env, 4, Duration::from_secs(600)), 0);
+        assert!(!cursor.exists(), "курсор за последним именем — сброс");
+        assert_eq!(gc_names(&env).len(), 10, "свежие файлы не тронуты");
     }
 }

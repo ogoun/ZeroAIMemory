@@ -1,7 +1,9 @@
 //! Адрес сервера для `zam init` (M6.6 §10.1, замечание обкатки 1): режим [`UrlTo`] и его вывод
 //! из прежнего блока, блок без строки адреса, `CLAUDE.local.md` и его исключение из git
-//! (`info/exclude`), итог по адресу. git запускается с потолками поиска `zam`. Чистые функции
-//! над текстом — в [`super::merge`].
+//! (`info/exclude`), итог по адресу. M7.6 §9.5: тем же помощником `info/exclude` — блок в
+//! `CLAUDE.local.md` (`--block-to local`) и файлы подключения (`--exclude-local`,
+//! [`plan_local_exclude`]). git запускается с потолками поиска `zam`. Чистые функции над текстом
+//! — в [`super::merge`].
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -95,13 +97,46 @@ pub enum Exclude {
     Unknown,
 }
 
+/// Строка `info/exclude` для пути `rel` от корня проекта: `/<префикс><путь>`, префикс каталога
+/// (`--show-prefix`) и путь — с экранированием символов шаблона gitignore.
+fn exclude_line(prefix: &str, rel: &str) -> String {
+    format!(
+        "/{}{}",
+        merge::gitignore_escape(prefix),
+        merge::gitignore_escape(rel)
+    )
+}
+
+/// `info/exclude` репозитория (общий для всех worktree) и префикс каталога проекта в нём; git не
+/// ответил или это не репозиторий — `None`.
+fn exclude_target(root: &Path) -> Option<(PathBuf, String)> {
+    let path = git(root, &["rev-parse", "--git-path", "info/exclude"]);
+    let prefix = git(root, &["rev-parse", "--show-prefix"]);
+    let (Some((0, path)), Some((0, prefix))) = (path, prefix) else {
+        return None;
+    };
+    Some((root.join(path), prefix))
+}
+
+/// Есть ли `.git` у корня проекта или выше (в пределах потолков поиска `zam`).
+fn in_git(root: &Path) -> bool {
+    locate::ancestors(root).any(|d| d.join(".git").exists())
+}
+
 /// План исключения `CLAUDE.local.md` (только чтение: `ls-files`, `check-ignore`, `rev-parse`).
 /// Строка — `/<префикс>CLAUDE.local.md`, префикс каталога (`--show-prefix`) — с экранированием
 /// символов шаблона gitignore. Файл уже в индексе git — отказ (код 1) до записи и регистрации:
 /// правила исключения к отслеживаемому файлу не применяются, и адрес ушёл бы в репозиторий
-/// следующим коммитом (решение координатора, круг правок 2 задачи 10).
-pub fn plan_exclude(root: &Path) -> Result<Exclude, CliError> {
+/// следующим коммитом (решение координатора, круг правок 2 задачи 10). `block` — в файле блок
+/// (`--block-to local`, M7.6 §9.5 п. 1), а не только адрес: другой текст отказа.
+pub fn plan_exclude(root: &Path, block: bool) -> Result<Exclude, CliError> {
     match git_tracked(root, LOCAL_MD) {
+        Some(true) if block => {
+            return Err(CliError::config(format!(
+                "{LOCAL_MD} в индексе git — блок и адрес попали бы в репозиторий: git rm \
+                 --cached {LOCAL_MD} или zam init --block-to agent"
+            )));
+        }
         Some(true) => {
             return Err(CliError::config(format!(
                 "{LOCAL_MD} в индексе git — адрес попал бы в репозиторий: git rm --cached \
@@ -110,8 +145,7 @@ pub fn plan_exclude(root: &Path) -> Result<Exclude, CliError> {
         }
         Some(false) => {}
         None => {
-            let in_git = locate::ancestors(root).any(|d| d.join(".git").exists());
-            return Ok(if in_git {
+            return Ok(if in_git(root) {
                 Exclude::Unknown
             } else {
                 Exclude::Done
@@ -123,13 +157,10 @@ pub fn plan_exclude(root: &Path) -> Result<Exclude, CliError> {
         Some(false) => {}
         None => return Ok(Exclude::Unknown),
     }
-    let path = git(root, &["rev-parse", "--git-path", "info/exclude"]);
-    let prefix = git(root, &["rev-parse", "--show-prefix"]);
-    let (Some((0, path)), Some((0, prefix))) = (path, prefix) else {
+    let Some((path, prefix)) = exclude_target(root) else {
         return Ok(Exclude::Unknown);
     };
-    let path = root.join(path);
-    let line = format!("/{}{LOCAL_MD}", merge::gitignore_escape(&prefix));
+    let line = exclude_line(&prefix, LOCAL_MD);
     let old = read_opt(&path)?;
     let text = merge::append_lines(old.as_deref(), &[&line]);
     Ok(if old.as_deref() == Some(text.as_str()) {
@@ -252,6 +283,10 @@ pub struct UrlReport {
     pub excluded: Option<bool>,
     /// Подключается Codex (`--agent codex|both`).
     pub codex: bool,
+    /// Блок Claude Code — в `CLAUDE.local.md` (`--block-to local`, M7.6 §9.5 п. 1).
+    pub block_local: bool,
+    /// Блок перенесён из `CLAUDE.md` в `CLAUDE.local.md`.
+    pub moved: bool,
 }
 
 impl UrlReport {
@@ -266,6 +301,8 @@ impl UrlReport {
             exclude_ok: false,
             excluded: None,
             codex,
+            block_local: false,
+            moved: false,
         }
     }
 
@@ -276,6 +313,13 @@ impl UrlReport {
             UrlTo::Home => "home",
             UrlTo::Local => "local",
         };
+        if self.block_local {
+            println!("Блок Claude Code — в {LOCAL_MD} (--block-to local), CLAUDE.md не меняется.");
+            if self.moved {
+                println!("блок перенесён из CLAUDE.md — проверьте git diff");
+            }
+            self.print_exclude(root);
+        }
         match self.mode {
             UrlTo::Block => {
                 for f in &self.tracked {
@@ -289,8 +333,11 @@ impl UrlReport {
                 "Адрес сервера — в ~/.zeroaimemory/config.toml, в блоке его нет (--url-to home)."
             ),
             UrlTo::Local => {
-                println!("Адрес сервера — в {LOCAL_MD}, в блоке его нет (--url-to local).");
-                self.print_exclude(root);
+                // блок в CLAUDE.local.md: адрес — его строкой, исключение уже в итоге
+                if !self.block_local {
+                    println!("Адрес сервера — в {LOCAL_MD}, в блоке его нет (--url-to local).");
+                    self.print_exclude(root);
+                }
                 if self.codex {
                     // `locate::resolve` от агента не зависит: хуки Codex и `zam mcp` читают
                     // CLAUDE.local.md; не видит адреса только сам агент (финальное ревью M6.6, M2)
@@ -339,7 +386,11 @@ impl UrlReport {
 
     /// Строка итога об исключении `CLAUDE.local.md`: `(предупреждение?, текст)`.
     fn exclude_message(&self, root: &Path) -> Option<(bool, String)> {
-        let leak = "адрес сервера может попасть в репозиторий";
+        let leak = if self.block_local {
+            "блок и адрес сервера могут попасть в репозиторий"
+        } else {
+            "адрес сервера может попасть в репозиторий"
+        };
         Some(match &self.exclude {
             Exclude::Done => return None,
             Exclude::Add { path, line, .. } if self.exclude_ok => {
@@ -388,6 +439,94 @@ impl UrlReport {
             ),
         })
     }
+}
+
+/// Файл подключения для `--exclude-local` (M7.6 §9.5 п. 2): путь от корня проекта (каталог — с
+/// `/` в конце) и правил ли его этот запуск `zam init`.
+#[derive(Debug, Clone)]
+pub struct LocalItem {
+    pub rel: String,
+    pub changed: bool,
+}
+
+/// План `--exclude-local` (только чтение git).
+#[derive(Debug)]
+pub enum LocalExclude {
+    /// Проект не в git — исключать нечего.
+    NotGit,
+    /// `.git` есть, а git не ответил.
+    Unknown,
+    Plan {
+        /// `info/exclude` репозитория.
+        path: PathBuf,
+        /// Дописать: путь и строка (файл не отслеживается и ещё не исключён).
+        add: Vec<(String, String)>,
+        /// Уже исключены.
+        done: Vec<String>,
+        /// Отслеживаются git и правятся этим запуском — предупреждение.
+        tracked: Vec<String>,
+    },
+}
+
+/// План `--exclude-local`: каждый файл `items`, который не отслеживается git, — строкой в
+/// `info/exclude` (тем же помощником, что `CLAUDE.local.md`); отслеживаемый и изменённый этим
+/// запуском — в предупреждения (правило исключения к нему не применяется); отслеживаемый и не
+/// изменённый — молча (следа этот запуск не добавляет).
+pub fn plan_local_exclude(root: &Path, items: &[LocalItem]) -> LocalExclude {
+    let Some((path, prefix)) = exclude_target(root) else {
+        return if in_git(root) {
+            LocalExclude::Unknown
+        } else {
+            LocalExclude::NotGit
+        };
+    };
+    let (mut add, mut done, mut tracked) = (Vec::new(), Vec::new(), Vec::new());
+    for it in items {
+        match git_tracked(root, &it.rel) {
+            Some(true) => {
+                if it.changed {
+                    tracked.push(it.rel.clone());
+                }
+                continue;
+            }
+            Some(false) => {}
+            None => return LocalExclude::Unknown,
+        }
+        match git_ignored(root, &it.rel) {
+            Some(true) => done.push(it.rel.clone()),
+            _ => add.push((it.rel.clone(), exclude_line(&prefix, &it.rel))),
+        }
+    }
+    LocalExclude::Plan {
+        path,
+        add,
+        done,
+        tracked,
+    }
+}
+
+/// Запись `--exclude-local` (подтверждена): недостающие строки — в конец `info/exclude`, текст
+/// файла читается заново (исключение `CLAUDE.local.md` этого же запуска уже записано); затем git
+/// проверяет каждый путь. Не исключённые после записи (правило «!» в `.gitignore`, git не
+/// ответил) — их пути.
+pub fn apply_local_exclude(root: &Path, plan: &LocalExclude) -> Result<Vec<String>, CliError> {
+    let LocalExclude::Plan { path, add, .. } = plan else {
+        return Ok(Vec::new());
+    };
+    if add.is_empty() {
+        return Ok(Vec::new());
+    }
+    let old = read_opt(path)?;
+    let lines: Vec<&str> = add.iter().map(|(_, l)| l.as_str()).collect();
+    let text = merge::append_lines(old.as_deref(), &lines);
+    if old.as_deref() != Some(text.as_str()) {
+        write_project_file(path, text.as_bytes())?;
+    }
+    Ok(add
+        .iter()
+        .filter(|(rel, _)| git_ignored(root, rel) != Some(true))
+        .map(|(rel, _)| rel.clone())
+        .collect())
 }
 
 #[cfg(test)]

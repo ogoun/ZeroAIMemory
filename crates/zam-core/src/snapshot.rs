@@ -95,8 +95,15 @@ pub struct SnapCommand {
     pub failed: Option<bool>,
 }
 
-/// Содержимое снимка (JSON `{compact_summary?, prompts[], files[], commands[{cmd, failed?}]}`):
-/// хвост конспекта сжатия, последние запросы человека, изменённые файлы, команды.
+/// Содержимое снимка (JSON `{compact_summary?, prompts[], files[], commands[{cmd, failed?}],
+/// task_id?, started_at?, ended_at?}`): хвост конспекта сжатия, последние запросы человека,
+/// изменённые файлы, команды; с M7.6 (§9.4, признак `snapshot_m76`) — задача сессии и даты.
+///
+/// - `task_id` — задача, захваченная сессией снимка (`in_progress`/`blocked`, свежая по ревизии):
+///   её пишет **сервер** при `PUT`, присланное клиентом отбрасывается;
+/// - `started_at`, `ended_at` — время первой строки журнала агента со временем (голова журнала) и
+///   последней строки хвоста, RFC 3339 UTC; их кладёт клиент, сервер проверяет формат (иное —
+///   поле отбрасывается). Сервер 0.0.18 эти поля молча отбрасывает (без `deny_unknown_fields`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotData {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +114,12 @@ pub struct SnapshotData {
     pub files: Vec<String>,
     #[serde(default)]
     pub commands: Vec<SnapCommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<crate::Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
 }
 
 #[cfg(test)]
@@ -147,6 +160,7 @@ mod tests {
                     failed: None,
                 },
             ],
+            ..SnapshotData::default()
         };
         let json = serde_json::to_string(&d).unwrap();
         assert_eq!(
@@ -156,5 +170,25 @@ mod tests {
         assert_eq!(serde_json::from_str::<SnapshotData>(&json).unwrap(), d);
         let empty: SnapshotData = serde_json::from_str("{}").unwrap();
         assert_eq!(empty, SnapshotData::default());
+    }
+
+    /// M7.6 §9.4: задача и даты сессии — необязательные поля в конце; без них JSON прежний.
+    #[test]
+    fn data_task_and_dates_optional() {
+        let id = crate::Id::new();
+        let d = SnapshotData {
+            task_id: Some(id),
+            started_at: Some("2026-11-10T08:00:00Z".into()),
+            ended_at: Some("2026-11-10T09:30:00Z".into()),
+            ..SnapshotData::default()
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"prompts":[],"files":[],"commands":[],"task_id":"{id}","started_at":"2026-11-10T08:00:00Z","ended_at":"2026-11-10T09:30:00Z"}}"#
+            )
+        );
+        assert_eq!(serde_json::from_str::<SnapshotData>(&json).unwrap(), d);
     }
 }

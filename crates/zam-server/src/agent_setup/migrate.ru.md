@@ -6,11 +6,11 @@
 
 - Сначала — `zam guide`: протокол (виды записей, поля, ошибки); задание на него опирается.
 - `zam status` из корня проекта показывает решение и блок — проект подключён, переходи к п. 2. Иначе — `{init}`. Адрес и токен `zam` берёт из `~/.zeroaimemory/config.toml`; в задании токена нет: не найден — попроси владельца выполнить `zam init` со страницы «Подключение агента» или задать `ZAM_TOKEN`.
-{?claude}- Существующий `CLAUDE.md` сохраняется: `zam init` добавляет только блок. Адрес сервера не должен попасть в git — `--url-to local` (адрес — в `CLAUDE.local.md`, его `zam init` исключает из git сам).
-{?codex,agents}- Существующий `AGENTS.md` сохраняется: `zam init` добавляет только блок. Адрес сервера не должен попасть в git — `--url-to home` (адрес — в `~/.zeroaimemory/config.toml`).
-{?claude}- В `.git/info/exclude` — неотслеживаемые `/.mcp.json`, `/.claude/settings.json`, `/.zeroaimemory/`. Отслеживаемый файл, изменённый `zam init` (`CLAUDE.md`, `.claude/settings.json`), не коммить — вопрос владельцу.
-{?codex}- В `.git/info/exclude` — неотслеживаемые `/.codex/hooks.json`, `/.zeroaimemory/`. Отслеживаемый файл, изменённый `zam init` (`AGENTS.md`, `.codex/hooks.json`), не коммить — вопрос владельцу. MCP Codex — в `~/.codex/config.toml`, образец печатает `zam init`.
-{?agents}- В `.git/info/exclude` — неотслеживаемый `/.zeroaimemory/`. Изменённый `zam init` отслеживаемый `AGENTS.md` не коммить — вопрос владельцу. MCP своего агента подключи по `zam guide` («Подключение»).
+{?claude}- Существующий `CLAUDE.md` сохраняется. Без следа в репозитории: `CLAUDE.md` отслеживается git (`git ls-files --error-unmatch CLAUDE.md` — код 0) — команда с `--block-to local --exclude-local` (блок и адрес — в `CLAUDE.local.md`, `CLAUDE.md` не меняется), иначе — с `--url-to local --exclude-local` (адрес — в `CLAUDE.local.md`). `--exclude-local` вносит неотслеживаемые файлы подключения в `.git/info/exclude`.
+{?codex,agents}- Существующий `AGENTS.md` сохраняется: `zam init` добавляет только блок. Адрес сервера не должен попасть в git — команда с `--url-to home --exclude-local` (адрес — в `~/.zeroaimemory/config.toml`, неотслеживаемые файлы подключения — в `.git/info/exclude`).
+{?claude}- Отслеживаемый файл, изменённый `zam init` (о нём предупредит `--exclude-local`), не коммить — вопрос владельцу.
+{?codex}- Отслеживаемый файл, изменённый `zam init` (`AGENTS.md`, `.codex/hooks.json`), не коммить — вопрос владельцу. MCP Codex — в `~/.codex/config.toml`, образец печатает `zam init`.
+{?agents}- Изменённый `zam init` отслеживаемый `AGENTS.md` не коммить — вопрос владельцу. MCP своего агента подключи по `zam guide` («Подключение»).
 - Инструменты MCP `memory_*` появляются при старте сессии. Нет их — CLI `zam` (`zam <команда> --help`) или пачка через stdio `zam mcp` из корня: строки JSON-RPC `initialize` (`protocolVersion` `2025-03-26`), `notifications/initialized`, затем `tools/call` `{name, arguments}` по строке на вызов; ответ — строка с тем же `id`. Вызовы пачки идут параллельно: зависимые (связи с новыми записями) — следующей пачкой. Каждой записи — `idempotency_key` (CLI `--key`) вида `migrate-<вид>-<метка>`: повтор после сбоя не создаст дублей.
 
 ## 2. Опись источников

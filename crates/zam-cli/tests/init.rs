@@ -2270,3 +2270,294 @@ fn init_url_home_unbound_token() {
     );
     assert!(!err(&o).contains("ключ без адреса"), "{}", err(&o));
 }
+
+// ---- M7.6 §9.5 пп. 1–2: подключение без следа в репозитории ----
+
+/// `--block-to local`: блок (с адресом) — в `CLAUDE.local.md` после своего текста, `CLAUDE.md`
+/// не создаётся; `zam status` находит адрес и версию блока там же.
+#[test]
+fn init_block_to_local_writes_claude_local() {
+    let (url, tok) = start("block-local");
+    let p = Proj::new("block-local", &url, &tok);
+    std::fs::write(p.repo.join("CLAUDE.local.md"), "# мои заметки\n").unwrap();
+    let o = p.init(&["--block-to", "local", "--yes"], "");
+    ok(&o);
+    assert!(!p.repo.join("CLAUDE.md").exists(), "CLAUDE.md не создаётся");
+    let local = p.read("CLAUDE.local.md");
+    assert!(local.starts_with("# мои заметки\n\n"), "{local}");
+    assert!(local.contains(&begin()), "{local}");
+    assert!(
+        local.contains(&format!("ZeroAIMemoryUrl={url}")),
+        "адрес — строкой блока: {local}"
+    );
+    assert_eq!(lines_eq(&local, &format!("ZeroAIMemoryUrl={url}")), 1);
+    assert!(p.repo.join(".mcp.json").is_file());
+    assert!(
+        out(&o).contains("Блок Claude Code — в CLAUDE.local.md (--block-to local)"),
+        "{}",
+        out(&o)
+    );
+    let o = p.cmd().arg("status").output().unwrap();
+    ok(&o);
+    let s = out(&o);
+    assert!(s.contains(&format!("Сервер:   {url}")), "{s}");
+    assert!(
+        s.contains(&format!("Блок инструкции: v{V} (актуален)")),
+        "версия блока — из CLAUDE.local.md: {s}"
+    );
+}
+
+/// `--block-to local` при блоке в `CLAUDE.md`: блок вырезается (остальной текст, BOM и CRLF —
+/// байт в байт), строка «блок перенесён из CLAUDE.md — проверьте git diff»; повтор ничего не
+/// меняет.
+#[test]
+fn init_block_to_local_moves_block() {
+    let (url, tok) = start("block-move");
+    let p = Proj::new("block-move", &url, &tok);
+    let own = "\u{feff}# Проект\r\n\r\nсвой текст\r\n";
+    std::fs::write(p.repo.join("CLAUDE.md"), own).unwrap();
+    ok(&p.init(&["--yes"], ""));
+    assert!(p.read("CLAUDE.md").contains(&begin()));
+    let o = p.init(&["--block-to", "local", "--yes"], "");
+    ok(&o);
+    assert_eq!(p.read("CLAUDE.md"), own, "CLAUDE.md — как до подключения");
+    assert!(p.read("CLAUDE.local.md").contains(&begin()));
+    assert!(
+        out(&o).contains("блок перенесён из CLAUDE.md — проверьте git diff"),
+        "{}",
+        out(&o)
+    );
+    let before = p.snapshot();
+    let o = p.init(&["--yes"], "");
+    ok(&o);
+    assert_eq!(
+        p.snapshot(),
+        before,
+        "повтор без флага — режим local, без правок"
+    );
+    assert!(!out(&o).contains("перенесён"), "{}", out(&o));
+    // CLAUDE.md только с блоком — удаляется
+    let q = Proj::new("block-move-only", &url, &tok);
+    ok(&q.init(&["--yes"], ""));
+    ok(&q.init(&["--block-to", "local", "--yes"], ""));
+    assert!(!q.repo.join("CLAUDE.md").exists());
+    assert!(q.read("CLAUDE.local.md").contains(&begin()));
+}
+
+/// `--block-to local` в репозитории git: `CLAUDE.local.md` вносится в `info/exclude` после
+/// подтверждения (тот же путь, что у `--url-to local`); отказ — предупреждение.
+#[test]
+fn init_block_to_local_excludes_file() {
+    let (url, tok) = start("block-exclude");
+    let p = Proj::new("block-exclude", &url, &tok);
+    git_init(&p);
+    let o = p.init(&["--block-to", "local"], "y\nn\n");
+    ok(&o);
+    assert!(!git_ignored(&p, "CLAUDE.local.md"));
+    assert!(
+        err(&o).contains("CLAUDE.local.md не внесён") && err(&o).contains("блок и адрес"),
+        "{}",
+        err(&o)
+    );
+    let o = p.init(&["--block-to", "local"], "y\ny\n");
+    ok(&o);
+    assert!(git_ignored(&p, "CLAUDE.local.md"));
+    assert_eq!(lines_eq(&exclude(&p), "/CLAUDE.local.md"), 1);
+    assert!(
+        out(&o).contains("CLAUDE.local.md внесён в .git/info/exclude."),
+        "{}",
+        out(&o)
+    );
+    assert!(!err(&o).contains("не исключён из git"), "{}", err(&o));
+}
+
+/// `--block-to local`: `CLAUDE.local.md` в индексе git — отказ (код 1) до записи и регистрации.
+#[test]
+fn init_block_to_local_tracked_refuses() {
+    let (url, tok) = start("block-tracked");
+    let p = Proj::new("block-tracked", &url, &tok);
+    git_init(&p);
+    std::fs::write(p.repo.join("CLAUDE.local.md"), "# мои\n").unwrap();
+    git_ok(&p.repo, &["add", "CLAUDE.local.md"]);
+    git_ok(&p.repo, &["commit", "-q", "-m", "local"]);
+    let before = p.snapshot();
+    let o = p.init(&["--block-to", "local", "--yes"], "");
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(
+        err(&o).contains(
+            "CLAUDE.local.md в индексе git — блок и адрес попали бы в репозиторий: git rm \
+             --cached CLAUDE.local.md или zam init --block-to agent"
+        ),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(p.snapshot(), before, "файлы проекта не тронуты");
+}
+
+/// `--block-to local` с `--agent codex|both` — код 1: Codex `CLAUDE.local.md` не читает.
+#[test]
+fn init_block_to_local_codex_refuses() {
+    let (url, tok) = start("block-codex");
+    let p = Proj::new("block-codex", &url, &tok);
+    let before = p.snapshot();
+    for agent in ["codex", "both"] {
+        let o = p.init(&["--block-to", "local", "--agent", agent, "--yes"], "");
+        assert_eq!(o.status.code(), Some(1), "{agent}: {}", out(&o));
+        assert!(
+            err(&o)
+                .contains("Codex не читает CLAUDE.local.md: блок для Codex — только в AGENTS.md"),
+            "{agent}: {}",
+            err(&o)
+        );
+        assert_eq!(p.snapshot(), before, "{agent}");
+    }
+}
+
+/// Без `--block-to` режим сохраняется: блок в `CLAUDE.local.md` и не в `CLAUDE.md` — `local`
+/// (новый блок туда же, `CLAUDE.md` не создаётся); `--block-to agent` возвращает блок в
+/// `CLAUDE.md`.
+#[test]
+fn init_block_to_local_mode_kept() {
+    let (url, tok) = start("block-kept");
+    let p = Proj::new("block-kept", &url, &tok);
+    ok(&p.init(&["--block-to", "local", "--yes"], ""));
+    // устаревший блок в CLAUDE.local.md: повтор без флага заменяет его там же
+    let local = p
+        .read("CLAUDE.local.md")
+        .replace(&begin(), "<!-- zeroaimemory:begin v1 -->");
+    std::fs::write(p.repo.join("CLAUDE.local.md"), &local).unwrap();
+    ok(&p.init(&["--yes"], ""));
+    assert!(p.read("CLAUDE.local.md").contains(&begin()));
+    assert!(!p.repo.join("CLAUDE.md").exists());
+    ok(&p.init(&["--block-to", "agent", "--yes"], ""));
+    assert!(p.read("CLAUDE.md").contains(&begin()));
+}
+
+/// `--block-to local --url-to home`: строка адреса из блока в `CLAUDE.local.md` вырезается, адрес
+/// — в домашнем конфиге; повтор без флагов режим держит.
+#[test]
+fn init_block_to_local_url_to_home_cuts_url() {
+    let (url, tok) = start("block-home");
+    let p = Proj::new("block-home", &url, &tok);
+    let o = p.init(&["--block-to", "local", "--url-to", "home", "--yes"], "");
+    ok(&o);
+    let local = p.read("CLAUDE.local.md");
+    assert!(local.contains(&begin()), "{local}");
+    assert!(
+        !local.contains("ZeroAIMemoryUrl") && !local.contains(&url),
+        "{local}"
+    );
+    let home: toml::Table =
+        toml::from_str(&std::fs::read_to_string(home_cfg(&p)).unwrap()).unwrap();
+    assert_eq!(home["url"].as_str(), Some(url.as_str()), "{home:?}");
+    let before = p.snapshot();
+    ok(&p.init(&["--yes"], ""));
+    assert_eq!(p.snapshot(), before);
+    // --url-to local у блока в CLAUDE.local.md — строкой блока, без второй строки
+    ok(&p.init(&["--url-to", "local", "--yes"], ""));
+    let local = p.read("CLAUDE.local.md");
+    assert_eq!(
+        lines_eq(&local, &format!("ZeroAIMemoryUrl={url}")),
+        1,
+        "{local}"
+    );
+}
+
+/// `--exclude-local`: файлы подключения, не отслеживаемые git, — в `info/exclude` (`.zeroaimemory/`
+/// каталогом), подсказка про GUID решения для другого клона; повтор строк не дублирует.
+#[test]
+fn init_exclude_local_untracked_files() {
+    let (url, tok) = start("ex-local");
+    let p = Proj::new("ex-local", &url, &tok);
+    git_init(&p);
+    let o = p.init(&["--exclude-local", "--yes"], "");
+    ok(&o);
+    for f in [
+        ".mcp.json",
+        ".claude/settings.json",
+        ".zeroaimemory/",
+        "CLAUDE.md",
+    ] {
+        assert!(git_ignored(&p, f), "{f}: {}", exclude(&p));
+    }
+    assert!(git_ignored(&p, ".zeroaimemory/solution.toml"));
+    let ex = exclude(&p);
+    assert_eq!(lines_eq(&ex, "/.zeroaimemory/"), 1, "{ex}");
+    let guid = p.read(".zeroaimemory/solution.toml");
+    let guid = guid.split('"').nth(1).unwrap();
+    assert!(
+        out(&o).contains(&format!(
+            "GUID решения не в репозитории: в другом клоне — zam init --id {guid}"
+        )),
+        "{}",
+        out(&o)
+    );
+    assert!(
+        out(&o).contains("Внесены в .git/info/exclude: "),
+        "{}",
+        out(&o)
+    );
+    let o = p.init(&["--exclude-local", "--yes"], "");
+    ok(&o);
+    assert_eq!(exclude(&p), ex, "повтор строк не дублирует");
+    // отказ на вопрос — предупреждение, исключение не пишется
+    let q = Proj::new("ex-local-no", &url, &tok);
+    git_init(&q);
+    let ex0 = exclude(&q);
+    let o = q.init(&["--exclude-local"], "y\nn\n");
+    ok(&o);
+    assert_eq!(exclude(&q), ex0);
+    assert!(err(&o).contains("повторите с --yes"), "{}", err(&o));
+}
+
+/// `--exclude-local`: отслеживаемый файл, который правит запуск, — предупреждение «отслеживается
+/// git — правка попадёт в репозиторий», в `info/exclude` его нет; прочие исключаются.
+#[test]
+fn init_exclude_local_tracked_warns() {
+    let (url, tok) = start("ex-tracked");
+    let p = Proj::new("ex-tracked", &url, &tok);
+    git_init(&p);
+    std::fs::write(p.repo.join(".mcp.json"), "{}\n").unwrap();
+    git_ok(&p.repo, &["add", ".mcp.json"]);
+    git_ok(&p.repo, &["commit", "-q", "-m", "mcp"]);
+    let o = p.init(&["--exclude-local", "--yes"], "");
+    ok(&o);
+    assert!(
+        err(&o)
+            .contains("предупреждение: .mcp.json отслеживается git — правка попадёт в репозиторий"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(lines_eq(&exclude(&p), "/.mcp.json"), 0, "{}", exclude(&p));
+    assert!(git_ignored(&p, ".claude/settings.json"));
+    // повтор: отслеживаемый файл не меняется — предупреждения нет
+    let o = p.init(&["--exclude-local", "--yes"], "");
+    ok(&o);
+    assert!(!err(&o).contains("отслеживается git"), "{}", err(&o));
+}
+
+/// `--exclude-local` вне git — «не git — исключать нечего», файлы подключения пишутся.
+#[test]
+fn init_exclude_local_not_git() {
+    let (url, tok) = start("ex-not-git");
+    let root = tmp("ex-not-git");
+    let proj = root.join("proj");
+    let home = root.join("home");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let mut ceil: Vec<PathBuf> = std::env::split_paths(&common::ceilings()).collect();
+    ceil.push(root.clone());
+    let o = common::zam_cmd()
+        .env(zam_core::CEILING_ENV, std::env::join_paths(ceil).unwrap())
+        .env("GIT_CEILING_DIRECTORIES", &root)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .current_dir(&proj)
+        .args(["init", "--url", &url, "--token", &tok])
+        .args(["--exclude-local", "--yes"])
+        .output()
+        .unwrap();
+    ok(&o);
+    assert!(out(&o).contains("не git — исключать нечего"), "{}", out(&o));
+    assert!(proj.join(".mcp.json").is_file());
+}

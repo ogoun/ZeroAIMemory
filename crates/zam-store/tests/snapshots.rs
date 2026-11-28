@@ -54,6 +54,7 @@ fn row(session: &str, taken_at: &str, trigger: SnapTrigger) -> SnapshotRow {
                     failed: None,
                 },
             ],
+            ..SnapshotData::default()
         },
     }
 }

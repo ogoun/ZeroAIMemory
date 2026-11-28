@@ -8,8 +8,10 @@
 //!   `snapshot.keep_days` ([`gc_snapshots`], воркер обслуживания).
 //! - Показ «последнего известного состояния» (§8а, задача 17c): последний снимок других
 //!   **оборванных** сессий решения ([`digest_snapshot`]), запись в память другой сессией после снимка
-//!   ([`writes_after`]), задачи сессии снимка ([`snapshot_tasks`]); моменты снимков списка
-//!   сессий — [`snapshot_times`].
+//!   ([`writes_after`]), задачи сессии снимка ([`snapshot_tasks`], по `task_id` снимка —
+//!   [`snapshot_task`]); моменты снимков списка сессий — [`snapshot_times`].
+//! - Задача снимка `task_id` (M7.6 §9.4) — захваченная сессией задача `in_progress`/`blocked`,
+//!   свежая по ревизии ([`session_claimed_task`]): её пишет сервер при `PUT`.
 use std::collections::HashMap;
 
 use jiff::Timestamp;
@@ -214,6 +216,49 @@ pub async fn snapshot_tasks(
     now: Timestamp,
     limit: usize,
 ) -> Result<Vec<SnapTask>, StoreError> {
+    snap_tasks_where(
+        db,
+        spaces,
+        session,
+        now,
+        "(json_extract(e.data, '$.claimed_by.session') = ?{s}
+          OR EXISTS (SELECT 1 FROM entry_revisions r
+                     WHERE r.entry_id = e.id AND r.session_id = ?{s}))
+         ORDER BY e.updated_at DESC, e.id DESC
+         LIMIT ?{x}",
+        limit.to_string(),
+    )
+    .await
+}
+
+/// Задача `id` пространств `spaces` в виде [`SnapTask`] для сессии снимка `session` (M7.6 §9.4,
+/// задача снимка `task_id`, которую не нашёл [`snapshot_tasks`]: захват снят или перехвачен);
+/// нет такой живой задачи — `None`.
+pub async fn snapshot_task(
+    db: &Db,
+    spaces: &[Id],
+    id: Id,
+    session: &str,
+    now: Timestamp,
+) -> Result<Option<SnapTask>, StoreError> {
+    Ok(
+        snap_tasks_where(db, spaces, session, now, "e.id = ?{x}", id.to_string())
+            .await?
+            .into_iter()
+            .next(),
+    )
+}
+
+/// Общий запрос [`snapshot_tasks`] и [`snapshot_task`]: `tail` — отбор, порядок и предел после
+/// общих условий (`?{s}` — сессия, `?{x}` — значение `x`: предел или id задачи).
+async fn snap_tasks_where(
+    db: &Db,
+    spaces: &[Id],
+    session: &str,
+    now: Timestamp,
+    tail: &str,
+    x: String,
+) -> Result<Vec<SnapTask>, StoreError> {
     if spaces.is_empty() {
         return Ok(Vec::new());
     }
@@ -221,7 +266,10 @@ pub async fn snapshot_tasks(
     let mut args: Vec<String> = spaces.iter().map(ToString::to_string).collect();
     args.push(session.to_string());
     args.push(fmt_ts(now));
-    args.push(limit.to_string());
+    args.push(x);
+    let tail = tail
+        .replace("?{s}", &format!("?{}", n + 1))
+        .replace("?{x}", &format!("?{}", n + 3));
     let sql = format!(
         "SELECT e.id, e.status,
                 (SELECT max(ts) FROM entry_revisions r WHERE r.entry_id = e.id),
@@ -229,15 +277,10 @@ pub async fn snapshot_tasks(
                   AND json_extract(e.data, '$.claimed_by.until') > ?{now}
          FROM entries e INDEXED BY entries_feed
          WHERE e.space_id IN ({list}) AND e.kind = 'task' AND e.deleted_at IS NULL
-           AND (json_extract(e.data, '$.claimed_by.session') = ?{s}
-                OR EXISTS (SELECT 1 FROM entry_revisions r
-                           WHERE r.entry_id = e.id AND r.session_id = ?{s}))
-         ORDER BY e.updated_at DESC, e.id DESC
-         LIMIT ?{lim}",
+           AND {tail}",
         list = crate::questions::in_list(n),
         s = n + 1,
         now = n + 2,
-        lim = n + 3,
     );
     db.read(move |c| {
         let mut st = c.prepare(&sql)?;
@@ -250,6 +293,41 @@ pub async fn snapshot_tasks(
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    })
+    .await
+}
+
+/// Задача, захваченная сессией `session` (любой срок захвата) в пространствах `spaces`, со
+/// статусом `in_progress` или `blocked` — свежая по ревизии (затем по id): `task_id` снимка,
+/// который сервер пишет при `PUT` (M7.6 §9.4). Id задачи и момент её последней ревизии (для
+/// выбора среди баз); нет — `None`.
+pub async fn session_claimed_task(
+    db: &Db,
+    spaces: &[Id],
+    session: &str,
+) -> Result<Option<(Id, Option<Timestamp>)>, StoreError> {
+    if spaces.is_empty() {
+        return Ok(None);
+    }
+    let n = spaces.len();
+    let mut args: Vec<String> = spaces.iter().map(ToString::to_string).collect();
+    args.push(session.to_string());
+    let sql = format!(
+        "SELECT e.id, (SELECT max(ts) FROM entry_revisions r WHERE r.entry_id = e.id) AS rev
+         FROM entries e INDEXED BY entries_feed
+         WHERE e.space_id IN ({list}) AND e.kind = 'task' AND e.deleted_at IS NULL
+           AND e.status IN ('in_progress', 'blocked')
+           AND json_extract(e.data, '$.claimed_by.session') = ?{s}
+         ORDER BY rev DESC, e.id DESC
+         LIMIT 1",
+        list = crate::questions::in_list(n),
+        s = n + 1,
+    );
+    db.read(move |c| {
+        Ok(c.query_row(&sql, params_from_iter(args), |r| {
+            Ok((r.get(0)?, ts_opt(r, 1)?))
+        })
+        .optional()?)
     })
     .await
 }

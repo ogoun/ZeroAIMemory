@@ -1133,3 +1133,82 @@ fn idea_list_old_server_without_returned() {
     assert!(err(&o).contains("неизвестное значение"), "{}", err(&o));
     assert_eq!(seen.lock().unwrap().len(), 5);
 }
+
+/// Сообщение `zam idea adopt` у сервера без флага `idea_adopt_token` (M7.6 §9.5 п. 4).
+const OLD_SERVER_ADOPT: &str = "сервер старше 0.0.19 — «Принять как свою» в WebUI";
+
+/// M7.6 §9.5 п. 4: `zam idea adopt` против сервера 0.0.18 — 403 на `/adopt` и нет флага
+/// `idea_adopt_token` в `/health` — код 1 с [`OLD_SERVER_ADOPT`]; тело — `{by, channel}`; сервер с
+/// флагом и 403 `idea-human-decision` — его ошибка как есть, без подсказки; `zam idea reopen` —
+/// `decide {decision: reopen, reason}` (маршрут с M5.7, флаг не нужен).
+#[test]
+fn idea_adopt_old_server_code_1() {
+    let dir = repo("adopt-old-repo");
+    let id = zam_core::Id::new().to_string();
+    let denied = r#"{"type":"about:blank","title":"Forbidden","status":403,"detail":"«принять как свою» — действие человека в WebUI"}"#;
+    let human = r#"{"type":"/problems/idea-human-decision","title":"Forbidden","status":403,"detail":"идею своей делает только человек"}"#;
+    let stub = |health: &'static str, adopt: &'static str| {
+        common::stub_with(Arc::new(move |_: &str, p: &str, _: usize| {
+            if p == "/api/v1/health" {
+                (200, health, Duration::ZERO)
+            } else if p.ends_with("/adopt") {
+                (403, adopt, Duration::ZERO)
+            } else {
+                (
+                    200,
+                    r#"{"entry":{"id":"x","status":"new","data":{}}}"#,
+                    Duration::ZERO,
+                )
+            }
+        }))
+    };
+    let body_of = |seen: &common::Seen, suffix: &str| -> serde_json::Value {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .find(|(m, p, _)| m == "POST" && p.ends_with(suffix))
+            .map(|(_, _, b)| b.clone())
+            .expect("запрос")
+    };
+    let (url, seen) = stub(
+        r#"{"status":"ok","version":"0.0.18-m7.5","features":["m6","idea_review"]}"#,
+        denied,
+    );
+    let o = stub_z(&url, &dir, &["idea", "adopt", &id, "--by", "human"]);
+    assert_eq!(code(&o), Some(1), "{}", err(&o));
+    assert_eq!(err(&o).trim(), OLD_SERVER_ADOPT);
+    assert_eq!(
+        body_of(&seen, "/adopt"),
+        serde_json::json!({"by": "human", "channel": "cli"})
+    );
+    // «Вернуть на разбор» — решение `reopen` у прежнего маршрута
+    let o = stub_z(
+        &url,
+        &dir,
+        &[
+            "idea",
+            "reopen",
+            &format!("w:{id}"),
+            "--reason",
+            "снова нужна",
+        ],
+    );
+    ok(&o);
+    assert_eq!(
+        body_of(&seen, "/decide"),
+        serde_json::json!({"decision": "reopen", "by": "human", "channel": "cli",
+                           "reason": "снова нужна"})
+    );
+    // сервер 0.0.19: отказ от имени агента — ошибка сервера, подсказки про версию нет
+    let (url, _) = stub(
+        r#"{"status":"ok","version":"0.0.19-m7.6","features":["m6","idea_adopt_token"]}"#,
+        human,
+    );
+    let o = stub_z(&url, &dir, &["idea", "adopt", &id, "--by", "agent"]);
+    assert_ne!(code(&o), Some(0));
+    assert!(
+        err(&o).contains("идею своей делает только человек") && !err(&o).contains("0.0.19"),
+        "{}",
+        err(&o)
+    );
+}
