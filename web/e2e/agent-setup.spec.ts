@@ -4,6 +4,7 @@
 import { expect, test, type Page } from '@playwright/test';
 import { fileURLToPath } from 'node:url';
 import { ADMIN_STATE } from './session';
+import { VIEWPORTS, noHorizontalScroll } from './viewports';
 
 const env = (k: string) => {
   const v = process.env[k];
@@ -123,7 +124,7 @@ test('Подключение агента: опции меняют фрагме�
   await page.screenshot({ path: `${screens}agent-setup.png`, fullPage: true });
 
   // токен тут же: окно токена, токен — в командах установки и zam init, не в блоке
-  await page.getByLabel('Имя токена').fill('e2e-setup');
+  await page.getByLabel('Название токена').fill('e2e-setup');
   await page.getByRole('button', { name: 'Выпустить токен' }).click();
   const dialog = page.getByRole('dialog');
   const plain = await dialog.getByLabel('Токен').inputValue();
@@ -161,12 +162,172 @@ test('Подключение агента: опции меняют фрагме�
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
+// M7.6 §9.1: «Подключить с переносом данных» — задание агенту на перенос проекта от сервера
+test('Подключение с переносом данных: задание с сервера, смена агента и языка, копирование, три ширины', async ({ page, context }) => {
+  const problems = watch(page);
+  await page.goto(`${base()}#/agent-setup`);
+  const opt = page.getByLabel('Подключить с переносом данных');
+  await expect(opt).toBeEnabled();
+  await expect(opt).not.toBeChecked();
+  const task = frag(page, 'Задание агенту на перенос');
+  await expect(task).toHaveCount(0);
+
+  await page.getByLabel('Новое (GUID выдаст сервер)').check();
+  await page.getByLabel('Имя решения').fill('Перенос E2E');
+  await opt.check();
+  const text = task.getByLabel('Текст задания на перенос');
+  await expect(text).toHaveValue(/Решение: «Перенос E2E» \(`[0-9a-f-]{36}`\)/);
+  await expect(text).toHaveValue(/~\/\.claude\/projects\//);
+  await expect(text).toHaveAttribute('readonly', '');
+  // блок — сразу под текстом для CLAUDE.md; токена в задании нет
+  const order = await page.locator('section.frag').evaluateAll((els) => els.map((e) => e.getAttribute('aria-label')));
+  expect(order.slice(0, 2)).toEqual(['Текст для CLAUDE.md', 'Задание агенту на перенос']);
+  await expect(text).not.toHaveValue(/zam_|<токен>/);
+
+  // агент Codex и язык — текст обновляется
+  await page.getByLabel('Codex (AGENTS.md и хуки Codex)').check();
+  await expect(text).toHaveValue(/~\/\.codex\/sessions\//);
+  await expect(text).not.toHaveValue(/~\/\.claude\/projects\//);
+  await page.getByLabel('Язык инструкции').selectOption('en');
+  await expect(text).toHaveValue(/^# Task: move the project into ZeroAIMemory memory/);
+  await page.getByLabel('Язык инструкции').selectOption('ru');
+  await page.getByLabel('Claude Code (CLAUDE.md)').check();
+  await expect(text).toHaveValue(/~\/\.claude\/projects\//);
+
+  // «Копировать» — в буфере текст задания
+  await task.getByRole('button', { name: 'Копировать' }).click();
+  await expect(task.getByRole('button', { name: 'Скопировано' })).toBeVisible();
+  await expect(task.getByRole('status')).toHaveText('Скопировано в буфер обмена.');
+  const value = await text.inputValue();
+  const port = new URL(base()).port;
+  await context.grantPermissions(['clipboard-read'], { origin: `http://localhost:${port}` });
+  const probe = await context.newPage();
+  await probe.goto(`http://localhost:${port}/`);
+  expect((await probe.evaluate(() => navigator.clipboard.readText())).replace(/\r\n/g, '\n')).toBe(value);
+  await probe.close();
+
+  // три ширины: без горизонтальной прокрутки; снимки — в .tmp/e2e/screens
+  for (const w of ['phone', 'tablet', 'desktop'] as const) {
+    await page.setViewportSize(VIEWPORTS[w]);
+    await expect(text).toBeVisible();
+    expect(await noHorizontalScroll(page), w).toBe(true);
+    await page.screenshot({ path: `${screens}agent-setup-migrate-${w}.png`, fullPage: true });
+    // окно с блоком задания (снимок всей страницы на телефоне слишком высок для просмотра)
+    await task.evaluate((e) => e.scrollIntoView({ block: 'start' }));
+    await page.screenshot({ path: `${screens}agent-setup-migrate-${w}-view.png` });
+  }
+
+  // галочка снята — блока нет
+  await opt.uncheck();
+  await expect(task).toHaveCount(0);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('Сервер без признака agent_setup_migrate — галочка выключена с пояснением', async ({ page }) => {
+  const problems = watch(page);
+  await page.route('**/api/v1/health', async (route) => {
+    const r = await route.fetch();
+    const j = await r.json();
+    j.features = (j.features ?? []).filter((f: string) => f !== 'agent_setup_migrate');
+    await route.fulfill({ response: r, json: j });
+  });
+  const setupUrls: string[] = [];
+  page.on('request', (r) => {
+    if (r.url().includes('/api/v1/agent-setup')) setupUrls.push(r.url());
+  });
+  await page.goto(`${base()}#/agent-setup`);
+  const opt = page.getByLabel('Подключить с переносом данных');
+  await expect(opt).toBeDisabled();
+  await expect(page.getByText('Сервер старше 0.0.19: задания на перенос нет — обновите сервер.')).toBeVisible();
+  await expect(frag(page, 'Текст для CLAUDE.md')).toBeVisible();
+  await expect(frag(page, 'Задание агенту на перенос')).toHaveCount(0);
+  expect(setupUrls.some((u) => u.includes('migrate='))).toBe(false);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+// M7.6 (решения координатора 141–143): «Название токена» — подпись и пояснение; пустое на
+// «Аккаунте» — ошибка под полем; на «Подключении агента» — название по умолчанию, «Отозвать этот
+// токен» возвращает заглушку, отозванный — в «Отозванные (N)»
+test('Название токена: пустое на «Аккаунте» — ошибка под полем и фокус', async ({ page }) => {
+  const problems = watch(page);
+  const posts: string[] = [];
+  page.on('request', (r) => {
+    if (r.method() === 'POST' && r.url().includes('/api/v1/auth/tokens')) posts.push(r.url());
+  });
+  await page.goto(`${base()}#/account`);
+  const field = page.getByLabel('Название токена');
+  await expect(field).toHaveAttribute('placeholder', 'например: ноутбук, Claude Code');
+  await expect(page.getByText('Это не сам токен, а подпись для себя — чтобы отличить его в списке.')).toBeVisible();
+  await page.getByRole('button', { name: 'Выпустить токен' }).click();
+  const form = page.getByRole('form', { name: 'Выпуск токена' });
+  await expect(form.getByRole('alert')).toHaveText('Укажите название токена');
+  await expect(field).toBeFocused();
+  await expect(field).toHaveAttribute('aria-invalid', 'true');
+  expect(posts).toEqual([]);
+  await field.fill('e2e-name');
+  await expect(form.getByRole('alert')).toHaveCount(0);
+  await expect(page.getByText('Отозвать — токен перестаёт работать сразу и навсегда; строка остаётся в истории.')).toBeVisible();
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('Выпуск на «Подключении агента»: название по умолчанию, «Отозвать этот токен», список отозванных', async ({ page }) => {
+  const problems = watch(page);
+  const day = new Date();
+  const p2 = (n: number) => String(n).padStart(2, '0');
+  const date = `${day.getFullYear()}-${p2(day.getMonth() + 1)}-${p2(day.getDate())}`;
+  await page.goto(`${base()}#/agent-setup`);
+  const field = page.getByLabel('Название токена');
+  await expect(field).toHaveValue(`Claude Code · новое решение · ${date}`);
+  // следует за агентом и решением, пока не правили
+  await page.getByLabel('Codex (AGENTS.md и хуки Codex)').check();
+  await page.getByLabel('Новое (GUID выдаст сервер)').check();
+  await page.getByLabel('Имя решения').fill('Токен E2E');
+  const name = `Codex · Токен E2E · ${date}`;
+  await expect(field).toHaveValue(name);
+  await expect(page.getByRole('link', { name: '«Мои токены»' })).toHaveAttribute('href', '#/account');
+  await expect(page.getByRole('link', { name: 'токены пользователей' })).toHaveAttribute('href', '#/admin');
+  await expect(page.getByText('«Администрирование» → «Пользователи»')).toBeVisible();
+
+  await page.getByRole('button', { name: 'Выпустить токен' }).click();
+  const dialog = page.getByRole('dialog');
+  const plain = await dialog.getByLabel('Токен').inputValue();
+  await dialog.getByRole('button', { name: 'Закрыть' }).click();
+  const init = frag(page, /zam init — Linux/);
+  await expect(init).toContainText(`--token '${plain}'`);
+
+  // отзыв: подтверждение, после — заглушка в командах
+  await page.getByRole('button', { name: 'Отозвать этот токен' }).click();
+  const ask = page.getByRole('dialog', { name: 'Отозвать токен?' });
+  await expect(ask).toContainText(name);
+  await ask.getByRole('button', { name: 'Отозвать', exact: true }).click();
+  await expect(ask).toBeHidden();
+  await expect(page.getByTestId('setup-token-notice')).toHaveText(`Токен «${name}» отозван: в командах снова заглушка <токен>.`);
+  await expect(page.getByTestId('setup-token-notice')).toBeFocused();
+  await expect(init).not.toContainText(plain);
+  await expect(page.getByRole('button', { name: 'Отозвать этот токен' })).toHaveCount(0);
+  expect((await fetch(`${base()}api/v1/spaces`, { headers: { Authorization: `Bearer ${plain}` } })).status).toBe(401);
+
+  // «Аккаунт»: токен — в свёрнутом списке отозванных
+  await page.getByRole('link', { name: '«Мои токены»' }).click();
+  await expect(page).toHaveURL(/#\/account$/);
+  const active = page.getByRole('table', { name: 'Мои токены' });
+  await expect(active).toBeVisible();
+  await expect(active.locator(`tr[data-token="${name}"]`)).toHaveCount(0);
+  const summary = page.getByText(/^Отозванные \(\d+\)$/);
+  await expect(page.getByRole('table', { name: 'Отозванные токены' })).toBeHidden();
+  await summary.click();
+  const row = page.getByRole('table', { name: 'Отозванные токены' }).locator(`tr[data-token="${name}"]`);
+  await expect(row).toBeVisible();
+  await expect(row).toContainText('отозван');
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
 test('Выпуск токена в «Пользователях» — сразу «Подключение агента»', async ({ page }) => {
   const problems = watch(page);
   await page.goto(`${base()}#/admin`);
   const row = page.getByRole('row').filter({ hasText: '(админ)' }).first();
   await row.getByRole('button', { name: 'Токены' }).click();
-  await page.getByPlaceholder('Имя токена').fill('e2e-jump');
+  await page.getByLabel('Название токена').fill('e2e-jump');
   await page.getByRole('button', { name: 'Выпустить токен' }).click();
   await expect(page).toHaveURL(/#\/agent-setup$/);
   const dialog = page.getByRole('dialog');

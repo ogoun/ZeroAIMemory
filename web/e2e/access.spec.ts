@@ -145,7 +145,7 @@ test('Токены: человеческих нет, axiom — обычным т
   await adminRow.getByRole('button', { name: 'Токены' }).click();
   // флажка «для человека» больше нет (§11.4, решение владельца 2026-10-26)
   await expect(page.getByLabel('для человека')).toHaveCount(0);
-  await page.getByPlaceholder('Имя токена').fill('e2e-agent');
+  await page.getByLabel('Название токена').fill('e2e-agent');
   await page.getByRole('button', { name: 'Выпустить токен' }).click();
   await expect(page).toHaveURL(/#\/agent-setup$/);
   const dialog = page.getByRole('dialog');

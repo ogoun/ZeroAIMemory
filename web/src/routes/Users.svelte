@@ -7,6 +7,8 @@
   // окно-подтверждение `danger`, фокус на «Отмена» (правило Д).
   import { onMount } from 'svelte';
   import Prompt, { type Ask } from '../components/Prompt.svelte';
+  import TokenNameField from '../components/TokenNameField.svelte';
+  import TokenTable from '../components/TokenTable.svelte';
   import {
     ApiError,
     clearUserPassword,
@@ -32,6 +34,9 @@
   let newName = $state('');
   let tokenName = $state('');
   let tokenAccess = $state<Access>('rw');
+  /** Ошибка поля «Название токена» (пустое; M7.6 §9.1, решение координатора 141). */
+  let nameError = $state('');
+  let nameInput = $state<HTMLInputElement>();
   let error = $state('');
   let notice = $state('');
   let ask = $state<Ask | null>(null);
@@ -70,6 +75,11 @@
 
   function addToken(e: SubmitEvent, userId: string) {
     e.preventDefault();
+    if (!tokenName.trim()) {
+      nameError = 'Укажите название токена';
+      nameInput?.focus();
+      return;
+    }
     return guard(async () => {
       const t = await issueToken(userId, tokenName, tokenAccess);
       tokenName = '';
@@ -194,34 +204,22 @@
           {#if open === u.id}
             <tr>
               <td colspan="5">
-                <table>
-                  <thead><tr><th>Имя</th><th>Префикс</th><th>Доступ</th><th>Использован</th><th></th></tr></thead>
-                  <tbody>
-                    {#each tokens[u.id] ?? [] as t (t.id)}
-                      <tr>
-                        <td>{t.name}</td>
-                        <td><code>zam_{t.prefix}…</code></td>
-                        <td>{t.access}</td>
-                        <td>{t.last_used_at ? localTime(t.last_used_at) : '—'}</td>
-                        <td>
-                          {#if t.revoked_at}
-                            <span class="muted">отозван</span>
-                          {:else}
-                            <button type="button" class="danger" onclick={() => revoke(u, t)}>Отозвать</button>
-                          {/if}
-                        </td>
-                      </tr>
-                    {/each}
-                  </tbody>
-                </table>
+                <TokenTable
+                  tokens={tokens[u.id] ?? []}
+                  label={`Токены пользователя ${u.name}`}
+                  time={(t) => localTime(t)}
+                  onrevoke={(t) => revoke(u, t)}
+                />
                 {#if !u.disabled_at}
-                  <form class="row" style="margin-top: 8px;" onsubmit={(e) => addToken(e, u.id)}>
-                    <input placeholder="Имя токена" bind:value={tokenName} required maxlength="64" />
-                    <select bind:value={tokenAccess} aria-label="Доступ">
-                      <option value="rw">rw (чтение и запись)</option>
-                      <option value="ro">ro (только чтение)</option>
-                    </select>
-                    <button class="primary">Выпустить токен</button>
+                  <form class="token-form" onsubmit={(e) => addToken(e, u.id)} novalidate aria-label="Выпуск токена">
+                    <TokenNameField bind:value={tokenName} bind:input={nameInput} error={nameError} oninput={() => (nameError = '')} />
+                    <div class="row">
+                      <select bind:value={tokenAccess} aria-label="Доступ">
+                        <option value="rw">rw (чтение и запись)</option>
+                        <option value="ro">ro (только чтение)</option>
+                      </select>
+                      <button class="primary">Выпустить токен</button>
+                    </div>
                   </form>
                 {/if}
               </td>

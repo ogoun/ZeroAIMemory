@@ -72,6 +72,7 @@ pub const FEATURES: &[&str] = &[
     "sessions_opened",
     "recall_m75",
     "reject_secrets",
+    "agent_setup_migrate",
 ];
 
 /// Версии компонентов, которые узнаются один раз при старте (`AppState::components`).

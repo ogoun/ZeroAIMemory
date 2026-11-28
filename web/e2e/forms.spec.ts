@@ -1127,6 +1127,8 @@ if (!SNAP) {
       await trow.getByRole('button', { name: 'Отозвать' }).click();
       await d.getByRole('button', { name: 'Отозвать', exact: true }).click();
       await expect(d).toBeHidden();
+      // отозванные свёрнуты под «Отозванные (N)» (M7.6, решение координатора 143)
+      await page.getByText(/^Отозванные \(\d+\)$/).click();
       await expect(trow).toContainText('отозван');
       await expect(page.getByTestId('users-notice')).toHaveText(`Токен «${tok}» пользователя «${name}» отозван.`);
       expect(await revokedUser()).not.toBeNull();

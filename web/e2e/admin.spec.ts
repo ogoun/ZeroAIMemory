@@ -79,7 +79,7 @@ test('администратор: вход, пользователь, токен
   // Выпуск ro-токена
   const row = page.getByRole('row').filter({ hasText: user });
   await row.getByRole('button', { name: 'Токены' }).click();
-  await page.getByPlaceholder('Имя токена').fill('e2e-ro');
+  await page.getByLabel('Название токена').fill('e2e-ro');
   await page.getByLabel('Доступ').selectOption('ro');
   await page.getByRole('button', { name: 'Выпустить токен' }).click();
   await expect(dialog).toBeVisible();
@@ -101,6 +101,8 @@ test('администратор: вход, пользователь, токен
   const revoke = page.getByRole('dialog', { name: 'Отозвать токен?' });
   await revoke.getByRole('button', { name: 'Отозвать', exact: true }).click();
   await expect(revoke).toHaveCount(0);
+  // отозванные свёрнуты под «Отозванные (N)» (M7.6, решение координатора 143)
+  await page.getByText(/^Отозванные \(\d+\)$/).click();
   await expect(roRow).toContainText('отозван');
   // Отдельный запрос без cookie сессии: отозванный токен отклоняется.
   const api = await request.get(`${base()}api/v1/spaces`, {

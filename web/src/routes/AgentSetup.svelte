@@ -7,8 +7,15 @@
   // сразу после создания пользователя или выпуска токена (lib/agentSetup.ts). Здесь же —
   // типы подсказок хуков пользователя на сервере (`hooks.<тип>`, §10.3, R5), проактивность идей
   // (`ideas.proactive`, M5.7 §8: раздел дайджеста об идеях и подсказки идей) и режим идей
-  // (`ideas.mode`, M6.5 §7: «Идеи: разбирать сам / предлагать мне»).
+  // (`ideas.mode`, M6.5 §7: «Идеи: разбирать сам / предлагать мне»). Галочка «Подключить с
+  // переносом данных» (M7.6 §9.1) — задание агенту на перенос проекта от сервера
+  // (`migration_prompt`); сервер без признака `agent_setup_migrate` — галочка выключена с пояснением.
+  // Выпуск токена (решения координатора 141–142): «Название токена» заполнено «<агент> · <решение> ·
+  // <дата>», пока его не правили; выпущенный здесь токен можно тут же отозвать — команды
+  // возвращаются к заглушке.
   import { onMount } from 'svelte';
+  import Prompt, { type Ask } from '../components/Prompt.svelte';
+  import TokenNameField from '../components/TokenNameField.svelte';
   import TokenShown from '../components/TokenShown.svelte';
   import {
     AGENT_KINDS,
@@ -21,6 +28,9 @@
     issueOwnToken,
     issueToken,
     listSolutions,
+    revokeOwnToken,
+    revokeToken,
+    serverFeatures,
     setUserHooks,
     setUserIdeas,
     type Access,
@@ -38,6 +48,8 @@
   } from '../lib/api';
   import { takeIssued } from '../lib/agentSetup';
   import { copyText } from '../lib/clipboard';
+  import { href } from '../lib/router';
+  import { defaultTokenName } from '../lib/tokenName';
 
   let { me, users, onexpired }: { me: Me; users: User[]; onexpired: () => void } = $props();
 
@@ -49,6 +61,8 @@
     agents: 'AGENTS.md (Codex, Cursor и др.)',
     codex: 'Codex (AGENTS.md и хуки Codex)',
   };
+  /** Агент в названии токена по умолчанию. */
+  const AGENT_SHORT: Record<AgentKind, string> = { claude: 'Claude Code', agents: 'AGENTS.md', codex: 'Codex' };
   const HOOK_TITLE: Record<HookKind, string> = {
     session_start: 'Дайджест при старте сессии (SessionStart)',
     prompt: 'Подсказки к запросу пользователя (UserPromptSubmit)',
@@ -80,13 +94,24 @@
   let hooks = $state(true);
   let rulesMode = $state<'server' | 'on' | 'off'>('server');
   let lang = $state<Lang>('ru');
+  /** «Подключить с переносом данных»: задание агенту на перенос проекта. */
+  let migrate = $state(false);
+  /** Сервер умеет задание на перенос (`agent_setup_migrate`); `null` — ещё не узнали. */
+  let migrateOk = $state<boolean | null>(null);
 
   let setup = $state<AgentSetup | null>(null);
   let error = $state('');
   let solutions = $state<SolutionItem[]>([]);
   let tokenName = $state('');
+  /** Название токена правил человек: значение по умолчанию больше не подставляется. */
+  let nameEdited = $state(false);
+  let nameError = $state('');
+  let nameInput = $state<HTMLInputElement>();
   let tokenAccess = $state<Access>('rw');
   let tokError = $state('');
+  /** Итог отзыва выпущенного здесь токена. */
+  let tokNotice = $state('');
+  let ask = $state<Ask | null>(null);
   let flags = $state<HookFlags | null>(null);
   /** `ideas.proactive` пользователя (`null` — ещё не прочитано). */
   let ideasOn = $state<boolean | null>(null);
@@ -102,6 +127,18 @@
   let userSolutions = $derived(
     admin ? solutions.filter((s) => s.owner.id === userId) : solutions,
   );
+  /** Решение в названии токена по умолчанию. */
+  let solTitle = $derived(
+    name.trim() ||
+      (solMode === 'existing' ? userSolutions.find((s) => s.agent_solution_id === existing)?.name : undefined) ||
+      'новое решение',
+  );
+  let tokenDefault = $derived(defaultTokenName(AGENT_SHORT[agent], solTitle, new Date()));
+
+  // название по умолчанию следует за агентом и решением, пока человек его не правил
+  $effect(() => {
+    if (!nameEdited) tokenName = tokenDefault;
+  });
 
   function fail(e: unknown): string {
     if (e instanceof ApiError && e.status === 401) {
@@ -130,6 +167,7 @@
           rulesWrite: rulesMode === 'server' ? undefined : rulesMode === 'on',
           lang,
           tokenPlaceholder: issued !== null,
+          migrate: migrate && migrateOk === true,
         },
         asUser(),
       );
@@ -144,7 +182,7 @@
 
   // любые опции — новый фрагмент (с небольшой задержкой при наборе имени)
   $effect(() => {
-    void [agent, solMode, existing, name, mcp, hooks, rulesMode, lang, userId, issued];
+    void [agent, solMode, existing, name, mcp, hooks, rulesMode, lang, userId, issued, migrate, migrateOk];
     const t = setTimeout(load, 150);
     return () => clearTimeout(t);
   });
@@ -221,17 +259,53 @@
   async function issue(e: SubmitEvent) {
     e.preventDefault();
     tokError = '';
+    tokNotice = '';
+    if (!tokenName.trim()) {
+      nameError = 'Укажите название токена';
+      nameInput?.focus();
+      return;
+    }
     try {
       const t =
         admin && !self
           ? await issueToken(userId, tokenName, tokenAccess)
           : await issueOwnToken(tokenName, tokenAccess);
-      tokenName = '';
+      nameEdited = false;
+      tokenName = tokenDefault;
       issued = t;
       shown = t;
     } catch (err) {
       tokError = fail(err);
     }
+  }
+
+  /** «Отозвать этот токен» — подтверждение тем же окном, что в «Аккаунте»; ошибка — в окне. После
+   * отзыва в командах снова заглушка `<токен>`. */
+  function revokeIssued() {
+    const t = issued;
+    if (!t) return;
+    tokError = '';
+    tokNotice = '';
+    ask = {
+      title: 'Отозвать токен?',
+      message: `Токен «${t.info.name}» (zam_${t.info.prefix}…) перестанет работать сразу: агенты и CLI с ним потеряют доступ. Вернуть его нельзя — только выпустить новый.`,
+      confirm: 'Отозвать',
+      danger: true,
+      run: async () => {
+        try {
+          if (admin && t.info.user_id !== me.user_id) await revokeToken(t.info.id);
+          else await revokeOwnToken(t.info.id);
+        } catch (err) {
+          if (err instanceof ApiError && err.status === 401) return onexpired();
+          throw new Error(errorText(err));
+        }
+        if (issued?.info.id === t.info.id) issued = null;
+        if (shown?.info.id === t.info.id) shown = null;
+        tokNotice = `Токен «${t.info.name}» отозван: в командах снова заглушка <токен>.`;
+      },
+      // кнопка ушла вместе с отзывом — фокус на итог
+      refocus: () => document.querySelector('[data-testid="setup-token-notice"]'),
+    };
   }
 
   const json = (v: unknown) => `${JSON.stringify(v, null, 2)}\n`;
@@ -274,8 +348,14 @@
     return out;
   });
 
+  /** Текст задания на перенос (только при выбранной галочке и ответе сервера с полем). */
+  let migration = $derived(migrate && migrateOk ? (setup?.migration_prompt ?? '') : '');
+
   onMount(() => {
     loadSolutions();
+    serverFeatures()
+      .then((f) => (migrateOk = f.includes('agent_setup_migrate')))
+      .catch(() => (migrateOk = false));
   });
 </script>
 
@@ -330,6 +410,20 @@
       {/if}
     </fieldset>
 
+    <div class="migrate-opt">
+      <label class="opt">
+        <input type="checkbox" bind:checked={migrate} disabled={migrateOk !== true} aria-describedby="migrate-note" />
+        Подключить с переносом данных
+      </label>
+      <p class="muted small" id="migrate-note">
+        {#if migrateOk === false}
+          Сервер старше 0.0.19: задания на перенос нет — обновите сервер.
+        {:else}
+          Агенту — ещё задание перенести в память всё, что уже наработано по проекту.
+        {/if}
+      </p>
+    </div>
+
     <fieldset>
       <legend>Опции</legend>
       <label class="opt"><input type="checkbox" bind:checked={mcp} /> MCP (<code>.mcp.json</code>)</label>
@@ -357,25 +451,45 @@
     <fieldset>
       <legend>Токен</legend>
       {#if issued}
-        <p class="small">
-          Новый токен <code>zam_{issued.info.prefix}…</code> ({issued.info.access}) подставлен в команды установки и
-          <code>zam init</code>.
-        </p>
+        <div class="row issued">
+          <p class="small">
+            Новый токен <code>zam_{issued.info.prefix}…</code> ({issued.info.access}) подставлен в команды установки и
+            <code>zam init</code>.
+          </p>
+          <button type="button" class="danger" onclick={revokeIssued}>Отозвать этот токен</button>
+        </div>
       {:else}
         <p class="muted small">
           Без нового токена в командах — заглушка <code>&lt;токен&gt;</code>: подставьте свой токен
           {userName}. Выпустить новый:
         </p>
       {/if}
-      <form class="row" onsubmit={issue}>
-        <input placeholder="Имя токена" bind:value={tokenName} required maxlength="64" aria-label="Имя токена" />
-        <select bind:value={tokenAccess} aria-label="Доступ">
-          <option value="rw">rw (чтение и запись)</option>
-          <option value="ro">ro (только чтение)</option>
-        </select>
-        <button class="primary">Выпустить токен</button>
+      <p class="small notice" role="status" tabindex="-1" data-testid="setup-token-notice">{tokNotice}</p>
+      <form class="token-form" onsubmit={issue} novalidate aria-label="Выпуск токена">
+        <TokenNameField
+          bind:value={tokenName}
+          bind:input={nameInput}
+          error={nameError}
+          oninput={() => {
+            nameEdited = true;
+            nameError = '';
+          }}
+        />
+        <div class="row">
+          <select bind:value={tokenAccess} aria-label="Доступ">
+            <option value="rw">rw (чтение и запись)</option>
+            <option value="ro">ro (только чтение)</option>
+          </select>
+          <button class="primary">Выпустить токен</button>
+        </div>
       </form>
       {#if tokError}<p class="error" role="alert">{tokError}</p>{/if}
+      <!-- тексты ссылок не повторяют пунктов меню («Аккаунт», «Администрирование», «Пользователи»):
+           путь — обычным текстом рядом -->
+      <p class="muted small">
+        Все токены — <a href={href({ name: 'account' })}>«Мои токены»</a> в «Аккаунте»{#if admin}; <a
+            href={href({ name: 'admin' })}>токены пользователей</a> — «Администрирование» → «Пользователи»{/if}.
+      </p>
     </fieldset>
   </div>
 
@@ -387,7 +501,7 @@
       {#if setup.solution} · решение <code>{setup.solution.agent_solution_id}</code>{/if}
     </p>
     {#each setup.warnings as w (w)}<p class="warn" role="alert">{w}</p>{/each}
-    {#each blocks as b (b.key)}
+    {#each blocks as b, i (b.key)}
       <section class="frag" aria-label={b.title}>
         <header class="row">
           <h3>{b.title}</h3>
@@ -398,6 +512,23 @@
         {#if copied === b.key}<p class="muted small" role="status">Скопировано в буфер обмена.</p>{/if}
         {#if copyHint === b.key}<p class="error small" role="alert">Не удалось скопировать автоматически: выделите текст и нажмите Ctrl+C.</p>{/if}
       </section>
+      {#if i === 0 && migration}
+        <!-- M7.6 §9.1: задание на перенос — сразу под текстом подключения -->
+        <section class="frag migrate" aria-label="Задание агенту на перенос">
+          <header class="row">
+            <h3>Задание агенту на перенос</h3>
+            <button type="button" class="copy" onclick={() => copy('migrate', migration)}>{copied === 'migrate' ? 'Скопировано' : 'Копировать'}</button>
+          </header>
+          <p class="muted small">
+            Дайте агенту в проекте: он подключит проект и перенесёт в память свою память и историю сессий, карту
+            кода, решения, ловушки, задачи и термины. Это займёт время и токены; секреты — только в Vault;
+            кандидатов в Rules и аксиомы принимаете вы.
+          </p>
+          <textarea readonly rows="14" spellcheck="false" aria-label="Текст задания на перенос" value={migration}></textarea>
+          {#if copied === 'migrate'}<p class="muted small" role="status">Скопировано в буфер обмена.</p>{/if}
+          {#if copyHint === 'migrate'}<p class="error small" role="alert">Не удалось скопировать автоматически: выделите текст и нажмите Ctrl+C.</p>{/if}
+        </section>
+      {/if}
     {/each}
     <p class="small">
       Бинарники <code>zam</code> раздаёт сервер:
@@ -481,6 +612,7 @@
 </section>
 
 <TokenShown bind:shown />
+<Prompt bind:ask />
 
 <style>
   .snapshot-keys h3 {
@@ -535,6 +667,48 @@
   .copy {
     margin-left: auto;
     padding: 2px 10px;
+  }
+  .token-form {
+    display: grid;
+    gap: 8px;
+  }
+  .issued {
+    align-items: center;
+  }
+  .issued p {
+    margin: 0;
+  }
+  .notice:empty {
+    margin: 0;
+  }
+  .migrate-opt {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+  }
+  .migrate-opt p {
+    margin: 0;
+  }
+  .migrate p {
+    margin: 0 0 6px;
+  }
+  .migrate textarea {
+    display: block;
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 100%;
+    max-height: 420px;
+    margin: 0;
+    padding: 10px 12px;
+    overflow: auto;
+    resize: vertical;
+    background: var(--code-bg, var(--hover));
+    color: inherit;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font: 12.5px/1.45 ui-monospace, Consolas, monospace;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
   pre {
     margin: 0;
