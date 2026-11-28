@@ -2237,6 +2237,7 @@ pub(crate) mod tests {
         let root = repo();
         let mut files = vec![
             root.join("README.md"),
+            root.join("docs/development.md"),
             root.join("deploy/README-install.md"),
         ];
         let wf = root.join(".github/workflows");
