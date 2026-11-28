@@ -16,7 +16,7 @@
 ## 2. Опись источников
 
 Сначала опись без записи: источник, число файлов, объём, период.
-{?claude}- **Память Claude Code** — `~/.claude/projects/<папка>/memory/` (индекс `MEMORY.md`); `<папка>` — путь корня, где всё, кроме букв и цифр, заменено на `-` (`C:\Work\Proj` → `C--Work-Proj`); папки с тем же началом (worktree) — тоже. В репозитории — `CLAUDE.md`, `CLAUDE.local.md`, `.claude/`.
+{?claude}- **Память Claude Code** — `~/.claude/projects/<папка>/memory/` (индекс `MEMORY.md`); `<папка>` — путь корня, где всё, кроме латинских букв и цифр, заменено на `-` (`C:\Work\Proj` → `C--Work-Proj`); папки с тем же началом (worktree) — тоже. В репозитории — `CLAUDE.md`, `CLAUDE.local.md`, `.claude/`.
 {?claude}- **Журналы сессий** — `*.jsonl` в той же папке, файл — сессия.
 {?codex}- **Память Codex** — `AGENTS.md` проекта и вложенные, `~/.codex/AGENTS.md` (общие указания владельца — кандидаты в Rules), заметки и планы в репозитории.
 {?codex}- **Журналы сессий** — `~/.codex/sessions/ГГГГ/ММ/ДД/rollout-*.jsonl`, у которых `session_meta.payload.cwd` (первая строка) — внутри проекта.

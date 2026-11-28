@@ -16,7 +16,7 @@ Move everything accumulated for the project into memory: the agent's memory, ses
 ## 2. Inventory of sources
 
 First an inventory without writing: source, number of files, size, period.
-{?claude}- **Claude Code memory** — `~/.claude/projects/<folder>/memory/` (index `MEMORY.md`); `<folder>` is the root path with everything except letters and digits replaced by `-` (`C:\Work\Proj` → `C--Work-Proj`); folders with the same prefix (worktrees) — too. In the repository — `CLAUDE.md`, `CLAUDE.local.md`, `.claude/`.
+{?claude}- **Claude Code memory** — `~/.claude/projects/<folder>/memory/` (index `MEMORY.md`); `<folder>` is the root path with everything except Latin letters and digits replaced by `-` (`C:\Work\Proj` → `C--Work-Proj`); folders with the same prefix (worktrees) — too. In the repository — `CLAUDE.md`, `CLAUDE.local.md`, `.claude/`.
 {?claude}- **Session logs** — `*.jsonl` in the same folder, one file per session.
 {?codex}- **Codex memory** — the project's `AGENTS.md` and nested ones, `~/.codex/AGENTS.md` (the owner's general instructions — Rules candidates), notes and plans in the repository.
 {?codex}- **Session logs** — `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` whose `session_meta.payload.cwd` (the first line) is inside the project.
