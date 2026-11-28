@@ -1,5 +1,5 @@
-//! `zam idea` — журнал «Идеи» (M5.7 §7.3, M6.5 §5, §7): `list`, `new`, `queue`, `review`,
-//! `propose`, `accept`, `defer`, `decline`.
+//! `zam idea` — журнал «Идеи» (M5.7 §7.3, M6.5 §5, §7, M7.6 §9.5 п. 4): `list`, `new`, `queue`,
+//! `review`, `propose`, `accept`, `defer`, `decline`, `reopen`, `adopt`.
 //!
 //! - `list [--status S]… [--origin human|agent] [--global] [--limit N | --all]` — строки
 //!   `w:<id> [статус] [приоритет] заголовок`, у идеи агента — `(от агента)`, у начатой — `→
@@ -24,7 +24,14 @@
 //!   (`Предложено вернуть w:<id> → вопрос q:<id>`, M5.7 §16);
 //! - `accept|defer|decline <w:id> [--by human|agent] [--channel chat|cli]` — решение человека:
 //!   `accept [--space GUID]` создаёт задачу (повтор — код 4 с той же задачей), `defer [--until
-//!   YYYY-MM-DD]` — отсрочка, `decline [--reason T]` — отказ.
+//!   YYYY-MM-DD]` — отсрочка, `decline [--reason T]` — отказ;
+//! - `reopen <w:id> --reason T [--by …] [--channel …]` — «Вернуть на разбор» (как в WebUI, M5.7):
+//!   `POST /entries/{id}/decide {decision: reopen, reason}` (маршрут с M5.7 — работает и со
+//!   старым сервером);
+//! - `adopt <w:id> [--by …] [--channel …]` — «Принять как свою»: идея агента становится идеей
+//!   человека, `POST /entries/{id}/adopt {by, channel}` — только по словам человека (`by: agent`
+//!   — 403 сервера). Сервер без флага `idea_adopt_token` в `/health` (он токену отвечает 403) —
+//!   код 1 с [`OLD_SERVER_ADOPT`].
 //!
 //! `--origin` и `--by` — по правилу `zam question answer --by`
 //! ([`super::question::resolve_human_agent`]): запустил агент — флаг обязателен, иначе код 6
@@ -66,6 +73,13 @@ pub const OLD_SERVER_REVIEW: &str =
 
 /// Флаг разбора идей в `GET /health` `features` (`docs/api-compat.md`).
 const FEATURE_REVIEW: &str = "idea_review";
+
+/// Сообщение для сервера без «Принять как свою» токеном (нет флага `idea_adopt_token` в
+/// `GET /health` `features`, M7.6 §9.5 п. 4).
+pub const OLD_SERVER_ADOPT: &str = "сервер старше 0.0.19 — «Принять как свою» в WebUI";
+
+/// Флаг «Принять как свою» токеном в `GET /health` `features` (`docs/api-compat.md`).
+const FEATURE_ADOPT: &str = "idea_adopt_token";
 
 /// Символов начала `missing` в строке ленты возвращённой идеи.
 const MISSING_SHOWN: usize = 80;
@@ -540,11 +554,56 @@ pub fn decide(ctx: &Ctx, decision: &str, o: DecideOpts) -> Result<(), CliError> 
     emit(s.as_bytes())
 }
 
+/// Тело `POST /entries/{id}/adopt`: кто и где решил.
+pub fn adopt_body(by: &str, channel: &str) -> Value {
+    json!({ "by": by, "channel": channel })
+}
+
+/// `zam idea adopt`: «Принять как свою» (ссылка проверяется до запроса, код 6); 403 — проба
+/// старого сервера ([`super::old_server`], флаг `idea_adopt_token`): флага нет — код 1 с
+/// [`OLD_SERVER_ADOPT`], есть — ошибка сервера как есть (`by: agent` — `idea-human-decision`).
+pub fn adopt(ctx: &Ctx, id: &str, by: &str, channel: &str) -> Result<(), CliError> {
+    let id = idea_id(id)?;
+    let v = ctx
+        .client
+        .post_json(&format!("/entries/{id}/adopt"), &adopt_body(by, channel))
+        .and_then(read_json)
+        .map_err(|e| super::old_server(ctx, e, &[403], FEATURE_ADOPT, OLD_SERVER_ADOPT))?;
+    ctx.note_write("idea");
+    if ctx.json {
+        return emit_json(&v);
+    }
+    emit(format!("Идея w:{id} принята как своя: идея человека\n").as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const ID: &str = "01JABCDEFGHJKMNPQRSTVWXYZ0";
+
+    /// M7.6 §9.5 п. 4: `zam idea reopen` — `decide {decision: reopen, by, channel, reason}`;
+    /// `zam idea adopt` — `{by, channel}`.
+    #[test]
+    fn idea_reopen_body() {
+        let o = DecideOpts {
+            id: ID,
+            by: "human",
+            channel: "cli",
+            space: None,
+            until: None,
+            reason: Some("снова актуальна"),
+        };
+        assert_eq!(
+            decide_req("reopen", &o).unwrap(),
+            json!({"decision": "reopen", "by": "human", "channel": "cli",
+                   "reason": "снова актуальна"})
+        );
+        assert_eq!(
+            adopt_body("human", "chat"),
+            json!({"by": "human", "channel": "chat"})
+        );
+    }
 
     #[test]
     fn bodies_and_lines() {

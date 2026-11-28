@@ -73,6 +73,9 @@ pub const FEATURES: &[&str] = &[
     "recall_m75",
     "reject_secrets",
     "agent_setup_migrate",
+    "snapshot_m76",
+    "agent_setup_local",
+    "idea_adopt_token",
 ];
 
 /// Версии компонентов, которые узнаются один раз при старте (`AppState::components`).

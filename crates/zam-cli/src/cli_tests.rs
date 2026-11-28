@@ -433,6 +433,71 @@ fn snapshot_tail_kb_flag_range() {
     assert!(reject_secrets);
 }
 
+/// M7.6 §9.5: `zam init --block-to agent|local` (без флага — `None`, режим прежнего подключения),
+/// `--exclude-local`; `zam idea reopen <w:id> --reason` (причина обязательна) и `zam idea adopt`
+/// с `--by`/`--channel` по образцу `accept`.
+#[test]
+fn init_block_to_and_idea_reopen_adopt_flags() {
+    let Ok(Cli {
+        cmd: Cmd::Init {
+            block_to,
+            exclude_local,
+            ..
+        },
+    }) = parse(&["init", "--block-to", "local", "--exclude-local"])
+    else {
+        panic!("init --block-to local --exclude-local");
+    };
+    assert_eq!(block_to, Some(cmd::init::BlockTo::Local));
+    assert!(exclude_local);
+    let Ok(Cli {
+        cmd:
+            Cmd::Init {
+                block_to: None,
+                exclude_local: false,
+                ..
+            },
+    }) = parse(&["init"])
+    else {
+        panic!("init без флагов");
+    };
+    assert!(parse(&["init", "--block-to", "home"]).is_err());
+    let Ok(Cli {
+        cmd:
+            Cmd::Idea {
+                cmd: IdeaCmd::Reopen {
+                    reason, channel, ..
+                },
+            },
+    }) = parse(&[
+        "idea",
+        "reopen",
+        "w:x",
+        "--reason",
+        "снова",
+        "--by",
+        "human",
+    ])
+    else {
+        panic!("idea reopen");
+    };
+    assert_eq!((reason.as_str(), channel.as_str()), ("снова", "cli"));
+    assert!(
+        parse(&["idea", "reopen", "w:x"]).is_err(),
+        "--reason обязателен"
+    );
+    let Ok(Cli {
+        cmd: Cmd::Idea {
+            cmd: IdeaCmd::Adopt { by, channel, .. },
+        },
+    }) = parse(&["idea", "adopt", "w:x", "--by", "human", "--channel", "chat"])
+    else {
+        panic!("idea adopt");
+    };
+    assert_eq!((by.as_deref(), channel.as_str()), (Some("human"), "chat"));
+    assert!(parse(&["idea", "adopt", "w:x", "--channel", "webui"]).is_err());
+}
+
 /// Ревью задачи 8, M4: отладочные проверки clap по всему дереву команд (имена и синонимы без
 /// повторов, `conflicts_with`, `requires_all`, группы ссылаются на существующие аргументы) — а не
 /// только у подкоманд, которые разбирают другие тесты.

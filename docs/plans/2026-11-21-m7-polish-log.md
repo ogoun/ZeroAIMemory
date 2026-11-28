@@ -9109,6 +9109,102 @@ warnings` и `cargo fmt -p zam-server --check` — чисто. WebUI: `npm run c
 новой ссылки с пунктом меню «Администрирование» (`admin.spec`, строгий режим) — ссылки
 переименованы («Мои токены», «токены пользователей»).
 
+### M7.6 · Задача 4 — Снимок сессии, подключение без следа, CLI идей
+
+Спецификация §9.4, §9.5 (решения координатора 157–162); worktree `.tmp/m76/wt-t4`, ветка
+`m7.6-t4` от `aa12b1cd` (слита задача 1). Миграций нет (`task_id` и даты — поля JSON
+`session_snapshots.data`), блок v8 не менялся, MCP — прежние 11 инструментов без новых полей.
+Признаки `/health.features` — `snapshot_m76`, `agent_setup_local`, `idea_adopt_token` (в конец
+массива после `agent_setup_migrate`; строки задачи 3 при слиянии встают перед ними).
+
+**Сделано.**
+- **Клиент снимка** (`hook/snapshot_queue.rs`, `hook/cache.rs`, `hook/session_start.rs`,
+  `hook/checkpoint.rs`): счётчик `missing` очереди (404 `session-not-found`, предел
+  `MISSING_ATTEMPTS` = 10, `Queued::spent`, общий `bump` со счётчиком старого сервера); метка
+  `endq-<сессия>.json` при сбое `PATCH {ended: true}` (`end_session`), отправка меток
+  (`flush_end_marks`) — в том же проходе каталога кэша, что очереди других сессий
+  (`flush_others(env, except, snapshots, current)`, поток старта теперь идёт всегда); уборка
+  `gc_cache` порцией (`gc_cache_batch`, `GC_BATCH` = 256, `GC_MS` = 30, курсор `.gc-cursor`,
+  `gc_ttl` по имени); `endq-*` — файл сессии (срок `SHOWN_TTL`).
+- **Даты** (`hook/snapshot/mod.rs`): голова журнала читается одним чтением (`read_head_bytes`,
+  до `HEAD_LINE_MAX`) и для первой строки Codex, и для `started_at`; `ended_at` — последняя строка
+  хвоста со временем (`line_time`: поле `timestamp` верхнего уровня, в UTC с секундами через
+  `zam_core::time`); всё — в потоке снимка. `zam sessions show` — «сессия: … — … UTC» и «задача:
+  k:<id>».
+- **Сервер** (`api/snapshot.rs`, `zam-store/src/snapshots.rs`): `PutReq.data` — сырой JSON
+  (`client_data`: `task_id` клиента убирается, даты разбираются `jiff`, неверная — WARN без
+  значения); `claimed_task` — `resolve_targets` по решению сессии (без Knowledge и Rules, как
+  показ) и `session_claimed_task` по каждой базе; показ — `snapshot_task` по `task_id`, если
+  `snapshot_tasks` его не нашёл (общий запрос `snap_tasks_where`).
+- **`zam init`** (`cmd/init.rs`, `init/url.rs`, `init/merge.rs`): `BlockTo` и `--block-to`,
+  `--exclude-local` (`main.rs`); `kept_block_local`, `local_block_text`, `moved_block_plan`
+  (`merge::remove_block` — обратная операция `upsert_block`), `plan_exclude(root, block)`,
+  `plan_local_exclude`/`apply_local_exclude` (`LocalItem`, `LocalExclude`, общие `exclude_line`,
+  `exclude_target`, `in_git`), итог `print_local_exclude`. Версия блока у Claude Code — и из
+  `CLAUDE.local.md` (`session_start::block_version`, им же пользуется `zam status`).
+- **«Подключить локально»**: `SetupQuery.local`, `InitCmd.local` (`local_flags`),
+  `agent_setup::block_without_url`; задание на перенос — шаг подключения с `--block-to local
+  --exclude-local`, если `CLAUDE.md` отслеживается git, у Codex и AGENTS.md — `--url-to home
+  --exclude-local` (ручная правка `info/exclude` из текста убрана); WebUI — галочка с пояснением
+  по агенту, подпись «Текст для CLAUDE.local.md» по ответу (`shownLocal`), `agentSetup({local})`.
+- **Идеи**: `POST /entries/{id}/adopt` — тело `AdoptReq {by, channel, message}` у токена
+  (`by_channel`, `by: agent` — 403), аудит `{by, channel}`; CLI `zam idea reopen` (через
+  `decide`) и `zam idea adopt` (`adopt_body`, проба старого сервера `old_server(…, [403],
+  "idea_adopt_token", …)`).
+- **Документы**: ТЗ §7.13 (строка `adopt`), §10.9, §12, §13.2, §14.1, §15.5 п. 9;
+  `docs/api-compat.md` (три строки и три раздела); руководство (подключение без следа, задание на
+  перенос, `zam idea reopen|adopt`); `docs/cli-reference.md`; README точечно; протокол
+  `guide.{ru,en}.md` («Подключение», «Идеи», «Блок инструкции»); CHANGELOG.
+
+**Решения исполнителя.**
+- [решение исполнителя, задача 4 M7.6] `task_id` в ядре — `Option<Id>`, а тело `PUT` разбирается
+  из сырого `data`: присланный клиентом `task_id` (любого типа) и неверная дата не стоят снимка
+  (иначе 400 — клиент отбросил бы его). Дата хранится как `jiff::Timestamp` в UTC (дробные секунды
+  — если были); клиент шлёт секунды (`zam_core::time`, у `zam` нет `jiff` в зависимостях).
+- [решение исполнителя, задача 4 M7.6] `task_id` при `PUT` — только из пространства решения
+  сессии (как показ: личное Knowledge общее для всех решений), захват любого срока; сессия без
+  решения — без задачи; сбой поиска — WARN, снимок пишется.
+- [решение исполнителя, задача 4 M7.6] Метка конца ставится и когда бюджет хука уже вышел до
+  запроса; 4xx у `SessionEnd`, кроме 404, — строка журнала без метки (повтор не поможет); удачный
+  `PATCH` и 404 снимают прежнюю метку сессии; `session-start` снимает свою метку без запроса
+  (сессия снова идёт — опоздавший `ended` закрыл бы её); метки шлются и при выключенном снимке —
+  поэтому поток очередей старта идёт всегда (лишний `read_dir` кэша, параллельно `/recall`).
+- [решение исполнителя, задача 4 M7.6] Порция уборки считает только имена, которые уборка может
+  удалить (`gc_ttl`): `triggers.json` и прочие в 256 не входят; курсор — `.gc-cursor` (точка в
+  начале, расширения `.tmp`/`.lock` нет — уборка его не удаляет).
+- [решение исполнителя, задача 4 M7.6] `--block-to local`: строки адреса вне блока в
+  `CLAUDE.local.md` убираются (адрес — строкой блока, второй строки нет); `CLAUDE.md`, где кроме
+  блока ничего не было, после переноса удаляется; режим адреса без `--url-to` — по первому блоку
+  среди коммитящихся файлов (AGENTS.md), затем переносимого из `CLAUDE.md`, последним —
+  `CLAUDE.local.md`: строка адреса блока в нём не возвращает адрес в `AGENTS.md` у `--agent
+  both`. Код 1 у Codex — только при явном `--block-to local`; сохранённый режим у `--agent both`
+  держит блок Claude Code в `CLAUDE.local.md`, а Codex — в `AGENTS.md`.
+- [решение исполнителя, задача 4 M7.6] `--exclude-local` исключает и уже существующие
+  (неизменённые) файлы подключения выбранного агента — иначе повтор в подключённом проекте ничего
+  не делал бы; предупреждение «отслеживается git» — только у изменённых этим запуском; `CLAUDE.md`
+  — только если запуск его правит; `.zeroaimemory/` — каталогом.
+- [решение исполнителя, задача 4 M7.6] `adopt` у сессии WebUI тело не читает (как раньше), аудит
+  — `by: human, channel: webui`; у токена «своей» идея становится для пользователя токена
+  (`adopted_by`). Прежние ожидания тестов `token_cannot_adopt_rewrite_or_delete_human_idea` и
+  `shared_solution_rights_matrix` (токен без тела — 403) — теперь 400 `by-required` и 403
+  `idea-human-decision` с `by: agent`.
+- [решение исполнителя, задача 4 M7.6] `zam sessions show` печатает и задачу снимка (`задача:
+  k:<id>`) — сервер её уже отдаёт; ни даты, ни задача в текст дайджеста не идут.
+
+**Проверки** (Windows 11, HDD). Сервер: `--test snapshot` — 34 (новые 6), `--test agent_setup`
+— 26 (новые 3; с bge-m3 `migration_prompt_token_budget`: ru 2939–3131, en 2879–3070 токенов —
+шаг подключения у Claude Code стал на ≈ 50 токенов длиннее, предел 3200), `--test ideas` — 25
+(новые 4), `--test boot` — 16 (`health_features_documented`), `--lib` (agent_setup, snapshot) —
+22; `zam-core` — 37, `zam-store --test snapshots` — 4. Клиент: `cargo test -p zam-cli` целиком —
+все наборы зелёные (`--bin zam` 248, `hooks` 130 — в том числе прежние тесты бюджетов и
+`session_start_big_cache_gc_does_not_delay_binding`, `init` 44, `idea` 21, `snapshot` 39).
+`cargo clippy -p zam-core -p zam-store -p zam-server -p zam-cli --all-targets -- -D warnings`
+(поймал `large_enum_variant` у `Taken` — снимок в `Box`) и `cargo fmt --all --check` — чисто.
+WebUI: `npm run check` — 0 ошибок, `test:build` — 137, `build`, `npx size-limit` — в пределах
+(`api` 27,24 из 29,7 КБ); e2e `agent-setup.spec.ts` на release-сервере — 9 passed (новые 2: флаги
+Claude, блок Codex без адреса, три ширины без горизонтальной прокрутки — снимки
+`.tmp/e2e/screens/agent-setup-local-*.png`; сервер без признака — галочка выключена).
+
 ## Уточнить у владельца
 
 1. **Коммит `959b1ed` «Docs» (2026-11-21 18:11) на ветке `m7.1-foundation`** — ранняя версия

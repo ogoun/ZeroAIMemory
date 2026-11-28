@@ -177,8 +177,8 @@ pub struct TakeOpts {
 /// Итог [`take_ext`].
 #[derive(Debug)]
 pub enum Taken {
-    /// Снимок и размер журнала при чтении, байт.
-    Snap(Snapshot, u64),
+    /// Снимок и размер журнала при чтении, байт (снимок — в куче: он крупнее прочих вариантов).
+    Snap(Box<Snapshot>, u64),
     /// Журнала нет или это не файл (и конспекта входа нет).
     Missing,
     /// Журнал есть, но не прочитан: ошибка открытия или чтения (на Windows — файл открыт другим
@@ -199,7 +199,7 @@ pub enum Taken {
 /// Из долгоживущих процессов (`zam mcp`) не вызывать.
 pub fn take(path: &Path, opts: &TakeOpts) -> Option<Snapshot> {
     match take_ext(path, opts) {
-        Taken::Snap(s, _) => Some(s),
+        Taken::Snap(s, _) => Some(*s),
         _ => None,
     }
 }
@@ -273,7 +273,7 @@ fn build(path: &Path, o: &TakeOpts, start: Instant) -> Taken {
                 ..SnapshotData::default()
             },
         };
-        return Taken::Snap(mask_and_limit(snap, o.max_bytes), 0);
+        return Taken::Snap(Box::new(mask_and_limit(snap, o.max_bytes)), 0);
     };
     let mut late = tail.late;
     let mut adapter = o.agent.adapter(&o.root, &o.session);
@@ -340,7 +340,7 @@ fn build(path: &Path, o: &TakeOpts, start: Instant) -> Taken {
         scan_depth_capped: false,
         data,
     };
-    Taken::Snap(mask_and_limit(snap, o.max_bytes), len)
+    Taken::Snap(Box::new(mask_and_limit(snap, o.max_bytes)), len)
 }
 
 /// Прочитанное [`read_tail`].

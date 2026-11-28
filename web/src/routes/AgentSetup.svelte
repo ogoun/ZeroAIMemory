@@ -12,7 +12,9 @@
   // (`migration_prompt`); сервер без признака `agent_setup_migrate` — галочка выключена с пояснением.
   // Выпуск токена (решения координатора 141–142): «Название токена» заполнено «<агент> · <решение> ·
   // <дата>», пока его не правили; выпущенный здесь токен можно тут же отозвать — команды
-  // возвращаются к заглушке.
+  // возвращаются к заглушке. Галочка «Подключить локально» (M7.6 §9.5 п. 3, признак
+  // `agent_setup_local`) — подключение без следа в репозитории: у Claude Code блок и адрес — в
+  // CLAUDE.local.md, у прочих — блок без адреса; файлы подключения — в .git/info/exclude.
   import { onMount } from 'svelte';
   import Prompt, { type Ask } from '../components/Prompt.svelte';
   import TokenNameField from '../components/TokenNameField.svelte';
@@ -98,6 +100,12 @@
   let migrate = $state(false);
   /** Сервер умеет задание на перенос (`agent_setup_migrate`); `null` — ещё не узнали. */
   let migrateOk = $state<boolean | null>(null);
+  /** «Подключить локально»: без следа в репозитории (`local=true`). */
+  let local = $state(false);
+  /** Сервер умеет «Подключить локально» (`agent_setup_local`); `null` — ещё не узнали. */
+  let localOk = $state<boolean | null>(null);
+  /** Ответ на экране получен с `local=true` (подпись блока — по нему, а не по галочке). */
+  let shownLocal = $state(false);
 
   let setup = $state<AgentSetup | null>(null);
   let error = $state('');
@@ -168,12 +176,14 @@
           lang,
           tokenPlaceholder: issued !== null,
           migrate: migrate && migrateOk === true,
+          local: local && localOk === true,
         },
         asUser(),
       );
       if (n !== seq) return;
       if (solMode === 'new' && !newGuid && r.solution) newGuid = r.solution.agent_solution_id;
       setup = r;
+      shownLocal = local && localOk === true;
       error = '';
     } catch (e) {
       if (n === seq) error = fail(e);
@@ -182,7 +192,7 @@
 
   // любые опции — новый фрагмент (с небольшой задержкой при наборе имени)
   $effect(() => {
-    void [agent, solMode, existing, name, mcp, hooks, rulesMode, lang, userId, issued, migrate, migrateOk];
+    void [agent, solMode, existing, name, mcp, hooks, rulesMode, lang, userId, issued, migrate, migrateOk, local, localOk];
     const t = setTimeout(load, 150);
     return () => clearTimeout(t);
   });
@@ -324,13 +334,9 @@
   let blocks = $derived.by(() => {
     const s = setup && issued ? withToken(setup, issued.plaintext) : setup;
     if (!s) return [];
+    const blockFile = s.agent === 'claude' ? (shownLocal ? 'CLAUDE.local.md' : 'CLAUDE.md') : 'AGENTS.md';
     const out: { key: string; title: string; file?: string; text: string }[] = [
-      {
-        key: 'block',
-        title: 'Текст для ' + (s.agent === 'claude' ? 'CLAUDE.md' : 'AGENTS.md'),
-        file: s.agent === 'claude' ? 'CLAUDE.md' : 'AGENTS.md',
-        text: s.block,
-      },
+      { key: 'block', title: 'Текст для ' + blockFile, file: blockFile, text: s.block },
     ];
     if (s.solution_toml)
       out.push({ key: 'toml', title: 'solution.toml', file: '.zeroaimemory/solution.toml', text: s.solution_toml });
@@ -354,8 +360,14 @@
   onMount(() => {
     loadSolutions();
     serverFeatures()
-      .then((f) => (migrateOk = f.includes('agent_setup_migrate')))
-      .catch(() => (migrateOk = false));
+      .then((f) => {
+        migrateOk = f.includes('agent_setup_migrate');
+        localOk = f.includes('agent_setup_local');
+      })
+      .catch(() => {
+        migrateOk = false;
+        localOk = false;
+      });
   });
 </script>
 
@@ -420,6 +432,22 @@
           Сервер старше 0.0.19: задания на перенос нет — обновите сервер.
         {:else}
           Агенту — ещё задание перенести в память всё, что уже наработано по проекту.
+        {/if}
+      </p>
+    </div>
+
+    <div class="migrate-opt">
+      <label class="opt">
+        <input type="checkbox" bind:checked={local} disabled={localOk !== true} aria-describedby="local-note" />
+        Подключить локально
+      </label>
+      <p class="muted small" id="local-note">
+        {#if localOk === false}
+          Сервер старше 0.0.19: подключения без следа в репозитории нет — обновите сервер.
+        {:else if agent === 'claude'}
+          Блок и адрес — в CLAUDE.local.md, файлы подключения — в .git/info/exclude, CLAUDE.md не меняется.
+        {:else}
+          Блок без адреса сервера, адрес — в ~/.zeroaimemory/config.toml, файлы подключения — в .git/info/exclude.
         {/if}
       </p>
     </div>

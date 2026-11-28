@@ -392,6 +392,13 @@ enum Cmd {
         /// Куда записать адрес сервера (без флага — как в прежнем блоке, нового — block)
         #[arg(long, value_enum)]
         url_to: Option<cmd::init::UrlTo>,
+        /// Куда записать блок Claude Code: agent — CLAUDE.md, local — CLAUDE.local.md,
+        /// исключённый из git (без флага — как в прежнем подключении, нового — agent)
+        #[arg(long, value_enum)]
+        block_to: Option<cmd::init::BlockTo>,
+        /// Внести файлы подключения, не отслеживаемые git, в .git/info/exclude
+        #[arg(long)]
+        exclude_local: bool,
     },
     /// Полный протокол работы агента с памятью (Markdown)
     Guide {
@@ -994,6 +1001,35 @@ enum IdeaCmd {
         /// GUID решения будущей задачи
         #[arg(long)]
         space: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Вернуть на разбор (решает человек): идея снова ждёт решения, причина обязательна
+    Reopen {
+        /// w:<id>
+        id: String,
+        /// Почему вернуть (слова человека)
+        #[arg(long)]
+        reason: String,
+        /// Чьё решение: human — слова человека (агенту обязателен)
+        #[arg(long, value_parser = ["human", "agent"])]
+        by: Option<String>,
+        /// Где человек решил
+        #[arg(long, default_value = "cli", value_parser = ["chat", "cli"])]
+        channel: String,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Принять как свою: идея агента становится идеей человека — только по словам человека
+    Adopt {
+        /// w:<id>
+        id: String,
+        /// Чьё решение: human — слова человека (агенту обязателен)
+        #[arg(long, value_parser = ["human", "agent"])]
+        by: Option<String>,
+        /// Где человек решил
+        #[arg(long, default_value = "cli", value_parser = ["chat", "cli"])]
+        channel: String,
         #[command(flatten)]
         common: Common,
     },
@@ -2161,6 +2197,33 @@ fn idea(c: IdeaCmd) -> Result<(), CliError> {
             };
             w::decide(&cmd::connect(&common)?, "defer", o)
         }
+        IdeaCmd::Reopen {
+            id,
+            reason,
+            by: b,
+            channel,
+            common,
+        } => {
+            let b = by(b)?;
+            let o = w::DecideOpts {
+                id: &id,
+                by: &b,
+                channel: &channel,
+                space: None,
+                until: None,
+                reason: Some(reason.as_str()),
+            };
+            w::decide(&cmd::connect(&common)?, "reopen", o)
+        }
+        IdeaCmd::Adopt {
+            id,
+            by: b,
+            channel,
+            common,
+        } => {
+            let b = by(b)?;
+            w::adopt(&cmd::connect(&common)?, &id, &b, &channel)
+        }
         IdeaCmd::Decline {
             id,
             reason,
@@ -2295,6 +2358,8 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             yes,
             lang,
             url_to,
+            block_to,
+            exclude_local,
         } => cmd::init::run(cmd::init::Opts {
             name,
             id,
@@ -2306,6 +2371,8 @@ fn dispatch(c: Cmd) -> Result<(), CliError> {
             yes,
             lang,
             url_to,
+            block_to,
+            exclude_local,
         }),
         Cmd::Guide { lang, common } => cmd::guide::run(&cmd::connect(&common)?, &lang),
         Cmd::Mcp { common } => cmd::mcp::run(cmd::connect(&common)?),

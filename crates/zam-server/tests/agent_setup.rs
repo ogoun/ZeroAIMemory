@@ -2079,3 +2079,110 @@ async fn migration_prompt_token_budget() {
 /// Предел задания на перенос в худшем случае теста, токенов bge-m3 (обычный адрес и имя — около
 /// 2,8 тыс.).
 const MIGRATION_TOKENS_MAX: usize = 3200;
+
+// ---- M7.6 §9.5 п. 3: «Подключить локально» (`agent_setup_local`) ----
+
+/// `local=true` у Claude Code: `init_cmd` (Linux и Windows) и однострочник задания на перенос —
+/// с `--block-to local --exclude-local` перед `--yes`; блок прежний, с адресом; признак
+/// `agent_setup_local` в `/health`.
+#[tokio::test]
+async fn agent_setup_local_claude_init_cmd() {
+    let a = api("agent-setup-local-claude", |_| {}).await;
+    let q = format!("agent=claude&solution={MIGRATE_GUID}&name=Proj");
+    let base = setup(&a, &a.token, &q).await;
+    let j = setup(&a, &a.token, &format!("{q}&local=true&migrate=true")).await;
+    assert_eq!(j["block"], base["block"], "блок прежний");
+    assert!(
+        j["block"]
+            .as_str()
+            .unwrap()
+            .contains("ZeroAIMemoryUrl=http://memory.lan:7700")
+    );
+    for os in ["linux", "windows"] {
+        let c = j["init_cmd"][os].as_str().unwrap();
+        assert!(
+            c.ends_with(" --block-to local --exclude-local --yes"),
+            "{os}: {c}"
+        );
+        let b = base["init_cmd"][os].as_str().unwrap();
+        assert!(
+            !b.contains("--block-to") && !b.contains("--exclude-local"),
+            "{b}"
+        );
+    }
+    let p = j["migration_prompt"].as_str().unwrap();
+    assert!(
+        p.contains(j["init_cmd"]["linux"].as_str().unwrap()),
+        "однострочник задания — с флагами: {p}"
+    );
+    let r = a.tok(&a.token, Method::GET, "/api/v1/health", None).await;
+    let f = r.json()["features"].clone();
+    for flag in ["agent_setup_local", "snapshot_m76", "idea_adopt_token"] {
+        assert!(
+            f.as_array().unwrap().iter().any(|x| x == flag),
+            "{flag}: {f}"
+        );
+    }
+}
+
+/// `local=true` у AGENTS.md и Codex: блок без строки `ZeroAIMemoryUrl=` (прочее — как без
+/// `local`), `init_cmd` с `--url-to home --exclude-local`; число токенов — по блоку ответа.
+#[tokio::test]
+async fn agent_setup_local_codex_block_without_url() {
+    let a = api("agent-setup-local-codex", |_| {}).await;
+    for agent in ["codex", "agents"] {
+        for lang in ["ru", "en"] {
+            let q = format!("agent={agent}&lang={lang}&solution={MIGRATE_GUID}&name=Proj");
+            let base = setup(&a, &a.token, &q).await;
+            let j = setup(&a, &a.token, &format!("{q}&local=true")).await;
+            let block = j["block"].as_str().unwrap();
+            assert!(
+                !block.contains("ZeroAIMemoryUrl") && !block.contains("memory.lan"),
+                "{agent} {lang}: {block}"
+            );
+            let want: String = base["block"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .filter(|l| !l.starts_with("ZeroAIMemoryUrl="))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            assert_eq!(block, want, "{agent} {lang}: только строка адреса");
+            assert!(
+                j["tokens"].as_u64() < base["tokens"].as_u64(),
+                "{agent} {lang}"
+            );
+            let c = j["init_cmd"]["linux"].as_str().unwrap();
+            assert!(
+                c.ends_with(" --url-to home --exclude-local --yes"),
+                "{agent} {lang}: {c}"
+            );
+        }
+    }
+}
+
+/// Эталон: без `local` и с `local=false` ответ байт в байт прежний (те же ключи, тот же блок и
+/// однострочники) у всех агентов.
+#[tokio::test]
+async fn agent_setup_without_local_unchanged() {
+    let a = api("agent-setup-local-off", |_| {}).await;
+    for agent in ["claude", "agents", "codex"] {
+        let q = format!("agent={agent}&solution={MIGRATE_GUID}&name=Proj&migrate=true");
+        let base = setup(&a, &a.token, &q).await;
+        assert_eq!(
+            setup(&a, &a.token, &format!("{q}&local=false")).await,
+            base,
+            "{agent}"
+        );
+        let b = base["block"].as_str().unwrap();
+        assert!(
+            b.contains("ZeroAIMemoryUrl=http://memory.lan:7700"),
+            "{agent}: {b}"
+        );
+        let c = base["init_cmd"]["linux"].as_str().unwrap();
+        assert!(
+            !c.contains("--exclude-local") && !c.contains("--block-to") && !c.contains("--url-to"),
+            "{agent}: {c}"
+        );
+    }
+}

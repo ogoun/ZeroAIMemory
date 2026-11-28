@@ -407,7 +407,7 @@ fn run_noted(env: &Env, s: &Settings, job: Job, send: bool, note: Option<&SendNo
     };
     let unreadable = matches!(taken, Taken::Unreadable);
     let (snap, len) = match taken {
-        Taken::Snap(snap, len) => (snap, len),
+        Taken::Snap(snap, len) => (*snap, len),
         Taken::Late => {
             // попытка — в `snapst-*` (`at`): правило 60 с у `Stop` действует и для опоздавших.
             // Повод, `ok_at`, размер и `prompt_at` — прежнего удавшегося снимка: опоздавший

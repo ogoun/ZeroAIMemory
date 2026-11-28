@@ -245,6 +245,83 @@ test('Сервер без признака agent_setup_migrate — галочк�
   expect(problems, problems.join('\n')).toEqual([]);
 });
 
+// M7.6 §9.5 п. 3: «Подключить локально» — подключение без следа в репозитории
+test('Подключить локально: Claude — флаги в команде, Codex — блок без адреса, три ширины', async ({ page }) => {
+  const problems = watch(page);
+  await page.goto(`${base()}#/agent-setup`);
+  const opt = page.getByLabel('Подключить локально');
+  await expect(opt).toBeEnabled();
+  await expect(opt).not.toBeChecked();
+  const sh = frag(page, 'zam init — Linux, macOS (sh)');
+  const ps = frag(page, 'zam init — Windows (PowerShell)');
+  await expect(sh).toContainText('zam init --url');
+  await expect(sh).not.toContainText('--exclude-local');
+
+  // Claude Code: блок прежний (с адресом) — «Текст для CLAUDE.local.md», флаги в команде
+  await opt.check();
+  await expect(
+    page.getByText(
+      'Блок и адрес — в CLAUDE.local.md, файлы подключения — в .git/info/exclude, CLAUDE.md не меняется.',
+    ),
+  ).toBeVisible();
+  const local = frag(page, 'Текст для CLAUDE.local.md');
+  await expect(local).toContainText('<!-- zeroaimemory:begin v');
+  await expect(local).toContainText('ZeroAIMemoryUrl=');
+  await expect(sh).toContainText('--block-to local --exclude-local --yes');
+  await expect(ps).toContainText('--block-to local --exclude-local --yes');
+
+  // Codex: блок без строки адреса, адрес — в домашнем конфиге
+  await page.getByLabel('Codex (AGENTS.md и хуки Codex)').check();
+  await expect(
+    page.getByText(
+      'Блок без адреса сервера, адрес — в ~/.zeroaimemory/config.toml, файлы подключения — в .git/info/exclude.',
+    ),
+  ).toBeVisible();
+  const agents = frag(page, 'Текст для AGENTS.md');
+  await expect(sh).toContainText('--url-to home --exclude-local --yes');
+  await expect(agents).toContainText('<!-- zeroaimemory:begin v');
+  await expect(agents).not.toContainText('ZeroAIMemoryUrl=');
+
+  // три ширины: без горизонтальной прокрутки; снимки — в .tmp/e2e/screens
+  for (const w of ['phone', 'tablet', 'desktop'] as const) {
+    await page.setViewportSize(VIEWPORTS[w]);
+    await expect(opt).toBeVisible();
+    expect(await noHorizontalScroll(page), w).toBe(true);
+    await page.screenshot({ path: `${screens}agent-setup-local-${w}.png`, fullPage: true });
+    // окно с галочкой и пояснением (блок опции, без горизонтального сдвига контейнеров)
+    await opt.evaluate((e) => e.closest('div')?.scrollIntoView({ block: 'center', inline: 'nearest' }));
+    await page.screenshot({ path: `${screens}agent-setup-local-${w}-view.png` });
+  }
+
+  // галочка снята — ответ прежний
+  await opt.uncheck();
+  await expect(agents).toContainText('ZeroAIMemoryUrl=');
+  await expect(sh).not.toContainText('--exclude-local');
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
+test('Сервер без признака agent_setup_local — галочка выключена с пояснением', async ({ page }) => {
+  const problems = watch(page);
+  await page.route('**/api/v1/health', async (route) => {
+    const r = await route.fetch();
+    const j = await r.json();
+    j.features = (j.features ?? []).filter((f: string) => f !== 'agent_setup_local');
+    await route.fulfill({ response: r, json: j });
+  });
+  const setupUrls: string[] = [];
+  page.on('request', (r) => {
+    if (r.url().includes('/api/v1/agent-setup')) setupUrls.push(r.url());
+  });
+  await page.goto(`${base()}#/agent-setup`);
+  await expect(page.getByLabel('Подключить локально')).toBeDisabled();
+  await expect(
+    page.getByText('Сервер старше 0.0.19: подключения без следа в репозитории нет — обновите сервер.'),
+  ).toBeVisible();
+  await expect(frag(page, 'Текст для CLAUDE.md')).toBeVisible();
+  expect(setupUrls.some((u) => u.includes('local='))).toBe(false);
+  expect(problems, problems.join('\n')).toEqual([]);
+});
+
 // M7.6 (решения координатора 141–143): «Название токена» — подпись и пояснение; пустое на
 // «Аккаунте» — ошибка под полем; на «Подключении агента» — название по умолчанию, «Отозвать этот
 // токен» возвращает заглушку, отозванный — в «Отозванные (N)»

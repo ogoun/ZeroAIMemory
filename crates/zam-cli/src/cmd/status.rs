@@ -197,8 +197,8 @@ fn registry_name(spaces: &Value, s: &Solution) -> Option<String> {
         .map(String::from)
 }
 
-/// Версия блока ближайшего CLAUDE.md/AGENTS.md (как у хука `session-start`) и версия
-/// сервера; сервер без `/agent-setup` (старый) — `None`.
+/// Версия блока ближайшего CLAUDE.local.md/CLAUDE.md/AGENTS.md (как у хука `session-start`) и
+/// версия сервера; сервер без `/agent-setup` (старый) — `None`.
 fn block_versions(
     agent: &ureq::Agent,
     url: &str,

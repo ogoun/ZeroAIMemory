@@ -31,6 +31,21 @@
 //! клиент, поэтому годится любой сервер), адрес — в `~/.zeroaimemory/config.toml` или в
 //! `CLAUDE.local.md`, исключённом из git. Без `--url-to` режим берётся из прежнего блока. Код
 //! адреса — в [`url`].
+//!
+//! **Подключение без следа в репозитории** (M7.6 §9.5):
+//! - [`BlockTo`]: `agent` (по умолчанию) — блок в `CLAUDE.md`/`AGENTS.md`, как раньше; `local` —
+//!   блок Claude Code в `CLAUDE.local.md` корня, `CLAUDE.md` не правится; файл вносится в
+//!   `info/exclude` тем же путём, что у `--url-to local` (в индексе git — отказ, код 1). Адрес —
+//!   строкой блока в том же файле; `--url-to home` его вырезает, прочие значения для этого файла
+//!   ничего не меняют. Блок уже в `CLAUDE.md` — переносится (вырезается, остальной текст, BOM и
+//!   CRLF сохраняются; «блок перенесён из CLAUDE.md — проверьте git diff»). `--agent codex|both`
+//!   — код 1: Codex `CLAUDE.local.md` не читает. Без флага режим сохраняется: блок в
+//!   `CLAUDE.local.md` и не в `CLAUDE.md` — `local`.
+//! - `--exclude-local`: файлы подключения (созданные или изменённые этим запуском и уже
+//!   существующие: `.mcp.json`, `.claude/settings.json`, `.zeroaimemory/` целиком,
+//!   `CLAUDE.local.md`, `AGENTS.md`, хуки Codex), которые не отслеживаются git, — в
+//!   `info/exclude` (вопрос или `--yes`); отслеживаемый и изменённый — предупреждение; с
+//!   исключённым `.zeroaimemory/` — подсказка `zam init --id <guid>` для другого клона.
 mod merge;
 mod ojson;
 mod url;
@@ -49,6 +64,15 @@ use crate::client::{CliError, Client, read_json};
 use crate::locate::{self, Flags, Source};
 use crate::target::{self, Solution};
 use ojson::J;
+
+/// Куда записать блок инструкции Claude Code (M7.6 §9.5 п. 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum BlockTo {
+    /// В CLAUDE.md (AGENTS.md — у Codex), как раньше
+    Agent,
+    /// В CLAUDE.local.md (исключается из git); CLAUDE.md не меняется — только Claude Code
+    Local,
+}
 
 /// Для какого агента подключать.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -73,6 +97,154 @@ pub struct Opts {
     pub lang: String,
     /// `None` — режим прежнего блока ([`url::kept_url_to`]).
     pub url_to: Option<UrlTo>,
+    /// `None` — режим прежнего подключения ([`kept_block_local`]).
+    pub block_to: Option<BlockTo>,
+    /// Файлы подключения, не отслеживаемые git, — в `info/exclude` (M7.6 §9.5 п. 2).
+    pub exclude_local: bool,
+}
+
+/// Без `--block-to`: блок в `CLAUDE.local.md` и не в `CLAUDE.md` — режим `local` (M7.6 §9.5 п. 1).
+fn kept_block_local(root: &Path, claude_md: Option<&str>) -> Result<bool, CliError> {
+    let has = |t: Option<&str>| t.is_some_and(|t| merge::find_block(t).ok().flatten().is_some());
+    Ok(!has(claude_md) && has(read_opt(&root.join(LOCAL_MD))?.as_deref()))
+}
+
+/// Текст `CLAUDE.local.md` с блоком (`--block-to local`): строки адреса вне блока уходят — адрес
+/// теперь строкой блока (или в домашнем конфиге у `--url-to home`); прочий текст, BOM и CRLF
+/// сохраняются.
+fn local_block_text(old: Option<&str>, block: &str) -> Result<String, String> {
+    let old = old.map(merge::without_url_lines);
+    merge::upsert_block(old.as_deref(), block)
+}
+
+/// Перенос блока из `CLAUDE.md` (`--block-to local`): план правки файла без блока; в файле
+/// ничего не осталось (только BOM и пробелы) — файл удаляется (символическая ссылка — нет).
+fn moved_block_plan(path: PathBuf, old: &str) -> Result<Option<Planned>, CliError> {
+    let Some(text) =
+        merge::remove_block(old).map_err(|e| CliError::config(format!("CLAUDE.md: {e}")))?
+    else {
+        return Ok(None);
+    };
+    let link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+    let blank = text
+        .strip_prefix(merge::BOM)
+        .unwrap_or(&text)
+        .trim()
+        .is_empty();
+    Ok(Some(Planned {
+        path,
+        remove: blank && !link,
+        text: if blank && !link { String::new() } else { text },
+        existed: true,
+    }))
+}
+
+/// Файлы подключения для `--exclude-local` (M7.6 §9.5 п. 2): записываемые этим запуском (кроме
+/// удаляемых) и уже существующие файлы подключения выбранного агента; всё в `.zeroaimemory/` —
+/// одним каталогом; `skip` — путь, который исключается отдельно (`CLAUDE.local.md` у
+/// `--block-to local` и `--url-to local`).
+fn local_items(
+    root: &Path,
+    planned: &[&Planned],
+    o: &Opts,
+    skip: Option<&str>,
+) -> Vec<url::LocalItem> {
+    let norm = |r: String| {
+        if r.starts_with(".zeroaimemory/") {
+            ".zeroaimemory/".to_string()
+        } else {
+            r
+        }
+    };
+    let mut items: Vec<url::LocalItem> = Vec::new();
+    let mut push = |rel: String, changed: bool| {
+        if skip == Some(rel.as_str()) {
+            return;
+        }
+        match items.iter_mut().find(|i| i.rel == rel) {
+            Some(i) => i.changed |= changed,
+            None => items.push(url::LocalItem { rel, changed }),
+        }
+    };
+    for p in planned.iter().filter(|p| !p.remove) {
+        push(norm(rel(root, &p.path)), true);
+    }
+    let claude = o.agent != InitAgent::Codex;
+    let codex = o.agent != InitAgent::Claude;
+    let known = [
+        (".zeroaimemory", true),
+        (".mcp.json", claude && !o.no_mcp),
+        (".claude/settings.json", claude && !o.no_hooks),
+        (LOCAL_MD, claude),
+        ("AGENTS.md", codex),
+        (".codex/hooks.json", codex && !o.no_hooks),
+    ];
+    for (f, want) in known {
+        if want && std::fs::symlink_metadata(root.join(f)).is_ok() {
+            let r = if f == ".zeroaimemory" {
+                ".zeroaimemory/".to_string()
+            } else {
+                f.to_string()
+            };
+            push(r, false);
+        }
+    }
+    items
+}
+
+/// Итог `--exclude-local`: внесённые файлы, предупреждения об отслеживаемых и не исключённых,
+/// подсказка про GUID решения у исключённого `.zeroaimemory/`.
+fn print_local_exclude(
+    root: &Path,
+    plan: &url::LocalExclude,
+    ok: bool,
+    failed: &[String],
+    guid: &str,
+) {
+    let url::LocalExclude::Plan {
+        path,
+        add,
+        done,
+        tracked,
+    } = plan
+    else {
+        match plan {
+            url::LocalExclude::NotGit => println!("не git — исключать нечего"),
+            _ => eprintln!(
+                "предупреждение: git не ответил — проверьте, что файлы подключения исключены из git"
+            ),
+        }
+        return;
+    };
+    let ex = rel(root, path);
+    for t in tracked {
+        eprintln!("предупреждение: {t} отслеживается git — правка попадёт в репозиторий");
+    }
+    let added: Vec<&str> = add
+        .iter()
+        .map(|(r, _)| r.as_str())
+        .filter(|r| ok && !failed.iter().any(|f| f == r))
+        .collect();
+    if !added.is_empty() {
+        println!("Внесены в {ex}: {}.", added.join(", "));
+    }
+    if !add.is_empty() && !ok {
+        let all: Vec<&str> = add.iter().map(|(r, _)| r.as_str()).collect();
+        eprintln!(
+            "предупреждение: файлы подключения не внесены в {ex}: {} — повторите с --yes",
+            all.join(", ")
+        );
+    }
+    for f in failed {
+        eprintln!(
+            "предупреждение: строка {f} дописана в {ex}, но git его не исключает (правило «!» в \
+             .gitignore?)"
+        );
+    }
+    let dir = ".zeroaimemory/";
+    if done.iter().any(|d| d == dir) || added.contains(&dir) {
+        println!("GUID решения не в репозитории: в другом клоне — zam init --id {guid}");
+    }
 }
 
 /// Файл, который надо записать (или удалить).
@@ -420,18 +592,38 @@ pub fn run(o: Opts) -> Result<(), CliError> {
             "zam init запускается в каталоге проекта, а не в домашнем",
         ));
     }
+    if o.block_to == Some(BlockTo::Local) && o.agent != InitAgent::Claude {
+        return Err(CliError::config(
+            "Codex не читает CLAUDE.local.md: блок для Codex — только в AGENTS.md",
+        ));
+    }
     let (sol, sol_path, sol_new) = solution(&root, &o)?;
     let client = Client::new(&url.value, &token.value, Some(sol.id.clone()));
 
+    // режим блока (M7.6 §9.5 п. 1): флаг или прежнее подключение (блок в CLAUDE.local.md и не в
+    // CLAUDE.md); у Codex блок — только в AGENTS.md
+    let claude_md = root.join("CLAUDE.md");
+    let claude_old = if o.agent != InitAgent::Codex {
+        read_opt(&claude_md)?
+    } else {
+        None
+    };
+    let block_local = o.agent != InitAgent::Codex
+        && match o.block_to {
+            Some(b) => b == BlockTo::Local,
+            None => kept_block_local(&root, claude_old.as_deref())?,
+        };
+    let claude_file = if block_local { LOCAL_MD } else { "CLAUDE.md" };
+
     // 1. фрагменты сервера (только чтение)
-    let agents: &[(&str, &str)] = match o.agent {
-        InitAgent::Claude => &[("claude", "CLAUDE.md")],
-        InitAgent::Codex => &[("codex", "AGENTS.md")],
-        InitAgent::Both => &[("claude", "CLAUDE.md"), ("codex", "AGENTS.md")],
+    let agents: Vec<(&str, &str)> = match o.agent {
+        InitAgent::Claude => vec![("claude", claude_file)],
+        InitAgent::Codex => vec![("codex", "AGENTS.md")],
+        InitAgent::Both => vec![("claude", claude_file), ("codex", "AGENTS.md")],
     };
     let mut setups = Vec::new();
     for (agent, file) in agents {
-        setups.push((*agent, *file, agent_setup(&client, agent, &sol, &o)?));
+        setups.push((agent, file, agent_setup(&client, agent, &sol, &o)?));
     }
 
     // 2. план файлов: всё разбирается и проверяется до регистрации и первой записи (M-5)
@@ -473,11 +665,31 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         .map(|(_, file, _)| read_opt(&root.join(file)))
         .collect::<Result<Vec<_>, _>>()?;
     let urls = url::urls_of(&url.value, setups.iter().map(|(_, _, v)| v));
+    // режим — по первому блоку: сначала файлы, которые коммитятся (AGENTS.md), затем переносимый
+    // из CLAUDE.md блок, последним — блок в CLAUDE.local.md (строка адреса в нём есть всегда,
+    // кроме --url-to home: по нему одному AGENTS.md получил бы адрес)
+    let mut mode_olds: Vec<Option<String>> = setups
+        .iter()
+        .zip(&olds)
+        .filter(|((_, file, _), _)| *file != LOCAL_MD)
+        .map(|(_, old)| old.clone())
+        .collect();
+    if block_local {
+        mode_olds.push(claude_old.clone());
+        mode_olds.extend(
+            setups
+                .iter()
+                .zip(&olds)
+                .filter(|((_, file, _), _)| *file == LOCAL_MD)
+                .map(|(_, old)| old.clone()),
+        );
+    }
     let url_to = match o.url_to {
         Some(m) => m,
-        None => url::kept_url_to(&olds, &urls, &root)?,
+        None => url::kept_url_to(&mode_olds, &urls, &root)?,
     };
     let mut ur = url::UrlReport::new(url_to, o.agent != InitAgent::Claude);
+    ur.block_local = block_local;
     // токен прежнего блока (v1) того файла, где блок заменяется (I-6); у `both` — из любого
     // из двух, разные — предупреждение, берётся из первого (N-6)
     let mut migrated: Option<(String, &str)> = None;
@@ -488,11 +700,16 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         let block = v["block"]
             .as_str()
             .ok_or_else(|| CliError::config("в ответе /agent-setup нет block"))?;
+        // блок в CLAUDE.local.md (`--block-to local`): адрес — строкой блока в том же
+        // исключённом файле, кроме `--url-to home`
+        let local_file = *file == LOCAL_MD;
         let block = match url_to {
+            UrlTo::Block | UrlTo::Local if local_file => block.to_string(),
             UrlTo::Block => {
                 block_has_url &= !merge::cut_url_lines(block).1.is_empty();
                 block.to_string()
             }
+            UrlTo::Home if local_file => url::block_without_url(file, block, &urls)?,
             UrlTo::Home | UrlTo::Local => {
                 // своя строка адреса вне блока — текст пользователя: не вырезается, а
                 // предупреждение (файл коммитится)
@@ -509,9 +726,27 @@ pub fn run(o: Opts) -> Result<(), CliError> {
                 Some(_) => {}
             }
         }
-        let text = merge::upsert_block(old.as_deref(), &block)
-            .map_err(|e| CliError::config(format!("{file}: {e}")))?;
+        let text = if local_file {
+            local_block_text(old.as_deref(), &block)
+        } else {
+            merge::upsert_block(old.as_deref(), &block)
+        }
+        .map_err(|e| CliError::config(format!("{file}: {e}")))?;
         plan.extend(Planned::new(root.join(file), old.as_deref(), text));
+    }
+    // перенос блока из CLAUDE.md (M7.6 §9.5 п. 1): токен прежнего блока v1 — как у заменяемого
+    if block_local && let Some(old) = claude_old.as_deref() {
+        if let Some(t) = locate::block_token(old) {
+            match &migrated {
+                None => migrated = Some((t, "CLAUDE.md")),
+                Some((first, _)) if *first != t => differs = Some("CLAUDE.md"),
+                Some(_) => {}
+            }
+        }
+        if let Some(p) = moved_block_plan(claude_md.clone(), old)? {
+            ur.moved = true;
+            plan.push(p);
+        }
     }
     // адрес вне блока: home — домашний конфиг (другой адрес там — отказ), local —
     // CLAUDE.local.md и его исключение из git; block — проверка, что файл не уйдёт в git
@@ -530,25 +765,36 @@ pub fn run(o: Opts) -> Result<(), CliError> {
     let mut home_url = locate::HomeUrlPlan::Unchanged;
     match url_to {
         UrlTo::Block => {
+            // CLAUDE.local.md с блоком исключается ниже — его не проверять
             ur.tracked = setups
                 .iter()
-                .filter(|(_, file, _)| url::git_ignored(&root, file) == Some(false))
+                .filter(|(_, file, _)| {
+                    *file != LOCAL_MD && url::git_ignored(&root, file) == Some(false)
+                })
                 .map(|(_, file, _)| file.to_string())
                 .collect();
         }
         // ключ без адреса рядом с `url` стал бы ключом этого адреса: сверка с токеном, который
         // пишется или найден для адреса
         UrlTo::Home => home_url = url::plan_home(&home, &url.value, addr_token)?,
+        // блок в CLAUDE.local.md уже несёт строку адреса
+        UrlTo::Local if block_local => {}
         UrlTo::Local => {
             let old = read_opt(&local_path)?;
             let text = merge::set_url_line(old.as_deref(), &url.value);
             plan.extend(Planned::new(local_path.clone(), old.as_deref(), text));
-            ur.exclude = url::plan_exclude(&root)?;
+            ur.exclude = url::plan_exclude(&root, false)?;
         }
     }
+    // блок в CLAUDE.local.md — исключение тем же путём, что у `--url-to local` (M7.6 §9.5 п. 1)
+    if block_local {
+        ur.exclude = url::plan_exclude(&root, true)?;
+    }
     // переход с local (`--url-to home|block`): строки адреса уходят из CLAUDE.local.md — она
-    // важнее домашнего конфига и блока, а повтор без флага выбрал бы по ней local
-    if o.url_to.is_some_and(|m| m != UrlTo::Local)
+    // важнее домашнего конфига и блока, а повтор без флага выбрал бы по ней local; у блока в
+    // CLAUDE.local.md строки адреса вне блока уже убраны
+    if !block_local
+        && o.url_to.is_some_and(|m| m != UrlTo::Local)
         && let Some(old) = read_opt(&local_path)?
         && !merge::url_values(&old).is_empty()
     {
@@ -587,6 +833,12 @@ pub fn run(o: Opts) -> Result<(), CliError> {
             merge::merge_mcp(j, &frag)
         })?);
     }
+    // файлы подключения в info/exclude (M7.6 §9.5 п. 2): только чтение git, до любой записи
+    let local_ex = o.exclude_local.then(|| {
+        let skip = (block_local || url_to == UrlTo::Local).then_some(LOCAL_MD);
+        let planned: Vec<&Planned> = plan.iter().chain(agent_plan.iter()).collect();
+        url::plan_local_exclude(&root, &local_items(&root, &planned, &o, skip))
+    });
     // `url` верхнего уровня (адрес для каталогов без своего): block — если его нет, home — этот,
     // local — не трогается
     let top = match url_to {
@@ -681,16 +933,38 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         url::Exclude::Add { path, .. } => {
             o.yes
                 || ask(&format!(
-                    "Внести {LOCAL_MD} в {} (адрес сервера не попадёт в git)?",
-                    rel(&root, path)
+                    "Внести {LOCAL_MD} в {} ({} не попадёт в git)?",
+                    rel(&root, path),
+                    if block_local {
+                        "блок с адресом сервера"
+                    } else {
+                        "адрес сервера"
+                    }
+                ))
+        }
+        _ => false,
+    };
+    let local_ok = match &local_ex {
+        Some(url::LocalExclude::Plan { path, add, .. }) if !add.is_empty() => {
+            let list: Vec<&str> = add.iter().map(|(r, _)| r.as_str()).collect();
+            o.yes
+                || ask(&format!(
+                    "Внести файлы подключения в {}: {}?",
+                    rel(&root, path),
+                    list.join(", ")
                 ))
         }
         _ => false,
     };
 
     // запись: исключение — раньше CLAUDE.local.md с адресом (обрыв между ними не оставит его
-    // вне исключения), затем повторная проверка git
+    // вне исключения), затем повторная проверка git; файлы подключения — следом, текст
+    // info/exclude перечитывается
     ur.excluded = url::apply_exclude(&root, &ur.exclude, ur.exclude_ok)?;
+    let not_excluded = match (&local_ex, local_ok) {
+        (Some(plan), true) => url::apply_local_exclude(&root, plan)?,
+        _ => Vec::new(),
+    };
     let mut report = Vec::new();
     let skipped = !agent_ok;
     let all = plan
@@ -777,6 +1051,9 @@ pub fn run(o: Opts) -> Result<(), CliError> {
         );
     }
     ur.print(&root);
+    if let Some(plan) = &local_ex {
+        print_local_exclude(&root, plan, local_ok, &not_excluded, &sol.id);
+    }
     if !o.no_mcp && claude && agent_ok {
         // M6 §7.1: stdio `zam mcp` — адрес, токен, решение и машина те же, что у zam и хуков
         println!(

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! GET /agent-setup?agent=claude|agents|codex&solution=<guid|new|auto>&name=&mcp=&hooks=
-//!                  &rules_write=&lang=ru|en&token=&token_placeholder=&migrate=
+//!                  &rules_write=&lang=ru|en&token=&token_placeholder=&migrate=&local=
 //!   → 200 {version, agent, lang, url, block, tokens, tokens_exact, warnings, template_custom,
 //!          solution_toml?, solution?, mcp_json?, claude_settings?, codex_hooks?,
 //!          install: {windows, linux}, init_cmd: {linux, windows}, migration_prompt?}
@@ -33,6 +33,11 @@
 //! - `migrate=true` (M7.6 §9.1, признак `agent_setup_migrate`) — ещё `migration_prompt`: задание
 //!   агенту на перенос проекта в память ([`agent_setup::migrate`]) для того же агента, решения и
 //!   языка; токена в нём нет никогда (и с `token=`). Без параметра или с `false` ответ прежний.
+//! - `local=true` (M7.6 §9.5 п. 3, признак `agent_setup_local`, «Подключить локально»): у
+//!   `claude` — `init_cmd` с `--block-to local --exclude-local` (блок прежний, с адресом: он ляжет
+//!   в исключённый из git `CLAUDE.local.md`), у `agents`/`codex` — блок без строки
+//!   `ZeroAIMemoryUrl=` и `init_cmd` с `--url-to home --exclude-local`; задание на перенос — с
+//!   тем же однострочником. Без параметра или с `false` ответ прежний байт в байт.
 use axum::Json;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
@@ -73,6 +78,9 @@ pub struct SetupQuery {
     token_placeholder: Option<bool>,
     /// Задание агенту на перенос проекта (`migration_prompt`).
     migrate: Option<bool>,
+    /// «Подключить локально»: флаги `zam init` без следа в репозитории, блок без адреса у
+    /// `agents`/`codex`.
+    local: Option<bool>,
 }
 
 fn parse_agent(raw: Option<&str>) -> Result<AgentKind, ApiError> {
@@ -209,6 +217,7 @@ pub async fn setup(
     let hooks = q.hooks.unwrap_or(true);
     let version = agent_setup::current_version(&st.system).await?;
     let (template, custom) = agent_setup::template(&st.system, agent, lang).await?;
+    let local = q.local.unwrap_or(false);
     let block = agent_setup::render_block(
         &template,
         version,
@@ -219,6 +228,12 @@ pub async fn setup(
             lang,
         },
     );
+    // «Подключить локально» у AGENTS.md/Codex: адрес — в домашнем конфиге (`--url-to home`)
+    let block = if local && agent != AgentKind::Claude {
+        agent_setup::block_without_url(&block)
+    } else {
+        block
+    };
     // размер блока — счётчиком чанкера (M6, задача 5): блок проверяется тестом по bge-m3, а
     // счётчик выдачи без модели — другая оценка (`EstimateCounter`) с иным разбросом
     let tokens = zam_store::count_tokens_chunker(&block);
@@ -252,6 +267,7 @@ pub async fn setup(
             hooks,
             mcp,
             lang,
+            local,
         }),
     });
     if q.migrate.unwrap_or(false) {
@@ -265,6 +281,7 @@ pub async fn setup(
             hooks,
             mcp,
             lang,
+            local,
         });
         out["migration_prompt"] = json!(agent_setup::migrate::render(&MigrateCtx {
             url: &url,

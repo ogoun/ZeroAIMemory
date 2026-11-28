@@ -11,7 +11,11 @@
 //!   ответа на вопрос ([`super::questions`]). Права проверяются до хранилища: токен без `by` —
 //!   400 `by-required`, `by: agent` — 403 `idea-human-decision`, кроме `decline` своей идеи
 //!   (`origin: agent`);
-//! - `POST /entries/{id}/adopt` → 200 `Entry`: только человек (сессия WebUI), токену 403;
+//! - `POST /entries/{id}/adopt {by?, channel?}` → 200 `Entry`: «принять как свою» — решение
+//!   человека. Сессия WebUI — как раньше (тело не читается); с M7.6 (§9.5 п. 4, признак
+//!   `idea_adopt_token`) и токен: `by: human` — агент передаёт слова человека (как `decide` и
+//!   ответ на вопрос), без `by` — 400 `by-required`, `by: agent` — 403 `idea-human-decision`
+//!   **[решение координатора 162]**; сервер до 0.0.19 токену отвечает 403;
 //! - `POST /entries/{id}/review {outcome, summary, missing?, basis?, similar?, task?, space?,
 //!   message?}` → 200 `{entry, task?, replay}` (M6.5 §5, [`zam_store::review_idea`]): разбор —
 //!   действие агента (сессии WebUI 422), только идеи решения (Knowledge 422), только в режиме
@@ -25,7 +29,7 @@
 //!   пользователей разборов ([`attach_reviewers`]).
 //!
 //! Аудит в `system.db` без текста: `entry.idea.propose`, `entry.idea.decide {decision}`,
-//! `entry.idea.adopt`, `entry.idea.review {outcome, task?}`.
+//! `entry.idea.adopt {by, channel}`, `entry.idea.review {outcome, task?}`.
 use std::collections::HashMap;
 
 use axum::Json;
@@ -597,28 +601,46 @@ pub async fn decide(
     shown(&p, out).await
 }
 
-/// `POST /entries/{id}/adopt` — «принять как свою»: только человек в WebUI, токену 403.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct AdoptReq {
+    by: Option<AnswerBy>,
+    channel: Option<Channel>,
+    message: Option<String>,
+}
+
+/// `POST /entries/{id}/adopt` — «принять как свою» (см. модуль): сессия WebUI — тело не читается;
+/// токен — `by: human` по правилам [`by_channel`], `by: agent` — 403 `idea-human-decision`.
 pub async fn adopt(
     State(st): State<AppState>,
     p: Principal,
     headers: HeaderMap,
     client: Client,
     Path(id): Path<String>,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let sc = idea_scope(&st, &p, &headers, &id).await?;
-    let user = match &p {
-        Principal::User { user_id, .. } => *user_id,
-        Principal::Admin { .. } => st.admin_id,
-        Principal::Token(_) => {
-            return Err(ApiError::Denied(
-                "«принять как свою» — действие человека в WebUI".into(),
-            ));
+    let (user, req) = match &p {
+        Principal::User { user_id, .. } => (*user_id, AdoptReq::default()),
+        Principal::Admin { .. } => (st.admin_id, AdoptReq::default()),
+        Principal::Token(t) => {
+            let req: AdoptReq = match &body {
+                Ok(b) if b.iter().all(u8::is_ascii_whitespace) => AdoptReq::default(),
+                _ => json_body(body)?,
+            };
+            (t.user_id, req)
         }
     };
-    let attrib = attribution(&p, &headers, None)?;
+    let (by, channel) = by_channel(&p, req.by, req.channel)?;
+    // «своей» идею делает только человек: агент от своего имени — 403 (как у `decide`)
+    if by == AnswerBy::Agent {
+        return Err(ApiError::IdeaHumanDecision);
+    }
+    let attrib = attribution(&p, &headers, req.message)?;
     let e = adopt_idea(&sc.db, sc.entry.id, user, &attrib).await?;
     st.index.notify();
-    audit(&st, &p, &client, &sc, "entry.idea.adopt", json!({})).await?;
+    let extra = json!({"by": by.as_str(), "channel": channel.as_str()});
+    audit(&st, &p, &client, &sc, "entry.idea.adopt", extra).await?;
     Ok(Json(
         super::insights::entry_json(&p, &sc.db, &e, sc.role).await?,
     ))

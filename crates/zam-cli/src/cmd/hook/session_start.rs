@@ -448,12 +448,14 @@ fn set_holdout(env: &Env, client: &crate::client::Client, id: &str) -> bool {
 }
 
 /// Версия блока инструкции (R2): маркер `<!-- zeroaimemory:begin vN -->` ближайшего
-/// CLAUDE.md/AGENTS.md вверх от `cwd` до корня проекта включительно (Codex — сначала
-/// AGENTS.md). Нет маркера или версии — `None`.
+/// CLAUDE.local.md/CLAUDE.md/AGENTS.md вверх от `cwd` до корня проекта включительно (Codex —
+/// сначала AGENTS.md, CLAUDE.local.md — нет). Нет маркера или версии — `None`.
 pub fn block_version(cwd: &Path, root: &Path, agent: super::Agent) -> Option<u32> {
-    let names: [&str; 2] = match agent {
-        super::Agent::Claude => ["CLAUDE.md", "AGENTS.md"],
-        super::Agent::Codex => ["AGENTS.md", "CLAUDE.md"],
+    // блок Claude Code бывает в CLAUDE.local.md (`zam init --block-to local`, M7.6 §9.5 п. 1) —
+    // в порядке поиска адреса (§11.4 п. 3); Codex его не читает
+    let names: &[&str] = match agent {
+        super::Agent::Claude => &["CLAUDE.local.md", "CLAUDE.md", "AGENTS.md"],
+        super::Agent::Codex => &["AGENTS.md", "CLAUDE.md"],
     };
     let stop = if cwd.starts_with(root) {
         Some(root)
@@ -564,5 +566,28 @@ mod tests {
             block_version(&sub, &root.join("a/b"), super::super::Agent::Claude),
             None
         );
+    }
+
+    /// M7.6 §9.5 п. 1: блок `zam init --block-to local` — в CLAUDE.local.md: его версию находит
+    /// Claude Code (раньше CLAUDE.md того же каталога), Codex — нет; файл только со строкой адреса
+    /// (`--url-to local`) версию не задаёт.
+    #[test]
+    fn block_version_read_from_claude_local() {
+        let root = tmp("block-version-local");
+        let claude = super::super::Agent::Claude;
+        std::fs::write(
+            root.join("CLAUDE.local.md"),
+            "# заметки\n\n<!-- zeroaimemory:begin v8 -->\nZeroAIMemoryUrl=http://h\n<!-- zeroaimemory:end -->\n",
+        )
+        .unwrap();
+        assert_eq!(block_version(&root, &root, claude), Some(8));
+        std::fs::write(root.join("CLAUDE.md"), "<!-- zeroaimemory:begin v7 -->\n").unwrap();
+        assert_eq!(block_version(&root, &root, claude), Some(8));
+        assert_eq!(
+            block_version(&root, &root, super::super::Agent::Codex),
+            Some(7)
+        );
+        std::fs::write(root.join("CLAUDE.local.md"), "ZeroAIMemoryUrl=http://h\n").unwrap();
+        assert_eq!(block_version(&root, &root, claude), Some(7));
     }
 }
