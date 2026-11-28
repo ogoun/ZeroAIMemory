@@ -49,6 +49,48 @@
 - Метка лока `rollback` (`LockMark::Rollback`): `backup` и `restore` во время отката отказывают
   «идёт откат (zam-server rollback): дождитесь его конца».
 
+### Добавлено (M7.4, задача 2 — API и CLI администратора)
+- **Фильтры аудита** `GET /admin/audit?action=&user=&since=&until=` — запросом к серверу, вместе с
+  прежними `limit` и `before`: `action` точно или префиксом (`user.*`; `_` — не шаблон), `user` —
+  id пользователя записи, период RFC 3339 (`until` исключительно); пустой параметр — без
+  фильтра, неверный — 400. Признак `/health` `audit_filters`.
+- **Сводка внутренних работ** `GET /admin/works` — только администратор: по каждому пользователю
+  режимы, пауза, очередь (`queued`, `running`), упавшие за 7 суток, последняя ночь, токены модели
+  суток и месяца, последний прогон проверки (`status`, `verdict`) — тем же кодом, что `GET
+  /works/usage` и `GET /check/status`; база не открылась — строка с `error`, остальные на месте.
+  Признак `admin_works`.
+- **Ручные пробы ночной проверки**: `POST /check/probes {question, targets, space?}` (токен `rw`
+  или человек; вид `manual`, автор по принципалу, часть — общим правилом по первой цели) и
+  снятие `DELETE /check/probes/{id} {reason}` — **только человек** (агентский токен — 403: агент
+  не прячет регрессию), аудит `check.probe.retire`; повтор вопроса — 409
+  `/problems/probe-duplicate`, 500 активных — 409 `/problems/probes-limit`, цель не найдена или
+  не действует — 422. CLI: `zam check probes list [--kind] [--status]`, `zam check probes add
+  "<вопрос>" --target <ссылка>… [--space]`, `zam check probes retire x:<id> --reason "…"`; с
+  сервером 0.0.16-m7.3 `add` и `retire` — код 1 с подсказкой обновить `zam-server`. Протокол `zam
+  guide` («Проверка памяти»): «ошибочную пробу не снимай — опиши человеку; новую — `zam check
+  probes add`». Признак `check_probes_manage`.
+- **Версии компонентов** в `GET /health` — `components: {qdrant: {mode, version}, onnxruntime:
+  {version, device}}`: управляемый Qdrant — версия манифеста сборки, внешний — его ответ при
+  старте (gRPC `HealthCheck`; недоступен — `null`), ONNX Runtime — версия загруженной библиотеки
+  `1.<minor>` и устройство эмбеддера. Признак `health_components`.
+- **`include_history`** — в схемах MCP `memory_search` и `memory_cache_put` (поле пересылалось и
+  раньше, агент о нём не знал); инструментов по-прежнему 11, описания до 300 символов.
+- **`[limits] big_body_permits`** (2, 1..=8) — сколько больших JSON-тел (отчёт MCP, тело `/mcp`)
+  обрабатывается одновременно; на малой машине (LXC 8 ГБ) — 1. Раньше — константа 2.
+
+### Изменено (M7.4, задача 2)
+- **Сводки лицензий Rust — по цели упаковки** (`cargo about generate --target`): комплект сервера
+  — цели `zam-server`, своего `zam` и `zam` другой платформы, который он раздаёт (426 крейтов на
+  обеих платформах, как раньше); архив клиента — только цель `zam` (Linux — musl): Windows — 118
+  крейтов, Linux — 104 (раньше обе — 119, по всем трём целям `about.toml`).
+
+### Для разработчиков (M7.4, задача 2)
+- Сторож `cli_env_literals_registered` (`crates/zam-cli/tests/env_literals.rs`): каждая строка
+  `"ZAM_…"` в исходниках `zam` — в `zam_core::CLIENT_ENV_VARS`, `RESERVED_ENV` сервера (теперь
+  `pub`) или в явном списке теста с причиной.
+- Флейк `deep_blocks_definition_respects_timeout` (`crates/zam-code/tests/extract.rs`): предел
+  времени разбора 150 мс → 1 с (регрессия, которую ловит тест, — 14 с; решение координатора 110).
+
 ## [0.0.16-m7.3] - 2026-11-28
 
 Волна M7.3 «Внутренние работы» этапа M7 «Полировка» — третья из шести (спецификация

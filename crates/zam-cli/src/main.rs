@@ -1410,6 +1410,49 @@ enum CheckCmd {
         #[command(flatten)]
         common: Common,
     },
+    /// Набор проб: список, ручная проба, снятие (снимает только человек)
+    Probes {
+        #[command(subcommand)]
+        cmd: ProbesCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProbesCmd {
+    /// Пробы строками: x:<id>, вид/часть, статус, вопрос, цели (--json — ответ сервера)
+    List {
+        #[arg(long, value_parser = ["probe", "cache", "negative", "manual"])]
+        kind: Option<String>,
+        #[arg(long, value_parser = ["active", "retired"])]
+        status: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Ручная проба — вопрос, который память должна находить; печатает x:<id>
+    Add {
+        /// Вопрос (как спросил бы человек)
+        question: String,
+        /// Цель — ссылка живой записи (n:<id> заметки, i:<id> insight, t:<id> термина …);
+        /// флаг повторяется
+        #[arg(long = "target", required = true)]
+        targets: Vec<String>,
+        /// Пространство пробы: knowledge, rules или GUID решения (по умолчанию — цели)
+        #[arg(long)]
+        space: Option<String>,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Снять пробу x:<id> с причиной — только человек (WebUI «Проверка памяти»); агентский
+    /// токен — 403
+    Retire {
+        /// Проба x:<id>
+        id: String,
+        /// Причина, 3–500 символов
+        #[arg(long, required = true)]
+        reason: String,
+        #[command(flatten)]
+        common: Common,
+    },
 }
 
 fn check(c: CheckCmd) -> Result<(), CliError> {
@@ -1417,6 +1460,29 @@ fn check(c: CheckCmd) -> Result<(), CliError> {
         CheckCmd::Status { common } => cmd::check::status(&cmd::connect(&common)?),
         CheckCmd::Report { common } => cmd::check::report(&cmd::connect(&common)?),
         CheckCmd::Run { no_wait, common } => cmd::check::run(&cmd::connect(&common)?, !no_wait),
+        CheckCmd::Probes { cmd: p } => match p {
+            ProbesCmd::List {
+                kind,
+                status,
+                common,
+            } => {
+                cmd::check::probes_list(&cmd::connect(&common)?, kind.as_deref(), status.as_deref())
+            }
+            ProbesCmd::Add {
+                question,
+                targets,
+                space,
+                common,
+            } => cmd::check::probes_add(
+                &cmd::connect(&common)?,
+                &question,
+                &targets,
+                space.as_deref(),
+            ),
+            ProbesCmd::Retire { id, reason, common } => {
+                cmd::check::probes_retire(&cmd::connect(&common)?, &id, &reason)
+            }
+        },
     }
 }
 

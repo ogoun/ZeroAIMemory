@@ -70,6 +70,9 @@ pub struct AppState {
     pub user_flags: Arc<api::user_settings::UserFlagsCache>,
     /// Разрешения на большие тела запросов (`POST /entries` с отчётом MCP, `/mcp`; M5.5).
     pub big_bodies: api::big_body::BigBodies,
+    /// Версии компонентов `/health.components` (M7.4 §7.6 п. 4): версия внешнего Qdrant —
+    /// узнаётся фоном при старте ([`api::health::probe_external_qdrant`]).
+    pub components: Arc<api::health::Components>,
     /// Карта кода (M5.6 §7): пересчёты рангов (single-flight на решение), слоты и кэш входов
     /// ранжирования с фокусом.
     pub code: Arc<api::code::CodeRuntime>,
@@ -441,10 +444,12 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
         export_tasks: Arc::default(),
         imports: Arc::default(),
         import_tasks: Arc::default(),
+        // разрешения больших тел — из конфигурации (M7.4 §7.6 п. 6, решение 108)
         big_bodies: api::big_body::BigBodies::new(
-            api::big_body::BIG_BODY_PERMITS,
+            cfg.limits.big_body_permits,
             api::note_body_max(&cfg.limits),
         ),
+        components: Arc::default(),
         users,
         index,
         docs,
@@ -477,6 +482,8 @@ pub(crate) async fn finish(p: Prepared) -> anyhow::Result<(Router, AppState, Boo
     state
         .night
         .start(crate::works::NightCtx::new(state.clone()));
+    // версия внешнего Qdrant для `/health.components` (M7.4 §7.6 п. 4) — фоном: старт не ждёт
+    api::health::probe_external_qdrant(&state);
     let router = router(state.clone());
     Ok((router, state, BootReport { initial_token }))
 }

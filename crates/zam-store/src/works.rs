@@ -1029,6 +1029,39 @@ pub async fn list(
     .await
 }
 
+/// Счётчики очереди для сводки администратора `GET /admin/works` (M7.4 §7.6 п. 2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StateCounts {
+    pub queued: u32,
+    pub running: u32,
+    /// `failed` с `finished_at` не раньше заданного момента.
+    pub failed_since: u32,
+}
+
+/// Работ `queued`, `running` и `failed` с `finished_at >= failed_since` (любого вида, строки
+/// неизвестного вида — тоже: они занимают очередь).
+pub async fn state_counts(db: &Db, failed_since: Timestamp) -> Result<StateCounts, StoreError> {
+    let since = fmt_ts(failed_since);
+    db.read(move |c| {
+        let n = |v: i64| u32::try_from(v).unwrap_or(u32::MAX);
+        Ok(c.query_row(
+            "SELECT count(*) FILTER (WHERE state = 'queued'),
+                    count(*) FILTER (WHERE state = 'running'),
+                    count(*) FILTER (WHERE state = 'failed' AND finished_at >= ?1)
+             FROM works",
+            [since],
+            |r| {
+                Ok(StateCounts {
+                    queued: n(r.get(0)?),
+                    running: n(r.get(1)?),
+                    failed_since: n(r.get(2)?),
+                })
+            },
+        )?)
+    })
+    .await
+}
+
 /// Последняя ночь с ночной постановкой работ (`zam work status`).
 pub async fn last_night(db: &Db) -> Result<Option<civil::Date>, StoreError> {
     db.read(|c| {

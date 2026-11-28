@@ -953,6 +953,18 @@ impl QdrantIndex {
         Ok(out)
     }
 
+    /// Версия сервера Qdrant — ответ gRPC `HealthCheck` (`title`, `version`, `commit` — то же, что
+    /// `GET /` REST; ключ не нужен): `/health.components` внешнего Qdrant (M7.4 §7.6 п. 4), у
+    /// которого настроен только gRPC-адрес.
+    pub async fn server_version(&self) -> Result<String, IndexError> {
+        let r = self
+            .client
+            .health_check()
+            .await
+            .map_err(|e| map_err("health_check", e))?;
+        Ok(r.version)
+    }
+
     async fn health_impl(&self) -> Result<(), IndexError> {
         // health_check в gRPC доступен без ключа; list_collections проверяет и ключ.
         self.client

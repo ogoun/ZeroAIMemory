@@ -17,9 +17,18 @@ use crate::MlError;
 struct Runtime {
     path: PathBuf,
     env: Environment,
+    /// Минорная версия библиотеки (`ort::util::probe`): ONNX Runtime 1.`minor`.
+    minor: u32,
 }
 
 static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
+
+/// Версия загруженного ONNX Runtime — `1.<minor>`, как в журнале загрузки
+/// (`/health.components`, M7.4 §7.6 п. 4); библиотека не загружена — `None`.
+pub fn ort_version() -> Option<String> {
+    let guard = RUNTIME.lock().unwrap_or_else(|p| p.into_inner());
+    guard.as_ref().map(|rt| format!("1.{}", rt.minor))
+}
 
 fn same_file(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
@@ -94,6 +103,7 @@ pub(crate) fn environment(dylib: &Path) -> Result<Environment, MlError> {
     *guard = Some(Runtime {
         path: dylib.to_path_buf(),
         env: env.clone(),
+        minor,
     });
     Ok(env)
 }

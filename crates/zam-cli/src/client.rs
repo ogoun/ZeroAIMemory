@@ -482,6 +482,17 @@ impl Client {
         self.check(self.prepare(self.agent.delete(&self.url(path)))?.call())
     }
 
+    /// DELETE `/api/v1{path}` с телом JSON (причина снятия пробы `DELETE /check/probes/{id}
+    /// {reason}`, M7.4): у DELETE тело в ureq — только явно (`force_send_body`).
+    pub fn delete_json(&self, path: &str, body: &Value) -> Result<Response<Body>, CliError> {
+        let rb = self.prepare(self.agent.delete(&self.url(path)))?;
+        self.check(
+            rb.force_send_body()
+                .content_type("application/json")
+                .send(body.to_string().as_bytes()),
+        )
+    }
+
     /// PATCH JSON без `If-Match`.
     pub fn patch_json(&self, path: &str, body: &Value) -> Result<Response<Body>, CliError> {
         let rb = self.prepare(self.agent.patch(&self.url(path)))?;

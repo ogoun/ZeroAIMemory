@@ -126,6 +126,14 @@ pub enum ApiError {
     /// последний ночной прогон идущего эпизода регрессии.
     #[error("принять как норму можно только последний ночной прогон идущего эпизода регрессии")]
     CheckAcceptNotLatest,
+    /// 409 `/problems/probe-duplicate` (M7.4 §7.6 п. 3): ручная проба повторяет вопрос активной
+    /// пробы пространства (нормализованная строка).
+    #[error("{0}")]
+    ProbeDuplicate(String),
+    /// 409 `/problems/probes-limit` (M7.4 §7.6 п. 3): активных проб с целью —
+    /// `zam_store::probes::PROBES_MAX`.
+    #[error("{0}")]
+    ProbesLimit(String),
     /// 422 `/problems/option-required` (M5.7 §5.3): ответ на вопрос-предложение без варианта.
     #[error("{0}")]
     OptionRequired(String),
@@ -334,6 +342,14 @@ impl ApiError {
                 "/problems/check-accept-not-latest",
                 "Conflict",
             ),
+            ApiError::ProbeDuplicate(_) => (
+                StatusCode::CONFLICT,
+                "/problems/probe-duplicate",
+                "Conflict",
+            ),
+            ApiError::ProbesLimit(_) => {
+                (StatusCode::CONFLICT, "/problems/probes-limit", "Conflict")
+            }
             ApiError::OptionRequired(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "/problems/option-required",
