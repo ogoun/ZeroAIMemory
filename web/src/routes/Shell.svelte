@@ -3,7 +3,8 @@
   // или администрирование. У пользователя (не администратора, §15.1) нет разделов
   // «Пользователи», «Администрирование», «Настройки» и полного «Индекса»: есть «Мои решения»,
   // «Аккаунт» и баннер перенарезки своей базы. «Администрирование» с M7.2 (§5.6) — ещё «Копии» и
-  // «Аудит» (ленивые чанки) и плашка `no_recent_backup` над его страницами. «Подключение
+  // «Аудит» (ленивые чанки) и плашка `no_recent_backup` над его страницами; с M7.6 (§9.9) —
+  // «Внутренние работы» сервера (ленивый чанк): настройки `[works]` и пределы пользователей. «Подключение
   // агента», «Кэш выжимок» и «Сессии» (M6 §8) — у обоих (страницы грузятся лениво, §15.4; сбой
   // загрузки — `LazyFail`).
   // Классы ширины (M7.2, §5.1, `layout.ts`): телефон — ☰, заголовок раздела, поиск и меню
@@ -192,9 +193,15 @@
     }
   }
 
-  /** Разделы администрирования (подменю «Пользователи», «Решения», «Настройки», «Копии», «Аудит»). */
+  /** Разделы администрирования (подменю «Пользователи», «Решения», «Настройки», «Внутренние работы»,
+   * «Копии», «Аудит»). */
   const isAdmin = (r: Route) =>
-    r.name === 'admin' || r.name === 'solutions' || r.name === 'settings' || r.name === 'backups' || r.name === 'audit';
+    r.name === 'admin' ||
+    r.name === 'solutions' ||
+    r.name === 'settings' ||
+    r.name === 'adminworks' ||
+    r.name === 'backups' ||
+    r.name === 'audit';
 
   // Пространство открытого журнала: имя и вид — для заголовка и вкладок журналов.
   let journalSpaces = $state<{ user: string; spaces: Space[] } | null>(null);
@@ -542,6 +549,7 @@
           <a href={href({ name: 'admin' })} aria-current={route.name === 'admin' ? 'page' : undefined}>Пользователи</a>
           <a href={href({ name: 'solutions' })} aria-current={route.name === 'solutions' ? 'page' : undefined}>Решения</a>
           <a href={href({ name: 'settings' })} aria-current={route.name === 'settings' ? 'page' : undefined}>Настройки</a>
+          <a href={href({ name: 'adminworks' })} aria-current={route.name === 'adminworks' ? 'page' : undefined}>Внутренние работы</a>
           <a href={href({ name: 'backups' })} aria-current={route.name === 'backups' ? 'page' : undefined}>Копии</a>
           <a href={href({ name: 'audit' })} aria-current={route.name === 'audit' ? 'page' : undefined}>Аудит</a>
         </nav>
@@ -551,6 +559,15 @@
           <Solutions {onexpired} />
         {:else if route.name === 'settings'}
           <Settings {onexpired} />
+        {:else if route.name === 'adminworks'}
+          <!-- настройки сервера внутренних работ и пределы пользователей (M7.6 §9.9) — ленивый чанк -->
+          {#await import('./AdminWorks.svelte')}
+            <p class="muted">Загрузка…</p>
+          {:then { default: AdminWorks }}
+            <AdminWorks {onexpired} />
+          {:catch e}
+            <LazyFail error={e} />
+          {/await}
         {:else if route.name === 'backups'}
           {#await import('./Backups.svelte')}
             <p class="muted">Загрузка…</p>

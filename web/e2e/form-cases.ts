@@ -12,7 +12,9 @@
 // «Добавить пробу» и «Снять» набора проб «Проверки памяти»; M7.5 задачи 5 — «Применить» (с полем
 // текста и подтверждение отзыва) и «Отклонить» предложения уборки; M7.6 задачи 2 — окно записи
 // Vault («Новая запись», «Изменить», «Удалить» страницы Vault; то же окно поверх окна подключения
-// модели — сценарии `works.spec.ts`: строки перечня рассчитаны на одно окно над страницей).
+// модели — сценарии `works.spec.ts`: строки перечня рассчитаны на одно окно над страницей); M7.6
+// задачи 6 — форма «Настройки сервера» на странице «Администрирование → Внутренние работы» и окно
+// «Предел токенов» (своя страница и таблица администратора).
 // Задачи дописывают
 // свои строки — перед последним элементом массива (не в хвост: параллельные задачи иначе правят
 // одну строку). Данные строк — `E2E_FORMS_*` (наполнение — `seedForms` в `forms.spec.ts`) и `E2E_*`
@@ -1126,6 +1128,47 @@ export const FORM_CASES: FormCase[] = [
     added: true,
     // запись на месте: «Удалить» у неё по-прежнему на странице
     kept: (p) => expect(p.getByRole('button', { name: 'Удалить E2E токен деплоя', exact: true })).toBeVisible(),
+  },
+  // ---- M7.6 задачи 6 (решения 171–172): настройки сервера внутренних работ и предел токенов ----
+  {
+    id: 'works-server-settings',
+    name: 'Настройки сервера (форма на странице)',
+    page: () => '#/admin/works',
+    open: async (p) => {
+      const f = p.getByRole('form', { name: 'Настройки сервера' }).getByLabel('Потолок токенов в сутки', { exact: true });
+      await expect(f).toBeVisible();
+      // поле — ниже первого экрана на телефоне: к нему прокручивает человек
+      await f.evaluate((e) => e.scrollIntoView({ block: 'center' }));
+    },
+    first: 'Потолок токенов в сутки',
+    fill: (p) => p.getByRole('form', { name: 'Настройки сервера' }).getByLabel('Потолок токенов в сутки', { exact: true }).fill('1234567'),
+    route: { method: 'PATCH', url: /\/api\/v1\/admin\/works\/settings$/ },
+    after: 'notice',
+    added: true,
+    inline: { scope: (p) => p.getByRole('form', { name: 'Настройки сервера' }), submit: 'Сохранить', focus: false },
+  },
+  {
+    id: 'works-limit',
+    name: 'Предел токенов',
+    page: () => '#/works',
+    open: (p) => press(p, 'Изменить предел'),
+    first: 'В сутки (UTC), токенов',
+    fill: (p) => type(p, 'Предел токенов', 'В сутки (UTC), токенов', '1000'),
+    route: { method: 'PATCH', url: SETTINGS },
+    after: 'notice',
+    added: true,
+  },
+  {
+    id: 'works-limit-admin',
+    name: 'Предел токенов пользователя (администратор)',
+    dialog: 'Предел токенов',
+    page: () => '#/admin/works',
+    open: (p) => p.getByRole('button', { name: /^Изменить предел: / }).first().click(),
+    first: 'В сутки (UTC), токенов',
+    fill: (p) => type(p, 'Предел токенов', 'В месяц (UTC), токенов', '5000'),
+    route: { method: 'PATCH', url: /\/api\/v1\/admin\/users\/[^/?]+\/settings$/ },
+    after: 'notice',
+    added: true,
   },
   {
     id: 'idea-delete',

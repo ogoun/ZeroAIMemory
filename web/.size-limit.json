@@ -36,5 +36,7 @@
   { "name": "Proposals (страница «Предложения»: кандидаты в Rules — M7.3; вкладка «Уборка», карточка tidy с диффом и вкладки — M7.5)", "path": "dist/assets/Proposals-*.js", "gzip": true, "limit": "11.9 KB" },
   { "name": "worksText (тексты страниц M7.3, общий ленивый чанк Works и Proposals; сводка администратора — M7.4; протокол Anthropic, путь адреса и итог проверки — M7.6)", "path": "dist/assets/worksText-*.js", "gzip": true, "limit": "6.9 KB" },
   { "name": "VaultForm (окно записи Vault, по нажатию: страница Vault и окно подключения модели — M7.6)", "path": "dist/assets/VaultForm-*.js", "gzip": true, "limit": "3.7 KB" },
+  { "name": "AdminWorks (страница «Администрирование → Внутренние работы»: настройки сервера и пределы пользователей — M7.6)", "path": "dist/assets/AdminWorks-*.js", "gzip": true, "limit": "7.2 KB" },
+  { "name": "WorksLimitDialog (окно «Предел токенов», общий чанк Works и AdminWorks — M7.6)", "path": "dist/assets/WorksLimitDialog-*.js", "gzip": true, "limit": "1.35 KB" },
   { "name": "pdf.worker", "path": "dist/pdfjs/pdf.worker-*.min.js", "gzip": true, "limit": "400 KB" }
 ]

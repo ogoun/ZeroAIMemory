@@ -44,8 +44,27 @@ export function reasonText(reason: string | null | undefined): string {
       return 'нет подключения модели';
     case 'paused':
       return 'исполнитель на паузе';
+    case 'blocked':
+      return 'администратор запретил отправку на адрес подключения';
     default:
       return reason ?? '';
+  }
+}
+
+/** Почему администратор запретил адрес сохранённого подключения (`works.model.blocked`, M7.6
+ * §9.9, решение 173). */
+export function blockedText(reason: string): string {
+  switch (reason) {
+    case 'model_access_off':
+      return 'Отправка данных памяти модели на сервере выключена.';
+    case 'model_access_lan':
+      return 'Разрешена только локальная сеть, а адрес подключения — вне её.';
+    case 'loopback_requires_admin':
+      return 'Адреса машины сервера (localhost, 127.0.0.1 и соседние служебные) не разрешены.';
+    case 'http_external':
+      return 'Вне локальной сети нужен адрес https://.';
+    default:
+      return reason;
   }
 }
 
@@ -62,7 +81,7 @@ export function checkOffText(reason: string | null | undefined): string {
 export const PAUSE_TITLE: Record<string, string> = {
   auth: 'модель не приняла ключ (HTTP 401/403)',
   not_found: 'модель или адрес не найдены (HTTP 404)',
-  blocked: 'адрес подключения запрещён политикой сервера',
+  blocked: 'администратор запретил отправку на этот адрес',
   vault: 'запись Vault подключения недоступна: удалена, перенесена, Vault заблокирован или в записи нет ключа',
   vault_changed: 'адрес подключения изменён',
 };
@@ -77,7 +96,7 @@ export function pauseHint(cls: string): string {
     case 'not_found':
       return 'Проверьте имя модели и адрес записи Vault (с /v1, как у поставщика), затем сохраните подключение или проверьте его.';
     case 'blocked':
-      return 'Адреса машины сервера и служебные локальные адреса подходят, только если их разрешил администратор сервера; если сервер ограничен локальной сетью, внешний адрес не подойдёт.';
+      return 'Адрес запрещён настройками сервера: куда можно отправлять данные и адреса машины сервера решает администратор. Когда он разрешит адрес, нажмите «Проверить подключение» — пауза снимется; или подключите другой адрес.';
     case 'vault':
       return 'Выберите запись личного Vault заново и сохраните подключение.';
     default:
@@ -430,6 +449,38 @@ const PCT = new Intl.NumberFormat('ru-RU', { maximumFractionDigits: 1 });
 
 /** Число с разрядами: «12 345». */
 export const num = (n: number): string => NUM.format(n);
+
+// ---- личный предел токенов (M7.6 §9.9, решение 172) ----
+
+/** Личный предел строкой: «400 000 в сутки · 900 000 в месяц»; нет — «нет (потолок сервера)». */
+export function limitsText(l: { daily_tokens: number; monthly_tokens: number } | null | undefined): string {
+  if (!l) return 'нет (потолок сервера)';
+  return `${num(l.daily_tokens)} в сутки · ${num(l.monthly_tokens)} в месяц`;
+}
+
+/** Поля окна «Предел токенов» → вход `works.limits`: пустое поле — потолок сервера, оба пустые —
+ * личного предела нет (`null`); целое от 0 до потолка; иначе — текст ошибки. */
+export function parseLimits(
+  daily: string,
+  monthly: string,
+  ceiling: { daily: number; monthly: number },
+): { value: { daily_tokens: number; monthly_tokens: number } | null } | { error: string } {
+  const d = daily.trim();
+  const m = monthly.trim();
+  if (!d && !m) return { value: null };
+  const one = (raw: string, cap: number, what: string): number | string => {
+    if (!raw) return cap;
+    const n = Number(raw.replace(/\s/g, ''));
+    if (!Number.isInteger(n) || n < 0) return `${what}: целое число токенов, 0 или больше.`;
+    if (n > cap) return `${what}: не больше потолка сервера — ${num(cap)}.`;
+    return n;
+  };
+  const dv = one(d, ceiling.daily, 'В сутки');
+  if (typeof dv === 'string') return { error: dv };
+  const mv = one(m, ceiling.monthly, 'В месяц');
+  if (typeof mv === 'string') return { error: mv };
+  return { value: { daily_tokens: dv, monthly_tokens: mv } };
+}
 
 /** Расход к пределу: «12 345 из 2 000 000 (0,6 %)»; предел 0 — «обращений нет: предел 0». */
 export function usageText(tokens: number, limit: number): string {

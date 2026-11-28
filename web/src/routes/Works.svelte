@@ -25,10 +25,14 @@
   // запись» и «Исправить адрес» — окно записи Vault `VaultForm` (ленивый чанк) поверх окна
   // подключения, после сохранения запись выбрана; куда уйдёт запрос — под выбором, адрес без /v1
   // — предупреждение; неудачная проверка — понятная причина и полный адрес запроса.
+  // M7.6 (§9.9, решения 172–173): «Токены модели» — свой предел (окно «Предел токенов», не больше
+  // потолка сервера); адрес подключения, запрещённый администратором (`works.model.blocked`), —
+  // плашка «Администратор запретил отправку на этот адрес»: подключение на месте, данные не уходят.
   import { onMount } from 'svelte';
   import FormDialog from '../components/FormDialog.svelte';
   import Notice from '../components/Notice.svelte';
   import WorksAdmin from '../components/WorksAdmin.svelte';
+  import WorksLimitDialog from '../components/WorksLimitDialog.svelte';
   import { ApiError, errorText, isAdminSession, listVault, type Me, type User, type VaultItem } from '../lib/api';
   import { attention } from '../lib/attention.svelte';
   import { isDirty } from '../lib/formDraft';
@@ -46,6 +50,7 @@
     type ModelConn,
     type WorkCall,
     type WorksList,
+    type WorksLimits,
     type WorksPatch,
     type WorksSettings,
     type WorksUsage,
@@ -64,6 +69,7 @@
     WORKS_MODES,
     WORK_KINDS,
     addressView,
+    blockedText,
     bodyExtraText,
     callDurationText,
     callMsText,
@@ -74,6 +80,7 @@
     outcomeText,
     parseBodyExtra,
     isModelUrl,
+    limitsText,
     pathWarning,
     pauseHint,
     pinnedUrl,
@@ -558,7 +565,20 @@
     await loadQueue();
   }
 
+  // ---- свой предел токенов (окно, решение 172) ----
+
+  let limitOpen = $state(false);
+  let limitNotice = $state('');
+
+  async function limitSaved(l: WorksLimits | null) {
+    limitOpen = false;
+    limitNotice = l ? `Предел сохранён: ${limitsText(l)}.` : 'Личного предела нет — действует потолок сервера.';
+    await Promise.all([loadSettings(), loadQueue()]);
+  }
+
   let pause = $derived(settings?.pause ?? null);
+  /** Адрес подключения запрещён администратором (решение 173): причина. */
+  let blocked = $derived(settings?.model?.blocked ?? null);
   /** Хост подключения вне LAN — только по полю сервера (`external`, без DNS при чтении). */
   let external = $derived(settings?.model?.external ? settings.model.host || 'адрес подключения' : null);
   /** Какой-нибудь вид работает в режиме «модель» сейчас (действующий режим) — данные уходят. */
@@ -616,6 +636,16 @@
         <p>Данные памяти уйдут за пределы локальной сети, когда вид работ будет в режиме «модель».</p>
       {/if}
       <p>Модели вне локальной сети уходит маскированный пакет работ (без Human, Vault и записей участников).</p>
+    </div>
+  {/if}
+  {#if blocked && !pause}
+    <div class="alert pause" role="note" aria-label="Отправка запрещена администратором" data-testid="works-blocked">
+      <p class="alert-title">Администратор запретил отправку на этот адрес{settings?.model?.host ? `: ${settings.model.host}` : ''}</p>
+      <p>{blockedText(blocked)}</p>
+      <p>
+        Подключение сохранено, данные памяти модели не уходят. Когда администратор разрешит адрес снова, обращения пойдут
+        сами; или подключите модель по другому адресу.
+      </p>
     </div>
   {/if}
   {#if pause}
@@ -826,7 +856,24 @@
       Вход и выход модели по журналу отправок. Потолок сервера — {num(u.ceiling.daily)} в сутки и {num(u.ceiling.monthly)}
       в месяц (настройка администратора сервера); не помещается — запрос не отправляется до следующей ночи.
     </p>
+    {#if settings}
+      <div class="row limit">
+        <span data-testid="works-limit">{target ? 'Предел пользователя' : 'Мой предел'}: {limitsText(settings.limits)}</span>
+        <button type="button" onclick={() => (limitOpen = true)}>Изменить предел</button>
+      </div>
+      <Notice text={limitNotice} />
+    {/if}
   </section>
+  <WorksLimitDialog
+    open={limitOpen}
+    user={target}
+    who={targetName}
+    limits={settings?.limits ?? null}
+    ceiling={u.ceiling}
+    onsaved={limitSaved}
+    onclose={() => (limitOpen = false)}
+    {onexpired}
+  />
 {/if}
 
 <section class="panel block" aria-labelledby="works-calls-h">
@@ -1145,6 +1192,11 @@
   }
   .actions {
     margin: 12px 0 8px;
+  }
+  .limit {
+    justify-content: space-between;
+    margin-top: 8px;
+    overflow-wrap: anywhere;
   }
   .facts {
     display: grid;

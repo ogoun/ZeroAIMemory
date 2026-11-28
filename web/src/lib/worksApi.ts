@@ -72,6 +72,10 @@ export interface ModelConn extends ModelConnInput {
   pinned?: { scheme: string; host: string; port: number; path: string };
   host?: string | null;
   external?: boolean;
+  /** M7.6 (§9.9, решение 173): адрес запрещён администратором — причина
+   * (`model_access_off`, `model_access_lan`, `loopback_requires_admin`, `http_external`),
+   * подключение сохранено, обращений нет; `null` — разрешён. Сервер считает без DNS. */
+  blocked?: string | null;
 }
 
 /** Вход для `PATCH` из подключения ответа — только поля входа. */
@@ -100,7 +104,7 @@ export interface WorksSettings {
   /** Переопределения видов. */
   kinds: Partial<Record<WorkKind, WorksMode>>;
   model: ModelConn | null;
-  limits: { daily_tokens: number; monthly_tokens: number } | null;
+  limits: WorksLimits | null;
   check: 'on' | 'off';
   pause: WorksPause | null;
   /** Действующий режим вида и причина `off`. */
@@ -113,6 +117,14 @@ export interface WorksPatch {
   kinds?: Partial<Record<WorkKind, WorksMode | null>>;
   model?: (ModelConnInput & { confirm_url?: string }) | null;
   check?: 'on' | 'off';
+  /** Личный предел токенов (не больше потолков сервера); `null` — снять (M7.6 §9.9). */
+  limits?: WorksLimits | null;
+}
+
+/** Личный предел токенов модели пользователя на сутки и месяц UTC (`works.limits`). */
+export interface WorksLimits {
+  daily_tokens: number;
+  monthly_tokens: number;
 }
 
 /** Ответ `PATCH`: все настройки и предупреждения (`works_model_external: <хост>`). */
@@ -248,9 +260,42 @@ export interface AdminWorksRow {
   last_night?: string | null;
   tokens?: { day: number; month: number };
   check?: { status: string | null; verdict: string | null };
+  /** M7.6 (§9.9): личный предел (`null` — нет) и действующий — меньший из потолка и личного. */
+  limits?: WorksLimits | null;
+  limit?: { daily: number; monthly: number };
 }
-/** Сводка работ всех пользователей — только администратор. */
-export const adminWorks = () => call<{ users: AdminWorksRow[] }>('GET', 'admin/works');
+
+/** Сводка работ всех пользователей — только администратор; с M7.6 — потолки и действующие
+ * настройки сервера (признак `admin_works_settings`; у старого сервера полей нет). */
+export interface AdminWorks {
+  users: AdminWorksRow[];
+  ceiling?: { daily: number; monthly: number };
+  settings?: ServerSettings;
+}
+export const adminWorks = () => call<AdminWorks>('GET', 'admin/works');
+
+// ---- настройки сервера внутренних работ (M7.6 §9.9, признак `admin_works_settings`) ----
+
+/** Ключ `[works]` в форме администратора: действующее значение, значение файла конфигурации,
+ * источник (`webui` — задано в WebUI, `config` — файл), когда действует, допустимое. */
+export interface ServerField {
+  value: boolean | number | string;
+  file: boolean | number | string;
+  source: 'webui' | 'config';
+  applies: 'next_call' | 'next_night';
+  options?: string[];
+  min?: number;
+  max?: number;
+}
+export interface ServerSettings {
+  /** Номер правки: другой у `PATCH` — 409 `settings_changed`. */
+  rev: number;
+  fields: Record<string, ServerField>;
+}
+export const serverSettings = () => call<ServerSettings>('GET', 'admin/works/settings');
+/** Правка: значение — сильнее файла, `null` — вернуть к файлу. */
+export const patchServerSettings = (rev: number, values: Record<string, unknown>) =>
+  call<ServerSettings>('PATCH', 'admin/works/settings', { rev, values });
 
 // ---- проверка памяти (§6.5) ----
 
