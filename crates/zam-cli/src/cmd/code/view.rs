@@ -123,6 +123,13 @@ fn status_text(v: &Value, mark: Option<&SyncMark>) -> String {
             "синхронизация с этой машины: {}\n",
             utc_time(&m.last_ok_at)
         ));
+        // M7.5 §8.6 п. 4: вендорный и созданный код по `.gitattributes` этой синхронизации
+        if m.excluded_gitattributes > 0 {
+            s.push_str(&format!(
+                "исключено по .gitattributes: {}\n",
+                m.excluded_gitattributes
+            ));
+        }
     }
     s
 }
@@ -474,11 +481,12 @@ mod tests {
         let v = json!({"exists": true, "files": 2, "symbols": 3,
                        "updated_at": "2026-10-10T14:03:22.123456Z", "branch": "main",
                        "rank_state": "ready", "by_lang": [], "skipped": [], "central": []});
-        let m = SyncMark {
+        let mut m = SyncMark {
             server: "s".into(),
             solution: "g".into(),
             last_ok_at: "2026-10-11T08:00:00Z".into(),
             head: None,
+            excluded_gitattributes: 0,
         };
         let s = status_text(&v, Some(&m));
         // M6.6 §9 (30): человеческая команда — время с пометкой «UTC» (без `T`, `Z` и смещения)
@@ -492,6 +500,11 @@ mod tests {
             s.contains("синхронизация с этой машины: 2026-10-11 08:00:00 UTC\n"),
             "{s}"
         );
+        // M7.5 §8.6 п. 4: число исключённых по `.gitattributes` — только если они есть
+        assert!(!s.contains(".gitattributes"), "{s}");
+        m.excluded_gitattributes = 7;
+        let s = status_text(&v, Some(&m));
+        assert!(s.contains("исключено по .gitattributes: 7\n"), "{s}");
         // не время — как есть, без пометки
         let v = json!({"files": 1, "symbols": 1, "updated_at": "?", "rank_state": "ready"});
         let s = status_text(&v, None);

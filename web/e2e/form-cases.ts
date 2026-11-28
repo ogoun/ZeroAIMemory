@@ -9,7 +9,8 @@
 // и Releases, окна дерева, вложений, истории, отчётов и кэша, администрирование, импорт, копии и
 // индекс; задачи 8 — страницы M7.3 (подключение модели, «Подтвердить адрес», «Отключить модель»,
 // «Запустить сейчас», «Принять как норму», «Принять» и «Отклонить» кандидата); M7.4 задачи 4 —
-// «Добавить пробу» и «Снять» набора проб «Проверки памяти». Задачи дописывают
+// «Добавить пробу» и «Снять» набора проб «Проверки памяти»; M7.5 задачи 5 — «Применить» (с полем
+// текста и подтверждение отзыва) и «Отклонить» предложения уборки. Задачи дописывают
 // свои строки — перед последним элементом массива (не в хвост: параллельные задачи иначе правят
 // одну строку). Данные строк — `E2E_FORMS_*` (наполнение — `seedForms` в `forms.spec.ts`) и `E2E_*`
 // global-setup.
@@ -17,7 +18,7 @@ import { expect, type Locator, type Page } from '@playwright/test';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { IDEAS_GUID } from './seed';
-import { checkFixture, runsReply } from './seed-internal';
+import { TIDY_MERGE, TIDY_RETRACT, checkFixture, routeTidy, runsReply } from './seed-internal';
 import type { PageCtx } from './mobile-pages';
 
 export interface FormCase {
@@ -114,6 +115,8 @@ const SETTINGS_PATCH = { method: 'PATCH', url: /\/api\/v1\/admin\/settings$/ };
 const REINDEX = { method: 'POST', url: /\/api\/v1\/admin\/reindex$/ };
 
 const TERM = 'Карточка термина';
+/** Карточка предложения уборки (M7.5). */
+const TIDY = 'Карточка предложения уборки';
 /** Вопрос ленты по id из `E2E_*`. */
 const question = (p: Page, k: string) => p.locator(`[data-question="${process.env[k]}"]`);
 /** Запись ленты Changelog из адреса (открытая сверху — первая). */
@@ -1012,6 +1015,48 @@ export const FORM_CASES: FormCase[] = [
     kept: async (p) => {
       await expect(p.getByTestId('reindex-status')).toHaveCount(0);
     },
+  },
+  // ---- «Предложения» → «Уборка» (M7.5 задача 5, §8.8 п. 1): карточки — подстановкой ответов
+  // (`routeTidy`: кандидата `merge` на release-сборке не подготовить), отправка — подстановка 422 ----
+  {
+    id: 'tidy-apply',
+    name: 'Применить предложение',
+    page: () => `#/proposals/${TIDY_MERGE}`,
+    prepare: (p) => routeTidy(p).then(() => undefined),
+    open: (p) => pressIn(p, TIDY, 'Применить'),
+    first: 'Текст объединённой записи',
+    fill: (p) => type(p, 'Применить предложение', 'Текст объединённой записи', `Окно формы — поверх страницы, на телефоне во весь экран ${stamp()}.`),
+    route: { method: 'POST', url: /\/api\/v1\/proposals\/[^/?]+\/accept$/ },
+    after: 'notice',
+    added: true,
+  },
+  {
+    id: 'tidy-apply-retract',
+    name: 'Применить предложение (отзыв)',
+    dialog: 'Применить предложение',
+    page: () => `#/proposals/${TIDY_RETRACT}`,
+    prepare: (p) => routeTidy(p).then(() => undefined),
+    open: (p) => pressIn(p, TIDY, 'Применить'),
+    route: { method: 'POST', url: /\/api\/v1\/proposals\/[^/?]+\/accept$/ },
+    after: 'notice',
+    confirm: true,
+    danger: true,
+    added: true,
+    kept: async (p) => {
+      await expect(p.getByRole('article', { name: TIDY }).getByTestId('proposal-status')).toHaveText('ждёт решения');
+    },
+  },
+  {
+    id: 'tidy-decline',
+    name: 'Отклонить предложение',
+    page: () => `#/proposals/${TIDY_MERGE}`,
+    prepare: (p) => routeTidy(p).then(() => undefined),
+    open: (p) => pressIn(p, TIDY, 'Отклонить'),
+    first: 'Причина',
+    fill: (p) => type(p, 'Отклонить предложение', 'Причина', 'это разные окна: формы и подтверждения'),
+    route: { method: 'POST', url: /\/api\/v1\/proposals\/[^/?]+\/decline$/ },
+    after: 'notice',
+    added: true,
   },
   {
     id: 'idea-delete',

@@ -15,7 +15,9 @@
 //!   (§8а, задача 17c), `recall_timeout` (§16 п. 19, задача 19), `idea_review` (M6.5 §7,
 //!   ключ `ideas.default_mode`), `post_tool_subject` (M7.1 §4.6 п. 3, ключ
 //!   `recall.post_tool_coverage.common_pct`), `memory_check` (M7.3 §6.5, ключ `works.check`:
-//!   сервер прогонов замера — без ночной проверки, [`NIGHT_CHECK_OFF`]); `code_recv` (§12а,
+//!   сервер прогонов замера — без ночной проверки, [`NIGHT_CHECK_OFF`]), `search_m75` (M7.5 §8.1,
+//!   ключ `search.fts_stop_words`; §8.3 — `recall.prompt_fts_coverage.*`,
+//!   `recall.post_tool_diag_words`); `code_recv` (§12а,
 //!   задача 14) — возможность без ключа конфигурации (в
 //!   [`KEYS`] её нет). Пока строки нет, ключ этой сборке не шлётся (а прогон с ним — не
 //!   сравнивается);
@@ -233,6 +235,12 @@ pub const KEYS: &[(&str, Since)] = &[
     ("recall.max_timeout_ms", F("recall_timeout")),
     ("ideas.default_mode", F("idea_review")),
     ("works.check", F("memory_check")),
+    ("search.fts_stop_words", F("search_m75")),
+    ("recall.prompt_fts_coverage.divisor", F("search_m75")),
+    ("recall.prompt_fts_coverage.cap", F("search_m75")),
+    ("recall.prompt_fts_coverage.word_match", F("search_m75")),
+    ("recall.prompt_fts_coverage.common_pct", F("search_m75")),
+    ("recall.post_tool_diag_words", F("search_m75")),
 ];
 
 /// Ночная проверка памяти сервера прогонов (M7.3, решение координатора 67): `works.check = off` —

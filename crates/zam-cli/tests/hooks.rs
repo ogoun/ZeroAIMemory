@@ -5676,7 +5676,9 @@ fn holdout_marker_cleared_by_server_response() {
     let _g = serial();
     let (url, tok) = start("holdout-clear");
     let p = Proj::new("holdout-clear", &url, &tok);
-    write_cache(&p, &url);
+    // кэш свежий: старше 5 минут его сверил бы с сервером `prompt` (M7.5 §8.9 п. 3) и заменил
+    // составом сервера, где этой ловушки нет
+    write_cache_at(&p, &url, &now_rfc());
     let post = |body: &str| {
         let r = http()
             .post(&format!("{url}/api/v1/sessions"))
@@ -7834,4 +7836,201 @@ fn post_tool_long_command_within_budget() {
         .unwrap_or_else(|| panic!("нет запроса /recall: {seen:?}"))
         .2;
     assert_eq!(body["path_words"], json!(["src", "web", "e2e"]), "{body}");
+}
+
+// ---------- M7.5 §8.9 п. 3: свежесть кэша триггеров ----------
+
+/// `fetched_at` кэша триггеров проекта.
+fn fetched_at(p: &Proj) -> String {
+    let v: Value =
+        serde_json::from_str(&std::fs::read_to_string(p.cache().join("triggers.json")).unwrap())
+            .unwrap();
+    v["fetched_at"].as_str().unwrap_or_default().to_string()
+}
+
+/// Кэш триггеров ([`write_cache`]) с `fetched_at` = `at`.
+fn write_cache_at(p: &Proj, server: &str, at: &str) {
+    write_cache(p, server);
+    let path = p.cache().join("triggers.json");
+    let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    v["fetched_at"] = json!(at);
+    std::fs::write(&path, v.to_string()).unwrap();
+}
+
+/// Сейчас, RFC 3339 UTC.
+fn now_rfc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    zam_core::time::rfc3339_from_secs(secs as i64)
+}
+
+/// Заглушка сервера: `GET /triggers` — 304 через `delay` (кэш прежний), `/recall` — тишина.
+fn triggers_stub(delay: Duration) -> (String, common::Seen) {
+    common::stub_body(std::sync::Arc::new(
+        move |_: &str, p: &str, _: usize, _: &Value| {
+            if p.starts_with("/api/v1/triggers") {
+                (304, String::new(), delay)
+            } else if p == "/api/v1/recall" {
+                (200, r#"{"text":"","items":[]}"#.to_string(), Duration::ZERO)
+            } else {
+                (200, "{}".to_string(), Duration::ZERO)
+            }
+        },
+    ))
+}
+
+fn triggers_requests(seen: &common::Seen) -> usize {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|(m, p, _)| m == "GET" && p.starts_with("/api/v1/triggers"))
+        .count()
+}
+
+/// M7.5 §8.9 п. 3: кэш триггеров старше 5 минут (или помеченный устаревшим) хук `prompt` сверяет
+/// условным `GET /triggers` параллельно своему запросу: 304 — состав прежний, `fetched_at`
+/// свежий; сервер не успел — хук в своём бюджете, кэш прежний; `pre_tool` выключен — сверки нет.
+#[test]
+fn prompt_refreshes_stale_triggers() {
+    let _g = serial();
+    let (url, seen) = triggers_stub(Duration::ZERO);
+    let p = Proj::new("prompt-stale", &url, "zam_x");
+    write_cache(&p, &url);
+    let pr = p.ev(
+        "UserPromptSubmit",
+        "ps-1",
+        json!({"prompt": "почему квазар светит"}),
+    );
+    ok(&p
+        .hook_content(&url, "prompt", "claude", pr.to_string().as_bytes())
+        .0);
+    assert_eq!(triggers_requests(&seen), 1, "{:?}", seen.lock().unwrap());
+    let at = zam_core::time::unix_secs(&fetched_at(&p)).unwrap();
+    assert!(
+        zam_core::time::unix_secs(&now_rfc()).unwrap() - at < 120,
+        "{}",
+        fetched_at(&p)
+    );
+    // пометка после записи (`fetched_at` — начало эпохи) — тоже повод
+    write_cache_at(&p, &url, "1970-01-01T00:00:00Z");
+    ok(&p
+        .hook_content(&url, "prompt", "claude", pr.to_string().as_bytes())
+        .0);
+    assert_eq!(triggers_requests(&seen), 2);
+    let c: Value =
+        serde_json::from_str(&std::fs::read_to_string(p.cache().join("triggers.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        c["triggers"].as_array().unwrap().len(),
+        3,
+        "304 — состав прежний: {c}"
+    );
+    // медленный сервер: хук не дольше своего бюджета, кэш прежний
+    let (slow, seen2) = triggers_stub(Duration::from_secs(2));
+    let q = Proj::new("prompt-stale-slow", &slow, "zam_x");
+    write_cache(&q, &slow);
+    let qr = q.ev(
+        "UserPromptSubmit",
+        "ps-2",
+        json!({"prompt": "почему квазар светит"}),
+    );
+    let (o, d) = q.hook_best(&slow, "prompt", "claude", qr.to_string().as_bytes());
+    ok(&o);
+    assert!(d <= max_inner("prompt"), "{d:?}");
+    assert!(triggers_requests(&seen2) >= 1);
+    assert_eq!(fetched_at(&q), "2026-10-27T00:00:00Z");
+    // `pre_tool` выключен — кэш не нужен, сверки нет
+    let (url3, seen3) = triggers_stub(Duration::ZERO);
+    let r = Proj::new("prompt-stale-off", &url3, "zam_x");
+    write_cache(&r, &url3);
+    project_hooks(&r, "pre_tool = false");
+    let rr = r.ev(
+        "UserPromptSubmit",
+        "ps-3",
+        json!({"prompt": "почему квазар светит"}),
+    );
+    ok(&r
+        .hook_content(&url3, "prompt", "claude", rr.to_string().as_bytes())
+        .0);
+    assert_eq!(triggers_requests(&seen3), 0);
+    assert!(
+        seen3
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(m, p, _)| m == "POST" && p == "/api/v1/recall")
+    );
+}
+
+/// M7.5 §8.9 п. 3: свежий кэш (моложе 5 минут) — `prompt` без запроса `/triggers`, только свой
+/// `/recall`; бюджет `prompt` прежний.
+#[test]
+fn prompt_fresh_triggers_no_request() {
+    let _g = serial();
+    let (url, seen) = triggers_stub(Duration::ZERO);
+    let p = Proj::new("prompt-fresh", &url, "zam_x");
+    write_cache_at(&p, &url, &now_rfc());
+    let pr = p.ev(
+        "UserPromptSubmit",
+        "pf-1",
+        json!({"prompt": "почему квазар светит"}),
+    );
+    let (o, d) = p.hook_best(&url, "prompt", "claude", pr.to_string().as_bytes());
+    ok(&o);
+    assert!(d <= max_inner("prompt"), "{d:?}");
+    assert_eq!(triggers_requests(&seen), 0, "{:?}", seen.lock().unwrap());
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|(m, p, _)| m == "POST" && p == "/api/v1/recall")
+    );
+}
+
+/// M7.5 §8.9 п. 3: `zam log insight` с триггерами, `zam insight triggers` и `zam insight supersede`
+/// помечают кэш триггеров устаревшим (`fetched_at` — начало эпохи); без триггеров — нет; следующий
+/// `prompt` приносит новый триггер в кэш, и `pre-tool` его видит без `session-start`.
+#[test]
+fn insight_with_triggers_marks_cache_stale() {
+    let _g = serial();
+    let (url, tok) = start("insight-stale");
+    let p = Proj::new("insight-stale", &url, &tok);
+    let ss = p.ev("SessionStart", "is-1", json!({"source": "startup"}));
+    p.hook("session-start", &ss);
+    let fresh = fetched_at(&p);
+    assert_ne!(fresh, "1970-01-01T00:00:00Z");
+    p.insight("Без триггеров", "gotcha", "solution", &[]);
+    assert_eq!(fetched_at(&p), fresh, "без триггеров — без пометки");
+    let id = p.insight(
+        "Скрипты — только LF",
+        "gotcha",
+        "solution",
+        &["file_glob:**/*.sh"],
+    );
+    assert_eq!(fetched_at(&p), "1970-01-01T00:00:00Z");
+    // `prompt` сверяет кэш: новый триггер — в кэше, `pre-tool` подсказывает
+    let pr = p.ev(
+        "UserPromptSubmit",
+        "is-1",
+        json!({"prompt": "что дальше по плану"}),
+    );
+    p.hook("prompt", &pr);
+    assert_ne!(fetched_at(&p), "1970-01-01T00:00:00Z");
+    let c = context(
+        &p.hook("pre-tool", &write_ev(&p, "is-1", "x/deploy.sh")),
+        "PreToolUse",
+    );
+    assert!(c.contains(&format!("i:{id}")), "{c}");
+    // `insight triggers` и `supersede` — тоже пометка
+    write_cache_at(&p, &url, &now_rfc());
+    ok(&p.zam(&["insight", "triggers", &id, "--clear"], b""));
+    assert_eq!(fetched_at(&p), "1970-01-01T00:00:00Z");
+    write_cache_at(&p, &url, &now_rfc());
+    ok(&p.zam(
+        &["insight", "supersede", &id, "--title", "LF в скриптах"],
+        "Уточнено.\n".as_bytes(),
+    ));
+    assert_eq!(fetched_at(&p), "1970-01-01T00:00:00Z");
 }

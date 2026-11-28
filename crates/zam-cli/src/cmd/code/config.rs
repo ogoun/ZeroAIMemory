@@ -31,6 +31,9 @@ pub struct CodeConfig {
     pub exclude: Vec<String>,
     /// Добавлять [`DEFAULT_EXCLUDE`] к `exclude` (M6 §12а).
     pub exclude_defaults: bool,
+    /// Не брать файлы `linguist-vendored` и `linguist-generated` из `.gitattributes` (M7.5 §8.6
+    /// п. 4, `scan::GitAttrs`).
+    pub exclude_gitattributes: bool,
     pub max_file_bytes: u64,
     pub max_files: u32,
     pub parse_timeout_ms: u64,
@@ -46,6 +49,7 @@ impl Default for CodeConfig {
             languages: None,
             exclude: Vec::new(),
             exclude_defaults: true,
+            exclude_gitattributes: true,
             max_file_bytes: 1_048_576,
             max_files: 50_000,
             parse_timeout_ms: 200,
@@ -92,6 +96,7 @@ struct Section {
     languages: Option<Vec<String>>,
     exclude: Option<Vec<String>>,
     exclude_defaults: Option<bool>,
+    exclude_gitattributes: Option<bool>,
     max_file_bytes: Option<i64>,
     max_files: Option<i64>,
     parse_timeout_ms: Option<i64>,
@@ -108,6 +113,7 @@ impl Section {
             languages: self.languages.or(weaker.languages),
             exclude: self.exclude.or(weaker.exclude),
             exclude_defaults: self.exclude_defaults.or(weaker.exclude_defaults),
+            exclude_gitattributes: self.exclude_gitattributes.or(weaker.exclude_gitattributes),
             max_file_bytes: self.max_file_bytes.or(weaker.max_file_bytes),
             max_files: self.max_files.or(weaker.max_files),
             parse_timeout_ms: self.parse_timeout_ms.or(weaker.parse_timeout_ms),
@@ -219,6 +225,7 @@ pub fn load(home: &Path, root: &Path) -> Result<CodeConfig, CliError> {
         languages,
         exclude,
         exclude_defaults: s.exclude_defaults.unwrap_or(d.exclude_defaults),
+        exclude_gitattributes: s.exclude_gitattributes.unwrap_or(d.exclude_gitattributes),
         max_file_bytes: ranged(
             s.max_file_bytes,
             d.max_file_bytes,
@@ -269,6 +276,7 @@ mod tests {
         let c = load(&home, &root).unwrap();
         assert_eq!(c.max_files, 9);
         assert!(!c.auto);
+        assert!(c.exclude_gitattributes, "умолчание M7.5 — true");
         assert_eq!(c.languages, Some(vec![Lang::Rust, Lang::Go]));
         assert!(c.lang_on(Lang::Go) && !c.lang_on(Lang::Python));
         for (bad, key) in [

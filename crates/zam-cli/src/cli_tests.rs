@@ -371,6 +371,68 @@ fn task_status_empty_next_accepted() {
     assert_eq!((status.as_str(), next.as_deref()), ("done", Some("")));
 }
 
+/// M7.5 §8.9 п. 4: `zam sessions snapshot --tail-kb N` — в диапазоне ключа `hooks.snapshot_tail_kb`
+/// (64..=16384), вне — ошибка разбора; без флага — `None` (ключ клиента); `zam sessions show <id>`.
+#[test]
+fn snapshot_tail_kb_flag_range() {
+    let snap = |extra: &[&str]| {
+        let mut args = vec!["sessions", "snapshot", "--transcript", "t.jsonl"];
+        args.extend_from_slice(extra);
+        parse(&args)
+    };
+    for (n, want) in [
+        ("64", Some(64)),
+        ("16384", Some(16384)),
+        ("2048", Some(2048)),
+    ] {
+        let Ok(Cli {
+            cmd:
+                Cmd::Sessions {
+                    cmd: SessionsCmd::Snapshot { tail_kb, .. },
+                },
+        }) = snap(&["--tail-kb", n])
+        else {
+            panic!("--tail-kb {n}");
+        };
+        assert_eq!(tail_kb, want);
+    }
+    for bad in ["63", "16385", "0", "x"] {
+        assert!(snap(&["--tail-kb", bad]).is_err(), "--tail-kb {bad}");
+    }
+    let Ok(Cli {
+        cmd: Cmd::Sessions {
+            cmd: SessionsCmd::Snapshot { tail_kb: None, .. },
+        },
+    }) = snap(&[])
+    else {
+        panic!("без --tail-kb");
+    };
+    let Ok(Cli {
+        cmd: Cmd::Sessions {
+            cmd: SessionsCmd::Show { id, .. },
+        },
+    }) = parse(&["session", "show", "S-1", "--json"])
+    else {
+        panic!("session show");
+    };
+    assert_eq!(id, "S-1");
+    // `--reject-secrets` у `write` и `import` (M7.5 §8.9 п. 5)
+    let Ok(Cli {
+        cmd: Cmd::Write { reject_secrets, .. },
+    }) = parse(&["write", "a/b", "--reject-secrets"])
+    else {
+        panic!("write --reject-secrets");
+    };
+    assert!(reject_secrets);
+    let Ok(Cli {
+        cmd: Cmd::Import { reject_secrets, .. },
+    }) = parse(&["import", "dir", "--reject-secrets"])
+    else {
+        panic!("import --reject-secrets");
+    };
+    assert!(reject_secrets);
+}
+
 /// Ревью задачи 8, M4: отладочные проверки clap по всему дереву команд (имена и синонимы без
 /// повторов, `conflicts_with`, `requires_all`, группы ссылаются на существующие аргументы) — а не
 /// только у подкоманд, которые разбирают другие тесты.

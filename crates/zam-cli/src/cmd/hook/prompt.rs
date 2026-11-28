@@ -12,6 +12,12 @@
 //! `/recall` и без `Ev::Prompt` в журнале сессии; очереди файлов и токенов уходят как прежде
 //! **[решение координатора; журнал — решение исполнителя, задача 2]**. Сервер отвечает на такие
 //! сообщения тишиной и сам — для клиентов 0.0.12.
+//!
+//! M7.5 §8.9 п. 3: кэш триггеров `triggers.json` старше [`cache::TRIGGERS_FRESH`] (5 мин; или
+//! помеченный устаревшим записью insight через `zam`, другого сервера или решения) хук сверяет с
+//! сервером условным `GET /triggers` (`If-None-Match`; обычно 304) — параллельно `/recall` и
+//! очередям, в том же сроке хука; не успел или сбой — кэш прежний, строка в журнал. Только при
+//! включённом `pre_tool` (кэш нужен ему); сверка идёт и у пересланного сообщения, как очереди.
 use serde_json::json;
 
 use super::cache;
@@ -40,13 +46,18 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
     let queued =
         env.solution.is_some() && session.is_some_and(|id| cache::changed_path(env, id).is_file());
     let tokens = cache::tokens_queued(env, session);
-    if prompt.is_none() && !queued && !tokens {
+    // кэш триггеров нужен только `pre-tool` (M7.5 §8.9 п. 3)
+    let pre_on = s.on(Kind::PreTool);
+    if prompt.is_none() && !queued && !tokens && !(pre_on && cache::triggers_stale(env, None)) {
         return Output::Empty;
     }
     let Some(client) = env.client() else {
         return Output::Empty;
     };
+    let refresh = pre_on && cache::triggers_stale(env, Some(client.base()));
     std::thread::scope(|sc| {
+        // сверка кэша триггеров — параллельно `/recall`, в общем сроке хука
+        let trig = refresh.then(|| sc.spawn(|| cache::refresh_triggers(env, &client, false)));
         let flush = queued.then(|| sc.spawn(|| cache::flush_changed(env, &client, session)));
         // очередь учёта локального вывода (M4.5 §9.5) — тем же сетевым вызовом хука
         let flush_tokens = session
@@ -62,6 +73,16 @@ pub fn run(env: &Env, inp: &Input, s: &Settings) -> Output {
             && h.join().is_err()
         {
             env.log("sessions(tokens): паника");
+        }
+        match trig.map(|h| h.join()) {
+            None => {}
+            Some(Ok(Ok((_, warnings)))) => {
+                for w in warnings {
+                    env.log(&format!("триггеры: предупреждение сервера: {w}"));
+                }
+            }
+            Some(Ok(Err(e))) => env.log(&format!("кэш триггеров не обновлён ({})", e.reason())),
+            Some(Err(_)) => env.log("кэш триггеров: паника"),
         }
         out
     })

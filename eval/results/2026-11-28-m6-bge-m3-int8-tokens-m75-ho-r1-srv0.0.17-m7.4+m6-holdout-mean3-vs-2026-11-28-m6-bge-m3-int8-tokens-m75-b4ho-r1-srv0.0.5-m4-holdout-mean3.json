@@ -1,0 +1,96 @@
+{
+  "base": "2026-11-28-m6-bge-m3-int8-tokens-m75-b4ho-r1-srv0.0.5-m4-holdout×3",
+  "arm": "2026-11-28-m6-bge-m3-int8-tokens-m75-ho-r1-srv0.0.17-m7.4+m6-holdout×3",
+  "base_files": [
+    "2026-11-28-m6-bge-m3-int8-tokens-m75-b4ho-r1-srv0.0.5-m4-holdout",
+    "2026-11-28-m6-bge-m3-int8-tokens-m75-b4ho-r2-srv0.0.5-m4-holdout",
+    "2026-11-28-m6-bge-m3-int8-tokens-m75-b4ho-r3-srv0.0.5-m4-holdout"
+  ],
+  "arm_files": [
+    "2026-11-28-m6-bge-m3-int8-tokens-m75-ho-r1-srv0.0.17-m7.4+m6-holdout",
+    "2026-11-28-m6-bge-m3-int8-tokens-m75-ho-r2-srv0.0.17-m7.4+m6-holdout",
+    "2026-11-28-m6-bge-m3-int8-tokens-m75-ho-r3-srv0.0.17-m7.4+m6-holdout"
+  ],
+  "split": "holdout",
+  "scenarios": 15,
+  "excluded": [
+    "s-19",
+    "s-44",
+    "s-45"
+  ],
+  "base_tokens_mean": 55352.66666666667,
+  "arm_tokens_mean": 49816.66666666666,
+  "r": {
+    "mean": 0.8999867516169047,
+    "lo": 0.848948480538634,
+    "hi": 0.9357249790745622
+  },
+  "base_micro": 0.8481012658227848,
+  "arm_micro": 0.8481012658227848,
+  "d_micro": {
+    "mean": 0.0,
+    "lo": -0.0547945205479452,
+    "hi": 0.058823529411764705
+  },
+  "net_losses": 0,
+  "net_losses_all_reps": 0,
+  "noninferior": false,
+  "noise_base_p95": 0.005485998711614391,
+  "noise_arm_p95": 0.03181836024322379,
+  "pairs": [
+    {
+      "base": "2026-11-28-m6-bge-m3-int8-tokens-m75-b4ho-r1-srv0.0.5-m4-holdout",
+      "arm": "2026-11-28-m6-bge-m3-int8-tokens-m75-ho-r1-srv0.0.17-m7.4+m6-holdout",
+      "r": {
+        "mean": 0.9004260235396058,
+        "lo": 0.8497925406749957,
+        "hi": 0.935651827204475
+      },
+      "d_micro": {
+        "mean": 0.0,
+        "lo": -0.0547945205479452,
+        "hi": 0.058823529411764705
+      },
+      "net_losses": 0,
+      "noninferior": false
+    },
+    {
+      "base": "2026-11-28-m6-bge-m3-int8-tokens-m75-b4ho-r2-srv0.0.5-m4-holdout",
+      "arm": "2026-11-28-m6-bge-m3-int8-tokens-m75-ho-r2-srv0.0.17-m7.4+m6-holdout",
+      "r": {
+        "mean": 0.8996238834038552,
+        "lo": 0.8488871841200641,
+        "hi": 0.935571156871013
+      },
+      "d_micro": {
+        "mean": 0.0,
+        "lo": -0.0547945205479452,
+        "hi": 0.058823529411764705
+      },
+      "net_losses": 0,
+      "noninferior": false
+    },
+    {
+      "base": "2026-11-28-m6-bge-m3-int8-tokens-m75-b4ho-r3-srv0.0.5-m4-holdout",
+      "arm": "2026-11-28-m6-bge-m3-int8-tokens-m75-ho-r3-srv0.0.17-m7.4+m6-holdout",
+      "r": {
+        "mean": 0.8999096820809248,
+        "lo": 0.8471690953707081,
+        "hi": 0.9364134210970089
+      },
+      "d_micro": {
+        "mean": 0.0,
+        "lo": -0.0547945205479452,
+        "hi": 0.058823529411764705
+      },
+      "net_losses": 0,
+      "noninferior": false
+    }
+  ],
+  "bootstrap": {
+    "samples": 10000,
+    "seed": 104372539625497,
+    "r_interval": "двусторонний 95 % (перцентили 2,5 и 97,5), парный бутстреп сценариев по средним повторов",
+    "d_micro_interval": "односторонние 95 % (перцентили 5 и 95), веса — число нагетов, доли — средние повторов"
+  }
+}

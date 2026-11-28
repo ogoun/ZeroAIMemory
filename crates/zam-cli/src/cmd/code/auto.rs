@@ -376,6 +376,7 @@ mod tests {
             solution: "g".into(),
             last_ok_at: at.into(),
             head: head.map(str::to_string),
+            excluded_gitattributes: 0,
         };
         let t = 1_793_102_461; // 2026-10-27T12:01:01Z
         let m = mark("2026-10-27T12:01:01Z", Some("a"));

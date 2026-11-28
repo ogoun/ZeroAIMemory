@@ -3,7 +3,8 @@
 //!
 //! - `file_glob` — по `tool_input.file_path` (у NotebookEdit — `notebook_path`) относительно
 //!   корня (`/` как разделитель, `.` и `..` нормализуются; вне корня — не сопоставляется); на
-//!   Windows без учёта регистра; `command_regex` — по `tool_input.command`;
+//!   Windows без учёта регистра; сопоставление — общий с пакетом `brief` сервера модуль
+//!   [`zam_search::triggers`] (M7.5 §8.9 п. 2); `command_regex` — по `tool_input.command`;
 //! - триггер с `tools` — только для этих инструментов (без учёта регистра);
 //! - Codex правит файлы инструментом `apply_patch` (`tool_input.command` — текст патча): пути для
 //!   `file_glob` — из заголовков `*** Add File:`, `*** Update File:`, `*** Delete File:` (и
@@ -23,10 +24,10 @@
 //! `zam init`) — запись `{at, agent_type, task}` в очередь `spawn-<сессия>.json`; её берёт
 //! `subagent-start`. Пишется по ключу `subagent_start`, независимо от `pre_tool`.
 
-use globset::GlobBuilder;
-// пути из входа инструментов агента — общие с адаптерами снимка сессии (§8а)
 use regex::RegexBuilder;
+// пути из входа инструментов агента — общие с адаптерами снимка сессии (§8а)
 pub use zam_core::toolpath::{glob_path, patch_files};
+use zam_search::triggers::glob_matches;
 
 use super::cache::{self, Trigger};
 use super::input::Input;
@@ -183,16 +184,9 @@ fn matches<'a>(
     for t in triggers.iter().filter(|t| t.for_tool(tool)) {
         match (t.kind.as_str(), command) {
             ("file_glob", _) if !rels.is_empty() => {
-                let g = GlobBuilder::new(&t.pattern)
-                    .case_insensitive(cfg!(windows))
-                    .build();
-                match g {
-                    Ok(g) => {
-                        let m = g.compile_matcher();
-                        if rels.iter().any(|p| m.is_match(p)) {
-                            out.push((t, format!("для {}: ", t.pattern)));
-                        }
-                    }
+                match glob_matches(&t.pattern, &rels, cfg!(windows)) {
+                    Ok(true) => out.push((t, format!("для {}: ", t.pattern))),
+                    Ok(false) => {}
                     Err(_) => env.log(&format!("триггер {}: неверная маска", t.id)),
                 }
             }
@@ -211,4 +205,108 @@ fn matches<'a>(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// Сопоставление `file_glob` до перехода на `zam_search::triggers` (M7.4): эталон поведения.
+    fn old_glob(pattern: &str, rels: &[String]) -> Option<bool> {
+        let m = globset::GlobBuilder::new(pattern)
+            .case_insensitive(cfg!(windows))
+            .build()
+            .ok()?
+            .compile_matcher();
+        Some(rels.iter().any(|p| m.is_match(p)))
+    }
+
+    fn trig(id: &str, kind: &str, pattern: &str, tools: Option<&[&str]>) -> Trigger {
+        Trigger {
+            id: id.into(),
+            entry_id: format!("E{id}"),
+            kind: kind.into(),
+            pattern: pattern.into(),
+            tools: tools.map(|t| t.iter().map(|s| s.to_string()).collect()),
+            ..Trigger::default()
+        }
+    }
+
+    /// M7.5 §8.9 п. 2: `pre_tool::matches` на общем модуле даёт то же, что прежнее сопоставление —
+    /// маски с `**`, `{a,b}`, классами, регистром ОС, путями вне корня и с `..`, неверная маска
+    /// (пропуск и строка журнала), `tools`, `command_regex` рядом.
+    #[test]
+    fn triggers_match_same_as_pre_tool() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("t-m75-pre-tool");
+        let env = Env {
+            kind: Kind::PreTool,
+            agent: super::super::Agent::Claude,
+            started: std::time::Instant::now(),
+            cwd: root.join("src"),
+            root: root.clone(),
+            solution: None,
+            home: PathBuf::from("."),
+        };
+        let patterns = [
+            "**/*.sh",
+            "scripts/{a,b}/*.ps1",
+            "src/*.rs",
+            "*.rs",
+            "**/Demo[A-Z]*.cs",
+            "SRC/**",
+            "a[b",
+            "**",
+        ];
+        let files: [&[&str]; 7] = [
+            &["deploy.sh"],
+            &["../scripts/a/x.ps1"],
+            &["lib.rs", "../README.md"],
+            &["../Services/DemoStrategy.cs"],
+            &["../../outside/x.sh"],
+            &[],
+            &["mod/../main.rs", "../src/x/y.sh"],
+        ];
+        let triggers: Vec<Trigger> = patterns
+            .iter()
+            .enumerate()
+            .map(|(i, p)| trig(&i.to_string(), "file_glob", p, None))
+            .chain([
+                trig("t", "file_glob", "**/*.sh", Some(&["Bash"])),
+                trig("c", "command_regex", "^git push", None),
+            ])
+            .collect();
+        for fs in files {
+            let fs: Vec<String> = fs.iter().map(|f| f.to_string()).collect();
+            let rels: Vec<String> = fs
+                .iter()
+                .filter_map(|f| glob_path(f, &env.cwd, &env.root))
+                .collect();
+            for tool in ["Write", "Bash"] {
+                let got: Vec<&str> = matches(&triggers, tool, &fs, Some("git push"), &env)
+                    .into_iter()
+                    .map(|(t, _)| t.id.as_str())
+                    .collect();
+                let mut want: Vec<&str> = Vec::new();
+                for t in &triggers {
+                    let applies = t.for_tool(Some(tool));
+                    let hit = match t.kind.as_str() {
+                        "file_glob" => {
+                            !rels.is_empty() && old_glob(&t.pattern, &rels) == Some(true)
+                        }
+                        _ => true,
+                    };
+                    if applies && hit {
+                        want.push(&t.id);
+                    }
+                }
+                assert_eq!(got, want, "{fs:?} {tool}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -347,8 +347,11 @@ pub(super) async fn kind_boost_exempt(
 /// записи той же выдачи, которая надёжнее его (`axiom` — любого элемента, кроме другой
 /// аксиомы; `theorem` — гипотезы или заметки), не стоит выше неё
 /// ([`zam_search::order_contradicted`]); задача 15: запрос `r-08` набора eval — гипотеза против
-/// `theorem`. Сдвинутой записи балл поднимается до балла следующего элемента, чтобы баллы не шли
-/// вразрез с порядком.
+/// `theorem`. Балл сдвинутой записи — `min(предыдущий, следующий + 0,0001)` ([`lift_moved`], M7.5
+/// §8.2 п. 1): баллы не идут вразрез с порядком, а сдвинутая стоит строго выше следующего, если
+/// предыдущий не ближе шага округления ответа (ничья с предыдущим допустима — порядок задаёт
+/// массив). Направление связи — только от менее надёжной записи к более надёжной, у
+/// [`kind_boost_exempt`] — оба конца (ТЗ §9.2, решение координатора 118: не выравниваются).
 /// Сбой чтения графа чужого решения решение не исключает: его элементы остаются без
 /// перестановки; обрезанный подграф — предупреждение ответа ([`contradicts_graph`]).
 pub(super) async fn order_by_contradicts(
@@ -392,16 +395,40 @@ pub(super) async fn order_by_contradicts(
     if pairs.is_empty() {
         return Ok(());
     }
-    if order_contradicted(items, |it| it.hit.target.id, &pairs) > 0 {
-        let moved: HashSet<Id> = pairs.iter().map(|p| p.1).collect();
-        for i in (0..items.len().saturating_sub(1)).rev() {
-            let next = items[i + 1].score;
-            if moved.contains(&items[i].hit.target.id) && items[i].score < next {
-                items[i].score = next;
-            }
+    // исходное место каждого элемента: перестановка поднимает только сдвинутые записи, остальные
+    // опускаются или стоят — элемент выше исходного места и есть сдвинутый
+    let mut placed: Vec<(usize, Item)> = std::mem::take(items).into_iter().enumerate().collect();
+    if order_contradicted(&mut placed, |p| p.1.hit.target.id, &pairs) > 0 {
+        let moved: Vec<bool> = placed.iter().enumerate().map(|(i, p)| p.0 > i).collect();
+        let mut scores: Vec<f64> = placed.iter().map(|p| p.1.score).collect();
+        lift_moved(&mut scores, &moved);
+        for (p, s) in placed.iter_mut().zip(scores) {
+            p.1.score = s;
         }
     }
+    items.extend(placed.into_iter().map(|p| p.1));
     Ok(())
+}
+
+/// Шаг округления балла ответа (`round_score`: 0..1 с точностью 1e-4).
+const SCORE_STEP: f64 = 1e-4;
+
+/// Баллы после порядка по `contradicts` (M7.5 §8.2 п. 1, решение координатора 117): сдвинутая
+/// запись (`moved`) с баллом не выше следующего получает `min(предыдущий, следующий +
+/// SCORE_STEP)` — строго выше следующего на шаг округления ответа, но не выше предыдущего (ничья
+/// с ним допустима: порядок задаёт массив ответа, eval сохраняет порядок сервера). «Предыдущий» —
+/// ближайший выше несдвинутый элемент: у нескольких сдвинутых подряд он общий потолок, и баллы
+/// не идут вразрез с порядком. Балл не понижается. До M7.5 сдвинутая получала балл следующего —
+/// ничья, которую eval разбирал по пути (`r-08`).
+fn lift_moved(scores: &mut [f64], moved: &[bool]) {
+    for i in (0..scores.len().saturating_sub(1)).rev() {
+        if !moved[i] || scores[i] > scores[i + 1] {
+            continue;
+        }
+        let up = scores[i + 1] + SCORE_STEP;
+        let ceil = (0..i).rev().find(|&j| !moved[j]).map(|j| scores[j]);
+        scores[i] = ceil.map_or(up, |c| c.min(up)).max(scores[i]);
+    }
 }
 
 #[cfg(test)]
@@ -447,6 +474,38 @@ mod tests {
         for (name, src, dst, live, want) in cases {
             assert_eq!(contradicts_applies(src, dst, live), want, "{name}");
         }
+    }
+
+    /// [`lift_moved`]: строго выше следующего, потолок — ближайший несдвинутый выше, балл не
+    /// понижается, несдвинутые не меняются.
+    #[test]
+    fn lift_moved_scores() {
+        let lift = |s: &[f64], m: &[bool]| {
+            let mut v = s.to_vec();
+            lift_moved(&mut v, m);
+            v
+        };
+        let close = |a: &[f64], b: &[f64]| {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-12)
+        };
+        // первая позиция: следующий + шаг
+        assert!(close(&lift(&[0.55, 0.8], &[true, false]), &[0.8001, 0.8]));
+        // равный следующему — тоже поднимается (строго выше)
+        assert!(close(&lift(&[0.8, 0.8], &[true, false]), &[0.8001, 0.8]));
+        // предыдущий ближе шага — ничья с ним
+        assert!(close(
+            &lift(&[0.80003, 0.55, 0.8], &[false, true, false]),
+            &[0.80003, 0.80003, 0.8]
+        ));
+        // две сдвинутые подряд: общий потолок, порядок баллов не нарушен
+        let v = lift(&[0.9, 0.3, 0.2, 0.8], &[false, true, true, false]);
+        assert!(close(&v, &[0.9, 0.8002, 0.8001, 0.8]), "{v:?}");
+        let v = lift(&[0.80015, 0.3, 0.2, 0.8], &[false, true, true, false]);
+        assert!(close(&v, &[0.80015, 0.80015, 0.8001, 0.8]), "{v:?}");
+        // выше следующего — без изменений; несдвинутые не трогаются
+        assert!(close(&lift(&[0.9, 0.5], &[true, false]), &[0.9, 0.5]));
+        assert!(close(&lift(&[0.5, 0.8], &[false, false]), &[0.5, 0.8]));
+        assert!(lift(&[], &[]).is_empty());
     }
 
     #[test]

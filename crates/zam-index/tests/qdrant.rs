@@ -246,64 +246,86 @@ async fn half_deleted(q: &TestQdrant, idx: &QdrantIndex) -> std::path::PathBuf {
     coll
 }
 
-/// Создать коллекцию поверх остатка ([`half_deleted`]) Qdrant 1.19 отказывается («Collection data
-/// already exists»); `ensure` — понятной ошибкой с советом по режиму: управляемый Qdrant —
-/// `zam-server qdrant reset`, внешний — удалить коллекцию на своём Qdrant.
+/// Ответ Qdrant 1.19 на Windows, когда каталог коллекции занят посторонним процессом
+/// (`i:01M7Y3C3A6E069FQ3QJXGZZGTQ`).
+const RENAME_FAILURE: &str = r"Service internal error: failed to rename file from \\?\D:\q\storage\collections\zam_chunks to \\?\D:\q\storage\.deleted\zam_chunks.1f0c";
+
+/// Самовосстановление (M7.5 §8.5): создать коллекцию поверх остатка ([`half_deleted`]) Qdrant
+/// 1.19 отказывается («Collection data already exists»), `ensure` один раз удаляет остаток
+/// (`delete_collection` — Qdrant убирает каталог коллекции, которой нет в списке) и создаёт
+/// коллекцию снова: `created` и `healed`, метаданные текущей модели, коллекция рабочая;
+/// следующий `ensure` — без изменений. Так и у внешнего Qdrant, и у управляемого.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ensure_over_half_deleted_collection_is_clear_error() {
-    let q = TestQdrant::start("half-del");
-    let idx = connect(&q);
-    half_deleted(&q, &idx).await;
-    let err = idx.ensure(MODEL, DIM).await.unwrap_err();
-    assert!(matches!(err, IndexError::Corrupt(_)), "{err:?}");
-    let text = err.to_string();
-    assert!(
-        text.contains("удалена частично")
-            && text.contains("DELETE /collections/zam_chunks")
-            && !text.contains("qdrant reset"),
-        "{text}"
-    );
-    let err = connect(&q)
-        .with_managed(true)
-        .ensure(MODEL, DIM)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("удалена частично") && err.contains("zam-server qdrant reset"),
-        "{err}"
-    );
+async fn ensure_heals_half_deleted_collection() {
+    let q = TestQdrant::start("half-heal");
+    for managed in [false, true] {
+        let faults = Arc::new(zam_index::test_hooks::DeleteFaults::default());
+        let idx = connect(&q)
+            .with_managed(managed)
+            .with_delete_faults(faults.clone());
+        let coll = half_deleted(&q, &idx).await;
+        faults.fail_next(0, "");
+        let m = idx.ensure(MODEL, DIM).await.unwrap();
+        assert!(m.created && m.healed, "{managed}: {m:?}");
+        assert_eq!(
+            (m.model_id.as_deref(), m.dim, m.points),
+            (Some(MODEL), DIM, 0)
+        );
+        assert_eq!(faults.attempts(), 1, "{managed}: одно удаление остатка");
+        assert!(
+            coll.join("config.json").is_file(),
+            "каталог новой коллекции"
+        );
+        let ctx = Ctx {
+            user: Id::new(),
+            space: Id::new(),
+        };
+        idx.upsert(vec![point(&ctx, Id::new(), "c1", 1, "a", "chunk")])
+            .await
+            .unwrap();
+        let hits = idx
+            .search(&vec_for(1), &sparse_for(1), &filter(&ctx))
+            .await
+            .unwrap();
+        assert_eq!(hits[0].chunk_id, "c1");
+        let again = idx.ensure(MODEL, DIM).await.unwrap();
+        assert!(!again.created && !again.healed, "{again:?}");
+        assert_eq!(again.points, 1);
+        idx.drop_all().await.unwrap();
+    }
 }
 
-/// Посылка повтора `delete_collection_retry`: остаток коллекции ([`half_deleted`]) Qdrant 1.19
-/// удаляет тем же `delete_collection` («not loaded, but its directory still exists»), и `ensure`
-/// после этого создаёт коллекцию.
+/// Самовосстановление не вышло (`delete_collection` не переименовал каталог за все попытки,
+/// `DeleteFaults`): `ensure` — прежний `IndexError::Corrupt` с советом по режиму (управляемый
+/// Qdrant — `zam-server qdrant reset`, внешний — удалить коллекцию на своём Qdrant); коллекция не
+/// создана, остаток на месте. Сбой снят — следующий `ensure` восстанавливает.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_collection_removes_half_deleted_leftover() {
-    use qdrant_client::Qdrant;
-    use qdrant_client::qdrant::DeleteCollectionBuilder;
-
-    let q = TestQdrant::start("half-del-retry");
-    let idx = connect(&q);
+async fn ensure_heal_failure_keeps_corrupt() {
+    let q = TestQdrant::start("half-heal-fail");
+    let faults = Arc::new(zam_index::test_hooks::DeleteFaults::default());
+    let idx = connect(&q).with_delete_faults(faults.clone());
     let coll = half_deleted(&q, &idx).await;
-    assert!(matches!(
-        idx.ensure(MODEL, DIM).await.unwrap_err(),
-        IndexError::Corrupt(_)
-    ));
-    let raw = Qdrant::from_url(&q.grpc_url())
-        .api_key(Some(q.api_key.clone()))
-        .skip_compatibility_check()
-        .build()
-        .unwrap();
-    raw.delete_collection(DeleteCollectionBuilder::new(zam_index::COLLECTION))
-        .await
-        .unwrap();
-    assert!(
-        !coll.exists(),
-        "остаток каталога удалён: {}",
-        coll.display()
-    );
-    assert!(idx.ensure(MODEL, DIM).await.unwrap().created);
+    for (managed, advice, other) in [
+        (false, "DELETE /collections/zam_chunks", "qdrant reset"),
+        (true, "zam-server qdrant reset", "DELETE /collections"),
+    ] {
+        faults.fail_next(u32::MAX, RENAME_FAILURE);
+        let idx = connect(&q)
+            .with_managed(managed)
+            .with_delete_faults(faults.clone());
+        let err = idx.ensure(MODEL, DIM).await.unwrap_err();
+        assert!(matches!(err, IndexError::Corrupt(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains("удалена частично") && text.contains(advice) && !text.contains(other),
+            "{managed}: {text}"
+        );
+        assert_eq!(faults.attempts(), 5, "повторы Windows M7.1");
+        assert!(coll.join("config.json").is_file(), "остаток на месте");
+    }
+    faults.fail_next(0, "");
+    let m = idx.ensure(MODEL, DIM).await.unwrap();
+    assert!(m.created && m.healed, "{m:?}");
 }
 
 /// Недетерминизм векторного канала (M6, задача 5, шаг 0): слияние RRF внутри Qdrant отдаёт

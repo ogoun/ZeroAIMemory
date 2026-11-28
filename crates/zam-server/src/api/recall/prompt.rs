@@ -19,6 +19,13 @@
 //!   ([`PromptGate::admits_card`]): балл гибрида нормирован по непустым каналам, и у слова без
 //!   FTS-совпадения ближайшая по вектору запись получала бы 1,0 при пороге 0,6. Поиск без модели
 //!   (`degraded`) правило не меняет: там все карточки и так из FTS.
+//! - **Покрытие без модели** (M7.5 §8.3 п. 1, ключ `recall.prompt_fts_coverage`; нет ключа — как
+//!   0.0.17): балл лучшего FTS ≈ 1 на любой запрос, и порог балла мусор не отделяет; поэтому при
+//!   `degraded` поиска подсказок карточка поиска проходит, только если предметных слов запроса
+//!   ([`prompt_subject_words`] по [`query_head`], [`CoverageQuery::subject`]; частые в insight —
+//!   при `common_pct` < 100, как у `post_tool`) покрыто в заголовке и фрагменте карточки не меньше
+//!   `need(n)` правила. На гибриде правило не действует; подсказку-задачу и подсказки-идеи не
+//!   трогает.
 //! - **Подсказка-задача** (M6.6 §3.4): отдельный проход FTS без эмбеддинга по задачам `open |
 //!   in_progress | blocked` решения и Knowledge — строгий запрос (все слова) проходит, ослабленный
 //!   (любое слово) — если промпт покрывает слова заголовка ([`title_covered`]); у короткого
@@ -47,7 +54,8 @@ use axum::http::HeaderMap;
 use serde_json::json;
 use zam_core::TargetKind;
 use zam_search::recall::{
-    PromptGate, StemWord, error_terms, hint_line, one_line, prompt_gate, stem_words,
+    CoverageQuery, CoverageRule, PromptGate, StemWord, error_terms, hint_line, is_error_code,
+    one_line, prompt_gate, prompt_subject_words, stem_words,
 };
 use zam_search::truncate_to_tokens;
 use zam_store::{
@@ -56,10 +64,11 @@ use zam_store::{
 
 use super::ideas::{QueueLine, prompt_ideas, review_queue_line};
 use super::{
-    Cand, Deadline, REASON_TASK, RecallReq, TASK_TITLE_CHARS, age_of, entry_spaces, hint_title,
-    inner_search, item_age, masked_clip, prompt_min_score, term_cands,
+    Cand, Deadline, REASON_TASK, RecallReq, TASK_TITLE_CHARS, age_of, common_terms, entry_spaces,
+    hint_title, inner_search, item_age, masked_clip, prompt_min_score, search_degraded, term_cands,
 };
 use crate::api::search::Health;
+use crate::api::search::targets::SearchTarget;
 use crate::api::sessions::RequestSession;
 use crate::app::AppState;
 use crate::auth::Principal;
@@ -134,9 +143,50 @@ fn query_head(prompt: &str) -> String {
         .collect()
 }
 
+/// Покрытие подсказок `prompt` без модели (M7.5 §8.3 п. 1): правило `rule`
+/// (`recall.prompt_fts_coverage`) — только при `degraded` поиска подсказок; иначе (гибрид или
+/// ключа нет) — `None`, отбор как 0.0.17.
+fn prompt_cover_rule(rule: Option<&CoverageRule>, degraded: bool) -> Option<&CoverageRule> {
+    rule.filter(|_| degraded)
+}
+
+/// Предметные слова запроса `query` под правило `rule` ([`CoverageQuery::subject`]): без
+/// служебных слов и реплик ([`prompt_subject_words`]), без частых в insight области
+/// ([`common_terms`], при `common_pct` < 100); коды ошибок — целиком.
+async fn prompt_cover(
+    rule: &CoverageRule,
+    query: &str,
+    targets: &[SearchTarget],
+    health: &Health<'_>,
+    deadline: &mut Deadline,
+) -> CoverageQuery {
+    let words = prompt_subject_words(query);
+    let counted: Vec<String> = words
+        .iter()
+        .filter(|w| !is_error_code(w))
+        .cloned()
+        .collect();
+    let common = common_terms(rule, counted, targets, health, deadline).await;
+    CoverageQuery::subject(&words, rule, |w| common.contains(w))
+}
+
+/// Текст покрытия карточки поиска (M7.5 §8.3 п. 1): заголовок (у insight — `title`, у заметки —
+/// путь и секция) и фрагмент без маркеров подсветки.
+fn card_cover_text(it: &serde_json::Value) -> String {
+    let field = |k: &str| it[k].as_str().unwrap_or_default();
+    format!(
+        "{}\n{}\n{}\n{}",
+        field("title"),
+        field("path"),
+        field("heading_path"),
+        field("snippet").replace([zam_store::MARK_START, zam_store::MARK_END], " ")
+    )
+}
+
 /// Внутренний `POST /search` (см. модуль [`super`]) по запросу `query` и отбор insight и заметок
 /// Rules: карточка — с баллом не ниже порога и принятая правилом тишины `gate`
-/// ([`PromptGate::admits_card`]: у короткого запроса — только лексические).
+/// ([`PromptGate::admits_card`]: у короткого запроса — только лексические); без модели — и
+/// покрытая правилом `recall.prompt_fts_coverage` ([`prompt_cover_rule`]).
 #[allow(clippy::too_many_arguments)]
 async fn prompt_hints(
     st: &AppState,
@@ -167,10 +217,24 @@ async fn prompt_hints(
         return Ok(Vec::new());
     };
     let min = prompt_min_score(st, &v);
+    let rule = prompt_cover_rule(
+        st.cfg.recall.prompt_fts_coverage.as_ref(),
+        search_degraded(&v),
+    );
+    let cover = match rule {
+        Some(r) => Some(prompt_cover(r, query, health.targets(), health, deadline).await),
+        None => None,
+    };
     let targets = health.targets();
     let mut out: Vec<Cand> = Vec::new();
     for it in v["items"].as_array().into_iter().flatten() {
         if it["score"].as_f64().unwrap_or(0.0) < min || !gate.admits_card(it) {
+            continue;
+        }
+        if cover
+            .as_ref()
+            .is_some_and(|c| !c.enough(&card_cover_text(it)))
+        {
             continue;
         }
         let space_kind = it["space"]["kind"].as_str().unwrap_or_default();
@@ -290,6 +354,7 @@ async fn task_prompt_cands(
             continue;
         }
         let q = FtsQuery {
+            drop_stop_words: false,
             alias_groups: Vec::new(),
             text: query.to_string(),
             space_ids: spaces,
@@ -388,6 +453,25 @@ mod tests {
             .into_iter()
             .map(StemWord::new)
             .collect()
+    }
+
+    /// M7.5 §8.3 п. 1: правило покрытия — только при `degraded` и заданном ключе; текст покрытия
+    /// карточки — заголовок, путь, секция и фрагмент без маркеров.
+    #[test]
+    fn prompt_cover_rule_only_degraded() {
+        let r = CoverageRule::M6;
+        assert_eq!(prompt_cover_rule(Some(&r), true), Some(&r));
+        assert_eq!(prompt_cover_rule(Some(&r), false), None);
+        assert_eq!(prompt_cover_rule(None, true), None);
+        let card = serde_json::json!({
+            "title": "Квазар",
+            "path": "rules/космос",
+            "heading_path": "Пульсары",
+            "snippet": format!("…{}магнетар{} рядом", zam_store::MARK_START, zam_store::MARK_END),
+        });
+        let words = vec!["квазар".to_string(), "пульсары".into(), "магнетар".into()];
+        let q = CoverageQuery::subject(&words, &r, |_| false);
+        assert_eq!(q.covered(&card_cover_text(&card)), 3);
     }
 
     /// Порог покрытия заголовка: `max(min(k, 2), ⌈2k/3⌉)` слов из `k`, по основам.

@@ -12,10 +12,10 @@ import { localTime } from './time.ts';
 
 /** Режим исполнителя: выкл, агент в своей сессии, подключённая модель. */
 export type WorksMode = 'off' | 'agent' | 'model';
-/** Вид внутренней работы M7.3. */
-export type WorkKind = 'probes' | 'rules';
+/** Вид внутренней работы M7.3; `tidy` — уборка памяти (M7.5, спецификация §8.7–§8.8). */
+export type WorkKind = 'probes' | 'rules' | 'tidy';
 
-export const WORK_KINDS: WorkKind[] = ['probes', 'rules'];
+export const WORK_KINDS: WorkKind[] = ['probes', 'rules', 'tidy'];
 export const WORKS_MODES: WorksMode[] = ['off', 'agent', 'model'];
 
 export const MODE_TITLE: Record<WorksMode, string> = { off: 'выкл', agent: 'агент', model: 'модель' };
@@ -29,9 +29,9 @@ export const MODE_NOTE: Record<WorksMode, string> = {
     'Работу ночью делает подключённая модель: сервер отправляет ей маскированный пакет (без Human, Vault и записей участников) и принимает итог той же проверкой, что у агента.',
 };
 
-export const KIND_TITLE: Record<WorkKind, string> = { probes: 'Пробы ночной проверки', rules: 'Кандидаты в Rules' };
+export const KIND_TITLE: Record<WorkKind, string> = { probes: 'Пробы ночной проверки', rules: 'Кандидаты в Rules', tidy: 'Уборка памяти' };
 /** Вид в строках журнала и очереди (коротко). */
-export const KIND_SHORT: Record<string, string> = { probes: 'пробы', rules: 'кандидаты в Rules', test: 'проверка подключения' };
+export const KIND_SHORT: Record<string, string> = { probes: 'пробы', rules: 'кандидаты в Rules', tidy: 'уборка', test: 'проверка подключения' };
 
 /** Причина `off` действующего режима вида. */
 export function reasonText(reason: string | null | undefined): string {
@@ -455,8 +455,8 @@ export function proposalAuthorText(kind: string, author: string | null | undefin
 
 // ---- сводка администратора `GET /admin/works` (M7.4 §7.6 п. 2, §7.7 п. 2) ----
 
-/** Действующие режимы видов строкой: «пробы: агент · кандидаты в Rules: выкл»; вид без строки —
- * «выкл». */
+/** Действующие режимы видов строкой: «пробы: агент · кандидаты в Rules: выкл · уборка: выкл»; вид
+ * без строки — «выкл». */
 export function modesSummary(modes: Record<string, { mode: WorksMode }> | null | undefined): string {
   return WORK_KINDS.map((k) => `${KIND_SHORT[k]}: ${MODE_TITLE[modes?.[k]?.mode ?? 'off'] ?? modes?.[k]?.mode}`).join(' · ');
 }

@@ -24,6 +24,10 @@
 //!   число. Сервер без признака `sessions_parent` (`/health.features`; `/health` не ответил —
 //!   проба `?parent=`, на 400) — один обход `GET /sessions?limit=500&tokens=true` по `parent_id`
 //!   с предупреждением ([`Server`]).
+//! - **Доля открытых подсказок** (M7.5 §8.8 п. 2, признак `sessions_opened`): `hints_shown` и
+//!   `hints_opened` сессии с субагентами — у прогона, по плечу — `opened {runs, shown, opened,
+//!   share}` (суммы по прогонам с данными) и столбец «открыто» `N/M (p %)`; сервер без полей —
+//!   `null` и «—».
 //! - **Выдано без сессии** (`--unattributed-days N`, 30) — `GET /sessions/unattributed?days=N`:
 //!   раздел вне плеч, JSON `unattributed {days, calls, tokens, by_event}` и предупреждение при
 //!   T > 0 (выдача MCP без сессии агента ни в один прогон не попала).
@@ -59,6 +63,8 @@ const SESSIONS_LIMIT: u32 = 500;
 const PARENT_FEATURE: &str = "sessions_parent";
 /// Признак `GET /sessions/unattributed` (M6 §7.1).
 const UNATTRIBUTED_FEATURE: &str = "unattributed";
+/// Признак полей `hints_shown`, `hints_opened` сессии (M7.5 §8.8 п. 2).
+const OPENED_FEATURE: &str = "sessions_opened";
 /// Известные пары плеч §12: (база, плечо).
 const KNOWN_PAIRS: [(&str, &str); 4] = [
     ("off", "memory"),
@@ -487,6 +493,20 @@ struct RunMemory {
     /// Токены субагентов.
     subagent_tokens: u64,
     holdout: bool,
+    /// Подсказки сессии с субагентами (M7.5 §8.8 п. 2): `(открыто, показано)`; `None` — у сервера
+    /// нет полей `hints_*` (без признака `sessions_opened`).
+    hints: Option<(u64, u64)>,
+}
+
+/// Подсказки сессий `list` (M7.5 §8.8 п. 2): `(Σ hints_opened, Σ hints_shown)`; у сессии нет полей
+/// (сервер без признака `sessions_opened`) — `None`.
+fn hints_of<'a>(list: impl IntoIterator<Item = &'a Value>) -> Option<(u64, u64)> {
+    let mut sum = (0, 0);
+    for s in list {
+        sum.0 += s["hints_opened"].as_u64()?;
+        sum.1 += s["hints_shown"].as_u64()?;
+    }
+    Some(sum)
 }
 
 /// Сервер памяти прогонов (`--server`): возможности из `/health`, сессии и субагенты прогонов,
@@ -554,16 +574,28 @@ impl Server {
     fn run(&mut self, id: &str) -> Result<RunMemory> {
         let path = format!("/api/v1/sessions/{}", encode_segment(id));
         let (st, text) = self.get(&path)?;
-        let (session, holdout) = match st {
+        let (session, holdout, own) = match st {
             200 => {
                 let v: Value =
                     serde_json::from_str(&text).with_context(|| format!("GET {path}: не JSON"))?;
-                (tokens_of(&v), v["holdout"].as_bool() == Some(true))
+                (
+                    tokens_of(&v),
+                    v["holdout"].as_bool() == Some(true),
+                    hints_of([&v]),
+                )
             }
-            404 => (0, false),
+            // плечо без памяти: подсказок не было — если сервер их считает
+            404 => (
+                0,
+                false,
+                (self.has(OPENED_FEATURE) != Some(false)).then_some((0, 0)),
+            ),
             _ => bail!("GET {path}: HTTP {st}: {text}"),
         };
         let subs = self.subagents(id)?;
+        let hints = own
+            .zip(hints_of(&subs))
+            .map(|(a, b)| (a.0 + b.0, a.1 + b.1));
         // в пределе списка сервера часть субагентов могла не войти (ревью задачи 9, Minor 6)
         if subs.len() >= SESSIONS_LIMIT as usize {
             self.warnings.push(format!(
@@ -576,6 +608,7 @@ impl Server {
             subagents: subs.len() as u64,
             subagent_tokens: subs.iter().map(tokens_of).sum(),
             holdout,
+            hints,
         })
     }
 
@@ -711,6 +744,11 @@ struct RunRow {
     /// Субагентов сессии на сервере.
     subagents: Option<u64>,
     holdout: Option<bool>,
+    /// Подсказок показано сессии и её субагентам (M7.5 §8.8 п. 2); `null` — без `--server` или
+    /// сервер без признака `sessions_opened`.
+    hints_shown: Option<u64>,
+    /// Из них открыто агентом.
+    hints_opened: Option<u64>,
 }
 
 /// Метрики прогона по имени (`input`, …, `pass`).
@@ -753,6 +791,37 @@ fn per_task(rows: &[&RunRow], name: &str) -> BTreeMap<String, f64> {
         .collect()
 }
 
+/// Доля открытых подсказок плеча (M7.5 §8.8 п. 2): суммы по прогонам с данными сервера —
+/// `{runs, shown, opened, share}` (`share` — `opened / shown`, без показов — `null`); ни у одного
+/// прогона данных нет (без `--server`, сервер без признака) — `null`.
+fn opened_json(rows: &[&RunRow]) -> Value {
+    let with: Vec<(u64, u64)> = rows
+        .iter()
+        .filter_map(|r| r.hints_opened.zip(r.hints_shown))
+        .collect();
+    if with.is_empty() {
+        return Value::Null;
+    }
+    let (opened, shown) = with
+        .iter()
+        .fold((0u64, 0u64), |a, (o, s)| (a.0 + o, a.1 + s));
+    let share = (shown > 0).then(|| opened as f64 / shown as f64);
+    json!({"runs": with.len(), "shown": shown, "opened": opened, "share": share})
+}
+
+/// Доля открытых строкой: «N/M (p %)», без показов — «0/0», без данных — «—».
+fn opened_text(o: &Value) -> String {
+    match (
+        o["opened"].as_u64(),
+        o["shown"].as_u64(),
+        o["share"].as_f64(),
+    ) {
+        (Some(n), Some(m), Some(p)) => format!("{n}/{m} ({:.0} %)", p * 100.0),
+        (Some(n), Some(m), None) => format!("{n}/{m}"),
+        _ => "—".to_string(),
+    }
+}
+
 fn arm_json(rows: &[&RunRow]) -> Value {
     let tasks: BTreeSet<&str> = rows.iter().map(|r| r.task.as_str()).collect();
     let mut sum = serde_json::Map::new();
@@ -770,6 +839,7 @@ fn arm_json(rows: &[&RunRow]) -> Value {
         "sum": sum,
         "per_task": avg,
         "pass_rate": estimate_with(&pass, BOOTSTRAP_M6),
+        "opened": opened_json(rows),
     })
 }
 
@@ -891,15 +961,15 @@ fn markdown(j: &Value) -> String {
          ({BOOTSTRAP_M6} выборок); память — сессия с субагентами, память сессии — без них\n\n\
          ## Плечи (среднее на задачу)\n\n\
          | плечо | прогонов | задач | вход | кэш чтение | кэш запись | выход | всего | память | \
-         память сессии | инструменты | доля успешных |\n\
-         |---|---|---|---|---|---|---|---|---|---|---|---|\n",
+         память сессии | инструменты | доля успешных | открыто |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
         j["runs"], j["tasks"]
     );
     if let Some(arms) = j["arms"].as_object() {
         for (name, a) in arms {
             let pt = &a["per_task"];
             s.push_str(&format!(
-                "| {name} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                "| {name} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 a["runs"],
                 a["tasks"],
                 est0(&pt["input"]),
@@ -911,6 +981,7 @@ fn markdown(j: &Value) -> String {
                 est0(&pt["memory_session"]),
                 est(&pt["tool_calls"]),
                 est(&a["pass_rate"]),
+                opened_text(&a["opened"]),
             ));
         }
     }
@@ -1029,8 +1100,11 @@ pub fn main(a: AbArgs) -> Result<()> {
             memory_session: mem.map(|m| m.session),
             subagents: mem.map(|m| m.subagents),
             holdout: mem.map(|m| m.holdout),
+            hints_shown: mem.and_then(|m| m.hints).map(|h| h.1),
+            hints_opened: mem.and_then(|m| m.hints).map(|h| h.0),
         });
     }
+    let mut warnings: Vec<String> = consistency_warnings(&rows);
     if !missing.is_empty() && !a.allow_missing {
         let ids: Vec<&str> = missing
             .iter()
@@ -1051,7 +1125,6 @@ pub fn main(a: AbArgs) -> Result<()> {
         arms_j.insert(arm.clone(), arm_json(&rs));
     }
     let mut cmp = Vec::new();
-    let mut warnings: Vec<String> = consistency_warnings(&rows);
     for (b, x) in pairs(&file, &arms) {
         match compare_json(&b, &x, &rows) {
             Some(c) => cmp.push(c),
@@ -1275,6 +1348,8 @@ mod tests {
             memory_session: memory,
             subagents: memory.map(|_| 0),
             holdout,
+            hints_shown: None,
+            hints_opened: None,
         };
         let w = consistency_warnings(&[
             row("holdout", Some(false), Some(0)),
@@ -1288,5 +1363,72 @@ mod tests {
         assert!(w[0].contains("плечо holdout"), "{w:?}");
         assert!(w[1].contains("плечо main"), "{w:?}");
         assert!(w[2].contains("плечо off") && w[2].contains("7"), "{w:?}");
+    }
+
+    /// M7.5 §8.8 п. 2: доля открытых подсказок по плечу — суммы прогонов с данными сервера
+    /// (сессия с субагентами), столбец «открыто» отчёта; без данных — `null` и «—»; показов нет —
+    /// «0/0»; поля сессии — `hints_of` (сервер без признака — `None`).
+    #[test]
+    fn ab_report_opened_share() {
+        let row = |arm: &str, task: &str, hints: Option<(u64, u64)>| RunRow {
+            task: task.into(),
+            arm: arm.into(),
+            rep: 1,
+            session: format!("s-{arm}-{task}"),
+            outcome: Outcome::Pass,
+            transcripts: 1,
+            input: 1,
+            cache_read: 0,
+            cache_creation: 0,
+            output: 1,
+            total: 2,
+            tool_calls: 0,
+            memory: Some(0),
+            memory_session: Some(0),
+            subagents: Some(0),
+            holdout: Some(false),
+            hints_shown: hints.map(|h| h.1),
+            hints_opened: hints.map(|h| h.0),
+        };
+        let mem = [
+            row("memory", "t1", Some((1, 4))),
+            row("memory", "t2", Some((2, 4))),
+        ];
+        let o = opened_json(&mem.iter().collect::<Vec<_>>());
+        assert_eq!(o["runs"], 2, "{o}");
+        assert_eq!(
+            (o["opened"].clone(), o["shown"].clone()),
+            (json!(3), json!(8))
+        );
+        assert!((o["share"].as_f64().unwrap() - 0.375).abs() < 1e-9, "{o}");
+        assert_eq!(opened_text(&o), "3/8 (38 %)");
+        let off = [row("off", "t1", Some((0, 0)))];
+        assert_eq!(
+            opened_text(&opened_json(&off.iter().collect::<Vec<_>>())),
+            "0/0"
+        );
+        let old = [row("memory", "t1", None)];
+        let o = opened_json(&old.iter().collect::<Vec<_>>());
+        assert!(o.is_null(), "{o}");
+        assert_eq!(opened_text(&o), "—");
+        // отчёт: столбец «открыто» у каждого плеча
+        let mut arms = serde_json::Map::new();
+        arms.insert("memory".into(), arm_json(&mem.iter().collect::<Vec<_>>()));
+        arms.insert("off".into(), arm_json(&old.iter().collect::<Vec<_>>()));
+        let md = markdown(&json!({"runs": 3, "tasks": 2, "arms": arms}));
+        assert!(md.contains("| доля успешных | открыто |"), "{md}");
+        let line = |name: &str| {
+            md.lines()
+                .find(|l| l.starts_with(&format!("| {name} |")))
+                .unwrap()
+                .to_string()
+        };
+        assert!(line("memory").ends_with("| 3/8 (38 %) |"), "{md}");
+        assert!(line("off").ends_with("| — |"), "{md}");
+        // поля сессии: сумма с субагентами; сессия без полей — нет данных
+        let s = json!({"hints_shown": 3, "hints_opened": 1});
+        let a = json!({"hints_shown": 2, "hints_opened": 2});
+        assert_eq!(hints_of([&s, &a]), Some((3, 5)));
+        assert_eq!(hints_of([&s, &json!({"tokens": {}})]), None);
     }
 }

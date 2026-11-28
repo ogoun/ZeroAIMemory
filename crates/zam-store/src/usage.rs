@@ -340,6 +340,34 @@ fn opened_many_in(
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+/// Открытия подсказок сессиями `ids` пользователя `user` в этой базе — базе целей (M7.5 §8.8 п. 2,
+/// доля открытых): число целей, открытых каждой сессией (`usage_opened` — одна строка на сессию и
+/// цель; чтение — по первичному ключу, `session_id` — его начало). `user` — владелец сессий: в базе
+/// чужого решения лежат открытия и его участников. Сессии без открытий в ответе нет.
+pub async fn opened_by_sessions(
+    db: &Db,
+    user: Id,
+    ids: &[String],
+) -> Result<HashMap<String, i64>, StoreError> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let list = serde_json::Value::from(ids.to_vec()).to_string();
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT session_id, count(*) FROM usage_opened
+             WHERE session_id IN (SELECT value FROM json_each(?1)) AND user_id = ?2
+               AND target_kind IN ('node', 'entry')
+             GROUP BY session_id",
+        )?;
+        let rows = st.query_map(params![list, user], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })
+    .await
+}
+
 /// Событие показа, к которому относится открытие цели `target` сессией `session` (§6.6 п. 2):
 /// `source` последнего показа цели этой сессии (`usage.recall_shown`, индекс `usage_target`).
 /// `None` — открытие этой сессией уже записано (повтор не берёт запись базы) или показа этой

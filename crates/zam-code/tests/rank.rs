@@ -1,11 +1,13 @@
-//! Ранжирование карты кода (спецификация M5.6 §7): граф файлов, PageRank, доли символов.
+//! Ранжирование карты кода (спецификация M5.6 §7): граф файлов, PageRank, доли символов;
+//! связывание ссылок с определениями (M7.5 §8.6).
 
 use std::collections::HashMap;
 
 use proptest::prelude::*;
 use zam_code::{
-    Focus, Graph, RankFile, RankWeights, RefKind, SymbolKind, central, edges_among, focus_idents,
-    focus_restart, ident_mult, pagerank, rank, rank_on_graph, rank_with,
+    Focus, Graph, RankFile, RankWeights, RefKind, SymbolKind, central, edges_among,
+    edges_among_with, focus_idents, focus_restart, ident_mult, pagerank, rank, rank_on_graph,
+    rank_with,
 };
 
 fn file(id: i64, path: &str, defs: &[(&str, SymbolKind)], refs: &[(&str, u32)]) -> RankFile {
@@ -687,20 +689,23 @@ fn synth(n: usize, common_def: f64, common_ref: f64) -> Vec<RankFile> {
     files
 }
 
-/// Замер: `cargo test -p zam-code --release --test rank -- --ignored --nocapture`.
+/// Замер: `cargo test -p zam-code --release --test rank -- --ignored --nocapture`. Правила M6 и
+/// со связыванием (В1 + В2, M7.5 §8.6) — по < 1 с.
 #[test]
 #[ignore = "замер в release: 50 000 файлов синтетики, rank() < 1 с"]
 fn rank_50k_files_under_1s_release() {
     for (def, rf) in [(0.01, 0.1), (0.1, 0.3)] {
         let files = synth(50_000, def, rf);
-        let t = std::time::Instant::now();
-        let r = rank(&files, None);
-        let el = t.elapsed();
-        let refs: usize = files.iter().map(|f| f.refs.len()).sum();
-        println!("50 000 файлов (def {def}, ref {rf}), ссылок {refs}: rank() {el:?}");
-        assert!((r.file_rank.iter().sum::<f64>() - 1.0).abs() < 1e-9);
-        if !cfg!(debug_assertions) {
-            assert!(el.as_secs_f64() < 1.0, "{el:?}");
+        for (name, w) in [("M6", RankWeights::M6), ("В1 + В2", W12)] {
+            let t = std::time::Instant::now();
+            let r = rank_with(&files, None, w);
+            let el = t.elapsed();
+            let refs: usize = files.iter().map(|f| f.refs.len()).sum();
+            println!("50 000 файлов (def {def}, ref {rf}), ссылок {refs}, {name}: rank() {el:?}");
+            assert!((r.file_rank.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+            if !cfg!(debug_assertions) {
+                assert!(el.as_secs_f64() < 1.0, "{name}: {el:?}");
+            }
         }
     }
 }
@@ -852,8 +857,8 @@ fn ranks_unchanged_when_recv_count_zero() {
     let want = read("ranks.json");
     // получатель учитывается, но счётчиков нет — как M5.7
     let recv_only = RankWeights {
-        kind_table: false,
         recv: true,
+        ..RankWeights::M57
     };
     assert_same_ranks(&files, &want, recv_only);
     assert_same_ranks(&files, &want, RankWeights::M57);
@@ -878,8 +883,8 @@ fn ranks_unchanged_when_recv_count_zero_full_repo() {
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let files = m57_inputs(&v);
     let recv_only = RankWeights {
-        kind_table: false,
         recv: true,
+        ..RankWeights::M57
     };
     assert_same_ranks(&files, &v["lib_ranks"], recv_only);
     let got = rank_with(&files, None, recv_only);
@@ -894,4 +899,494 @@ fn ranks_unchanged_when_recv_count_zero_full_repo() {
         files.len()
     );
     assert!(worst < 1e-3, "{worst}");
+}
+
+// ---- M7.5 §8.6: связывание ссылки с определением ----
+
+/// В1 «по виду» на весах M6.
+const W1: RankWeights = RankWeights {
+    bind_kind: true,
+    ..RankWeights::M6
+};
+/// В2 «экспорт» на весах M6.
+const W2: RankWeights = RankWeights {
+    bind_export: true,
+    ..RankWeights::M6
+};
+/// В1 + В2.
+const W12: RankWeights = RankWeights {
+    bind_kind: true,
+    bind_export: true,
+    ..RankWeights::M6
+};
+
+/// Файл с определениями `(имя, вид, exported)` и ссылками `(имя, вид, count)` (`recv` = 0).
+fn bfile(
+    path: &str,
+    defs: &[(&str, SymbolKind, Option<bool>)],
+    refs: &[(&str, RefKind, u32)],
+) -> RankFile {
+    RankFile {
+        id: 0,
+        path: path.to_string(),
+        defs: defs
+            .iter()
+            .map(|(n, k, e)| (n.to_string(), *k, *e))
+            .collect(),
+        refs: refs
+            .iter()
+            .map(|(n, k, c)| (n.to_string(), *k, *c, 0))
+            .collect(),
+    }
+}
+
+fn all_edges(files: &[RankFile], w: RankWeights) -> Vec<(usize, usize, f64)> {
+    let all: Vec<usize> = (0..files.len()).collect();
+    edges_among_with(files, &all, w)
+}
+
+/// В1: ссылка `type`/`impl` идёт только к определениям-типам, `call` — только к функциям и
+/// методам; `d(n)` — число подходящих (не всех одноимённых); `import` — ко всем, как в M6.
+#[test]
+fn bind_by_kind_type_refs_to_types_only() {
+    use SymbolKind as S;
+    let files = [
+        bfile("a.ts", &[], &[("Node", RefKind::Type, 4)]),
+        bfile("b.ts", &[("Node", S::Class, None)], &[]),
+        bfile("c.ts", &[("Node", S::Function, None)], &[]),
+        bfile("d.ts", &[], &[("Node", RefKind::Call, 9)]),
+        bfile("e.ts", &[], &[("Node", RefKind::Impl, 1)]),
+        bfile("f.ts", &[], &[("Node", RefKind::Import, 4)]),
+    ];
+    let e = all_edges(&files, W1);
+    // тип: √(4 × 2) к классу, d = 1; к функции — нет
+    assert!(close(edge(&e, 0, 1).unwrap(), 8f64.sqrt()), "{e:?}");
+    assert_eq!(edge(&e, 0, 2), None, "{e:?}");
+    // вызов: √9 к функции, d = 1; к классу — нет
+    assert!(close(edge(&e, 3, 2).unwrap(), 3.0), "{e:?}");
+    assert_eq!(edge(&e, 3, 1), None, "{e:?}");
+    // реализация — к типу
+    assert!(close(edge(&e, 4, 1).unwrap(), 2f64.sqrt()), "{e:?}");
+    assert_eq!(edge(&e, 4, 2), None, "{e:?}");
+    // импорт — ко всем одноимённым, d = 2
+    assert!(close(edge(&e, 5, 1).unwrap(), 1.0) && close(edge(&e, 5, 2).unwrap(), 1.0));
+    // M6: тип — к обоим, d = 2
+    let m6 = all_edges(&files, RankWeights::M6);
+    assert!(close(edge(&m6, 0, 1).unwrap(), 8f64.sqrt() / 2.0), "{m6:?}");
+    assert!(close(edge(&m6, 0, 2).unwrap(), 8f64.sqrt() / 2.0), "{m6:?}");
+    // ранг: класс получает поток ссылок типа, функция — вызова
+    let r = rank_with(&files, None, W1);
+    let only_type = [files[0].clone(), files[1].clone(), files[2].clone()];
+    let rt = rank_with(&only_type, None, W1).file_rank;
+    assert!(rt[1] > rt[2], "{rt:?}");
+    let r6 = rank_with(&only_type, None, RankWeights::M6).file_rank;
+    assert!(close(r6[1], r6[2]), "M6 — поровну: {r6:?}");
+    assert!((r.file_rank.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+    // ссылка типа на имя одного файла с типом и функцией: поток — типу, не функции
+    let both = [
+        bfile("a.rs", &[], &[("Store", RefKind::Type, 4)]),
+        bfile(
+            "b.rs",
+            &[("Store", S::Struct, None), ("Store", S::Function, None)],
+            &[],
+        ),
+    ];
+    // функции — только доля символов без входящих ссылок (10 %)
+    let s = &rank_with(&both, None, W1).symbol_share[1];
+    assert!(close(s[0], 0.9) && close(s[1], 0.1), "{s:?}");
+    let s6 = &rank_with(&both, None, RankWeights::M6).symbol_share[1];
+    assert!(close(s6[0], s6[1]), "M6 — поровну одноимённым: {s6:?}");
+}
+
+/// В1: имя без определения нужного вида — ко всем одноимённым, как в M6 (`d` — все); прочие
+/// виды ссылок (`import`, `other`) — ко всем.
+#[test]
+fn bind_by_kind_falls_back() {
+    use SymbolKind as S;
+    let files = [
+        bfile(
+            "a.rs",
+            &[],
+            &[
+                ("make_store", RefKind::Type, 2),
+                ("Store", RefKind::Call, 4),
+                ("cfg", RefKind::Other, 1),
+            ],
+        ),
+        bfile(
+            "b.rs",
+            &[
+                ("make_store", S::Function, None),
+                ("Store", S::Struct, None),
+                ("cfg", S::Const, None),
+            ],
+            &[],
+        ),
+        bfile(
+            "c.rs",
+            &[("make_store", S::Function, None), ("cfg", S::Module, None)],
+            &[],
+        ),
+    ];
+    for w in [W1, W12] {
+        let e = all_edges(&files, w);
+        let m6 = all_edges(&files, RankWeights::M6);
+        assert_eq!(e.len(), m6.len(), "{w:?}: {e:?}");
+        for (x, y) in e.iter().zip(&m6) {
+            assert!(
+                x.0 == y.0 && x.1 == y.1 && close(x.2, y.2),
+                "{w:?}: {e:?} / {m6:?}"
+            );
+        }
+        assert_eq!(rank_with(&files, None, w), rank(&files, None), "{w:?}");
+    }
+    // тип `make_store` (функции в b и c): √(2 × 2) × 10 / 2 к каждому
+    let e = all_edges(&files, W1);
+    assert!(close(edge(&e, 0, 2).unwrap(), 10.0 + 0.5), "{e:?}");
+}
+
+/// В2: ссылка из другого файла не идёт к определению с `exported = Some(false)`; `None`
+/// (язык без признака) — идёт; своё закрытое определение файла — среди подходящих (`d`), но
+/// ребра к себе нет.
+#[test]
+fn bind_exported_skips_private_cross_file() {
+    use SymbolKind as S;
+    let files = [
+        bfile("a.rs", &[], &[("helper", RefKind::Call, 9)]),
+        bfile(
+            "b.rs",
+            &[
+                ("helper", S::Function, Some(false)),
+                ("Api", S::Struct, Some(true)),
+            ],
+            &[],
+        ),
+        bfile("c.rs", &[("helper", S::Function, Some(true))], &[]),
+        bfile("d.py", &[("helper", S::Function, None)], &[]),
+        bfile(
+            "e.rs",
+            &[("helper", S::Function, Some(false))],
+            &[("helper", RefKind::Call, 9), ("Api", RefKind::Type, 2)],
+        ),
+    ];
+    for w in [W2, W12] {
+        let e = all_edges(&files, w);
+        // a: подходящие — c и d (d = 2): √9 / 2
+        assert_eq!(edge(&e, 0, 1), None, "{w:?}: {e:?}");
+        assert!(close(edge(&e, 0, 2).unwrap(), 1.5) && close(edge(&e, 0, 3).unwrap(), 1.5));
+        // e: подходящие — c, d и своё закрытое (d = 3), ребра к себе и к b нет
+        assert!(close(edge(&e, 4, 2).unwrap(), 1.0), "{w:?}: {e:?}");
+        assert!(close(edge(&e, 4, 3).unwrap(), 1.0), "{w:?}: {e:?}");
+        assert_eq!(edge(&e, 4, 4), None);
+        // тип `Api` открыт — ребро есть
+        assert!(close(edge(&e, 4, 1).unwrap(), 2.0), "{w:?}: {e:?}");
+        // доли b: закрытый `helper` потока не получает — у него доля символов без ссылок
+        let s = &rank_with(&files, None, w).symbol_share[1];
+        assert!(close(s[1], 0.9) && close(s[0], 0.1), "{w:?}: {s:?}");
+    }
+    let s6 = &rank_with(&files, None, RankWeights::M6).symbol_share[1];
+    assert!(s6[0] > 0.1 && s6[1] < 0.9, "M6: {s6:?}");
+    // M6: к закрытому тоже (d = 4)
+    let m6 = all_edges(&files, RankWeights::M6);
+    assert!(close(edge(&m6, 0, 1).unwrap(), 0.75), "{m6:?}");
+    // все определения имени закрыты: ссылка из другого файла рёбер не даёт
+    let closed = [
+        bfile("a.rs", &[], &[("helper", RefKind::Call, 4)]),
+        bfile("b.rs", &[("helper", S::Function, Some(false))], &[]),
+    ];
+    assert!(all_edges(&closed, W2).is_empty());
+    assert_eq!(all_edges(&closed, RankWeights::M6).len(), 1);
+}
+
+/// Входы эталона M6 (`tests/fixtures/rank_m57/inputs.json`) с `recv_count = count / 2` у
+/// вызовов — так эталон проверяет и вызов по получателю.
+fn m6_inputs(v: &serde_json::Value) -> Vec<RankFile> {
+    m57_inputs(v)
+        .into_iter()
+        .map(|mut f| {
+            for r in &mut f.refs {
+                if r.1 == RefKind::Call {
+                    r.3 = r.2 / 2;
+                }
+            }
+            f
+        })
+        .collect()
+}
+
+/// Числа эталона — строки `{:?}` (кратчайшая точная запись `f64`): разбор без потерь.
+fn exact(v: &serde_json::Value) -> Vec<f64> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().parse::<f64>().unwrap())
+        .collect()
+}
+
+/// Правила M6 (`RankWeights::M6`, связывание «ко всем») после M7.5 дают побайтово прежние ранги
+/// файлов, доли символов, ранги с фокусом и рёбра. Эталон `tests/fixtures/rank_m57/ranks_m6.json`
+/// посчитан библиотекой до M7.5 (база ветки `19c521b7`) на входах эталона M5.7 (`rank_m57`).
+#[test]
+fn rank_m6_unchanged() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rank_m57");
+    let read = |f: &str| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(dir.join(f)).unwrap()).unwrap()
+    };
+    let files = m6_inputs(&read("inputs.json"));
+    let want = read("ranks_m6.json");
+    assert_eq!(
+        RankWeights::M6,
+        RankWeights {
+            kind_table: true,
+            recv: true,
+            bind_kind: false,
+            bind_export: false,
+        }
+    );
+    for r in [rank(&files, None), rank_with(&files, None, RankWeights::M6)] {
+        assert_eq!(r.file_rank, exact(&want["file_rank"]), "ранги файлов");
+        let shares: Vec<Vec<f64>> = want["symbol_share"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(exact)
+            .collect();
+        assert_eq!(r.symbol_share, shares, "доли символов");
+    }
+    let f = &want["focus"];
+    let focus = Focus {
+        paths: vec![f["paths"][0].as_str().unwrap().to_string()],
+        idents: vec![f["idents"][0].as_str().unwrap().to_string()],
+        text: f["text"].as_str().map(str::to_string),
+    };
+    let restart = focus_restart(&files, &focus).unwrap();
+    assert_eq!(
+        Graph::new(&files),
+        Graph::with_weights(&files, RankWeights::M6)
+    );
+    let fr = rank_on_graph(&Graph::new(&files), Some(&restart));
+    assert_eq!(fr, exact(&want["focus_rank"]), "ранги с фокусом");
+    let all: Vec<usize> = (0..files.len()).collect();
+    let want_edges: Vec<(usize, usize, f64)> = want["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e[0].as_u64().unwrap() as usize,
+                e[1].as_u64().unwrap() as usize,
+                e[2].as_str().unwrap().parse().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(edges_among(&files, &all), want_edges, "рёбра");
+    assert_eq!(edges_among_with(&files, &all, RankWeights::M6), want_edges);
+    // связывание меняет ранги этих входов (иначе эталон ничего не проверял бы)
+    for w in [W1, W2, W12] {
+        assert_ne!(rank_with(&files, None, w).file_rank, r_m6(&files), "{w:?}");
+    }
+}
+
+/// Правила сервера M7.5 — M6 и В2 (выбор `code-bench`, журнал этапа); отпечатки правил различны.
+#[test]
+fn m75_is_m6_with_export_binding() {
+    assert_eq!(RankWeights::M75, W2);
+    assert_eq!(RankWeights::M75.rules_id(), "rank:1101");
+    assert_eq!(RankWeights::M6.rules_id(), "rank:1100");
+    assert_eq!(RankWeights::M57.rules_id(), "rank:0000");
+}
+
+fn r_m6(files: &[RankFile]) -> Vec<f64> {
+    rank(files, None).file_rank
+}
+
+/// Класс ссылки при связывании В1 (эталон, независимо от `rank.rs`): 1 — типы, 2 — функции и
+/// методы, 0 — все виды.
+fn ref_class(k: RefKind, w: RankWeights) -> u8 {
+    match k {
+        _ if !w.bind_kind => 0,
+        RefKind::Type | RefKind::Impl => 1,
+        RefKind::Call => 2,
+        RefKind::Import | RefKind::Other => 0,
+    }
+}
+
+fn def_in_class(k: SymbolKind, class: u8) -> bool {
+    match class {
+        1 => matches!(
+            k,
+            SymbolKind::Class
+                | SymbolKind::Struct
+                | SymbolKind::Enum
+                | SymbolKind::Interface
+                | SymbolKind::Trait
+                | SymbolKind::Type
+        ),
+        2 => matches!(k, SymbolKind::Function | SymbolKind::Method),
+        _ => true,
+    }
+}
+
+/// Плотный эталон связывания (M7.5 §8.6): для каждой ссылки A — класс (нет определений класса —
+/// все виды), подходящие файлы (у В2 — с открытым определением; своё закрытое учитывается в `d`),
+/// ребро к каждому подходящему B ≠ A весом `√c × m(n, файлов группы) / d`.
+type Group = (String, u8);
+
+fn dense_bound(files: &[RankFile], w: RankWeights) -> Vec<(usize, usize, Group, f64)> {
+    let files_of = |name: &str, class: u8, open: bool| -> Vec<usize> {
+        (0..files.len())
+            .filter(|&i| {
+                files[i].defs.iter().any(|(n, k, e)| {
+                    n == name && def_in_class(*k, class) && (!open || *e != Some(false))
+                })
+            })
+            .collect()
+    };
+    let mut out = Vec::new();
+    for (a, f) in files.iter().enumerate() {
+        let mut agg: HashMap<Group, f64> = HashMap::new();
+        for (n, k, c, r) in &f.refs {
+            let mut class = ref_class(*k, w);
+            if class != 0 && files_of(n, class, false).is_empty() {
+                class = 0;
+            }
+            *agg.entry((n.clone(), class)).or_default() += table_contribution(*k, *c, *r);
+        }
+        for ((n, class), c) in agg {
+            let all = files_of(&n, class, false);
+            if all.is_empty() || c == 0.0 {
+                continue;
+            }
+            let rcv = if w.bind_export {
+                files_of(&n, class, true)
+            } else {
+                all.clone()
+            };
+            let own_closed = all.contains(&a) && !rcv.contains(&a);
+            let d = rcv.len() + usize::from(own_closed);
+            let wt = c.sqrt() * ident_mult(&n, all.len()) / d as f64;
+            for &b in rcv.iter().filter(|&&b| b != a) {
+                out.push((a, b, (n.clone(), class), wt));
+            }
+        }
+    }
+    out
+}
+
+fn dense_bound_edges(files: &[RankFile], w: RankWeights) -> Vec<(usize, usize, f64)> {
+    let mut sum: HashMap<(usize, usize), f64> = HashMap::new();
+    for (a, b, _, wt) in dense_bound(files, w) {
+        *sum.entry((a, b)).or_default() += wt;
+    }
+    let mut e: Vec<_> = sum.into_iter().map(|((a, b), x)| (a, b, x)).collect();
+    e.sort_by_key(|e| (e.0, e.1));
+    e
+}
+
+/// Плотный эталон долей при связывании: поток группы, пришедший в файл, делится поровну между
+/// определениями файла, которые его принимают (вид класса, у В2 — открытые).
+fn dense_bound_shares(files: &[RankFile], r: &[f64], w: RankWeights) -> Vec<Vec<f64>> {
+    let named = dense_bound(files, w);
+    let mut out = vec![0.0; files.len()];
+    for (a, _, _, x) in &named {
+        out[*a] += x;
+    }
+    let mut inflow: Vec<HashMap<Group, f64>> = vec![HashMap::new(); files.len()];
+    for (a, b, g, x) in named {
+        *inflow[b].entry(g).or_default() += r[a] * x / out[a];
+    }
+    files
+        .iter()
+        .zip(&inflow)
+        .map(|(f, inf)| {
+            let groups = |(n, k, e): &(String, SymbolKind, Option<bool>)| -> Vec<Group> {
+                if w.bind_export && *e == Some(false) {
+                    return Vec::new();
+                }
+                let mut g = vec![(n.clone(), 0)];
+                for class in [1, 2] {
+                    if w.bind_kind && def_in_class(*k, class) {
+                        g.push((n.clone(), class));
+                    }
+                }
+                g
+            };
+            let mut takers: HashMap<Group, f64> = HashMap::new();
+            for d in &f.defs {
+                for g in groups(d) {
+                    *takers.entry(g).or_default() += 1.0;
+                }
+            }
+            let fl: Vec<f64> = f
+                .defs
+                .iter()
+                .map(|d| {
+                    groups(d)
+                        .iter()
+                        .map(|g| inf.get(g).copied().unwrap_or(0.0) / takers[g])
+                        .sum()
+                })
+                .collect();
+            let hot: f64 = fl.iter().sum();
+            let cold: f64 = f
+                .defs
+                .iter()
+                .zip(&fl)
+                .filter(|(_, x)| **x <= 0.0)
+                .map(|((_, k, e), _)| kind_w(*k, *e))
+                .sum();
+            let (hp, cp) = match (hot > 0.0, cold > 0.0) {
+                (true, true) => (0.9, 0.1),
+                (true, false) => (1.0, 0.0),
+                _ => (0.0, 1.0),
+            };
+            f.defs
+                .iter()
+                .zip(&fl)
+                .map(|((_, k, e), x)| {
+                    if *x > 0.0 {
+                        hp * x / hot
+                    } else {
+                        cp * kind_w(*k, *e) / cold
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+proptest! {
+    /// Факторизованный граф со связыванием (В1, В2, В1 + В2) = плотный эталон: ранги с
+    /// перезапуском и без, рёбра, доли символов.
+    #[test]
+    fn bound_factorized_equals_dense(
+        files in arb_files(),
+        restart in proptest::collection::vec(0.0f64..1.0, 25),
+        focused in any::<bool>(),
+        variant in 0usize..3,
+    ) {
+        let w = [W1, W2, W12][variant];
+        let n = files.len();
+        let restart = focused.then(|| restart[..n].to_vec());
+        let fact = rank_on_graph(&Graph::with_weights(&files, w), restart.as_deref());
+        let dense = pagerank(n, &dense_bound_edges(&files, w), restart.as_deref());
+        let l1: f64 = fact.iter().zip(&dense).map(|(a, b)| (a - b).abs()).sum();
+        prop_assert!(l1 < 1e-9, "L1 {}", l1);
+        let all: Vec<usize> = (0..n).rev().collect();
+        let mut among = edges_among_with(&files, &all, w);
+        among.sort_by_key(|e| (e.0, e.1));
+        let de = dense_bound_edges(&files, w);
+        prop_assert_eq!(among.len(), de.len(), "{:?} / {:?}", among, de);
+        for (x, y) in among.iter().zip(&de) {
+            prop_assert!(x.0 == y.0 && x.1 == y.1 && (x.2 - y.2).abs() < 1e-12);
+        }
+        let r = rank_with(&files, None, w);
+        let shares = dense_bound_shares(&files, &r.file_rank, w);
+        for (i, (s, d)) in r.symbol_share.iter().zip(&shares).enumerate() {
+            prop_assert_eq!(s.len(), d.len());
+            for (a, b) in s.iter().zip(d) {
+                prop_assert!((a - b).abs() < 1e-9, "файл {}: {:?} != {:?}", i, s, d);
+            }
+        }
+    }
 }

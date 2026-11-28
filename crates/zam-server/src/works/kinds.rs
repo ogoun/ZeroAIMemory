@@ -9,9 +9,18 @@
 //! - `rules` (задача 7) — кандидаты в Rules ([`super::rules`]): сборщик, инструкция, схема,
 //!   проверка элемента (общая со спонтанным кандидатом агента), отказ исполнителя — строка
 //!   `skipped`, контекст пакета — действующие заметки Rules (запись `n="0"`);
+//! - `tidy` (M7.5 §8.7) — уборка памяти ([`super::tidy`]): кандидаты — сборщик
+//!   [`zam_store::tidy`] (почти-дубли, противоречия, устаревшие, шумные, непроходящие пробы),
+//!   инструкция, схема, проверка операции; итог — предложения человеку, отказ и `keep` — строки
+//!   `skipped`;
 //! - `echo` (только фича `test-hooks`, решение 73) — тестовый вид: кандидаты — записи журнала
 //!   пространства, итог элемента — `{n, target?, text}` без записи в память (тесты очереди,
 //!   пакета, итога и режима модели).
+//!
+//! **Отсев — один раз на запуск вида** ([`sifted`], M7.5 §8.7 п. 4): отправленное в этом запуске
+//! (`offered_refs`), итоги прежних работ вида (выброшенное вторым сканом; у `echo` — ещё
+//! принятое) и у `tidy` — отклонённое человеком по ссылкам; считается в начале запуска и
+//! передаётся сборщику каждого пространства (`exclude`), а не собирается на каждом.
 //!
 //! **Что уходит наружу** (§6 «Общее»): сборщики берут только записи решений и Knowledge владельца
 //! базы и заметки его Rules, автор каждой ревизии — владелец
@@ -24,7 +33,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 use zam_core::Id;
-use zam_store::works::{ItemWrite, Origin, WorkKind};
+use zam_store::works::{ItemWrite, WorkKind};
 use zam_store::{Db, SpaceKind, StoreError};
 
 use super::night::NightCtx;
@@ -32,7 +41,8 @@ use crate::agent_setup::Lang;
 use crate::app::AppState;
 
 /// Кандидат пакета: ссылка и ревизия записи, её вид, заголовок (исходник; маска — при выдаче),
-/// текст вида агента (маска уже наложена, обрезан) и сигналы вида (`имя`, `значение`).
+/// текст вида агента (маска уже наложена, обрезан), сигналы вида (`имя`, `значение`) и остальные
+/// записи кандидата `refs` (у кандидата уборки из нескольких записей; у прочих видов пусто).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub target: String,
@@ -41,6 +51,7 @@ pub struct Candidate {
     pub title: String,
     pub text: String,
     pub signals: Vec<(String, String)>,
+    pub refs: Vec<(String, i64)>,
 }
 
 impl Candidate {
@@ -54,6 +65,7 @@ impl Candidate {
             title: self.title,
             text: self.text,
             signals: self.signals,
+            refs: self.refs,
         }
     }
 
@@ -66,8 +78,81 @@ impl Candidate {
             title: i.title.clone(),
             text: i.text.clone(),
             signals: i.signals.clone(),
+            refs: i.refs.clone(),
         }
     }
+}
+
+/// Отсев запуска вида (§8.7 п. 4, [`sifted`]): пары «ссылка, ревизия», которые сборщик не берёт,
+/// и у `tidy` — ключи кандидатов, отклонённых человеком (по ссылкам, в любой ревизии); у `tidy`
+/// ещё — кандидаты всего запуска, собранные один раз (первым пространством; курсор почти-дублей
+/// сдвигается раз за запуск, срез до 20 за ночь — по всем пространствам пользователя).
+#[derive(Debug, Default)]
+pub struct Sifted {
+    pub pairs: HashSet<(String, i64)>,
+    pub declined: HashSet<String>,
+    /// У `tidy` — остаток кандидатов запуска ([`super::tidy::room`]) на момент отсева.
+    pub(super) tidy_room: Option<usize>,
+    pub(super) tidy: tokio::sync::OnceCell<Vec<zam_store::tidy::TidyCandidate>>,
+}
+
+impl Sifted {
+    /// Отсев из пар `pairs` (тесты и вызовы вне запуска).
+    pub fn of(pairs: HashSet<(String, i64)>) -> Sifted {
+        Sifted {
+            pairs,
+            ..Sifted::default()
+        }
+    }
+
+    /// Элементы работы, отправленные в этом запуске (работа модели выполнена): той же ночью их
+    /// записи снова не идут.
+    pub fn add_items(&mut self, items: &[zam_store::works::WorkItem]) {
+        self.pairs
+            .extend(items.iter().flat_map(zam_store::works::WorkItem::all_refs));
+    }
+}
+
+/// Отсев вида `kind` вне запуска — итоги прежних работ и решения человека без «отправлено в этом
+/// запуске»: выброшенное вторым сканом ([`zam_store::works::excluded_refs`]); у `echo` — ещё
+/// принятое в той же ревизии ([`zam_store::works::accepted_refs`]); у `tidy` — отклонённое
+/// человеком по ссылкам в любой ревизии. Принятое у `probes`, `rules` и `tidy` отсеивается не
+/// парами `accepted_refs`, а самими записями итога: активная проба, строка `proposals` с ключом
+/// отсева — запись, чья проба или предложение не записались, возвращается (ревью M7.3 r1, M1 и
+/// Minor 5–6), а запись кандидата уборки не выпадает на год из кандидатов других типов
+/// [решение исполнителя, задача 2 M7.5].
+pub async fn settled(db: &Db, kind: WorkKind) -> Result<Sifted, StoreError> {
+    let mut s = Sifted::of(zam_store::works::excluded_refs(db, kind).await?);
+    match kind {
+        WorkKind::Tidy => {
+            s.declined = zam_store::proposals::declined_tidy_keys(db).await?;
+        }
+        #[cfg(feature = "test-hooks")]
+        WorkKind::Echo => {
+            s.pairs
+                .extend(zam_store::works::accepted_refs(db, kind).await?);
+        }
+        WorkKind::Probes | WorkKind::Rules => {}
+    }
+    Ok(s)
+}
+
+/// Отсев запуска `plan` (§8.7 п. 4) — **один раз на вид и запуск**: [`settled`] и отправленное в
+/// пакетах вида этого запуска ([`zam_store::works::offered_refs`]); у `tidy` — ещё остаток
+/// кандидатов запуска.
+pub async fn sifted(
+    db: &Db,
+    kind: WorkKind,
+    plan: &super::queue::Plan,
+) -> Result<Sifted, StoreError> {
+    #[cfg(feature = "test-hooks")]
+    test_hooks::count_sift(plan.user, kind);
+    let mut s = settled(db, kind).await?;
+    s.pairs.extend(super::queue::offered(db, plan).await?);
+    if kind == WorkKind::Tidy {
+        s.tidy_room = Some(super::tidy::room(db, plan).await?);
+    }
+    Ok(s)
 }
 
 /// Отказ элемента итога: причина для исполнителя (`rejected: [{n, target, reason}]`).
@@ -128,6 +213,7 @@ pub fn space_kinds(kind: WorkKind) -> &'static [SpaceKind] {
     match kind {
         WorkKind::Probes => &[SpaceKind::Solution, SpaceKind::Knowledge, SpaceKind::Rules],
         WorkKind::Rules => &[SpaceKind::Rules],
+        WorkKind::Tidy => &[SpaceKind::Solution, SpaceKind::Knowledge],
         #[cfg(feature = "test-hooks")]
         WorkKind::Echo => &[SpaceKind::Solution, SpaceKind::Knowledge],
     }
@@ -140,27 +226,31 @@ pub fn label(kind: WorkKind, lang: Lang) -> &'static str {
         (WorkKind::Probes, Lang::En) => "probes",
         (WorkKind::Rules, Lang::Ru) => "правила",
         (WorkKind::Rules, Lang::En) => "rules",
+        (WorkKind::Tidy, Lang::Ru) => "уборка",
+        (WorkKind::Tidy, Lang::En) => "tidy",
         #[cfg(feature = "test-hooks")]
         (WorkKind::Echo, _) => "echo",
     }
 }
 
 /// Кандидаты вида в пространстве `space` пользователя `user` — детерминированно, до `limit`
-/// (§6.3 п. 2), без пар «ссылка, ревизия» `exclude` — уже отправленных в пакетах этого запуска
-/// (ночь, сутки ручных запусков; [`zam_store::works::offered_refs`]): они отсеиваются **до**
-/// `limit`, той же ночью запись в пакет снова не идёт (ревью r1 задачи 4, I1). Пусто — работы нет.
+/// (§6.3 п. 2), без пар «ссылка, ревизия» отсева запуска `sifted` ([`sifted`]: отправленные в
+/// пакетах этого запуска — ночь, сутки ручных запусков, — и итоги прежних работ): они
+/// отсеиваются **до** `limit`, той же ночью запись в пакет снова не идёт (ревью r1 задачи 4, I1).
+/// Пусто — работы нет.
 pub async fn collect(
     kind: WorkKind,
     ctx: &NightCtx,
     user: Id,
     space: Id,
     limit: usize,
-    exclude: &HashSet<(String, i64)>,
+    sifted: &Sifted,
 ) -> Result<Vec<Candidate>, StoreError> {
-    let _ = (ctx, user, space, limit, exclude);
+    let exclude = &sifted.pairs;
     match kind {
         WorkKind::Probes => super::probes::collect(ctx, user, space, limit, exclude).await,
         WorkKind::Rules => super::rules::collect(ctx, user, space, limit, exclude).await,
+        WorkKind::Tidy => super::tidy::collect(ctx, user, space, limit, sifted).await,
         #[cfg(feature = "test-hooks")]
         WorkKind::Echo => echo::collect(ctx, user, space, limit, exclude).await,
     }
@@ -173,6 +263,7 @@ pub fn instruction(kind: WorkKind, lang: Lang) -> &'static str {
         (WorkKind::Probes, Lang::Ru) => super::probes::INSTRUCTION_RU,
         (WorkKind::Probes, Lang::En) => super::probes::INSTRUCTION_EN,
         (WorkKind::Rules, lang) => super::rules::instruction(lang),
+        (WorkKind::Tidy, lang) => super::tidy::instruction(lang),
         #[cfg(feature = "test-hooks")]
         (WorkKind::Echo, Lang::Ru) => {
             "Тестовый вид echo: для каждой записи верни элемент {n, text} — text: заголовок \
@@ -192,6 +283,7 @@ pub fn schema(kind: WorkKind) -> &'static str {
     match kind {
         WorkKind::Probes => super::probes::SCHEMA,
         WorkKind::Rules => super::rules::SCHEMA,
+        WorkKind::Tidy => super::tidy::SCHEMA,
         #[cfg(feature = "test-hooks")]
         WorkKind::Echo => r#"{"items": [{"n": 1, "text": "…"}], "skip": "<причина>"?}"#,
     }
@@ -211,10 +303,10 @@ pub async fn accept_item(
     item: &Value,
     prior: &[ItemWrite],
 ) -> Result<Vec<ItemWrite>, Reject> {
-    let _ = (ctx, n, item, prior);
     match kind {
         WorkKind::Probes => super::probes::accept(ctx, n, item, prior).await,
         WorkKind::Rules => super::rules::accept(ctx, n, item, prior).await,
+        WorkKind::Tidy => super::tidy::accept(ctx, n, item).await,
         #[cfg(feature = "test-hooks")]
         WorkKind::Echo => echo::accept(ctx, n, item).await,
     }
@@ -235,6 +327,9 @@ pub fn kept_item(rows: &[ItemWrite]) -> Value {
             reason,
             ..
         }) => serde_json::json!({"rule": {"path": path, "content": content}, "reason": reason}),
+        Some(ItemWrite::Tidy {
+            payload, reason, ..
+        }) => serde_json::json!({"op": payload["op"], "reason": reason}),
         #[cfg(feature = "test-hooks")]
         Some(ItemWrite::Echo { text, .. }) => serde_json::json!({"text": text}),
         Some(ItemWrite::RuleSkip { .. }) | None => serde_json::json!({}),
@@ -253,6 +348,7 @@ pub fn skip_writes(
 ) -> Vec<ItemWrite> {
     match kind {
         WorkKind::Rules => super::rules::skip(ctx, item, why),
+        WorkKind::Tidy => super::tidy::skip(ctx, item, why),
         WorkKind::Probes => Vec::new(),
         #[cfg(feature = "test-hooks")]
         WorkKind::Echo => Vec::new(),
@@ -270,7 +366,7 @@ pub async fn context(
 ) -> Result<Option<Candidate>, StoreError> {
     match kind {
         WorkKind::Rules => super::rules::context(db, space, budget).await,
-        WorkKind::Probes => Ok(None),
+        WorkKind::Probes | WorkKind::Tidy => Ok(None),
         #[cfg(feature = "test-hooks")]
         WorkKind::Echo => Ok(None),
     }
@@ -282,17 +378,29 @@ pub fn repeats(kind: WorkKind) -> bool {
     matches!(kind, WorkKind::Probes)
 }
 
+/// Находит ли поле `target` элемента итога элемент пакета (у `probes`, `rules`, `echo` — да: номер
+/// `n` или ссылка); у `tidy` — нет: `target` там — цель операции (любая запись кандидата), элемент
+/// — только по `n`.
+pub fn target_locates(kind: WorkKind) -> bool {
+    kind != WorkKind::Tidy
+}
+
 /// Сколько кандидатов вида ещё имеет смысл поставить пользователю базы `db` в запуске постановки
-/// `origin` (предел записей вида, а не пакетов): у `probes` — остаток пределов новых и активных
-/// проб (0 — запуск вида закончен: пакетов и обращений к модели нет); `None` — предела нет.
+/// `plan` (предел записей вида, а не пакетов): у `probes` — остаток пределов новых и активных
+/// проб (0 — запуск вида закончен: пакетов и обращений к модели нет); у `tidy` — остаток
+/// [`zam_store::tidy::NIGHT_MAX`] кандидатов за ночь (у ручных — за сутки UTC); `None` — предела
+/// нет.
 pub async fn room(
     kind: WorkKind,
     ctx: &NightCtx,
     db: &Db,
-    origin: Origin,
+    plan: &super::queue::Plan,
 ) -> Result<Option<usize>, StoreError> {
     match kind {
-        WorkKind::Probes => super::probes::room(ctx.st(), db, origin).await.map(Some),
+        WorkKind::Probes => super::probes::room(ctx.st(), db, plan.origin)
+            .await
+            .map(Some),
+        WorkKind::Tidy => super::tidy::room(db, plan).await.map(Some),
         WorkKind::Rules => Ok(None),
         #[cfg(feature = "test-hooks")]
         WorkKind::Echo => Ok(None),
@@ -301,6 +409,38 @@ pub async fn room(
 
 #[cfg(feature = "test-hooks")]
 pub use echo::TEST_CANCEL_DURING_ACCEPT;
+
+/// Тестовые точки диспетчера (фича `test-hooks`): число расчётов отсева [`sifted`] по
+/// пользователю и виду (§8.7 п. 4: один раз на запуск вида).
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub mod test_hooks {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    use zam_core::Id;
+    use zam_store::works::WorkKind;
+
+    static SIFTS: LazyLock<Mutex<HashMap<(Id, WorkKind), u32>>> = LazyLock::new(Default::default);
+
+    pub(super) fn count_sift(user: Id, kind: WorkKind) {
+        *SIFTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry((user, kind))
+            .or_default() += 1;
+    }
+
+    /// Сколько раз считался отсев вида `kind` пользователя `user` (а с ним — `offered_refs`).
+    pub fn sifts(user: Id, kind: WorkKind) -> u32 {
+        SIFTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(user, kind))
+            .copied()
+            .unwrap_or(0)
+    }
+}
 
 /// Тестовый вид `echo` (фича `test-hooks`).
 #[cfg(feature = "test-hooks")]
@@ -312,8 +452,9 @@ mod echo {
     use super::{Candidate, ItemCtx, ItemWrite, NightCtx, Reject};
     use crate::works::package::{ITEM_TEXT_MAX_CHARS, agent_text};
 
-    /// Кандидаты — живые insight пространства владельца, кроме принятых в той же ревизии,
-    /// отсеянных ([`zam_store::works::excluded_refs`]) и отправленных в этом запуске (`exclude`).
+    /// Кандидаты — живые insight пространства владельца, кроме пар отсева запуска `exclude`
+    /// (принятые в той же ревизии, выброшенные вторым сканом, отправленные в этом запуске —
+    /// [`super::sifted`]).
     pub(super) async fn collect(
         ctx: &NightCtx,
         user: Id,
@@ -322,12 +463,8 @@ mod echo {
         exclude: &std::collections::HashSet<(String, i64)>,
     ) -> Result<Vec<Candidate>, StoreError> {
         let db = ctx.st().users.get(user).await?;
-        let kind = zam_store::works::WorkKind::Echo;
-        let mut skip = zam_store::works::excluded_refs(&db, kind).await?;
-        skip.extend(zam_store::works::accepted_refs(&db, kind).await?);
-        skip.extend(exclude.iter().cloned());
         let rows =
-            zam_store::works::owner_entries(&db, user, space, &["insight"], &skip, limit).await?;
+            zam_store::works::owner_entries(&db, user, space, &["insight"], exclude, limit).await?;
         Ok(rows
             .into_iter()
             .map(|e| Candidate {
@@ -337,6 +474,7 @@ mod echo {
                 title: e.title,
                 text: agent_text(&e.body),
                 signals: Vec::new(),
+                refs: Vec::new(),
             })
             .collect())
     }

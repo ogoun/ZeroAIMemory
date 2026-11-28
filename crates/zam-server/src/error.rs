@@ -161,6 +161,11 @@ pub enum ApiError {
     /// маски; в `detail` — номера строк маскированного вида, без значений.
     #[error("{0}")]
     SecretContextChanged(String),
+    /// 422 `/problems/secrets-detected`, `code: secrets_detected` (M7.5 §8.9 п. 5): запись с
+    /// `reject_secrets: true`, в тексте которой сканер нашёл новые значения, похожие на секреты, —
+    /// ничего не записано; тело несёт `secrets_detected: [{kind, line}]` (без значений).
+    #[error("{detail}")]
+    SecretsDetected { detail: String, hits: Vec<Value> },
     /// 422 `/problems/certainty` (§7.5): нарушение матрицы прав `certainty` — нет
     /// доказательства или причины; `code` — машинный код ([`zam_store::CertaintyError::code`]).
     #[error("{0}")]
@@ -393,6 +398,11 @@ impl ApiError {
                 "/problems/secret-context-changed",
                 "Unprocessable Content",
             ),
+            ApiError::SecretsDetected { .. } => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "/problems/secrets-detected",
+                "Unprocessable Content",
+            ),
             ApiError::Certainty(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "/problems/certainty",
@@ -543,6 +553,13 @@ impl IntoResponse for ApiError {
             o.insert(
                 "code".into(),
                 json!(crate::api::secret_restore::SECRET_CONTEXT_CHANGED),
+            );
+        }
+        if let (ApiError::SecretsDetected { hits, .. }, Value::Object(o)) = (&self, &mut body) {
+            o.insert("code".into(), json!(crate::api::secrets::SECRETS_DETECTED));
+            o.insert(
+                crate::api::secrets::SECRETS_DETECTED.into(),
+                Value::Array(hits.clone()),
             );
         }
         if let (ApiError::SolutionAccess { guid, state }, Value::Object(o)) = (&self, &mut body) {

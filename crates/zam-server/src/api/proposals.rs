@@ -31,6 +31,18 @@
 //! - `POST /proposals/{id}/withdraw` — автор отзывает своё: токен `rw` пользователя, предложение
 //!   агента (`author_kind = agent`); человеку — 403 (он отклоняет), предложению модели — 403.
 //!
+//!
+//! **Уборка** (M7.5 §8.7, тип `tidy`, признак `tidy`): предложения создаёт только внутренняя
+//! работа вида `tidy` (`POST /proposals` с `type: tidy` — 400). Карточка — ещё `candidate`,
+//! `signals`, `records` (ссылка, ревизия, L1, `human_decision` у `axiom`), `ops`, `op` и `stale`
+//! (запись изменилась после предложения: «Применить» — 409). «Применить» — `POST
+//! /proposals/{id}/accept {text?}` (только сессия WebUI; `text` — правка человеком текста `merge`
+//! или `append`): ревизии всех записей сверяются до первой операции — не та — предложение
+//! `stale`, 409 `code: stale`; операция — **тем же кодом, что у человека в WebUI** (замещение,
+//! отзыв, `PATCH` записи, создание термина), от имени человека, сообщение ревизии «из
+//! предложения o:<id> (model:<имя> | сессия <id>)» ([`accept_tidy`]). Удаления нет. «Отклонить» —
+//! `declined`: тот же кандидат по ссылкам больше не предлагается ни в какой ревизии.
+//!
 //! Ответы токену — с маской `‹secret›` (вид агента); человеку — исходник. Предложения —
 //! служебные данные (ссылка `o:`): `memory_read` их не читает, в экспорт и архив пространства не
 //! входят; маршруты — вне `memory_routes` (предложение само ничего не меняет в памяти).
@@ -67,8 +79,8 @@ pub const LIST_LIMIT_DEFAULT: usize = 50;
 /// `detail` ответа 403 токену `ro` (§6.7 п. 2).
 pub const RW_REQUIRED_DETAIL: &str = "кандидат в Rules требует токен rw";
 /// `detail` ответа 403 токену на «Принять» и «Отклонить» (§6.7 п. 4).
-pub const HUMAN_ONLY_DETAIL: &str = "кандидата в Rules принимает и отклоняет только человек \
-     (WebUI «Кандидаты в Rules»); своё агент отзывает — POST /proposals/{id}/withdraw";
+pub const HUMAN_ONLY_DETAIL: &str = "предложение (кандидата в Rules, уборку) принимает и отклоняет \
+     только человек (WebUI «Предложения»); своё агент отзывает — POST /proposals/{id}/withdraw";
 
 /// Решения по предложениям — по одному: у принятия создание заметки и решение — два шага, и
 /// отклонение или отзыв между ними оставили бы заметку при ответе 409 (ревью r1, Minor 1); второе
@@ -84,15 +96,19 @@ fn proposal_id(raw: &str) -> Result<Id, ApiError> {
         .map_err(|_| ApiError::BadRequest("предложение: o:<id>".into()))
 }
 
-/// Тип по строке запроса: `rule` (по умолчанию); иное — 400.
+/// Тип по строке запроса: `rule` (по умолчанию) | `tidy`; иное — 400.
 fn parse_type(raw: Option<&str>) -> Result<ProposalType, ApiError> {
     match raw.map(str::trim).filter(|s| !s.is_empty()) {
         None => Ok(ProposalType::Rule),
-        Some(s) => ProposalType::parse(s).ok_or_else(|| ApiError::BadRequest("type: rule".into())),
+        Some(s) => {
+            ProposalType::parse(s).ok_or_else(|| ApiError::BadRequest("type: rule | tidy".into()))
+        }
     }
 }
 
-/// Предложение как JSON (карточка списка); токену — с маской.
+/// Предложение как JSON (карточка списка); токену — с маской. У `tidy` — ещё поля кандидата
+/// уборки из `payload` (`candidate`, `signals`, `records`, `ops`, `op`); `stale` ставит
+/// вызывающий ([`mark_live`]).
 pub fn proposal_json(p: &Principal, x: &Proposal) -> Value {
     let ts = |t: Option<jiff::Timestamp>| t.map(zam_store::time::fmt_ts);
     let mut v = json!({
@@ -116,10 +132,44 @@ pub fn proposal_json(p: &Principal, x: &Proposal) -> Value {
         "decision_note": x.decision_note,
         "result_ref": x.result_ref,
     });
+    if x.ptype == ProposalType::Tidy {
+        for k in ["candidate", "signals", "records", "ops", "op"] {
+            v[k] = x.payload.get(k).cloned().unwrap_or(Value::Null);
+        }
+        v["stale"] = json!(x.status == ProposalStatus::Stale);
+    }
     if agent_view::masks(p) {
         agent_view::mask_value(&mut v);
     }
     v
+}
+
+/// Пометка `stale` карточек уборки `cards` (по порядку `items`): предложение `stale` или
+/// открытое, чья запись удалена или сменила ревизию (одно чтение на выборку).
+async fn mark_live(
+    db: &zam_store::Db,
+    items: &[Proposal],
+    cards: &mut [Value],
+) -> Result<(), ApiError> {
+    let refs: Vec<(String, i64)> = items
+        .iter()
+        .filter(|x| x.ptype == ProposalType::Tidy && x.status == ProposalStatus::Proposed)
+        .flat_map(|x| x.targets.iter().map(|t| (t.target.clone(), t.rev)))
+        .collect();
+    if refs.is_empty() {
+        return Ok(());
+    }
+    let live = zam_store::works::live_refs(db, &refs).await?;
+    for (x, v) in items.iter().zip(cards.iter_mut()) {
+        if x.ptype == ProposalType::Tidy && x.status == ProposalStatus::Proposed {
+            let ok = x
+                .targets
+                .iter()
+                .all(|t| live.contains(&(t.target.clone(), t.rev)));
+            v["stale"] = json!(!ok);
+        }
+    }
+    Ok(())
 }
 
 /// База пользователя запроса.
@@ -215,7 +265,9 @@ pub async fn create(
     require_rw(&p).map_err(|_| ApiError::Denied(RW_REQUIRED_DETAIL.into()))?;
     let b: CreateBody = json_body(body)?;
     if parse_type(Some(&b.ptype))? != ProposalType::Rule {
-        return Err(ApiError::BadRequest("type: rule".into()));
+        return Err(ApiError::BadRequest(
+            "type: rule (кандидатов уборки предлагает внутренняя работа tidy)".into(),
+        ));
     }
     let basis = check_basis(b.basis)?;
     let session = request_session(
@@ -320,12 +372,12 @@ pub async fn list(
         },
     )
     .await?;
-    Ok(Json(json!({
-        "proposals": items.iter().map(|x| proposal_json(&p, x)).collect::<Vec<_>>(),
-    })))
+    let mut cards: Vec<Value> = items.iter().map(|x| proposal_json(&p, x)).collect();
+    mark_live(&db, &items, &mut cards).await?;
+    Ok(Json(json!({ "proposals": cards })))
 }
 
-/// `GET /proposals/counts` → `{rules}`.
+/// `GET /proposals/counts` → `{rules, tidy}`.
 pub async fn counts(
     State(st): State<AppState>,
     p: Principal,
@@ -333,7 +385,7 @@ pub async fn counts(
 ) -> Result<Json<Value>, ApiError> {
     let (_, db) = user_db(&st, &p, &headers).await?;
     let c = pr::counts(&db).await?;
-    Ok(Json(json!({"rules": c.rules})))
+    Ok(Json(json!({"rules": c.rules, "tidy": c.tidy})))
 }
 
 /// Ссылки основания и источников с заголовками (записи журнала и заметки базы). Ссылки `basis`
@@ -409,11 +461,15 @@ pub async fn get(
     let (_, db) = user_db(&st, &p, &headers).await?;
     let x = load(&db, &raw).await?;
     let mut v = proposal_json(&p, &x);
-    let space = rules::rules_space(&db).await?;
-    // прирост — только у открытого: принятый уже в сумме своей заметкой
-    let add = (x.status == ProposalStatus::Proposed).then(|| (x.path(), x.content()));
-    let (now, after) = rules::rules_tokens(&db, space, add).await?;
-    v["rules_tokens"] = json!({"now": now, "after": after});
+    if x.ptype == ProposalType::Rule {
+        let space = rules::rules_space(&db).await?;
+        // прирост — только у открытого: принятый уже в сумме своей заметкой
+        let add = (x.status == ProposalStatus::Proposed).then(|| (x.path(), x.content()));
+        let (now, after) = rules::rules_tokens(&db, space, add).await?;
+        v["rules_tokens"] = json!({"now": now, "after": after});
+    } else {
+        mark_live(&db, std::slice::from_ref(&x), std::slice::from_mut(&mut v)).await?;
+    }
     let mut src = Value::from(sources(&p, &db, &x).await?);
     if agent_view::masks(&p) {
         agent_view::mask_value(&mut src);
@@ -425,8 +481,12 @@ pub async fn get(
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptBody {
+    /// Кандидат в Rules: путь заметки.
     path: Option<String>,
+    /// Кандидат в Rules: текст правила.
     content: Option<String>,
+    /// Кандидат уборки: текст `merge` или `append`, поправленный человеком.
+    text: Option<String>,
 }
 
 /// Тело или пусто (`{}` по умолчанию).
@@ -477,6 +537,19 @@ pub async fn accept(
     let x = load(&db, &raw).await?;
     if x.status != ProposalStatus::Proposed {
         return Err(not_open(&x));
+    }
+    if x.ptype == ProposalType::Tidy {
+        if b.path.is_some() || b.content.is_some() {
+            return Err(ApiError::BadRequest(
+                "path и content — у кандидата в Rules; у уборки — text (merge, append)".into(),
+            ));
+        }
+        return accept_tidy(&st, client, &p, &headers, user, &db, x, b.text).await;
+    }
+    if b.text.is_some() {
+        return Err(ApiError::BadRequest(
+            "text — у кандидата уборки; у кандидата в Rules — path и content".into(),
+        ));
     }
     let path = rules::rule_path(b.path.as_deref().unwrap_or(x.path()))?;
     let content = b
@@ -540,6 +613,357 @@ pub async fn accept(
     Ok(Json(
         json!({"proposal": proposal_json(&p, &x), "note": note_json}),
     ))
+}
+
+/// 409 «цель изменилась после предложения» (`code: stale`; кандидат вернётся следующей ночью).
+fn stale_conflict(x: &Proposal) -> ApiError {
+    let mut extra = serde_json::Map::new();
+    extra.insert("code".into(), json!("stale"));
+    extra.insert("status".into(), json!(x.status.as_str()));
+    ApiError::Conflict {
+        detail: format!(
+            "предложение o:{}: запись изменилась после предложения (ревизия не та) — оно \
+             устарело, кандидат вернётся следующей ночью с новыми ревизиями",
+            x.id
+        ),
+        extra,
+    }
+}
+
+/// Устаревшая ревизия записи у операции (409 хранилища с `rev`).
+fn is_stale_rev(e: &ApiError) -> bool {
+    matches!(e, ApiError::Conflict { extra, .. } if extra.contains_key("rev"))
+}
+
+/// Заголовки вызова операции от имени человека: заголовки запроса «Применить» (пользователь
+/// запроса), `If-Match` — ревизия записи из предложения, без `Idempotency-Key`.
+fn op_headers(headers: &HeaderMap, rev: i64) -> HeaderMap {
+    let mut h = headers.clone();
+    h.remove("idempotency-key");
+    if let Ok(v) = axum::http::HeaderValue::from_str(&rev.to_string()) {
+        h.insert(axum::http::header::IF_MATCH, v);
+    }
+    h
+}
+
+/// Тело JSON вызова операции.
+fn op_body(v: Value) -> Result<Bytes, BytesRejection> {
+    Ok(Bytes::from(v.to_string()))
+}
+
+/// Id записи по ссылке `i:<id>` / `t:<id>`.
+fn ref_id(r: &str) -> Result<String, ApiError> {
+    r.split_once(':')
+        .map(|(_, id)| id.to_string())
+        .ok_or_else(|| ApiError::Internal(format!("предложение уборки: ссылка «{r}»")))
+}
+
+/// Ранг достоверности для «меньшей из двух»: `hypothesis` < `theorem` < `axiom`.
+fn certainty_rank(c: zam_store::Certainty) -> u8 {
+    match c {
+        zam_store::Certainty::Hypothesis => 0,
+        zam_store::Certainty::Theorem => 1,
+        zam_store::Certainty::Axiom => 2,
+    }
+}
+
+/// Достоверность замещающей записи `merge` (§8.7 п. 3): меньшая из `keep` и `drop` (запись без
+/// статуса в минимуме не участвует; обе без статуса — без статуса), но не выше `theorem`, если
+/// человек не правил текст.
+pub fn merged_certainty(
+    keep: Option<zam_store::Certainty>,
+    drop: Option<zam_store::Certainty>,
+    edited: bool,
+) -> Option<zam_store::Certainty> {
+    let min = [keep, drop]
+        .into_iter()
+        .flatten()
+        .min_by_key(|c| certainty_rank(*c))?;
+    if !edited && min == zam_store::Certainty::Axiom {
+        return Some(zam_store::Certainty::Theorem);
+    }
+    Some(min)
+}
+
+/// Контекст операции уборки от имени человека.
+struct OpCtx<'a> {
+    st: &'a AppState,
+    client: Client,
+    p: &'a Principal,
+    headers: &'a HeaderMap,
+    /// «из предложения o:<id> (model:<имя> | сессия <id>)».
+    message: String,
+}
+
+impl OpCtx<'_> {
+    /// Причина ревизии записи: `reason` и происхождение (у записей журнала сообщение ревизии —
+    /// её причина), не длиннее `REASON_MAX_CHARS` (обрезается `reason`).
+    fn reason(&self, reason: &str) -> String {
+        let tail = format!(" — {}", self.message);
+        let room = zam_store::REASON_MAX_CHARS.saturating_sub(tail.chars().count());
+        let head: String = reason.trim().chars().take(room).collect();
+        if head.is_empty() {
+            self.message.clone()
+        } else {
+            format!("{head}{tail}")
+        }
+    }
+
+    /// Отзыв записи `target` ревизии `rev` с причиной `reason` и происхождением (как `POST
+    /// /entries/{id}/retract`).
+    async fn retract(&self, target: &str, rev: i64, reason: &str) -> Result<(), ApiError> {
+        super::insights::retract(
+            State(self.st.clone()),
+            self.p.clone(),
+            op_headers(self.headers, rev),
+            self.client,
+            Path(ref_id(target)?),
+            op_body(json!({"reason": self.reason(reason), "message": self.message})),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Правка записи `target` ревизии `rev` (как `PATCH /entries/{id}`): поля `fields`, причина
+    /// ревизии `reason` с происхождением.
+    async fn patch(
+        &self,
+        target: &str,
+        rev: i64,
+        reason: &str,
+        mut fields: Value,
+    ) -> Result<(), ApiError> {
+        fields["message"] = json!(self.message);
+        fields["reason"] = json!(self.reason(reason));
+        super::entries::patch(
+            State(self.st.clone()),
+            self.p.clone(),
+            op_headers(self.headers, rev),
+            Path(ref_id(target)?),
+            op_body(fields),
+        )
+        .await
+        .map(|_| ())
+    }
+}
+
+/// «Применить» кандидата уборки `x` (§8.7 п. 3; только сессия WebUI — проверено вызывающим):
+/// сверка ревизий **всех** записей до первой операции (не та — `stale`, 409), операция тем же
+/// кодом, что у человека в WebUI, от его имени с сообщением ревизии «из предложения o:<id> (…)»;
+/// предложение `accepted` с `result_ref`, аудит `proposal.accept`. `text` — правка человеком
+/// текста `merge` или `append`. Удаления нет.
+#[allow(clippy::too_many_arguments)]
+async fn accept_tidy(
+    st: &AppState,
+    client: Client,
+    p: &Principal,
+    headers: &HeaderMap,
+    user: Id,
+    db: &zam_store::Db,
+    x: Proposal,
+    text: Option<String>,
+) -> Result<Json<Value>, ApiError> {
+    use zam_store::tidy::Op;
+    let refs: Vec<(String, i64)> = x
+        .targets
+        .iter()
+        .map(|t| (t.target.clone(), t.rev))
+        .collect();
+    let live = zam_store::works::live_refs(db, &refs).await?;
+    let mark_stale = async |x: &Proposal| -> Result<ApiError, ApiError> {
+        let d = Decision {
+            to: DecisionKind::Stale,
+            by: p.actor(),
+            note: Some("цель изменилась после предложения".into()),
+            result_ref: None,
+        };
+        Ok(match pr::decide(db, x.id, d).await? {
+            Decided::Done(x) | Decided::NotOpen(x) => stale_conflict(&x),
+        })
+    };
+    if refs.is_empty() || refs.iter().any(|r| !live.contains(r)) {
+        return Err(mark_stale(&x).await?);
+    }
+    let op = &x.payload["op"];
+    let rev_of = |r: &str| refs.iter().find(|(t, _)| t == r).map(|(_, rev)| *rev);
+    let field = |k: &str| op[k].as_str().unwrap_or("").to_string();
+    let kind = Op::parse(op["op"].as_str().unwrap_or(""))
+        .ok_or_else(|| ApiError::Internal(format!("предложение o:{}: операции нет", x.id)))?;
+    let text = text.map(|t| t.trim().to_string());
+    if text.is_some() && !matches!(kind, Op::Merge | Op::Append) {
+        return Err(ApiError::BadRequest(
+            "text — правка текста у merge и append".into(),
+        ));
+    }
+    if let Some(t) = &text {
+        if t.is_empty() {
+            return Err(ApiError::Unprocessable("text: пустой текст".into()));
+        }
+        if check_mask_literal(t).is_err() {
+            return Err(ApiError::Unprocessable(MASK_LITERAL_REASON.into()));
+        }
+    }
+    // довод исполнителя — причина отзыва, пересмотра и правки (с происхождением)
+    let reason = x.reason.clone().unwrap_or_default();
+    let o = OpCtx {
+        st,
+        client,
+        p,
+        headers,
+        message: rules::origin_message(&x),
+    };
+    let target = field("target");
+    let mut warnings: Vec<String> = Vec::new();
+    let done: Result<String, ApiError> = async {
+        let rev = |r: &str| {
+            rev_of(r).ok_or_else(|| {
+                ApiError::Internal(format!("предложение o:{}: {r} — не запись кандидата", x.id))
+            })
+        };
+        Ok(match kind {
+            Op::Merge => {
+                let (keep, drop) = (field("keep"), field("drop"));
+                let proposed = op["text"].as_str().map(str::to_string);
+                let edited = text
+                    .as_deref()
+                    .is_some_and(|t| proposed.as_deref().map(str::trim) != Some(t));
+                match text.clone().or(proposed) {
+                    None => {
+                        o.retract(&drop, rev(&drop)?, &format!("дубль {keep}")).await?;
+                        drop
+                    }
+                    Some(body) => {
+                        let k = zam_store::get_entry(db, ref_id(&keep)?.parse().map_err(|_| {
+                            ApiError::Internal(format!("предложение o:{}: {keep}", x.id))
+                        })?)
+                        .await?;
+                        let d = zam_store::get_entry(db, ref_id(&drop)?.parse().map_err(|_| {
+                            ApiError::Internal(format!("предложение o:{}: {drop}", x.id))
+                        })?)
+                        .await?;
+                        let triggers: Vec<Value> = zam_store::entry_triggers(db, k.id)
+                            .await?
+                            .into_iter()
+                            .map(|t| json!({"type": t.kind, "pattern": t.pattern, "tools": t.tools}))
+                            .collect();
+                        let mut req = json!({
+                            "title": k.title, "body": body, "data": k.data, "tags": k.tags,
+                            "area": k.area, "triggers": triggers, "message": o.message,
+                        });
+                        if let Some(c) = merged_certainty(k.certainty, d.certainty, edited) {
+                            req["certainty"] = json!(c.as_str());
+                        }
+                        let (_, Json(resp)) = super::insights::supersede(
+                            State(st.clone()),
+                            p.clone(),
+                            op_headers(headers, rev(&keep)?),
+                            client,
+                            Path(ref_id(&keep)?),
+                            op_body(req),
+                        )
+                        .await?;
+                        let new = format!("i:{}", resp["entry"]["id"].as_str().unwrap_or(""));
+                        // замещение прошло: отказ отзыва `drop` — предупреждение, а не откат
+                        if let Err(e) = o.retract(&drop, rev(&drop)?, &format!("дубль {new}")).await
+                        {
+                            tracing::warn!(proposal = %x.id, error = %e, "уборка: drop не отозван после замещения keep");
+                            warnings.push(format!("{drop} не отозван: {e}"));
+                        }
+                        new
+                    }
+                }
+            }
+            Op::Retract => {
+                o.retract(&target, rev(&target)?, &reason).await?;
+                target
+            }
+            Op::Revisit => {
+                o.patch(&target, rev(&target)?, &reason, json!({"status": "revisit"}))
+                    .await?;
+                target
+            }
+            Op::Triggers => {
+                let fields = json!({"triggers": op["triggers"]});
+                o.patch(&target, rev(&target)?, &reason, fields).await?;
+                target
+            }
+            Op::Append => {
+                let body = text.clone().unwrap_or_else(|| field("text"));
+                let fields = json!({"append_body": body});
+                o.patch(&target, rev(&target)?, &reason, fields).await?;
+                target
+            }
+            Op::Term if !target.is_empty() => {
+                let t = zam_store::get_entry(db, ref_id(&target)?.parse().map_err(|_| {
+                    ApiError::Internal(format!("предложение o:{}: {target}", x.id))
+                })?)
+                .await?;
+                let mut data = t.data.clone();
+                let mut aliases: Vec<Value> = data["aliases"].as_array().cloned().unwrap_or_default();
+                for a in op["aliases"].as_array().into_iter().flatten() {
+                    if !aliases.contains(a) {
+                        aliases.push(a.clone());
+                    }
+                }
+                data["aliases"] = Value::from(aliases);
+                o.patch(&target, rev(&target)?, &reason, json!({"data": data}))
+                    .await?;
+                target
+            }
+            Op::Term => {
+                let body = json!({
+                    "kind": "term", "title": op["title"],
+                    "data": {"definition": op["definition"], "aliases": op["aliases"]},
+                    "message": o.message,
+                });
+                let mut h = headers.clone();
+                h.remove("idempotency-key");
+                let (_, Json(resp)) = super::insights::create(
+                    st,
+                    p,
+                    &h,
+                    &client,
+                    &x.space_id.to_string(),
+                    body,
+                )
+                .await?;
+                format!("t:{}", resp["id"].as_str().unwrap_or(""))
+            }
+            Op::Keep => return Err(not_open(&x)),
+        })
+    }
+    .await;
+    let result = match done {
+        Ok(r) => r,
+        // запись изменили между сверкой и операцией
+        Err(e) if is_stale_rev(&e) => return Err(mark_stale(&x).await?),
+        Err(e) => return Err(e),
+    };
+    let d = Decision {
+        to: DecisionKind::Accepted,
+        by: p.actor(),
+        note: None,
+        result_ref: Some(result.clone()),
+    };
+    let x = match pr::decide(db, x.id, d).await? {
+        Decided::Done(x) => x,
+        Decided::NotOpen(x) => return Err(not_open(&x)),
+    };
+    st.system
+        .audit(
+            &p.actor(),
+            Some(user),
+            "proposal.accept",
+            Some(&format!("o:{}", x.id)),
+            Some(&client.ip.to_string()),
+            json!({"id": format!("o:{}", x.id), "type": x.ptype.as_str(), "result": result}),
+        )
+        .await?;
+    let mut out = json!({"proposal": proposal_json(p, &x), "result": result});
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
+    }
+    Ok(Json(out))
 }
 
 #[derive(Deserialize, Default)]
@@ -632,5 +1056,32 @@ pub async fn withdraw(
     match pr::decide(&db, x.id, d).await? {
         Decided::Done(x) => Ok(Json(proposal_json(&p, &x))),
         Decided::NotOpen(x) => Err(not_open(&x)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zam_store::Certainty::{Axiom, Hypothesis, Theorem};
+
+    /// Достоверность замещающей записи `merge` (§8.7 п. 3): меньшая из двух, без правки
+    /// человеком — не выше `theorem`; запись без статуса в минимуме не участвует.
+    #[test]
+    fn merged_certainty_cases() {
+        assert_eq!(
+            merged_certainty(Some(Axiom), Some(Axiom), false),
+            Some(Theorem)
+        );
+        assert_eq!(
+            merged_certainty(Some(Axiom), Some(Axiom), true),
+            Some(Axiom)
+        );
+        assert_eq!(
+            merged_certainty(Some(Axiom), Some(Hypothesis), true),
+            Some(Hypothesis)
+        );
+        assert_eq!(merged_certainty(Some(Theorem), None, false), Some(Theorem));
+        assert_eq!(merged_certainty(None, None, false), None);
+        assert_eq!(merged_certainty(None, Some(Axiom), false), Some(Theorem));
     }
 }

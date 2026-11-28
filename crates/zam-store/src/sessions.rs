@@ -707,6 +707,56 @@ pub async fn hint_shown(
         .collect())
 }
 
+/// Показанное сессии подсказками (M7.5 §8.8 п. 2, [`hints_shown_many`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HintsShown {
+    /// Целей — узлов и записей журналов, — показанных сессии подсказкой `/recall` (каждая — один
+    /// раз, в любой эпохе).
+    pub shown: i64,
+    /// Владельцы баз этих целей (открытия лежат в базе цели — [`crate::opened_by_sessions`]).
+    pub owners: Vec<Id>,
+}
+
+/// Показанное подсказками сессиям `ids` (M7.5 §8.8 п. 2, доля открытых): отметки `session_seen`
+/// части [`RECALL_PART`] — узлы и записи журналов (открытие бывает только у них, §6.6 п. 1), цель —
+/// один раз за сессию, во всех эпохах, — и владельцы баз целей. Сессии без подсказок в ответе нет.
+/// Одно чтение по первичному ключу (`session_id` — его начало).
+pub async fn hints_shown_many(
+    db: &Db,
+    ids: &[String],
+) -> Result<HashMap<String, HintsShown>, StoreError> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let list = serde_json::Value::from(ids.to_vec()).to_string();
+    db.read(move |c| {
+        let mut st = c.prepare_cached(
+            "SELECT session_id, owner_id, count(DISTINCT target_kind || ':' || target_id)
+             FROM session_seen
+             WHERE session_id IN (SELECT value FROM json_each(?1)) AND part = ?2
+               AND target_kind IN ('node', 'entry')
+             GROUP BY session_id, owner_id",
+        )?;
+        let rows = st.query_map(params![list, RECALL_PART], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Id>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut out: HashMap<String, HintsShown> = HashMap::new();
+        for row in rows {
+            let (session, owner, n) = row?;
+            let h = out.entry(session).or_default();
+            // цель лежит в одной базе: суммы по владельцам не пересекаются
+            h.shown += n;
+            h.owners.push(owner);
+        }
+        Ok(out)
+    })
+    .await
+}
+
 /// Записи журналов (`target_kind = entry`) базы владельца `owner`, выданные сессии с частью
 /// `part` (любая ревизия, **любая эпоха** — показ идей, M6 §7.2): по ним вызывающий узнаёт,
 /// показывалась ли сессии запись нужного вида (раздел идей M5.7 §6.1 — только на первом

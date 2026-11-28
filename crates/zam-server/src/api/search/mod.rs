@@ -1084,6 +1084,27 @@ fn chunk_meta(h: &FtsHit) -> Option<ChunkMeta> {
 }
 
 /// `notes`: по одному элементу на узел (лучший чанк), не больше `top_k`.
+/// Окно порядка по `contradicts` — элементы, которые войдут в выдачу режима (индекс конца окна в
+/// `items`): у `notes` — до первого фрагмента цели сверх `top_k` (выдача сворачивает фрагменты в
+/// узел или запись после порядка, [`group_by_node`]; M7.5, задача 1, решение координатора по
+/// `kc-21`: окно из `top_k` фрагментов теряло теорему — 9-ю заметку при 2–3 фрагментах у узлов
+/// выше), у `brief` и `chunks` — первые `top_k` фрагментов (их выдача — фрагменты).
+fn contradicts_window(items: &[Item], top_k: usize, mode: SearchMode) -> usize {
+    if mode != SearchMode::Notes {
+        return top_k.min(items.len());
+    }
+    let mut seen: HashSet<TargetRef> = HashSet::new();
+    for (i, it) in items.iter().enumerate() {
+        if !seen.contains(&it.hit.target) {
+            if seen.len() == top_k {
+                return i;
+            }
+            seen.insert(it.hit.target);
+        }
+    }
+    items.len()
+}
+
 fn group_by_node(items: Vec<Item>, top_k: usize) -> Vec<Item> {
     let mut order: Vec<Item> = Vec::new();
     let mut pos: HashMap<TargetRef, usize> = HashMap::new();
@@ -2615,6 +2636,7 @@ pub(crate) async fn search_with(
                 Vec::new()
             };
             let q = FtsQuery {
+                drop_stop_words: !st.cfg.search.fts_stop_words,
                 text: req.query.clone(),
                 space_ids: tg.space_ids(),
                 path_prefix: prefix.clone(),
@@ -2990,9 +3012,10 @@ pub(crate) async fn search_with(
     };
     // порядок по `contradicts` — после реранка и бустов (M4.5, §5.2)
     let mut items = items;
-    // только первые `top_k` элементов («обе в выдаче»): аксиома из хвоста окна в выдачу не поднимается
+    // только окно выдачи («обе в выдаче», [`contradicts_window`]): аксиома из хвоста окна в выдачу
+    // не поднимается
     if st.cfg.search.contradicts_order && top_k > 1 && items.len() > 1 {
-        let tail = items.split_off(top_k.min(items.len()));
+        let tail = items.split_off(contradicts_window(&items, top_k, mode));
         let r = graph::order_by_contradicts(&mut health, &mut items).await;
         items.extend(tail);
         r?;
@@ -3494,6 +3517,39 @@ mod tests {
             0,
         );
         assert_eq!(p.len(), 1);
+    }
+
+    /// Окно порядка по `contradicts` (M7.5, задача 1, `kc-21`): у `notes` — фрагменты первых
+    /// `top_k` целей (поздние фрагменты этих целей — в хвосте, свёртка их подберёт), у `brief` и
+    /// `chunks` — первые `top_k` фрагментов.
+    #[test]
+    fn contradicts_window_notes_by_targets() {
+        let (a, b, c, d) = (Id::new(), Id::new(), Id::new(), Id::new());
+        let it = items(
+            vec![
+                hit(a, "1"),
+                hit(a, "22"),
+                hit(b, "333"),
+                hit(a, "4444"),
+                hit(c, "55555"),
+                hit(b, "666666"),
+                hit(d, "7777777"),
+            ],
+            false,
+        );
+        // три цели: a, b, c — окно до первого фрагмента d
+        assert_eq!(contradicts_window(&it, 3, SearchMode::Notes), 6);
+        assert_eq!(contradicts_window(&it, 2, SearchMode::Notes), 4);
+        assert_eq!(contradicts_window(&it, 10, SearchMode::Notes), 7);
+        for mode in [SearchMode::Brief, SearchMode::Chunks] {
+            assert_eq!(contradicts_window(&it, 3, mode), 3);
+            assert_eq!(contradicts_window(&it, 10, mode), 7);
+        }
+        // свёртка окна и хвоста — те же цели, что у выдачи `notes`
+        let w = contradicts_window(&it, 3, SearchMode::Notes);
+        let g = group_by_node(it, 3);
+        assert_eq!(g.len(), 3);
+        assert!(w > 3, "окно шире {w} фрагментов");
     }
 
     #[test]

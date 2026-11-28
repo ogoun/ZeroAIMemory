@@ -572,6 +572,50 @@ async fn dropped_collection_is_rebuilt_from_embeddings() {
     w.shutdown().await;
 }
 
+/// Самовосстановление (M7.5 §8.5): коллекция удалена частично (в списке Qdrant её нет, каталог с
+/// `config.json` остался) — `ensure` воркера убирает остаток и создаёт коллекцию, в базе ставится
+/// отметка reindex всей базы из кэша: точки заметки возвращаются без инференса, отметка снята.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn half_deleted_collection_healed_from_cache() {
+    let e = env("half-heal").await;
+    let a = e.note(e.knowledge, "a", NOTE).await;
+    {
+        let w = e.spawn();
+        e.indexed(a).await;
+        w.shutdown().await;
+    }
+    let coll =
+        e._q.dir
+            .join("storage")
+            .join("collections")
+            .join(zam_index::COLLECTION);
+    let config = std::fs::read(coll.join("config.json")).unwrap();
+    e.vector.drop_all().await.unwrap();
+    std::fs::create_dir_all(&coll).unwrap();
+    std::fs::write(coll.join("config.json"), config).unwrap();
+    e.faults.fail_next(0, "");
+    let chunks = e.chunks(a).await;
+    let f = VectorFilter {
+        path_prefix: Some("a".into()),
+        ..e.whole_base().await
+    };
+    let w = e.spawn();
+    // до восстановления коллекции нет: `count` — NotFound
+    e.until("точки восстановлены", async || {
+        e.vector.count(&f).await.unwrap_or(0) == chunks
+    })
+    .await;
+    e.until("отметка reindex снята", async || {
+        pending_reindex(&e.db).await.unwrap().is_none()
+    })
+    .await;
+    assert_eq!(e.faults.attempts(), 1, "одно удаление остатка");
+    assert_eq!(w.embedded_texts(), 0, "из кэша, без инференса");
+    let st = w.status();
+    assert!(st.vector_ready && st.model_mismatch.is_none(), "{st:?}");
+    w.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unavailable_qdrant_keeps_queue_and_catches_up() {
     let mut e = env("outage").await;

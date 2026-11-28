@@ -1,0 +1,28 @@
+# Сетка тишины подсказок к `prompt` без модели — `recall.prompt_fts_coverage` (M7.5 §8.3 пп. 1–3,
+# задача 3):
+#   cargo xtask eval --hints --grid eval/grid-m75-hints-fts.toml --mode fts
+# Сервер без модели: поиск `prompt` деградирует до FTS (`degraded`), балл лучшего FTS ≈ 1 на
+# любой запрос, и порог балла мусор не отделяет; правило покрытия пропускает карточку, только если
+# предметные слова запроса покрыты заголовком и фрагментом не меньше `need(n)`. Первая точка —
+# умолчание (ключа нет, как 0.0.17), снимается дважды (A/A — побайтово). `common_pct = 100` во
+# всех точках: частота слов в спецификации не перебирается. Случаи — `prompt` eval/hints.toml;
+# правило выбора (`xtask/src/eval/hints/grid.rs`, `choose_prompt_coverage`) записано в журнал
+# этапа до прогона.
+
+rule = "prompt_fts_coverage"
+
+[[point]]
+name = "off"
+env = {}
+
+[[point]]
+name = "m6-plain"
+env = { ZAM_RECALL__PROMPT_FTS_COVERAGE__DIVISOR = "2", ZAM_RECALL__PROMPT_FTS_COVERAGE__CAP = "6", ZAM_RECALL__PROMPT_FTS_COVERAGE__WORD_MATCH = "plain", ZAM_RECALL__PROMPT_FTS_COVERAGE__COMMON_PCT = "100" }
+
+[[point]]
+name = "m6-stems"
+env = { ZAM_RECALL__PROMPT_FTS_COVERAGE__DIVISOR = "2", ZAM_RECALL__PROMPT_FTS_COVERAGE__CAP = "6", ZAM_RECALL__PROMPT_FTS_COVERAGE__WORD_MATCH = "stems", ZAM_RECALL__PROMPT_FTS_COVERAGE__COMMON_PCT = "100" }
+
+[[point]]
+name = "m4-stems"
+env = { ZAM_RECALL__PROMPT_FTS_COVERAGE__DIVISOR = "3", ZAM_RECALL__PROMPT_FTS_COVERAGE__CAP = "4", ZAM_RECALL__PROMPT_FTS_COVERAGE__WORD_MATCH = "stems", ZAM_RECALL__PROMPT_FTS_COVERAGE__COMMON_PCT = "100" }

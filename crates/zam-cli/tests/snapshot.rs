@@ -1296,7 +1296,8 @@ fn cli_snapshot_no_session_exit_1() {
     // плохой формат и нет файла — ошибки ввода, не паника
     let o = cli(&c, &url, &["--transcript", &t, "--format", "gemini"], &[]);
     assert!(o.status.code().is_some_and(|x| x != 0));
-    // пустой снимок (в журнале нет ни одной записи формата) — ошибка ввода без запросов
+    // пустой снимок (в журнале нет ни одной записи формата) — с M7.5 не ошибка: «снимать
+    // нечего», код 0, без запросов (`snapshot_no_requests_nothing_to_take`)
     let empty_t = c.dir.join("empty.jsonl");
     std::fs::write(
         &empty_t,
@@ -1306,11 +1307,11 @@ fn cli_snapshot_no_session_exit_1() {
     .unwrap();
     let et = empty_t.to_string_lossy().into_owned();
     let o = cli(&c, &url, &["--transcript", &et, "--session", "S"], &[]);
-    assert_eq!(o.status.code(), Some(6));
+    assert_eq!(o.status.code(), Some(0));
     assert!(
-        String::from_utf8_lossy(&o.stderr).contains("снимок пуст"),
+        String::from_utf8_lossy(&o.stdout).contains("снимать нечего"),
         "{}",
-        String::from_utf8_lossy(&o.stderr)
+        String::from_utf8_lossy(&o.stdout)
     );
     let o = cli(
         &c,
@@ -1320,4 +1321,197 @@ fn cli_snapshot_no_session_exit_1() {
     );
     assert!(o.status.code().is_some_and(|x| x != 0));
     assert!(seen_of(&seen).is_empty());
+}
+
+// ------------------------------------------------- M7.5 §8.9 п. 4: большие и пустые журналы
+
+/// Служебная строка Claude Code с `sessionId` (не проходит предфильтр снимка).
+fn bridge_line(s: &str) -> String {
+    serde_json::json!({"type": "bridge-session", "sessionId": s, "timestamp": "2026-11-28T10:00:00Z"})
+        .to_string()
+}
+
+/// Запрос человека без поля `sessionId` (старые и служебные записи).
+fn human_without_session(c: &Case, text: &str) -> String {
+    let mut v: serde_json::Value = serde_json::from_str(&claude_human(c, text)).unwrap();
+    v.as_object_mut().unwrap().remove("sessionId");
+    v.to_string()
+}
+
+/// Id сессии — из любой строки журнала: у записей с запросами `sessionId` нет, он есть только
+/// в служебной строке `bridge-session` (её предфильтр снимка не пропускает) — снимок уходит в эту
+/// сессию, а не «укажите --session».
+#[test]
+fn snapshot_session_id_from_any_line() {
+    let c = Case::new("cli-any-line");
+    let p = c.journal(
+        &[],
+        &[
+            bridge_line("S-old"),
+            human_without_session(&c, "запрос без id"),
+            bridge_line("S-any"),
+            human_without_session(&c, "ещё запрос"),
+        ],
+    );
+    let t = p.to_string_lossy().into_owned();
+    let (url, seen) = cli_stub(200);
+    let o = cli(&c, &url, &["--transcript", &t, "--format", "claude"], &[]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(out.contains("снимок сессии S-any: "), "{out}");
+    let puts: Vec<_> = seen_of(&seen)
+        .into_iter()
+        .filter(|(m, _, _)| m == "PUT")
+        .collect();
+    assert_eq!(puts.len(), 1);
+    assert_eq!(puts[0].1, "/api/v1/sessions/S-any/snapshot");
+    assert_eq!(
+        puts[0].2["data"]["prompts"],
+        serde_json::json!(["запрос без id", "ещё запрос"])
+    );
+}
+
+/// Журнал без запросов (отменённый `/resume`, `/model`, `bridge-session`) — «в журнале нет
+/// запросов — снимать нечего», код 0, без запросов к серверу; `--json` — `status: empty`.
+#[test]
+fn snapshot_no_requests_nothing_to_take() {
+    let c = Case::new("cli-nothing");
+    let model = serde_json::json!({"type": "system", "subtype": "local_command",
+        "sessionId": "S-empty", "content": "<command-name>/model</command-name>"})
+    .to_string();
+    let p = c.journal(&[], &[bridge_line("S-empty"), model]);
+    let t = p.to_string_lossy().into_owned();
+    let (url, seen) = cli_stub(200);
+    let o = cli(&c, &url, &["--transcript", &t], &[]);
+    assert_eq!(o.status.code(), Some(0));
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(
+        out.trim(),
+        "в журнале нет запросов — снимать нечего (сессия S-empty)"
+    );
+    let o = cli(&c, &url, &["--transcript", &t, "--json"], &[]);
+    assert_eq!(o.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!({"session": "S-empty", "bytes": 0, "status": "empty"})
+    );
+    assert!(seen_of(&seen).is_empty());
+}
+
+/// `--tail-kb` — хвост журнала: старый запрос за окном 64 КиБ в снимок не входит, с окном по
+/// умолчанию (2048 КиБ) — входит.
+#[test]
+fn snapshot_tail_kb_reads_tail() {
+    let c = Case::new("cli-tail-kb");
+    let filler = bridge_line(&"x".repeat(1000));
+    let mut lines = vec![claude_human(&c, "старый запрос")];
+    lines.extend(std::iter::repeat_n(filler, 100));
+    lines.push(claude_human(&c, "новый запрос"));
+    let p = c.journal(&[], &lines);
+    let t = p.to_string_lossy().into_owned();
+    let prompts = |extra: &[&str]| {
+        let (url, seen) = cli_stub(200);
+        let mut args = vec!["--transcript", t.as_str()];
+        args.extend_from_slice(extra);
+        let o = cli(&c, &url, &args, &[]);
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        seen_of(&seen)
+            .into_iter()
+            .find(|(m, _, _)| m == "PUT")
+            .map(|(_, _, b)| b["data"]["prompts"].clone())
+            .unwrap()
+    };
+    assert_eq!(
+        prompts(&["--tail-kb", "64"]),
+        serde_json::json!(["новый запрос"])
+    );
+    assert_eq!(
+        prompts(&[]),
+        serde_json::json!(["старый запрос", "новый запрос"])
+    );
+}
+
+/// Ответ `GET /sessions/{id}/snapshot` заглушки.
+const SNAPSHOT_REPLY: &str = r#"{"session_id":"S-show","taken_at":"2026-11-28T10:00:00Z",
+"trigger":"stop","agent":"claude","status":"partial","skipped":2,"bytes":321,
+"data":{"compact_summary":"Сделали шаг 1.\nДальше шаг 2.","prompts":["почини хук","и тесты\nвторой строкой"],
+"files":["src/a.rs"],"commands":[{"cmd":"cargo test","failed":true},{"cmd":"git status","failed":false}]}}"#;
+
+/// `zam sessions show <id>` — снимок с сервера текстом (время `agent_ts` UTC, повод, полнота,
+/// размер, конспект, запросы, файлы, команды с пометкой ошибки); `--json` — ответ как есть;
+/// снимка нет — код 5.
+#[test]
+fn sessions_show_prints_snapshot() {
+    let c = Case::new("cli-show");
+    let (url, seen) = common::stub_body(std::sync::Arc::new(
+        |_: &str, p: &str, _: usize, _: &serde_json::Value| {
+            if p == "/api/v1/sessions/S-show/snapshot" {
+                (200, SNAPSHOT_REPLY.to_string(), Duration::ZERO)
+            } else {
+                (
+                    404,
+                    r#"{"status":404,"detail":"нет снимка"}"#.to_string(),
+                    Duration::ZERO,
+                )
+            }
+        },
+    ));
+    let show = |args: &[&str]| {
+        let home = c.dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        common::zam_cmd()
+            .env("ZAM_URL", &url)
+            .env("ZAM_TOKEN", "zam_x")
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .current_dir(&c.root)
+            .args(["sessions", "show"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let o = show(&["S-show"]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let out = String::from_utf8_lossy(&o.stdout);
+    let want = "снимок сессии S-show · 2026-11-28 10:00:00 UTC · stop · partial · 321 байт · \
+                пропущено строк 2\n\
+                конспект:\n  Сделали шаг 1.\n  Дальше шаг 2.\n\
+                запросы (2):\n  - почини хук\n  - и тесты\n    второй строкой\n\
+                файлы (1):\n  - src/a.rs\n\
+                команды (2):\n  - [ошибка] cargo test\n  - git status\n";
+    assert_eq!(out, want);
+    let o = show(&["S-show", "--json"]);
+    assert_eq!(o.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["bytes"], 321);
+    let o = show(&["S-none"]);
+    assert_eq!(o.status.code(), Some(5));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("снимка сессии S-none нет"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        seen_of(&seen)
+            .iter()
+            .all(|(m, p, _)| m == "GET" && p.ends_with("/snapshot")),
+        "{:?}",
+        seen_of(&seen)
+    );
 }

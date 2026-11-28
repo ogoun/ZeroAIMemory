@@ -1,7 +1,9 @@
 //! Перенос пространства (M6 §12б.5): `zam export [--space S] [--path P]… [--kind K]…
 //! [--no-history] -o <файл.zip>` — архив `GET /spaces/{space}/export` в файл; `zam import
 //! <файл.zip|каталог> [--space S] [--own] [--on-conflict skip|revision] [--axioms demote|keep]
-//! [--dry-run]` — `POST /spaces/{space}/import` потоком (каталог упаковывается в zip на лету,
+//! [--dry-run] [--reject-secrets]` — `POST /spaces/{space}/import` потоком (каталог упаковывается
+//! в zip на лету; `--reject-secrets` — файл с секретом не пишется, конфликт `secrets` в отчёте,
+//! M7.5 §8.9 п. 5; сервер без признака `reject_secrets` — код 1 до отправки,
 //! без временного файла; каталог без `manifest.json` — «папка `.md`»: на сервер уходят только
 //! `*.md`, архив чужой). Сервер отвечает 202 с заданием; `zam` опрашивает его раз в 2 с, печатает
 //! этап в stderr и выходит с кодом 2, если хода нет дольше `ZAM_IMPORT_IDLE_SECS` (600 с). Ctrl+C
@@ -375,6 +377,9 @@ pub struct ImportArgs<'a> {
     pub on_conflict: Option<&'a str>,
     pub axioms: Option<&'a str>,
     pub dry_run: bool,
+    /// `--reject-secrets` (M7.5 §8.9 п. 5): файл с секретом — конфликт `secrets` в отчёте, не
+    /// пишется; сервер без признака `reject_secrets` — код 1 до отправки архива.
+    pub reject_secrets: bool,
 }
 
 /// Переменная предела отсутствия хода задания импорта, с (в `zam_core::CLIENT_ENV_VARS`).
@@ -687,6 +692,11 @@ pub fn import(ctx: &mut Ctx, a: &ImportArgs) -> Result<(), CliError> {
     }
     if a.dry_run {
         q.push("dry_run=true".into());
+    }
+    if a.reject_secrets {
+        // старый сервер параметр пропустил бы и записал секреты — проверка признака до тела
+        super::write::ensure_reject_secrets(ctx)?;
+        q.push("reject_secrets=true".into());
     }
     // имя каталога «папки .md» — в источнике id назначения: разные папки не делят id
     if a.src.is_dir()

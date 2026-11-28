@@ -560,9 +560,16 @@ async fn probes_sample_stratified_deterministic() {
     .unwrap();
     assert!(h.is_empty(), "{h:?}");
     // диспетчер вида и ночь: работы решения и Rules, Human — нет
-    let d = kinds::collect(WorkKind::Probes, &c, user, g1, 100, &none())
-        .await
-        .unwrap();
+    let d = kinds::collect(
+        WorkKind::Probes,
+        &c,
+        user,
+        g1,
+        100,
+        &kinds::Sifted::of(none()),
+    )
+    .await
+    .unwrap();
     assert_eq!(set(&d), set(&first));
     agent_mode(&a).await;
     night_of(&a, day(23)).await;
@@ -1151,6 +1158,7 @@ async fn probes_secret_dropped_not_reoffered_until_new_rev() {
         title: "Запись".into(),
         text,
         signals: Vec::new(),
+        refs: Vec::new(),
     };
     let s = secret();
     store::enqueue(
@@ -1181,8 +1189,13 @@ async fn probes_secret_dropped_not_reoffered_until_new_rev() {
     assert_eq!(rej[0]["target"], leaky.as_str(), "{rej}");
     assert_eq!(rej[0]["reason"], store::SECRET_IN_PAYLOAD);
     // следующая ночь: чистая запись опробована, запись с ключом — до новой ревизии вне пакетов
+    // (отсев итогов прежних работ — один раз на запуск вида, `kinds::settled`, M7.5 §8.7 п. 4)
     let c = ctx(&a);
-    let got = probes::collect_on(&c, a.st.admin_id, kn, day(24), 100, &none())
+    let settled = kinds::settled(&db(&a).await, WorkKind::Probes)
+        .await
+        .unwrap()
+        .pairs;
+    let got = probes::collect_on(&c, a.st.admin_id, kn, day(24), 100, &settled)
         .await
         .unwrap();
     assert!(got.is_empty(), "{got:?}");
@@ -1191,7 +1204,11 @@ async fn probes_secret_dropped_not_reoffered_until_new_rev() {
     assert_eq!(ws.len(), 1, "{ws:?}");
     assert_eq!(m.count(), 1);
     revise(&a, &a.token, &leaky, "новый текст без ключа").await;
-    let got = probes::collect_on(&c, a.st.admin_id, kn, day(24), 100, &none())
+    let settled = kinds::settled(&db(&a).await, WorkKind::Probes)
+        .await
+        .unwrap()
+        .pairs;
+    let got = probes::collect_on(&c, a.st.admin_id, kn, day(24), 100, &settled)
         .await
         .unwrap();
     assert_eq!(
@@ -1344,18 +1361,32 @@ async fn probes_offered_not_reoffered_same_night() {
     assert!(later.is_empty(), "{later:?}");
     let kn = space(&a, SpaceKind::Knowledge).await;
     let c = ctx(&a);
-    let got = kinds::collect(WorkKind::Probes, &c, a.st.admin_id, kn, 10, &later)
-        .await
-        .unwrap();
+    let got = kinds::collect(
+        WorkKind::Probes,
+        &c,
+        a.st.admin_id,
+        kn,
+        10,
+        &kinds::Sifted::of(later),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         got.into_iter()
             .map(|c| (c.target, c.rev))
             .collect::<HashSet<_>>(),
         all
     );
-    let none_left = kinds::collect(WorkKind::Probes, &c, a.st.admin_id, kn, 10, &tonight)
-        .await
-        .unwrap();
+    let none_left = kinds::collect(
+        WorkKind::Probes,
+        &c,
+        a.st.admin_id,
+        kn,
+        10,
+        &kinds::Sifted::of(tonight),
+    )
+    .await
+    .unwrap();
     assert!(none_left.is_empty(), "{none_left:?}");
 }
 
@@ -1387,6 +1418,7 @@ async fn probes_requeued_last_night_counts_as_offered() {
         title: "Запись".into(),
         text: "текст".into(),
         signals: Vec::new(),
+        refs: Vec::new(),
     };
     // работа прошлой ночи, оставшаяся в очереди (пауза, стоп): этой ночью она идёт первой
     let old = store::enqueue(
@@ -1524,6 +1556,7 @@ async fn probes_write_rechecks_in_transaction() {
                     title: "Запись".into(),
                     text: "текст".into(),
                     signals: Vec::new(),
+                    refs: Vec::new(),
                 }],
             },
         )

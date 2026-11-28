@@ -1,12 +1,13 @@
-//! Предложения человеку — кандидаты в Rules (M7.3 §6.7 п. 1; миграция 0027, таблица
-//! `proposals`).
+//! Предложения человеку — кандидаты в Rules (M7.3 §6.7 п. 1) и кандидаты уборки (M7.5 §8.7;
+//! миграция 0027, таблица `proposals`).
 //!
 //! Предложение `o:<id>` — служебный шаг до решения человека, а не запись памяти: у него нет
 //! ревизий, корзины, поиска и экспорта (решение координатора 51). Тип — `proposals.type` без
-//! CHECK ([`ProposalType`]; в M7.3 — только `rule`): **выборки и счёт** ([`list`], [`counts`],
-//! предел [`PROPOSALS_OPEN_MAX`]) — с условием `type = ?` **в SQL**, поэтому строки других
-//! типов (тестовый `echo` очереди работ, будущие типы уборки M7.5) их не задевают; строка
-//! неизвестного типа, статуса или вида автора, прочитанная по id ([`get`]), пропускается с WARN.
+//! CHECK ([`ProposalType`]: `rule`, с M7.5 — `tidy`): **выборки и счёт** ([`list`], [`counts`],
+//! предел [`PROPOSALS_OPEN_MAX`] — на тип) — с условием `type = ?` **в SQL**, поэтому строки
+//! других типов (тестовый `echo` очереди работ) их не задевают; строка неизвестного типа, статуса
+//! или вида автора, прочитанная по id ([`get`]), пропускается с WARN (так сервер 0.0.17 после
+//! отката пропускает строки `tidy`).
 //!
 //! **Отсев повторов** — `dedup_key` (`blake3`, [`key_source`], [`key_source_rev`],
 //! [`key_text`]; решение координатора 64): у предложения из работы — по ссылке источника (его
@@ -17,11 +18,13 @@
 //! (решение 64 «навсегда» — только у человека; ревью r1 задачи 7, Minor 5), отозванный источник
 //! снова кандидат, тот же текст — новое предложение.
 //!
-//! Статусы: `proposed → accepted | declined | withdrawn` ([`decide`]); `skipped` — исполнитель
-//! решил «правила здесь нет», человеку не показывается (только отсев повторов); `stale` —
-//! зарезервирован схемой (код M7.3 его не ставит). Предложение само ничего не применяет: заметку
-//! Rules создаёт человек, принимая его (сервер, `POST /proposals/{id}/accept`), здесь —
-//! только `result_ref` (`n:<id>`).
+//! Статусы: `proposed → accepted | declined | withdrawn | stale` ([`decide`]); `skipped` —
+//! исполнитель решил «правила здесь нет» (у уборки — операция `keep` или отказ `{n, skip}`),
+//! человеку не показывается (только отсев повторов); `stale` — у уборки: запись кандидата
+//! изменилась после предложения (ревизия не та) — при «Применить» или сборщиком ночи
+//! ([`mark_stale_tidy`]). Предложение само ничего не применяет: заметку Rules и операцию уборки
+//! выполняет человек, принимая его (сервер, `POST /proposals/{id}/accept`), здесь — только
+//! `result_ref`.
 
 use std::collections::HashSet;
 
@@ -189,6 +192,26 @@ pub fn key_source_rev(ptype: ProposalType, target: &str, rev: i64) -> String {
 /// Ключ отсева спонтанного кандидата: путь и текст.
 pub fn key_text(ptype: ProposalType, path: &str, content: &str) -> String {
     hash(&[ptype.as_str(), "text", path, content])
+}
+
+/// Ключ отсева кандидата уборки (M7.5 §8.7 п. 1, `dedup_key`): тип кандидата `kind`, ссылки и
+/// ревизии записей (порядок не важен).
+pub fn key_refs_rev(ptype: ProposalType, kind: &str, refs: &[(String, i64)]) -> String {
+    let mut v: Vec<String> = refs.iter().map(|(r, rev)| format!("{r}@{rev}")).collect();
+    v.sort();
+    let mut parts = vec![ptype.as_str(), "refs-rev", kind];
+    parts.extend(v.iter().map(String::as_str));
+    hash(&parts)
+}
+
+/// Ключ «отклонено человеком» кандидата уборки: тип кандидата и ссылки записей **без ревизий**
+/// (отклонённое не возвращается ни в какой ревизии, §8.7 п. 1).
+pub fn key_refs(ptype: ProposalType, kind: &str, refs: &[String]) -> String {
+    let mut v: Vec<&str> = refs.iter().map(String::as_str).collect();
+    v.sort_unstable();
+    let mut parts = vec![ptype.as_str(), "refs", kind];
+    parts.extend(v);
+    hash(&parts)
 }
 
 fn hash(parts: &[&str]) -> String {
@@ -379,6 +402,8 @@ pub enum DecisionKind {
     Declined,
     /// Отозвано автором.
     Withdrawn,
+    /// Цель изменилась после предложения (уборка, M7.5 §8.7 п. 3).
+    Stale,
 }
 
 impl DecisionKind {
@@ -387,6 +412,7 @@ impl DecisionKind {
             DecisionKind::Accepted => ProposalStatus::Accepted,
             DecisionKind::Declined => ProposalStatus::Declined,
             DecisionKind::Withdrawn => ProposalStatus::Withdrawn,
+            DecisionKind::Stale => ProposalStatus::Stale,
         }
     }
 }
@@ -435,11 +461,14 @@ pub async fn decide(db: &Db, id: Id, d: Decision) -> Result<Decided, StoreError>
     .await
 }
 
-/// Счёт открытых предложений по типам (`GET /proposals/counts`, метка дерева «кандидаты: N»).
+/// Счёт открытых предложений по типам (`GET /proposals/counts`, метка дерева «кандидаты: N»,
+/// вкладки «Предложений» WebUI).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ProposalCounts {
     /// Открытых кандидатов в Rules (`type = 'rule'`, `proposed`).
     pub rules: u32,
+    /// Открытых кандидатов уборки (`type = 'tidy'`, `proposed`; M7.5 §8.8).
+    pub tidy: u32,
 }
 
 /// [`ProposalCounts`] базы.
@@ -447,7 +476,82 @@ pub async fn counts(db: &Db) -> Result<ProposalCounts, StoreError> {
     db.read(|c| {
         Ok(ProposalCounts {
             rules: open_count(c, ProposalType::Rule)?,
+            tidy: open_count(c, ProposalType::Tidy)?,
         })
+    })
+    .await
+}
+
+/// Ключи «отклонено человеком» ([`key_refs`]) предложений уборки `declined` — отсев сборщика по
+/// ссылкам в любой ревизии (M7.5 §8.7 пп. 1, 4). Тип кандидата — `payload.candidate`.
+pub async fn declined_tidy_keys(db: &Db) -> Result<HashSet<String>, StoreError> {
+    db.read(|c| {
+        let mut st = c.prepare_cached(
+            "SELECT targets, payload FROM proposals WHERE type = ?1 AND status = 'declined'",
+        )?;
+        let rows = st.query_map([ProposalType::Tidy.as_str()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut out = HashSet::new();
+        for row in rows {
+            let (t, p) = row?;
+            let targets: Vec<SourceRef> = serde_json::from_str(&t).unwrap_or_default();
+            let payload: Value = serde_json::from_str(&p).unwrap_or(Value::Null);
+            let kind = payload["candidate"].as_str().unwrap_or("");
+            let refs: Vec<String> = targets.into_iter().map(|x| x.target).collect();
+            out.insert(key_refs(ProposalType::Tidy, kind, &refs));
+        }
+        Ok(out)
+    })
+    .await
+}
+
+/// Открытые (`proposed`) предложения уборки, чья запись удалена или сменила ревизию, —
+/// `stale` (сборщик ночи, M7.5 §8.7 п. 3: кандидат вернётся с новыми ревизиями). Сколько снято.
+pub async fn mark_stale_tidy(db: &Db) -> Result<u64, StoreError> {
+    db.write(|t| {
+        let open: Vec<(Id, String)> = {
+            let mut st = t.prepare_cached(
+                "SELECT id, targets FROM proposals WHERE type = ?1 AND status = 'proposed'",
+            )?;
+            let rows = st.query_map([ProposalType::Tidy.as_str()], |r| {
+                Ok((r.get::<_, Id>(0)?, r.get::<_, String>(1)?))
+            })?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let mut cur = t.prepare_cached(
+            "SELECT current_rev FROM entries WHERE id = ?1 AND deleted_at IS NULL",
+        )?;
+        let at = fmt_ts(now());
+        let mut n = 0u64;
+        for (id, targets) in open {
+            let targets: Vec<SourceRef> = serde_json::from_str(&targets).unwrap_or_default();
+            let mut live = !targets.is_empty();
+            for x in &targets {
+                let rid = x
+                    .target
+                    .split_once(':')
+                    .and_then(|(_, r)| r.parse::<Id>().ok());
+                let rev: Option<i64> = match rid {
+                    Some(rid) => cur.query_row([rid], |r| r.get(0)).optional()?,
+                    None => None,
+                };
+                if rev != Some(x.rev) {
+                    live = false;
+                    break;
+                }
+            }
+            if !live {
+                let changed = t.execute(
+                    "UPDATE proposals SET status = 'stale', decided_at = ?2,
+                            decision_note = 'цель изменилась после предложения'
+                     WHERE id = ?1 AND status = 'proposed'",
+                    params![id, at],
+                )?;
+                n += changed as u64;
+            }
+        }
+        Ok(n)
     })
     .await
 }
@@ -500,5 +604,21 @@ mod tests {
         assert_ne!(key_source_rev(t, "i:1", 1), key_source_rev(t, "i:1", 2));
         assert_ne!(key_text(t, "a", "bc"), key_text(t, "ab", "c"));
         assert_eq!(key_text(t, "a", "b"), key_text(t, "a", "b"));
+        // уборка: порядок ссылок не важен, ревизия и тип кандидата — важны
+        let u = ProposalType::Tidy;
+        let nd = "near_duplicate";
+        let ab = [("i:a".to_string(), 1), ("i:b".to_string(), 2)];
+        let ba = [("i:b".to_string(), 2), ("i:a".to_string(), 1)];
+        assert_eq!(key_refs_rev(u, nd, &ab), key_refs_rev(u, nd, &ba));
+        let ab3 = [("i:a".to_string(), 1), ("i:b".to_string(), 3)];
+        assert_ne!(key_refs_rev(u, nd, &ab), key_refs_rev(u, nd, &ab3));
+        assert_ne!(
+            key_refs_rev(u, nd, &ab),
+            key_refs_rev(u, "contradiction", &ab)
+        );
+        let r = ["i:b".to_string(), "i:a".to_string()];
+        let r2 = ["i:a".to_string(), "i:b".to_string()];
+        assert_eq!(key_refs(u, nd, &r), key_refs(u, nd, &r2));
+        assert_ne!(key_refs(u, nd, &r), key_refs_rev(u, nd, &ab));
     }
 }

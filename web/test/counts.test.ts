@@ -13,9 +13,22 @@ import {
   formatCount,
   notesLabel,
   openLabel,
+  proposalsOpen,
   tasksSplit,
   type CountsSlot,
 } from '../src/lib/counts.ts';
+
+// M7.5 §8.8 п. 1: число раздела «Предложения» — кандидаты в Rules и уборки; сервер 0.0.17 — без
+// `tidy`; решения по уборке (`accept`, `decline`) — изменяющие запросы, числа перечитываются
+test('counts_include_tidy', () => {
+  assert.equal(proposalsOpen({ rules: 2, tidy: 3 }), 5);
+  assert.equal(proposalsOpen({ rules: 4 }), 4);
+  assert.equal(proposalsOpen({ rules: 0, tidy: 0 }), 0);
+  assert.equal(proposalsOpen(null), 0);
+  assert.equal(changesCounts('POST', 'proposals/o:01KQ/accept'), true);
+  assert.equal(changesCounts('POST', 'proposals/o:01KQ/decline'), true);
+  assert.equal(changesCounts('GET', 'proposals?type=tidy'), false);
+});
 
 test('count_label_ru', () => {
   const ideas = [1, 2, 5, 11, 21, 122].map((n) => countLabel('ideas', n));

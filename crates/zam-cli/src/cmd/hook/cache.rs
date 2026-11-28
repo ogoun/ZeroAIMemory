@@ -321,6 +321,59 @@ pub fn refresh_triggers(
     Ok((Refresh::Updated(c.triggers.len()), warnings))
 }
 
+/// Возраст `triggers.json`, после которого хук `prompt` сверяет его с сервером условным
+/// `GET /triggers` (M7.5 §8.9 п. 3).
+pub const TRIGGERS_FRESH: Duration = Duration::from_secs(5 * 60);
+
+/// `fetched_at` пометки «кэш устарел» ([`mark_triggers_stale`]): начало эпохи Unix.
+pub const TRIGGERS_STALE_AT: &str = "1970-01-01T00:00:00Z";
+
+/// Заголовок `triggers.json` без самих триггеров (их разбор хуку `prompt` не нужен).
+#[derive(Deserialize)]
+struct TriggersHead {
+    #[serde(default)]
+    fetched_at: String,
+    #[serde(default)]
+    server: String,
+    #[serde(default)]
+    solution: Option<String>,
+}
+
+/// Кэш триггеров надо сверить с сервером `server` (M7.5 §8.9 п. 3; `None` — адрес ещё не
+/// известен, без сверки адреса): файла нет или он битый, он другого сервера или решения,
+/// `fetched_at` не RFC 3339 или старше [`TRIGGERS_FRESH`] (в том числе пометка
+/// [`mark_triggers_stale`]).
+pub fn triggers_stale(env: &Env, server: Option<&str>) -> bool {
+    let head = read_json_file::<TriggersHead>(&triggers_path(&env.root))
+        .ok()
+        .flatten();
+    let Some(h) = head else { return true };
+    let sol = env.solution.as_ref().map(|s| s.id.as_str());
+    if server.is_some_and(|s| h.server != s) || h.solution.as_deref() != sol {
+        return true;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    zam_core::time::unix_secs(&h.fetched_at)
+        .and_then(|t| u64::try_from(t).ok())
+        .is_none_or(|t| now.saturating_sub(t) >= TRIGGERS_FRESH.as_secs())
+}
+
+/// Пометка «кэш триггеров устарел» после записи insight с триггерами через `zam` (M7.5 §8.9
+/// п. 3): `fetched_at` = [`TRIGGERS_STALE_AT`] — следующий хук `prompt` сверит кэш с сервером.
+/// Только существующий файл проекта `root` (команда не создаёт `.zeroaimemory/`); битый, сбой
+/// записи — без пометки (кэш и так обновит `session-start`).
+pub fn mark_triggers_stale(root: &Path) {
+    let path = triggers_path(root);
+    let Ok(Some(mut v)) = read_json_file::<Value>(&path) else {
+        return;
+    };
+    let Some(o) = v.as_object_mut() else { return };
+    o.insert("fetched_at".into(), Value::from(TRIGGERS_STALE_AT));
+    let _ = write_json_file(&path, &v);
+}
+
 /// Запись индекса `GET /file-refs`: ссылка (`n:`/`i:`/…), вид, заголовок, состояние и символ
 /// (`qual`, если ссылка на символ — M5.6 §8; кэш клиента M4.5 без поля читается).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

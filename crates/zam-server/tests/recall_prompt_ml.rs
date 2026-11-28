@@ -226,3 +226,61 @@ async fn prompt_short_vector_only_silent() {
         .unwrap();
     assert_eq!(item["reason"], "search", "{j}");
 }
+
+/// M7.5 §8.3 п. 1 (ML, MiniLM): правило покрытия `recall.prompt_fts_coverage` действует только
+/// при `degraded` поиска подсказок — на гибриде (векторный канал жив) запись, покрывающая одно
+/// предметное слово из трёх, остаётся подсказкой, как без ключа (без модели — снимается,
+/// `recall::prompt_fts_coverage_gates_degraded_only`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prompt_fts_coverage_ignored_on_hybrid() {
+    use common::ml::{MINILM, external, have, ml, vector_ready};
+    use zam_search::recall::CoverageRule;
+    if !have(MINILM) {
+        return;
+    }
+    let q = common::qdrant::TestQdrant::start("recall-cov-hybrid");
+    let a = api("recall-prompt-cov-hybrid", |c| {
+        roomy(c);
+        ml(c, MINILM);
+        external(c, &q);
+        c.recall.prompt_min_score = 0.0;
+        c.recall.prompt_fts_coverage = Some(CoverageRule {
+            common_pct: 100,
+            ..CoverageRule::M6
+        });
+    })
+    .await;
+    vector_ready(&a).await;
+    let full = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "Quasar and pulsar in one field",
+        "A quasar next to a pulsar; the magnetic field is weak.",
+        "discovery",
+    )
+    .await;
+    let one = insight(
+        &a,
+        &a.token,
+        "knowledge",
+        "Telescope calibration",
+        "Mirror calibration before the season; no quasar observed.",
+        "discovery",
+    )
+    .await;
+    wait_indexed(&a, &[full.clone(), one.clone()]).await;
+    let j = ok(
+        &a,
+        &a.token,
+        None,
+        json!({"event": "prompt", "prompt": "quasar pulsar magnetar"}),
+    )
+    .await;
+    let got = ids(&j);
+    assert!(got.contains(&format!("i:{full}")), "{j}");
+    assert!(
+        got.contains(&format!("i:{one}")),
+        "гибрид — правило покрытия не действует: {j}"
+    );
+}

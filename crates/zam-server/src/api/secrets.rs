@@ -36,10 +36,20 @@ pub fn attach(v: &mut Value, text: &str) {
 /// оставшиеся прежними значения агенту не новость (ключа он не знает, перенести его в Vault не
 /// может).
 pub fn attach_new(v: &mut Value, text: &str, base: &str) {
-    let scan = scan_secrets_ext(text);
+    let scan = new_scan(text, Some(base));
     if scan.hits.is_empty() {
         return;
     }
+    attach_scan(v, text.len(), scan);
+}
+
+/// Находки текста `text`, которые ответ записи назвал бы в `secrets_detected`: все, а с прежним
+/// текстом `base` — только значения, которых в нём нет ([`attach_new`]).
+fn new_scan(text: &str, base: Option<&str>) -> ScanOutcome {
+    let scan = scan_secrets_ext(text);
+    let Some(base) = base.filter(|_| !scan.hits.is_empty()) else {
+        return scan;
+    };
     let known: std::collections::HashSet<&str> = zam_markdown::scan_secrets(base)
         .into_iter()
         .filter_map(|h| base.get(h.range))
@@ -49,7 +59,33 @@ pub fn attach_new(v: &mut Value, text: &str, base: &str) {
         .into_iter()
         .filter(|h| text.get(h.range.clone()).is_none_or(|s| !known.contains(s)))
         .collect();
-    attach_scan(v, text.len(), ScanOutcome { hits, ..scan });
+    ScanOutcome { hits, ..scan }
+}
+
+/// Отказ записи при секрете (M7.5 §8.9 п. 5, `reject_secrets: true`): находки текста `text` — те
+/// же, что попали бы в `secrets_detected` ответа (с `base` — только новые, [`attach_new`]); есть —
+/// 422 `/problems/secrets-detected` с `[{kind, line}]` и без значений, запись не выполняется.
+pub fn reject(text: &str, base: Option<&str>) -> Result<(), crate::error::ApiError> {
+    let hits = new_scan(text, base).hits;
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let list: Vec<String> = hits
+        .iter()
+        .map(|h| format!("{} (строка {})", h.kind.as_str(), h.line))
+        .collect();
+    Err(crate::error::ApiError::SecretsDetected {
+        detail: format!(
+            "в тексте найдены значения, похожие на секреты: {} — ничего не записано \
+             (reject_secrets); уберите их из текста, а ключи храните в Vault (`zam vault set \
+             <имя>`, memory_vault)",
+            list.join(", ")
+        ),
+        hits: hits
+            .iter()
+            .map(|h| json!({ "kind": h.kind.as_str(), "line": h.line }))
+            .collect(),
+    })
 }
 
 /// [`attach_new`] по текстам записи и её прежнего вида.

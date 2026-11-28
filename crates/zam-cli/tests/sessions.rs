@@ -43,6 +43,9 @@ struct Seed {
     /// через полночь UTC между посевом и запросом не меняет ожиданий (ревью задачи 9, Minor 7);
     /// `None` — сегодня в момент посева.
     today: Option<jiff::civil::Date>,
+    /// Подсказки `s-new` (M7.5 §8.8 п. 2): три цели показаны подсказкой (`session_seen`, часть
+    /// `recall`), одна из них открыта (`usage_opened`).
+    hints: bool,
 }
 
 /// Выдача без сессии: сегодня `mcp` 2/30 и `brief` 1/5, три дня назад `mcp` 1/7 (за 30 суток —
@@ -147,6 +150,36 @@ fn start_with(name: &str, seed: Seed) -> (String, String) {
             )
             .await
             .unwrap();
+            if seed.hints {
+                let targets: Vec<zam_core::TargetRef> = (0..3)
+                    .map(|_| zam_core::TargetRef {
+                        kind: zam_core::TargetKind::Entry,
+                        id: zam_core::Id::new(),
+                    })
+                    .collect();
+                let items: Vec<zam_store::SeenItem> = targets
+                    .iter()
+                    .map(|t| zam_store::SeenItem {
+                        key: zam_store::SeenKey {
+                            owner_id: u.id,
+                            target: zam_store::SeenTarget::Ref(*t),
+                            part: zam_store::RECALL_PART.into(),
+                        },
+                        rev: 1,
+                    })
+                    .collect();
+                zam_store::mark_seen(&db, &touch("s-new"), &items)
+                    .await
+                    .unwrap();
+                let ev = zam_store::OpenedEvent {
+                    ts: zam_store::time::now(),
+                    user_id: u.id,
+                    session_id: "s-new".into(),
+                    target: targets[0],
+                    source: zam_store::UsageSource::PostTool,
+                };
+                assert!(zam_store::record_opened(&db, &ev).await.unwrap());
+            }
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             tx.send((url, t)).unwrap();
@@ -308,6 +341,89 @@ fn cli_sessions_tokens_old_server() {
         err.contains("сервер не поддерживает учёт по сессиям"),
         "{err}"
     );
+}
+
+/// M7.5 §8.8 п. 2: под таблицей — «открыто подсказок: N/M (p %)» (`hints_opened`/`hints_shown`
+/// сессии; у `--last N` — сумма, у `--by-holdout` — по группе; группа без подсказок — без
+/// строки); `--json` — `hints {shown, opened}` группы. Сервер без признака `sessions_opened`
+/// (0.0.17: сессия с `tokens`, но без `hints_*`) — «открыто подсказок: —» и `hints: null`.
+#[test]
+fn sessions_tokens_prints_opened() {
+    let (url, tok) = start_with(
+        "opened",
+        Seed {
+            hints: true,
+            ..Seed::default()
+        },
+    );
+    let r = tmp("opened-repo");
+    let one = ok(&zam(&url, &tok, &r, &["sessions", "tokens", "s-new"], None));
+    assert!(one.contains("\nоткрыто подсказок: 1/3 (33 %)\n"), "{one}");
+    let last = ok(&zam(
+        &url,
+        &tok,
+        &r,
+        &["sessions", "tokens", "--last", "2"],
+        None,
+    ));
+    assert!(last.contains("\nоткрыто подсказок: 1/3 (33 %)\n"), "{last}");
+    // контрольная группа (s-old) подсказок не видела — строки нет; основная — 1/3
+    let by = ok(&zam(
+        &url,
+        &tok,
+        &r,
+        &["sessions", "tokens", "--last", "2", "--by-holdout"],
+        None,
+    ));
+    let (main, hold) = by
+        .split_once("\nконтрольная группа (holdout): сессий 1\n")
+        .unwrap_or_else(|| panic!("{by}"));
+    assert!(main.contains("открыто подсказок: 1/3 (33 %)"), "{by}");
+    assert!(!hold.contains("открыто подсказок"), "{by}");
+    let j: Value = serde_json::from_str(&ok(&zam(
+        &url,
+        &tok,
+        &r,
+        &["sessions", "tokens", "s-new", "--json"],
+        None,
+    )))
+    .unwrap();
+    assert_eq!(
+        j["groups"]["all"]["hints"],
+        serde_json::json!({"shown": 3, "opened": 1}),
+        "{j}"
+    );
+    assert_eq!(j["items"][0]["hints_shown"], 3, "{j}");
+
+    // сервер 0.0.17: учёт есть, полей подсказок нет
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let old = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for mut s in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let body = r#"{"id":"s-old","agent":"claude","started_at":"2026-11-01T00:00:00Z","last_seen_at":"2026-11-01T00:10:00Z","seen_epoch":0,"tokens":{"read":{"calls":1,"tokens":5}}}"#;
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let out = ok(&zam(&old, "t", &r, &["sessions", "tokens", "s-old"], None));
+    assert!(out.contains("\nread\t1\t5\t\n"), "{out}");
+    assert!(out.contains("\nоткрыто подсказок: —\n"), "{out}");
+    let j: Value = serde_json::from_str(&ok(&zam(
+        &old,
+        "t",
+        &r,
+        &["sessions", "tokens", "s-old", "--json"],
+        None,
+    )))
+    .unwrap();
+    assert!(j["groups"]["all"]["hints"].is_null(), "{j}");
 }
 
 /// M7 §5.8 п. 2: `--unattributed [--days N]` — выдача без сессии по суткам и событиям
@@ -605,8 +721,9 @@ fn sessions_tokens_old_server_no_line() {
     }));
     let r = tmp("old-line-repo");
     let out = ok(&zam(&url, "t", &r, &["sessions", "tokens", "s-old"], None));
+    // M7.5 §8.8 п. 2: у сервера без полей подсказок — «открыто подсказок: —» под таблицей
     assert!(
-        out.ends_with("\nитого\t\t10\t\nуже выдавалось: read 0 из 1 (0 %)\n"),
+        out.ends_with("\nитого\t\t10\t\nуже выдавалось: read 0 из 1 (0 %)\nоткрыто подсказок: —\n"),
         "{out}"
     );
     assert!(!out.contains("без сессии"), "{out}");
